@@ -15,6 +15,7 @@ config/.env
 
 # Laufzeitdaten
 state/
+state/*.json
 Archiv/
 *.log
 *.bak
@@ -26,3 +27,12 @@ tmp/
 # Editor
 .vscode/
 .idea/
+
+# Python build metadata
+*.egg-info/
+build/
+dist/
+
+# macOS/Windows (falls mal per SMB/GUI)
+.DS_Store
+Thumbs.db
