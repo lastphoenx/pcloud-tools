@@ -27,6 +27,7 @@ tmp/
 # Editor
 .vscode/
 .idea/
+state/*.json
 
 # Python build metadata
 *.egg-info/

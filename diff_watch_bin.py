@@ -38,7 +38,7 @@ LE_U16, LE_U32, LE_U64 = "<H", "<I", "<Q"
 PARAM_STRING, PARAM_NUMBER, PARAM_BOOL = 0, 1, 2
 TYPE_HASH, TYPE_ARRAY, TYPE_FALSE, TYPE_TRUE, TYPE_DATA, TYPE_END = 16, 17, 18, 19, 20, 255
 
-DEFAULT_STATE = "/opt/entropywatcher/pcloud/.pcloud_diff_state.json"
+DEFAULT_STATE = "/opt/apps/pcloud-tools/main/state/.pcloud_diff_state.json"
 
 # -------------------- .env --------------------
 def load_env(p: str)->Dict[str,str]:
