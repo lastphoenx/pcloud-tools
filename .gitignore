@@ -26,3 +26,13 @@ tmp/
 # Editor
 .vscode/
 .idea/
+state/*.json
+
+# Python build metadata
+*.egg-info/
+build/
+dist/
+
+# macOS/Windows (falls mal per SMB/GUI)
+.DS_Store
+Thumbs.db
