@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv-*
+
+
+# Secrets
+config/.env
+*.env
+**/*.env
+.env
+.env.* 
+!config/*.env.example
+
+# Laufzeitdaten
+state/
+Archiv/
+*.log
+*.bak
+*.swp
+*.tmp
+.cache/
+tmp/
+
+# Editor
+.vscode/
+.idea/
