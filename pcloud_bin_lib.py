@@ -22,9 +22,23 @@ Hinweis zur Binary-API:
 Diese Bibliothek dekodiert **nicht** den kompletten Baum generisch,
 sondern extrahiert gezielt Felder für die verwendeten Methoden.
 """
-from __future__ import annotations
-import os, ssl, socket, struct, time, hashlib, inspect
+
+import os
+import ssl
+import socket
+import struct
+import time
+import hashlib
+import inspect
+import json as _json
+import tempfile as _tempfile
 from typing import Any, Dict, Callable, Optional, Tuple
+import requests as _requests
+
+
+#from __future__ import annotations
+#import os, ssl, socket, struct, time, hashlib, inspect
+#from typing import Any, Dict, Callable, Optional, Tuple
 
 # --- Konstanten / Formate ---
 LE_U16, LE_U32, LE_U64 = "<H", "<I", "<Q"
@@ -458,76 +472,79 @@ def getapiserver(cfg: Dict[str, Any]) -> Dict[str, Any]:
     _expect_ok(top)
     return top
 
-def choose_nearest_bin_host(cfg: Dict[str, Any],
-                            *,
-                            attempts_per_host: int = 2,
-                            connect_timeout_s: float = 3.0,
-                            cache_ttl_s: int = 3600) -> str:
-    """
-    Wählt den effektiv nächsten Binär-API-Host anhand von TLS-Handshake-Zeitmessung.
-    Kandidaten kommen aus getapiserver()['binapi']; Fallback ist cfg['host'].
-    Ergebnis wird ~1h gecached.
-    """
-    import json, time, os, socket, ssl
 
-    base_host = cfg["host"]; port = int(cfg["port"])
+def choose_nearest_bin_host(cfg, enabled=False, attempts_per_host=2, connect_timeout_s=3.0, cache_ttl_s=3600):
+    """
+    Bestimme (optional) den 'nächsten' Binär-API-Host per kurzer TLS-Handshakes.
+    Standardmäßig AUS (enabled=False) -> immer cfg['host'] zurückgeben.
 
-    # Cache lesen
-    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "pcloud")
-    cache_file = os.path.join(cache_dir, "nearest_bin.json")
+    cfg erwartet:
+      cfg['host']  : Basis-Host (Default eapi.pcloud.com)
+      cfg['port']  : Binärport (Default 8399)
+    """
+    # Vereinheitlichung: keine Host-Differenzierung, wenn nicht ausdrücklich gewünscht.
+    if not enabled:
+        return cfg.get("host") or "eapi.pcloud.com"
+
+    import time, os, json, socket, ssl
+
+    base_host = cfg.get("host") or "eapi.pcloud.com"
+    port = int(cfg.get("port") or 8399)
+    cache_file = os.path.join(os.path.expanduser("~"), ".pcloud_nearest_cache.json")
+
+    # Cache prüfen
     try:
-        if os.path.isfile(cache_file):
-            with open(cache_file, "r", encoding="utf-8") as f:
-                c = json.load(f)
-            if (time.time() - float(c.get("ts", 0))) <= cache_ttl_s and c.get("host"):
-                return c["host"]
+        with open(cache_file, "r", encoding="utf-8") as f:
+            c = json.load(f)
+        if isinstance(c, dict) and (time.time() - float(c.get("ts", 0)) < cache_ttl_s):
+            cached = c.get("chosen")
+            if cached:
+                return cached
     except Exception:
         pass
 
-    # Kandidaten holen
-    candidates: list[str] = []
+    # Kandidaten vom API-Server holen (falls verfügbar)
     try:
-        ap = getapiserver(cfg)
-        binapi = ap.get("binapi") or []
-        if isinstance(binapi, list):
-            candidates.extend([h for h in binapi if isinstance(h, str)])
+        ap = getapiserver(cfg)  # muss in derselben Datei vorhanden sein
+        candidates = list(ap.get("binapi") or [])  # Liste von Hostnamen
+        if base_host not in candidates:
+            candidates.append(base_host)
+        candidates = list(dict.fromkeys(candidates))  # dedupe, Reihenfolge erhalten
     except Exception:
-        pass
-    if base_host not in candidates:
-        candidates.append(base_host)
+        candidates = [base_host]
 
-    # Messen (connect + TLS handshake)
-    def measure(host: str) -> float | None:
-        best = None
-        for _ in range(max(1, attempts_per_host)):
-            t0 = time.perf_counter()
+    def handshake_latency(host):
+        lat = []
+        for _ in range(max(1, int(attempts_per_host))):
+            t0 = time.time()
             try:
-                raw = socket.create_connection((host, port), timeout=connect_timeout_s)
+                s = socket.create_connection((host, port), timeout=connect_timeout_s)
                 ctx = ssl.create_default_context()
-                tls = ctx.wrap_socket(raw, server_hostname=host)
-                tls.close()
-                dt = time.perf_counter() - t0
-                best = dt if (best is None or dt < best) else best
+                with ctx.wrap_socket(s, server_hostname=host):
+                    pass
+                lat.append(time.time() - t0)
             except Exception:
-                return None
-        return best
+                lat.append(float("inf"))
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        return sum(lat) / len(lat)
 
-    scores = []
+    times = []
     for h in candidates:
-        dt = measure(h)
-        if dt is not None:
-            scores.append((dt, h))
-    if not scores:
-        return base_host
+        t = handshake_latency(h)
+        times.append((t, h))
 
-    scores.sort()
-    chosen = scores[0][1]
+    # Wähle den kleinsten (aber fallback auf base_host, falls alles inf ist)
+    times.sort(key=lambda x: x[0])
+    chosen = times[0][1] if times and times[0][0] != float("inf") else base_host
 
-    # Cache schreiben (best effort)
+    # Cache speichern (best effort)
     try:
-        os.makedirs(cache_dir, exist_ok=True)
         with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump({"host": chosen, "ts": time.time(), "candidates": candidates}, f)
+            json.dump({"ts": time.time(), "chosen": chosen}, f)
     except Exception:
         pass
 
@@ -1149,3 +1166,268 @@ def relative_paths(rows: list[dict], base_path: str) -> list[dict]:
         nr["path"] = rp
         out.append(nr)
     return out
+
+def deletefolder_recursive(cfg: dict, *, path: str | None = None, folderid: int | None = None) -> dict:
+    """
+    Löscht einen Ordner rekursiv (wie deletefolderrecursive).
+    """
+    if (path is None) == (folderid is None):
+        raise ValueError("deletefolder_recursive: genau eines von path oder folderid angeben.")
+    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    if path is not None:
+        params["path"] = _norm_remote_path(path)
+    else:
+        params["folderid"] = int(folderid)
+    top, _ = _rpc(cfg["host"], int(cfg["port"]), int(cfg["timeout"]), "deletefolderrecursive", params)
+    _expect_ok(top)
+    return top
+
+def put_textfile(cfg: dict, *, path: str, text: str, encoding: str = "utf-8") -> dict:
+    """Schreibt Textdatei robust per Binary-Upload (kein REST)."""
+    rp = _norm_remote_path(path)
+    folderid = ensure_parent_dirs(cfg, rp)  # gibt parent-folderid
+    import tempfile, os as _os
+    with tempfile.NamedTemporaryFile("w", encoding=encoding, delete=False) as tf:
+        tf.write(text)
+        tmp = tf.name
+    try:
+        return upload_streaming(cfg, tmp, dest_folderid=folderid, filename=rp.rsplit("/",1)[-1])
+    finally:
+        try: _os.remove(tmp)
+        except: pass
+
+
+def deletefile(cfg: dict, *, path: str | None = None, fileid: int | None = None) -> dict:
+    """Datei löschen (Binary API)."""
+    if (path is None) == (fileid is None):
+        raise ValueError("deletefile: genau eines von path oder fileid angeben.")
+    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    if path is not None:
+        params["path"] = _norm_remote_path(path)
+    else:
+        params["fileid"] = int(fileid)
+    top, _ = _rpc(cfg["host"], int(cfg["port"]), int(cfg["timeout"]), "deletefile", params)
+    _expect_ok(top)
+    return top
+
+
+# ======== REST-Mini-Client & High-Level Helpers (add to end of file) ========
+def _rest_base(cfg):
+    """
+    Einheitliche REST-Basis-URL.
+    Nutzt immer cfg['host'] (Default 'eapi.pcloud.com'), unabhängig davon ob Binary- oder JSON-Client.
+    """
+    h = (cfg.get("host") or "eapi.pcloud.com").strip()
+    return "https://%s" % h
+
+def _rest_get_json(cfg: dict, method: str, params: dict) -> dict:
+    """
+    JSON-REST-Call: https://<host>/<method>?access_token=...
+    Wirft eine klare Exception bei result!=0.
+    """
+    url = f"{_rest_base(cfg)}/{method.lstrip('/')}"
+    p = dict(params or {})
+    p["access_token"] = cfg["token"]
+    r = _requests.get(url, params=p, timeout=int(cfg.get("timeout", 30)))
+    r.raise_for_status()
+    obj = r.json()
+    if obj.get("result") not in (0, "0", 0.0, None):
+        raise RuntimeError(f"REST {method} error {obj.get('result')}: {obj.get('error')}")
+    return obj
+
+def get_textfile(cfg: dict, *, path: str | None = None, fileid: int | None = None,
+                 maxbytes: int | None = None, encoding: str = "utf-8") -> str:
+    """
+    Liest kleine Textdateien robust:
+      1) /getfilelink (signierter Download-Link)
+      2) direkten Link abrufen (ohne Token/Headers)
+    Gibt den Datei-INHALT als String zurück.
+    """
+    import requests as _requests
+    import json as _json
+
+    if (path is None) == (fileid is None):
+        raise ValueError("get_textfile: genau eines von path oder fileid angeben.")
+
+    # 1) signierten Link holen
+    gl_params = {"access_token": cfg["token"]}
+    if path is not None:
+        gl_params["path"] = _norm_remote_path(path)
+    else:
+        gl_params["fileid"] = int(fileid)
+
+    gl_url = f"{_rest_base(cfg)}/getfilelink"
+    gl = _requests.get(gl_url, params=gl_params, timeout=int(cfg.get("timeout", 30)))
+    gl.raise_for_status()
+
+    jd = gl.json()
+    if int(jd.get("result", -1)) != 0:
+        raise RuntimeError(f"getfilelink fehlgeschlagen: {jd}")
+
+    hosts = jd.get("hosts") or []
+    link_path = jd.get("path")
+    if not hosts or not link_path:
+        raise RuntimeError(f"getfilelink Antwort unvollständig: {jd}")
+
+    # 2) Datei abrufen (optional begrenzen)
+    link = f"https://{hosts[0]}{link_path}"
+    headers = {}
+    if maxbytes is not None:
+        headers["Range"] = f"bytes=0-{int(maxbytes)-1}"
+
+    r = _requests.get(link, headers=headers, timeout=int(cfg.get("timeout", 30)), allow_redirects=True)
+    r.raise_for_status()
+    return r.content.decode(encoding, errors="replace")
+
+def copyfile(cfg: Dict[str, Any],
+             *,
+             from_path: str | None = None,
+             to_path: str | None = None,
+             from_fileid: int | None = None,
+             to_folderid: int | None = None,
+             to_name: str | None = None,
+             overwrite: bool = False) -> Dict[str, Any]:
+    """
+    Serverseitige Kopie (ohne erneutes Hochladen). Ideal für Materialisierung
+    in 1:1-Snapshot-Pfaden. Nutzt REST /copyfile.
+    Varianten:
+      - from_path + to_path
+      - from_fileid + (to_folderid + to_name)
+    """
+    params: Dict[str, Any] = {"nopartial": 1}
+    if from_path is not None:
+        params["path"] = _norm_remote_path(from_path)
+    elif from_fileid is not None:
+        params["fileid"] = int(from_fileid)
+    else:
+        raise ValueError("copyfile: Quelle fehlt (from_path oder from_fileid).")
+
+    if to_path is not None:
+        params["topath"] = _norm_remote_path(to_path)
+    elif (to_folderid is not None) and to_name:
+        params["tofolderid"] = int(to_folderid)
+        params["toname"] = to_name
+    else:
+        raise ValueError("copyfile: Ziel fehlt (to_path ODER to_folderid+to_name).")
+
+    if overwrite:
+        params["force"] = 1
+
+    return _rest_get(cfg, "copyfile", params)
+
+def renamefile(cfg: Dict[str, Any], *, fileid: int | None = None,
+               path: str | None = None, toname: str = "") -> Dict[str, Any]:
+    """REST /renamefile – umbenennen ohne Re-Upload."""
+    if not toname:
+        raise ValueError("renamefile: toname required.")
+    params: Dict[str, Any] = {"toname": toname}
+    if fileid is not None:
+        params["fileid"] = int(fileid)
+    elif path is not None:
+        params["path"] = _norm_remote_path(path)
+    else:
+        raise ValueError("renamefile: fileid ODER path.")
+    return _rest_get(cfg, "renamefile", params)
+
+def getfilehistory(cfg: Dict[str, Any], *, fileid: int) -> Dict[str, Any]:
+    """REST /getfilehistory – liefert Historie (sofern vorhanden/aktiv)."""
+    return _rest_get(cfg, "getfilehistory", {"fileid": int(fileid)})
+
+# ---- JSON Komfort: remote lesen/schreiben ----
+
+def read_json_at_path(cfg: Dict[str, Any], path: str, maxbytes: int | None = None) -> dict:
+    txt = get_textfile(cfg, path=path, maxbytes=maxbytes or 1024*1024)
+    try:
+        return _json.loads(txt)
+    except Exception as e:
+        raise RuntimeError(f"JSON parse failed for {path}: {e}")
+
+def upload_text_as_file(cfg: Dict[str, Any], text: str, dest_path: str, filename: str | None = None) -> Dict[str, Any]:
+    """
+    Text (JSON etc.) als Datei hochladen.
+    WICHTIG: Wir geben der Binary-API NICHT den vollen Dateipfad als 'path',
+    sondern laden in den Elternordner via 'dest_folderid' + 'filename'.
+    """
+    import tempfile as _tempfile, os as _os
+
+    dest_path = _norm_remote_path(dest_path)
+    # Elternordner sicherstellen und folderid holen
+    parent_dir = dest_path.rsplit("/", 1)[0] or "/"
+    ensure_path(cfg, parent_dir)
+    md_parent = stat_folder(cfg, path=parent_dir)
+    folderid = int(md_parent.get("folderid") or 0)
+
+    # Dateiname bestimmen
+    fname = filename or (dest_path.rsplit("/", 1)[-1] or "file.txt")
+
+    # temporäre Datei erzeugen
+    with _tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+        tf.write(text)
+        tmp = tf.name
+    try:
+        return upload_streaming(cfg, tmp, dest_folderid=folderid, filename=fname)
+    finally:
+        try:
+            _os.remove(tmp)
+        except Exception:
+            pass
+
+def write_json_at_path(cfg: dict, path: str, obj: dict) -> dict:
+    """JSON robust hochladen (Binary)."""
+    return put_textfile(cfg, path=_norm_remote_path(path), text=_json.dumps(obj, ensure_ascii=False, indent=2))
+
+# ---- Kleinzeug für Push/Stub-Workflows ----
+
+def ensure_parent_dirs(cfg: dict, dest_path: str) -> int:
+    """Eltern-Ordner von Datei-Pfad sicherstellen und folderid zurückgeben."""
+    dest_path = _norm_remote_path(dest_path)
+    parent = dest_path.rsplit("/", 1)[0] or "/"
+    return ensure_path(cfg, parent)
+
+def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int | None = None) -> dict:
+    """Wie stat_file, aber fängt 2055/Not-Found sauber ab und gibt {} zurück."""
+    try:
+        return stat_file(cfg, path=path, fileid=fileid, with_checksum=False, enrich_path=True) or {}
+    except Exception as e:
+        msg = str(e)
+        if "2055" in msg or "not found" in msg.lower():
+            return {}
+        raise
+
+# ---- für leichtes pcloud-Delete-CLI ----
+def delete_file(cfg: Dict[str, Any], *, fileid: int | None = None, path: str | None = None) -> Dict[str, Any]:
+    """
+    Löscht eine Datei (Binary-API deletefile).
+    Genau eines von fileid oder path angeben.
+    """
+    if (fileid is None) == (path is None):
+        raise ValueError("delete_file: genau eines von fileid oder path angeben.")
+    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    if fileid is not None:
+        params["fileid"] = int(fileid)
+    else:
+        params["path"] = _norm_remote_path(path)
+    top, _ = _rpc(cfg["host"], cfg["port"], cfg["timeout"], "deletefile", params)
+    _expect_ok(top)
+    return top
+
+
+def delete_folder(cfg: Dict[str, Any], *, folderid: int | None = None, path: str | None = None,
+                  recursive: bool = False) -> Dict[str, Any]:
+    """
+    Löscht einen Ordner (Binary-API deletefolder / deletefolderrecursive).
+    Genau eines von folderid oder path angeben.
+    """
+    if (folderid is None) == (path is None):
+        raise ValueError("delete_folder: genau eines von folderid oder path angeben.")
+    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    if folderid is not None:
+        params["folderid"] = int(folderid)
+    else:
+        params["path"] = _norm_remote_path(path)
+    method = "deletefolderrecursive" if recursive else "deletefolder"
+    top, _ = _rpc(cfg["host"], cfg["port"], cfg["timeout"], method, params)
+    _expect_ok(top)
+    return top
+
+
