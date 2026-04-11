@@ -154,6 +154,10 @@ Primary Tools:
   pcloud_restore.py                          Restore backups from manifests
   pcloud_integrity_check.py                  Verify cloud backup integrity
 
+Diagnostic & Repair Tools:
+  pcloud_quick_delta.py                      Fast tamper detection (2s for 20k files)
+  pcloud_repair_index.py                     Clean phantom holders from index
+
 Helper Tools:
   pcloud_bin_lib.py                          Binary client library for pCloud API
   wrapper_pcloud_sync_1to1.sh                Shell wrapper for backup automation
@@ -177,6 +181,10 @@ Umgebungsvariablen (.env):
 * **Full Restore** - Rekonstruiert komplette Backups aus Manifests + File-Pool
 
 * **Integrity Check** - Verifiziert Cloud-Backups gegen SHA256-Hashes
+
+* **Fast Tamper Detection** - 2-second delta check via single API call (vs. hours with traditional methods)
+
+* **Automated Index Repair** - Clean phantom holders after interrupted uploads
 
 * **Incremental Uploads** - Nur neue/geänderte Dateien werden hochgeladen
 
@@ -268,6 +276,137 @@ PCLOUD_VERBOSE=1                           # Show detailed logs
 ```
 
 **Real-world Impact:** Successfully uploaded 19,808 files / 89.66 GB including 910MB video files that previously failed with connection errors.
+
+## Diagnostic & Repair Tools
+
+### Fast Tamper Detection (`pcloud_quick_delta.py`)
+
+**Purpose:** Verify cloud backup integrity in seconds using a single API call.
+
+**How it works:**
+- Fetches remote folder structure via one recursive `listfolder` call (2-3s for 20k files)
+- Compares against local `content_index.json` (hash-based deduplication index)
+- Detects missing files, hash mismatches, size discrepancies, and unknown files
+
+**Use cases:**
+- Quick tamper detection after upload (verify all files reached pCloud)
+- Pre-backup validation (ensure remote state matches local index)
+- Identify phantom index entries (files marked as uploaded but missing on remote)
+
+**Example:**
+```bash
+# Quick delta check
+python pcloud_quick_delta.py \
+  --snapshot 2026-04-10-075334 \
+  --dest-root /Backup/rtb_1to1 \
+  --env-file .env \
+  --json-out /srv/pcloud-temp/delta.json
+
+# Output:
+# ✅ 15,028 files OK (hash + fileid + size match)
+# ❌ 2,900 missing anchors (in index but not on pCloud)
+# ⚠️ 0 hash gaps (file exists but no pcloud_hash in index)
+# 🔍 2 unknown files (on pCloud but not in index)
+```
+
+**Performance:** ~2 seconds for 20k files (vs. traditional checksumfile verification: hours)
+
+**Output formats:**
+- Console summary (colored diff report)
+- JSON export (`--json-out`) for automation/repair workflows
+
+---
+
+### Index Repair (`pcloud_repair_index.py`)
+
+**Purpose:** Clean phantom holder entries from local index based on delta report.
+
+**How it works:**
+- Reads delta report from `pcloud_quick_delta.py`
+- Removes holders for missing files (phantom entries from interrupted uploads)
+- Preserves valid holders for existing files
+- Saves cleaned index to `/srv/pcloud-temp/pcloud_index_<snapshot>.json`
+
+**Use cases:**
+- Fix index after interrupted upload (resume upload will skip valid files, re-upload missing)
+- Clean up after partial upload failures
+- Prepare index for re-run without re-uploading entire snapshot
+
+**Example:**
+```bash
+# Step 1: Detect issues
+python pcloud_quick_delta.py \
+  --snapshot 2026-04-10-075334 \
+  --dest-root /Backup/rtb_1to1 \
+  --env-file .env \
+  --json-out /srv/pcloud-temp/delta.json
+
+# Step 2: Repair index
+python pcloud_repair_index.py \
+  --delta-report /srv/pcloud-temp/delta.json \
+  --env-file .env
+
+# Output:
+# 🔧 Processing 17,928 index nodes...
+# ❌ Removed 2,900 phantom holders
+# 🗑️ Deleted 2,703 nodes with no remaining holders
+# ✅ Cleaned index: 15,225 nodes, 16,908 holders
+# 💾 Saved to: /srv/pcloud-temp/pcloud_index_2026-04-10-075334.json
+
+# Step 3: Resume upload with cleaned index
+python pcloud_push_json_manifest_to_pcloud.py \
+  --manifest /srv/pcloud-temp/pcloud_mani.2026-04-10-075334.json \
+  --dest-root /Backup/rtb_1to1 \
+  --snapshot-mode 1to1 \
+  --env-file .env
+  
+# Upload will automatically use cleaned index from /srv/pcloud-temp/
+# Result: uploaded=2,703 (missing files), resumed=16,908 (valid files)
+```
+
+**Safety:**
+- Operates on local copy (original index on pCloud untouched)
+- Dry-run available via `--dry` flag
+- Cleaned index written to separate file for review before upload
+
+---
+
+### Diagnostic Workflow
+
+**Scenario:** Upload reports success but integrity check shows missing files
+
+```bash
+# 1. Quick delta check (2s)
+python pcloud_quick_delta.py \
+  --snapshot 2026-04-10-075334 \
+  --dest-root /Backup/rtb_1to1 \
+  --env-file .env \
+  --json-out /srv/pcloud-temp/delta.json
+
+# 2. Repair index (removes phantom holders)
+python pcloud_repair_index.py \
+  --delta-report /srv/pcloud-temp/delta.json \
+  --env-file .env
+
+# 3. Resume upload (only missing files uploaded)
+python pcloud_push_json_manifest_to_pcloud.py \
+  --manifest /srv/pcloud-temp/pcloud_mani.2026-04-10-075334.json \
+  --dest-root /Backup/rtb_1to1 \
+  --snapshot-mode 1to1 \
+  --env-file .env
+```
+
+**Key metrics:**
+- Delta check: 2 seconds (single API call)  
+- Index repair: 274 lines, instant execution
+- Upload resume: Skips 16,908 valid files, uploads 2,703 missing (90% time saved)
+
+**Comparison to alternatives:**
+| Method | Time | API Calls | Accuracy |
+|--------|------|-----------|----------|
+| `pcloud_quick_delta.py` | 2s | 1 | Hash + Fileid + Size |
+| Traditional checksumfile | 2+ hours | 20,000+ | SHA256 only |
+| Manual index rebuild | N/A | N/A | Loses dedup info |
 
 ## Examples
 
