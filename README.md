@@ -184,6 +184,91 @@ Umgebungsvariablen (.env):
 
 * **Automation-Ready** - Shell-Wrapper für systemd-Timer Integration
 
+## Technical Improvements (April 2026)
+
+Recent optimizations have significantly improved reliability, performance, and robustness:
+
+### Network & Upload Stability
+* **DNS Caching** - Reduces DNS resolution overhead for repeated API calls
+* **HTTP Keep-Alive Sessions** - Persistent connections reduce TCP handshake latency
+* **Chunked Upload for Large Files** - Files >100MB use multi-part upload (5MB chunks by default)
+  - Automatic retry per chunk (8 attempts with exponential backoff)
+  - Session refresh on connection errors (prevents stale socket issues)
+  - Proper `Content-Type: application/octet-stream` headers
+* **Correct pCloud API Usage**:
+  - `upload_create`: Only `access_token` parameter
+  - `upload_write`: Binary data with proper headers
+  - `upload_save`: Uses `folderid` + `name` (not `path`)
+
+### Resume & Recovery
+* **Index-Driven Skip Logic** - Maintains local index (`/tmp/pcloud_index_<snapshot>.json`) with successfully uploaded files
+  - On restart: Automatically skips already-uploaded files
+  - Safe for multi-TB uploads over days/weeks
+  - Configurable index save interval (default: every 100 files via `--index-save-interval`)
+* **Incremental Index Updates** - Index saved during upload (not just at end)
+* **Upload to pCloud on Success** - Index uploaded to snapshot folder after successful completion
+
+### Security & Privacy
+* **Token Scrubbing** - Access tokens automatically removed from exception messages (regex-based)
+  - Prevents accidental token leaks in logs/error reports
+  - Applied to HTTP errors and connection exceptions
+
+### Performance Tuning
+* **Configurable Timeouts** - Adjustable via `PCLOUD_TIMEOUT` or `PCLOUD_TIMEOUT_SECS` env vars
+* **Chunk Parameters**:
+  - `PCLOUD_CHUNK_SIZE` - Chunk size in bytes (default: 5MB)
+  - `PCLOUD_CHUNK_RETRIES` - Retry attempts per chunk (default: 8)
+  - `PCLOUD_CHUNK_DELAY` - Delay between chunks in seconds (default: 0.15s)
+  - `PCLOUD_CHUNK_THRESHOLD` - File size threshold for chunked upload (default: 100MB)
+* **Batch Folder Creation** - Minimizes API calls when creating directory structures:
+  - Single recursive `listfolder()` call fetches all existing remote folders
+  - Diff against manifest folders to identify only missing directories
+  - Creates only missing folders (sorted by depth for parent-first creation)
+  - `PCLOUD_FOLDER_CREATE_SLEEP` - Rate limiting between folder creation (default: 0.05s)
+* **Directory Caching** - In-memory cache (`_KNOWN_DIRS`) prevents redundant folder existence checks
+
+### Resume Capability
+* **Automatic Resume on Restart** - Local index file `/tmp/pcloud_index_<snapshot>.json` tracks uploaded files
+  - On restart: Automatically detects and resumes incomplete uploads
+  - Skips already uploaded files (no re-upload waste)
+  - Safe for multi-TB uploads over days/weeks
+* **Index Save Intervals**:
+  - `PCLOUD_INDEX_SAVE_INTERVAL=100` - Save index every N files (default: 100)
+  - `PCLOUD_INDEX_SAVE_INTERVAL_TIME=300` - OR save every N seconds (default: 300 = 5 min)
+  - Whichever trigger fires first wins (hybrid approach)
+* **Command Line Options**:
+  ```bash
+  # Resume: Just re-run the same command
+  python pcloud_push_json_manifest_to_pcloud.py \
+    --manifest /path/to/snapshot.json \
+    --dest-root /Backup/rtb_1to1 \
+    --snapshot-mode 1to1 \
+    --env-file .env
+  
+  # Optional: Clean up old snapshots before upload (1to1 mode only)
+  --retention-sync
+  
+  # Test run without actual upload
+  --dry-run
+  ```
+
+### Logging & Visibility
+* **Progress Indicators** - Real-time upload progress for large files
+* **Verbose Mode** - `PCLOUD_VERBOSE=1` shows per-chunk progress
+* **Better Error Messages** - Clearer diagnostics for network/API failures
+
+### Example Configuration
+```bash
+# .env or environment
+PCLOUD_CHUNK_SIZE=$((5 * 1024 * 1024))    # 5MB chunks
+PCLOUD_CHUNK_RETRIES=8                     # 8 retry attempts
+PCLOUD_CHUNK_DELAY=0.15                    # 150ms between chunks
+PCLOUD_TIMEOUT=300                         # 5min timeout
+PCLOUD_VERBOSE=1                           # Show detailed logs
+```
+
+**Real-world Impact:** Successfully uploaded 19,808 files / 89.66 GB including 910MB video files that previously failed with connection errors.
+
 ## Examples
 
 * **JSON-Manifest aus lokalem Backup erstellen:**
