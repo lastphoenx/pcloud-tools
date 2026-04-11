@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv-*
+
+
+# Secrets
+config/.env
+*.env
+**/*.env
+.env
+.env.* 
+
+# ABER: .env.example Dateien PUSHEN (anonymisierte Beispieldateien)
+!*.env.example
+
+# ABER: .server-config/example/ Dateien PUSHEN (anonymisierte Templates)
+!*.timer.example
+!*.service.example
+
+# Laufzeitdaten
+state/
+state/*.json
+Archiv/
+*.log
+*.bak
+*.swp
+*.tmp
+.cache/
+tmp/
+
+
+
+# Editor
+.vscode/
+.idea/
+state/*.json
+
+# Python build metadata
+*.egg-info/
+build/
+dist/
+
+# macOS/Windows (falls mal per SMB/GUI)
+.DS_Store
+Thumbs.db
+2_chatgpt_pcloud_integrity_check.py

@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========= Basiskonfiguration =========
+MAIN_DIR=${MAIN_DIR:-/opt/apps/pcloud-tools/main}
+RTB=${RTB:-/mnt/backup/rtb_nas}
+
+ENV_FILE=${ENV_FILE:-${MAIN_DIR}/.env}
+PCLOUD_DEST=${PCLOUD_DEST:-/Backup/rtb_1to1}
+
+MANI=${MANI:-${MAIN_DIR}/pcloud_json_manifest.py}
+PUSH=${PUSH:-${MAIN_DIR}/pcloud_push_json_manifest_to_pcloud.py}
+
+# Python-Interpreter (venv bevorzugt)
+if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+  PY="${VIRTUAL_ENV}/bin/python"
+elif [[ -x "/opt/apps/pcloud-tools/venv/bin/python" ]]; then
+  PY="/opt/apps/pcloud-tools/venv/bin/python"
+else
+  PY="${PY:-python3}"
+fi
+
+# Module auffindbar machen
+export PYTHONPATH="${MAIN_DIR}:${PYTHONPATH:-}"
+
+# Finalize: standardmäßig im Wrapper aus Performance-Gründen überspringen.
+export PCLOUD_SKIP_FINALIZE=${PCLOUD_SKIP_FINALIZE:-1}
+
+# Pretty-Print für JSON (Stubs + Index) - aus .env-File lesen falls vorhanden
+if [[ -f "${ENV_FILE:-}" ]]; then
+  while IFS='=' read -r key val; do
+    # Kommentare und Leerzeilen überspringen
+    [[ "$key" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "$key" ]] && continue
+    # PCLOUD_PRETTY_JSON exportieren falls im .env gesetzt
+    if [[ "$key" == "PCLOUD_PRETTY_JSON" ]]; then
+      export PCLOUD_PRETTY_JSON="${val}"
+    fi
+  done < "${ENV_FILE}"
+fi
+
+# ========= Globales Lock =========
+LOCKFILE=${LOCKFILE:-/run/backup_pipeline.lock}
+WAIT_SEC=${WAIT_SEC:-7200}
+SAFETY_DELAY_SEC=${SAFETY_DELAY_SEC:-120}
+
+# ========= Logging =========
+PCLOUD_LOG=${PCLOUD_LOG:-/var/log/backup/pcloud_sync.log}
+mkdir -p "$(dirname "$PCLOUD_LOG")"
+exec > >(tee -a "$PCLOUD_LOG") 2>&1
+
+log(){ printf "%s %s\n" "$(date '+%F %T')" "$*"; }
+
+require_file(){
+  [[ -f "$1" ]] || { log "[error] Datei fehlt: $1"; exit 2; }
+}
+
+validate_inputs_or_exit() {
+  require_file "$ENV_FILE"
+  # Zielpfad prüfen/normalisieren
+  if [[ -z "${PCLOUD_DEST:-}" || "${PCLOUD_DEST:0:1}" != "/" ]]; then
+    log "[error] Ungültiger PCLOUD_DEST (muss mit / beginnen): '${PCLOUD_DEST:-<leer>}'"
+    exit 2
+  fi
+  PCLOUD_DEST="${PCLOUD_DEST%/}"
+  export PCLOUD_DEST
+}
+
+last_snapshot_mtime() {
+  local latest_dir; latest_dir="$(readlink -f "${RTB}/latest" 2>/dev/null || true)"
+  [[ -z "$latest_dir" ]] && echo 0 && return
+  stat -c %Y "$latest_dir" 2>/dev/null || echo 0
+}
+
+# --- Preflight: liefert Status "OK|OVERQUOTA|DOWN", keine Policy hier ---
+preflight_or_mark_down() {
+  "${PY}" - <<'PY'
+import os, sys, json, traceback
+sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
+try:
+    import pcloud_bin_lib as pc
+except Exception:
+    print("DOWN"); sys.exit(0)
+
+try:
+    cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
+    dest_root = pc._norm_remote_path(os.environ.get("PCLOUD_DEST","/Backup/rtb_1to1"))
+
+    # 1) Auth/Token + Quota via REST
+    ui = pc._rest_get(cfg, "userinfo", {"getauth": 1})
+    if int(ui.get("result", -1)) != 0:
+        print("DOWN"); sys.exit(0)
+    info = ui.get("userinfo") or {}
+    used = int(info.get("usedquota") or 0)
+    quota = int(info.get("quota") or 0)
+    if quota and used >= quota:
+        print("OVERQUOTA"); sys.exit(0)
+
+    # 2) Reachability via listfolder('/')
+    lf = pc._rest_get(cfg, "listfolder", {"path": "/", "nofiles": 1, "showpath": 1})
+    if int(lf.get("result", -1)) != 0:
+        print("DOWN"); sys.exit(0)
+
+    print("OK")
+except Exception:
+    # Netzwerk/Timeout/etc.
+    print("DOWN")
+PY
+}
+
+# --- Remote Snapshot Listing (Python/REST) ---
+load_remote_snapshots() {
+  "${PY}" - <<'PY'
+import os, sys, json
+sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
+import pcloud_bin_lib as pc
+
+cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
+snap_root = f"{pc._norm_remote_path(os.environ.get('PCLOUD_DEST','/Backup/rtb_1to1')).rstrip('/')}/_snapshots"
+
+# listfolder auf snap_root
+try:
+    js = pc._rest_get(cfg, "listfolder", {"path": snap_root, "nofiles": 1})
+except Exception:
+    # API down → wie "leer" behandeln (Preflight filtert solche Fälle bereits)
+    print("")
+    raise SystemExit(0)
+
+if int(js.get("result", -1)) != 0:
+    # Ordner existiert evtl. noch nicht: leer zurückgeben
+    print("")
+    raise SystemExit(0)
+
+names = []
+for c in (js.get("metadata") or {}).get("contents", []) or []:
+    if c.get("isfolder") and c.get("name") != "_index":
+        names.append(c["name"])
+for n in sorted(names):
+    print(n)
+PY
+}
+
+remote_has_snapshots() {
+  local out; out="$(load_remote_snapshots || true)"
+  [[ -n "$out" ]] && echo YES || echo NO
+}
+
+remote_snapshot_exists() {
+  local snapname="$1"
+  local out; out="$(load_remote_snapshots || true)"
+  grep -qx "$snapname" <<<"$out" && echo YES || echo NO
+}
+
+local_snapshot_names() {
+  find "$RTB" -maxdepth 1 -type d -printf '%f\n' \
+  | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' \
+  | sort
+}
+
+remote_snapshot_names() { load_remote_snapshots; }
+
+need_retention_sync() {
+  local locals remotes s remote_only=""
+  locals="$(local_snapshot_names | sort -u)"
+  remotes="$(remote_snapshot_names | sort -u)"
+  while IFS= read -r s; do
+    [[ -z "$s" ]] && continue
+    if ! grep -qxF "$s" <<<"$locals"; then
+      remote_only+="$s"$'\n'
+    fi
+  done <<<"$remotes"
+  [[ -n "$remote_only" ]] && echo YES || echo NO
+}
+
+build_and_push() {
+  local SNAP="$1" SNAPNAME; SNAPNAME="$(basename "$SNAP")"
+  log "[info] push snapshot: $SNAPNAME"
+
+  local mani; mani="$(mktemp -t "pcloud_mani.${SNAPNAME}.XXXXXX.json")"
+  trap 'rm -f "$mani"' RETURN
+
+  local T0=$(date +%s)
+  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start manifest"
+  "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256
+  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && { log "[t] done manifest (Δ=$(( $(date +%s)-T0 ))s)"; T1=$(date +%s); }
+
+  local RET=""
+  [[ "$(need_retention_sync)" == "YES" ]] && RET="--retention-sync"
+
+  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start push"
+  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE"
+  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] done push (Δ=$(( $(date +%s)-T1 ))s), total=$(( $(date +%s)-T0 ))s)"
+}
+
+# ========= Start =========
+# Lock holen (mit Timeout) – überspringen wenn bereits von rtb_wrapper gehalten
+if [[ "${BACKUP_PIPELINE_LOCKED:-0}" != "1" ]]; then
+  exec 9>"$LOCKFILE"
+  if ! flock -w "$WAIT_SEC" 9; then
+    log "[skip] Konnte Lock innerhalb ${WAIT_SEC}s nicht bekommen."
+    exit 0
+  fi
+fi
+
+log "[start] pcloud_sync_1to1"
+
+validate_inputs_or_exit
+
+# Preflight (Status) + Policy im Wrapper
+PF="$(preflight_or_mark_down)"
+case "$PF" in
+  OK)        log "[ok] pCloud Preflight ok" ;;
+  OVERQUOTA) log "[warn] pCloud Preflight: Konto über Quota – Sync wird übersprungen."; exit 0 ;;
+  DOWN)      log "[warn] pCloud Preflight: API/Auth nicht erreichbar – Sync wird übersprungen."; exit 0 ;;
+  *)         log "[warn] pCloud Preflight: unbekannter Status '$PF' – Sync wird übersprungen."; exit 0 ;;
+esac
+
+# Safety-Delay nach RTB
+if [[ -L "${RTB}/latest" || -d "${RTB}/latest" ]]; then
+  latest_dir="$(readlink -f "${RTB}/latest" 2>/dev/null || echo "")"
+  if [[ -n "$latest_dir" && -d "$latest_dir" ]]; then
+    now=$(date +%s); lm=$(stat -c '%Y' "$latest_dir" 2>/dev/null || echo 0)
+    if (( lm > 0 && now - lm < SAFETY_DELAY_SEC )); then
+      wait=$(( SAFETY_DELAY_SEC - (now - lm) ))
+      log "[info] safety-delay ${wait}s (warte nach RTB)"
+      sleep "$wait"
+    fi
+  fi
+fi
+
+# Bootstrap (remote leer)
+if [[ "$(remote_has_snapshots)" == "NO" ]]; then
+  log "[bootstrap] Remote leer – backfill aller lokalen Snapshots (alt → neu)"
+  mapfile -t SNAPS < <(find "$RTB" -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' | sort)
+  if [[ ${#SNAPS[@]} -eq 0 ]]; then
+    log "[skip] keine lokalen Snapshots gefunden."
+    exit 0
+  fi
+  export PCLOUD_SKIP_FINALIZE=1
+  for s in "${SNAPS[@]}"; do
+    build_and_push "$RTB/$s"
+  done
+  # einmaliges Finalize
+  "${PY}" - <<'PY'
+import os
+import pcloud_bin_lib as pc
+from pcloud_push_json_manifest_to_pcloud import finalize_index_fileids
+cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
+dest_root = os.environ.get("PCLOUD_DEST","/Backup/rtb_1to1")
+snapshots_root = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots"
+fixed = finalize_index_fileids(cfg, snapshots_root)
+print(f"[finalize] index fileids fixed={fixed}")
+PY
+  log "[done] bootstrap/backfill abgeschlossen."
+  exit 0
+fi
+
+# Normalfall: latest
+SNAP="$(readlink -f "${RTB}/latest" 2>/dev/null || true)"
+if [[ -z "$SNAP" || ! -d "$SNAP" ]]; then
+  log "[skip] kein lokaler Snapshot gefunden."
+  exit 0
+fi
+SNAPNAME="$(basename "$SNAP")"
+
+if [[ "$(remote_snapshot_exists "$SNAPNAME")" == "YES" ]]; then
+  log "[skip] Snapshot $SNAPNAME bereits auf pCloud vorhanden."
+  exit 0
+fi
+
+build_and_push "$SNAP"
+log "[done] pcloud_sync_1to1"

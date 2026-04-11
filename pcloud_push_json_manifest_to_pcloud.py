@@ -1,0 +1,1333 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pcloud_push_json_manifest_to_pcloud.py
+
+Lädt ein lokales Manifest (v2) nach pCloud.
+
+Zwei Betriebsarten:
+- --snapshot-mode objects  : Hash-Object-Store + JSON-Stubs (effizient, globale Dedupe).
+- --snapshot-mode 1to1     : 1:1-Snapshot-Bäume; erstes Auftreten eines Inhalts wird "materialisiert"
+                             (echte Datei im Snapshot), weitere Hardlinks als Stubs.
+                             Content-Index in _snapshots/_index/content_index.json.
+
+Erwartetes Manifest (schema=2):
+{
+  "schema": 2,
+  "snapshot": "YYYY-mm-dd-HHMMSS" oder ähnlich,
+  "root": "/abs/pfad/zum/snapshot",
+  "hash": "sha256",
+  "follow_symlinks": bool,
+  "follow_hardlinks": bool,
+  "items": [
+    {"type":"dir","relpath":"..."},
+    {"type":"file","relpath":"...", "size":..., "mtime":..., "source_path":"...", "sha256":"...", "ext":".txt",
+     "inode": {"dev": 2049, "ino": 228196364, "nlink": 3}}
+    ...
+  ]
+}
+
+Benötigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
+"""
+
+from __future__ import annotations
+import os, sys, json, argparse, time
+import concurrent.futures
+from typing import Dict, Any, Optional, Tuple
+
+
+
+# ---- Lib laden ----
+try:
+    import pcloud_bin_lib as pc
+except Exception as e:
+    print(f"Fehler: pcloud_bin_lib konnte nicht importiert werden: {e}", file=sys.stderr)
+    sys.exit(2)
+
+
+# Performance-Messung
+fid_cache = {}
+fid_lookups = 0          # Anzahl _fid_for Aufrufe
+fid_cache_hits = 0       # Treffer im Cache
+fid_rest_ms = 0.0        # aufsummierte Zeit in pc.resolve_fileid_cached
+t_phase_start = time.time()
+
+# --- shared fileid cache for this process ---
+_fid_cache_shared: dict = {}
+
+# --- Metrics (Prometheus-freundlich) ---
+MET_UPLOADED_FILES = 0
+MET_STUBS_WRITTEN  = 0
+MET_PROMOTED       = 0
+MET_REMOVED_NODES  = 0
+MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional Zähler aus Lib/Wrapper
+
+# ----------------- Utilities -----------------
+
+def _ensure_parent(cfg, remote_path: str, *, dry: bool = False) -> None:
+    """
+    Stellt sicher, dass alle Elternordner für `remote_path` existieren.
+    Delegiert vollständig an pcloud_bin_lib.ensure_parent_dirs(...).
+    """
+    if dry:
+        return
+    pc.ensure_parent_dirs(cfg, remote_path)
+
+
+def write_hardlink_stub_1to1(cfg, snapshots_root, snapshot_name, relpath, file_item, node, dry=False):
+    """
+    Schreibt die .meta.json für einen 1:1-Hardlink-Stub und sorgt dafür,
+    dass 'fileid' (falls möglich) gesetzt und im Index-Node mitgeführt wird.
+    """
+    meta_path = f"{snapshots_root.rstrip('/')}/{snapshot_name}/{relpath}.meta.json"
+
+    # Ordner sicherstellen (nur via Lib-Helper)
+    _ensure_parent(cfg, meta_path, dry=dry)
+
+    # fileid nachziehen, falls im Node noch None
+    fileid = node.get("fileid")
+    if not fileid and node.get("anchor_path"):
+        fid = pc.resolve_fileid_cached(cfg, path=node.get("anchor_path"), cache=_fid_cache_shared)
+        if fid:
+            fileid = fid
+            node["fileid"] = fid
+
+    payload = {
+        "type":   "hardlink",
+        "sha256": (file_item.get("sha256") or "").lower(),
+        "size":   int(file_item.get("size") or 0),
+        "mtime":  float(file_item.get("mtime") or 0.0),
+        "inode":  {
+            "dev":   int(((file_item.get("inode") or {}).get("dev")  or 0)),
+            "ino":   int(((file_item.get("inode") or {}).get("ino")  or 0)),
+            "nlink": int(((file_item.get("inode") or {}).get("nlink") or 1)),
+        },
+        "anchor_path": node.get("anchor_path"),
+        "fileid": fileid if fileid is not None else None,
+        "snapshot": snapshot_name,
+        "relpath": relpath,
+    }
+
+    if dry:
+        print(f"[dry] stub: {meta_path} -> {node.get('anchor_path')}")
+    else:
+        pc.write_json_at_path(cfg, path=meta_path, obj=payload)
+
+    # Metrics
+    globals()["MET_STUBS_WRITTEN"] += 1
+
+    # holders[] pflegen
+    holders = node.setdefault("holders", [])
+    h = {"snapshot": snapshot_name, "relpath": relpath}
+    if h not in holders:
+        holders.append(h)
+
+    return meta_path, payload
+
+
+def stat_file_safe(cfg: dict, *, path: Optional[str]=None, fileid: Optional[int]=None) -> Optional[dict]:
+    """Stat-Datei; gibt None bei 'not found' zurück (anstatt Exception)."""
+    try:
+        if path is not None:
+            md = pc.stat_file(cfg, path=pc._norm_remote_path(path), with_checksum=False, enrich_path=True)
+        else:
+            md = pc.stat_file(cfg, fileid=int(fileid), with_checksum=False, enrich_path=True)
+        if not md or md.get("isfolder"):
+            return None
+        return md
+    except Exception:
+        return None
+def ensure_parent_dirs(cfg: dict, remote_path: str, *, dry: bool=False) -> None:
+    """Sorgt dafür, dass alle Ordner bis zum parent von remote_path existieren."""
+    p = pc._norm_remote_path(remote_path)
+    parent = p.rsplit("/", 1)[0] or "/"
+    if dry:
+        return
+    pc.ensure_path(cfg, parent)
+
+def upload_json_stub(cfg: dict, remote_path: str, payload: dict, *, dry: bool=False) -> None:
+    if dry:
+        target = payload.get("object_path") or payload.get("anchor_path") or payload.get("sha256")
+        print(f"[dry] stub: {remote_path} -> {target}")
+        return
+    pc.ensure_parent_dirs(cfg, remote_path)
+    pc.write_json_at_path(cfg, remote_path, payload)
+
+def _bytes_to_tempfile(b: bytes) -> str:
+    import tempfile
+    fd, p = tempfile.mkstemp(prefix="pcloud_stub_", suffix=".json")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b)
+    return p
+
+def object_path_for(objects_root: str, sha256: str, ext: Optional[str], layout: str="two-level") -> str:
+    """Pfad im Object-Store. layout='two-level' legt /_objects/xx/sha.ext an."""
+    sha = (sha256 or "").lower()
+    if not sha or len(sha) < 2:
+        sub = "zz"
+    else:
+        sub = sha[:2]
+    e = (ext or "").lstrip(".")
+    tail = sha if not e else (sha + "." + e)
+    return f"{objects_root.rstrip('/')}/{sub}/{tail}"
+
+def snapshot_path_for(snapshots_root: str, snapshot: str, relpath: str) -> str:
+    return f"{snapshots_root.rstrip('/')}/{snapshot}/{relpath}".replace("//", "/")
+
+def stub_path_for(snapshots_root: str, snapshot: str, relpath: str) -> str:
+    return f"{snapshots_root.rstrip('/')}/{snapshot}/{relpath}.meta.json".replace("//", "/")
+
+def key_from_inode(item: dict) -> Optional[str]:
+    """Erzeugt einen Key für Hardlink-Gruppierung; None wenn kein inode."""
+    ino = (item.get("inode") or {})
+    dev = ino.get("dev"); n = ino.get("ino")
+    if dev is None or n is None:
+        return None
+    return f"{dev}:{n}"
+
+def save_content_index_local(local_path: str, index: dict) -> None:
+    """Speichert den Index lokal als JSON."""
+    import tempfile
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    # Atomic write via tempfile
+    dir_path = os.path.dirname(local_path)
+    with tempfile.NamedTemporaryFile(mode='w', dir=dir_path, delete=False, suffix='.tmp') as f:
+        json.dump(index, f, separators=(',', ':'))
+        temp_path = f.name
+    os.replace(temp_path, local_path)
+
+def load_content_index_local(local_path: str) -> dict:
+    """Lädt den Index lokal, falls vorhanden."""
+    try:
+        with open(local_path, 'r') as f:
+            j = json.load(f)
+        if "items" not in j or not isinstance(j["items"], dict):
+            j["items"] = {}
+        if "version" not in j:
+            j["version"] = 1
+        return j
+    except FileNotFoundError:
+        return {"version": 1, "items": {}}
+    except Exception:
+        return {"version": 1, "items": {}}
+
+def load_content_index(cfg: dict, snapshots_root: str) -> dict:
+    """
+    Lädt _snapshots/_index/content_index.json robust.
+    - Wenn Datei fehlt/kaputt: leeren Index zurückgeben.
+    - Ein 'result'≠0 im JSON gilt als API-Fehler (dann leerer Index).
+    - Fehlt 'result' völlig (Normalfall bei echter Index-Datei) → OK.
+    """
+    idx_path = f"{snapshots_root.rstrip('/')}/_index/content_index.json"
+    try:
+        txt = pc.get_textfile(cfg, path=idx_path)
+        j = json.loads(txt)
+
+        # Nur als API-Fehler werten, wenn 'result' vorhanden *und* != 0
+        if isinstance(j, dict) and "result" in j and j.get("result") != 0:
+            return {"version": 1, "items": {}}
+
+        if "items" not in j or not isinstance(j["items"], dict):
+            j["items"] = {}
+        if "version" not in j:
+            j["version"] = 1
+        return j
+    except Exception:
+        return {"version": 1, "items": {}}
+
+def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool=False) -> None:
+    """
+    content_index.json effizient schreiben:
+    - ohne erneutes ensure()
+    - minified JSON
+    """
+    idx_dir  = f"{snapshots_root.rstrip('/')}/_index"
+    idx_name = "content_index.json"
+
+    if dry:
+        print(f"[dry] write index: {idx_dir}/{idx_name} (items={len(index.get('items',{}))})")
+        return
+
+    # Ordner muss existieren (wurde vorher per Batch-Ensure angelegt)
+    fid = pc.stat_folderid_fast(cfg, idx_dir)
+    if not fid:
+        # sehr selten: Fallback (legt an und holt folderid)
+        fid = pc.ensure_path(cfg, idx_dir)
+
+    # Pretty-Print via ENV steuerbar
+    pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
+    pc.write_json_to_folderid(cfg, folderid=int(fid), filename=idx_name, obj=index, minify=(not pretty))
+
+def list_remote_snapshot_names(cfg: dict, snapshots_root: str) -> set[str]:
+    """Liest die Ordnernamen unter <snapshots_root> (außer '_index')."""
+    out: set[str] = set()
+    try:
+        top = pc.listfolder(cfg, path=snapshots_root, recursive=False, nofiles=True, showpath=False)
+        for it in (top.get("metadata", {}) or {}).get("contents", []) or []:
+            if it.get("isfolder") and it.get("name") and it.get("name") != "_index":
+                out.add(it["name"])
+    except Exception:
+        pass
+    return out
+
+def list_local_snapshot_names(manifest_root: str) -> set[str]:
+    """Liest Geschwister-Ordner des gegebenen Snapshot-Roots (RTB-Stil)."""
+    base = os.path.dirname(os.path.abspath(manifest_root))  # parent von ".../<snapshot>"
+    names = set()
+    try:
+        for n in os.listdir(base):
+            p = os.path.join(base, n)
+            if os.path.isdir(p) and n not in ("latest",):
+                names.add(n)
+    except Exception:
+        pass
+    return names
+
+
+def finalize_index_fileids(cfg, snapshots_root):
+    """
+    Lädt <snapshots_root>/_index/content_index.json und füllt fehlende fileids
+    (für Nodes mit anchor_path) via REST /stat nach. Schreibt nur bei Änderungen.
+    Return: Anzahl reparierter Einträge.
+    """
+    start = time.time()
+
+    idx_path = f"{pc._norm_remote_path(snapshots_root).rstrip('/')}/_index/content_index.json"
+    try:
+        index = json.loads(pc.get_textfile(cfg, path=idx_path))
+    except Exception:
+        return 0
+    if not isinstance(index, dict):
+        return 0
+
+    items = index.get("items", {})
+    if not isinstance(items, dict) or not items:
+        return 0
+
+    repaired = 0
+    changed  = False
+
+    # Gemeinsamer Cache mit dem Modul-Cache teilen:
+    global _fid_cache_shared
+    cache = _fid_cache_shared
+
+    for sha, node in list(items.items()):
+        if not isinstance(node, dict):
+            continue
+        if (node.get("fileid") in (None, "")) and node.get("anchor_path"):
+            fid = pc.resolve_fileid_cached(cfg, path=node["anchor_path"], cache=cache)
+            if fid:
+                node["fileid"] = fid
+                repaired += 1
+                changed = True
+
+    if changed:
+        try:
+            pc.put_textfile(cfg, path=idx_path, text=json.dumps(index, ensure_ascii=False, indent=2))
+        except Exception:
+            pc.write_json_at_path(cfg, path=idx_path, obj=index)
+
+    if os.environ.get("PCLOUD_TIMING") == "1":
+        print(f"[timing] finalize_index_fileids: fixed={repaired}, total={time.time()-start:.2f}s")
+
+    return repaired
+
+def _batch_ensure_paths(cfg: dict, paths: list[str], *, dry: bool = False) -> None:
+    """
+    Batch-Version von ensure_parent_dirs für mehrere Pfade.
+    Nutzt createfolderrecursive (ein Call pro Parent-Kette).
+    """
+    if not paths:
+        return
+
+    # eindeutige Parents sammeln
+    parents = { os.path.dirname(p.rstrip("/")) for p in paths if p }
+    # stabile Reihenfolge (kann helfen beim Debug)
+    parents = sorted(parents)
+
+    for parent in parents:
+        try:
+            pc.ensure_path(cfg, parent, dry=dry)
+        except Exception:
+            # nicht hart abbrechen – idempotent, nächste versuchen
+            continue
+
+def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = False) -> None:
+    """
+    Schreibt gesammelte Stubs (.meta.json) in ihre Zielordner (parent folderid + filename).
+    'stubs' ist eine Liste von Tuples: (remote_stub_path, payload_dict)
+    Pretty-Print via ENV: PCLOUD_PRETTY_JSON=1
+    Erweitert Payload um menschenlesbare Felder: format_version, kind, holder_type, mtime_iso
+    """
+    import datetime
+
+    if not stubs:
+        return
+
+    pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
+
+    # 1) nach Parent gruppieren
+    by_parent: dict[str, list[tuple[str, dict]]] = {}
+    for stub_path, payload in stubs:
+        parent = os.path.dirname(stub_path.rstrip("/"))
+        name = os.path.basename(stub_path)
+        by_parent.setdefault(parent, []).append((name, payload))
+
+    # 2) parent-fids auflösen
+    parent_fids: dict[str, int] = {}
+    for parent in by_parent.keys():
+        if dry:
+            # im Dry-Run keine REST-Lookups; fiktive fid
+            parent_fids[parent] = 0
+            continue
+        try:
+            fid = pc.ensure_path(cfg, path=parent)  # returns folderid (idempotent)
+            parent_fids[parent] = int(fid)
+        except Exception as e:
+            print(f"[warn] cannot resolve/ensure folderid for {parent}: {e}", file=sys.stderr)
+
+    # 3) Schreibjobs bauen (nur Parents mit bekannter fid) + Payload anreichern
+    tasks: list[tuple[str, str, dict]] = []
+    for parent, items in by_parent.items():
+        if parent not in parent_fids:
+            continue
+        for name, payload in items:
+            # Payload "menschenfreundlich" erweitern (restore bleibt kompatibel)
+            if "format_version" not in payload:
+                payload["format_version"] = 1
+            if "kind" not in payload:
+                payload["kind"] = "stub"
+            if "holder_type" not in payload and payload.get("type") == "hardlink":
+                payload["holder_type"] = "hardlink"
+            
+            # mtime_iso hinzufügen falls mtime vorhanden
+            mtime = payload.get("mtime")
+            if mtime and "mtime_iso" not in payload:
+                try:
+                    payload["mtime_iso"] = datetime.datetime.utcfromtimestamp(float(mtime)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    pass
+            
+            tasks.append((parent, name, payload))
+
+    if not tasks:
+        return
+
+    threads = int(os.environ.get("PCLOUD_STUB_THREADS", "4") or "4")
+
+    def _upload_one(args: tuple[str, str, dict]):
+        parent, name, payload = args
+        if dry:
+            # Pretty-Print auch im Dry-Run für Debug
+            if pretty:
+                txt = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                print(f"[dry] stub write: {parent}/{name}\n{txt}")
+            else:
+                print(f"[dry] stub write: {parent}/{name}")
+            return True
+        
+        ret = pc.write_json_to_folderid(cfg,
+                                        folderid=parent_fids[parent],
+                                        filename=name,
+                                        obj=payload,
+                                        minify=(not pretty))
+        # --- metriken: nur bei erfolgreichem write inkrementieren
+        try:
+            if ret:
+                globals()["MET_STUBS_WRITTEN"] += 1
+        except Exception:
+            pass
+        return ret
+
+    if threads > 1 and len(tasks) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            list(ex.map(_upload_one, tasks))
+    else:
+        for t in tasks:
+            _upload_one(t)
+
+# ----------------- Haupt-Logik -----------------
+
+def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, objects_layout: str="two-level") -> None:
+    """Hash-Object-Store + Stubs in Snapshot."""
+    objects_root   = f"{dest_root.rstrip('/')}/_objects"
+    snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
+    snapshot       = manifest["snapshot"]
+    items          = manifest.get("items") or []
+
+    uploaded = 0; skipped = 0; stubs = 0
+
+    print(f"[plan] objects={objects_root} snapshot={snapshots_root}/{snapshot}")
+
+    # 1) echte Objekte sicherstellen
+    for it in items:
+        if it.get("type") != "file": continue
+        sha = it.get("sha256")
+        ext = (it.get("ext") or "").lstrip(".")
+        if not sha:
+            print(f"[warn] file ohne sha256: {it.get('relpath')}", file=sys.stderr)
+            continue
+
+        obj_path = object_path_for(objects_root, sha, ext, layout=objects_layout)
+        md = stat_file_safe(cfg, path=obj_path)
+        if md:
+            skipped += 1
+        else:
+            if dry:
+                print(f"[dry] upload object: {obj_path}  <- {it.get('source_path')}")
+            else:
+                ensure_parent_dirs(cfg, obj_path, dry=False)
+                pc.upload_streaming(cfg, it["source_path"], dest_path=obj_path, filename=os.path.basename(obj_path))
+            uploaded += 1
+
+    print(f"objects: uploaded={uploaded} skipped={skipped}")
+
+    # 2) Snapshot-Stubs erzeugen
+    for it in items:
+        if it.get("type") != "file": continue
+        sha = it.get("sha256")
+        ext = (it.get("ext") or "").lstrip(".")
+        obj_path = object_path_for(objects_root, sha, ext, layout=objects_layout)
+        stub_remote = stub_path_for(snapshots_root, snapshot, it["relpath"])
+        payload = {
+            "type": "link",
+            "sha256": sha,
+            "size": it.get("size"),
+            "mtime": it.get("mtime"),
+            "object_path": obj_path,
+            "ext": ext or None,
+            "inode": it.get("inode"),
+            "snapshot": snapshot,
+            "relpath": it.get("relpath"),
+        }
+        upload_json_stub(cfg, stub_remote, payload, dry=dry)
+        stubs += 1
+
+    print(f"stubs: {stubs} (snapshot={snapshot})")
+
+
+def ensure_snapshots_layout(cfg: dict, dest_root: str, *, dry: bool = False) -> None:
+    """
+    Stellt sicher, dass <dest_root>/_snapshots und _snapshots/_index existieren
+    und dass eine leere Index-Datei angelegt werden kann.
+    """
+    snapshots_root = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots"
+    index_dir = f"{snapshots_root}/_index"
+    if dry:
+        print(f"[dry] ensure: {snapshots_root}")
+        print(f"[dry] ensure: {index_dir}")
+        return
+    pc.ensure_path(cfg, snapshots_root)
+    pc.ensure_path(cfg, index_dir)
+
+def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False):
+    """
+    1:1-Modus mit Resume-Unterstützung:
+      - .upload_started Marker beim Start
+      - .upload_complete Marker beim erfolgreichen Abschluss
+      - Unvollständige Snapshots werden erkannt und neu gestartet
+    """
+    t_phase_start = time.time()
+    ensure_ms = 0.0
+    upload_ms = 0.0
+    write_ms  = 0.0
+
+    snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
+    dest_root = pc._norm_remote_path(dest_root)
+    snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
+    dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+
+    # === NEU: Upload-Status-Marker ===
+    marker_started = f"{dest_snapshot_dir}/.upload_started"
+    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+    
+    # Prüfen ob unvollständiger Upload existiert
+    incomplete_upload = False
+    try:
+        pc.stat_file(cfg, path=marker_started, with_checksum=False)
+        # Started-Marker existiert
+        try:
+            pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+            # Complete-Marker auch da → Upload war erfolgreich
+            print(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+            return {"uploaded": 0, "stubs": 0, "resumed": False}
+        except:
+            # Nur Started, kein Complete → unvollständig!
+            incomplete_upload = True
+            print(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
+    except:
+        # Kein Started-Marker → frischer Upload
+        pass
+    
+    # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
+    if incomplete_upload:
+        print(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
+    # === ENDE NEU ===
+
+    print(f"[plan] 1to1 snapshot={dest_snapshot_dir}")
+
+    # === NEU: Started-Marker setzen ===
+    if not dry:
+        try:
+            pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
+            pc.call_with_backoff(pc.put_textfile, cfg, path=marker_started,
+                          text=json.dumps({
+                              "snapshot": snapshot_name,
+                              "started_at": time.time(),
+                              "host": os.uname().nodename
+                          }))
+        except Exception as e:
+            print(f"[warn] Konnte Started-Marker nicht setzen: {e}")
+    # === ENDE NEU ===
+
+    # --- kleine Helfer ---
+    def _ensure(path: str) -> None:
+        nonlocal ensure_ms
+        if not path:
+            return
+        if dry:
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                print(f"[dry] ensure: {path}")
+            return
+        t0 = time.time()
+        pc.call_with_backoff(pc.ensure_path, cfg, path)
+        ensure_ms += (time.time() - t0) * 1000.0
+
+    def _delete_if_exists(path: str) -> None:
+        if dry:
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                print(f"[dry] delete-if-exists: {path}")
+            return
+        try:
+            md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=path) or {}
+            fid = md.get("fileid")
+            if fid:
+                pc.delete_file(cfg, fileid=int(fid))
+        except Exception:
+            pass
+
+    # Lokaler Index-Cache-Pfad (nur während Upload, wird am Ende hochgeladen)
+    import tempfile
+    _local_index_dir = tempfile.gettempdir()
+    _local_index_path = os.path.join(_local_index_dir, f"pcloud_index_{snapshot_name}.json")
+
+    # Index laden: erst lokal (falls vorhanden), sonst von pCloud
+    if os.path.exists(_local_index_path):
+        print(f"[resume] Lade lokalen Index: {_local_index_path}")
+        index = load_content_index_local(_local_index_path)
+    else:
+        index = load_content_index(cfg, snapshots_root)
+    items = index.setdefault("items", {})
+
+    # Anchor-Cache aufbauen
+    known_anchors = {}
+    for sha, node in items.items():
+        ap = node.get("anchor_path")
+        fid = node.get("fileid")
+        if ap and fid:
+            known_anchors[sha] = (ap, fid)
+    
+    if known_anchors and os.environ.get("PCLOUD_VERBOSE") == "1":
+        print(f"[prefetch] {len(known_anchors)} bekannte Anchors gecacht")
+
+    # Hilfstabellen
+    seen_inodes: dict[tuple[int,int], str] = {}
+    uploaded = 0
+    resumed = 0   # Bereits im Index für diesen Snapshot
+    stubs = 0
+    index_changed = False
+    stubs_to_write: list[tuple[str, dict]] = []
+
+    # --- Upload-Hilfsroutine ---
+    def _upload_real_file(abs_src: str, dst_path: str) -> tuple:
+        """Returns (fileid, pcloud_hash)"""
+        nonlocal upload_ms
+        parent = os.path.dirname(dst_path.rstrip("/"))
+        if parent:
+            _ensure(parent)
+        if dry:
+            print(f"[dry] upload 1to1: {dst_path}  <- {abs_src}")
+            return (None, None)
+
+        # Progress-Hinweis für große Dateien
+        file_size = os.path.getsize(abs_src)
+        if file_size > 100 * 1024**2:  # > 100MB
+            print(f"[upload] Starte Upload: {os.path.basename(dst_path)} ({file_size/1024**2:.1f} MB)", flush=True)
+
+        t0 = time.time()
+        res = pc.call_with_backoff(pc.upload_file, cfg, local_path=abs_src, remote_path=dst_path, attempts=12, max_sleep=60.0)
+        upload_ms += (time.time() - t0) * 1000.0
+
+        # Metrics (Prometheus-freundlich), wenn definiert
+        try:
+            globals()["MET_UPLOADED_FILES"] += 1
+        except Exception:
+            pass
+
+        # fileid + hash aus der Upload-Antwort
+        try:
+            md = (res or {}).get("metadata") or {}
+            fileid = md.get("fileid")
+            pcloud_hash = md.get("hash")  # pCloud's hash field
+        except Exception:
+            fileid = None
+            pcloud_hash = None
+
+        # Optional: Eager-FileID via stat, falls Upload keine liefert
+        if (not fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
+            try:
+                stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=dst_path) or {}
+                if not fileid:
+                    fileid = stat_md.get("fileid")
+                if not pcloud_hash:
+                    pcloud_hash = stat_md.get("hash")
+            except Exception:
+                pass
+
+        return (fileid, pcloud_hash)
+
+    # --- Stub sammeln ---
+    def _queue_stub(relpath: str, file_item: dict, node: dict) -> None:
+        nonlocal stubs, index_changed
+
+        eager = os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0"
+        if eager and (not node.get("fileid")) and node.get("anchor_path"):
+            fid = pc.resolve_fileid_cached(cfg, path=node["anchor_path"], cache=_fid_cache_shared)
+            if fid:
+                node["fileid"] = fid
+                index_changed = True
+
+        meta_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
+        payload = {
+            "type": "hardlink",
+            "sha256": file_item.get("sha256"),
+            "size": file_item.get("size"),
+            "mtime": file_item.get("mtime"),
+            "snapshot": snapshot_name,
+            "relpath": relpath,
+            "anchor_path": node.get("anchor_path"),
+            "fileid": node.get("fileid") if node.get("fileid") is not None else None,
+            "inode": file_item.get("inode"),
+        }
+        if dry:
+            print(f"[dry] write stub: {meta_path}")
+        else:
+            stubs_to_write.append((meta_path, payload))
+        stubs += 1
+
+    # --- Hauptschleife: Items des Manifests ---
+    _all_items = [it for it in (manifest.get("items") or []) if it.get("type") == "file"]
+    _total_items = len(_all_items)
+    _total_size = sum(it.get("size") or 0 for it in _all_items)
+    _done_items = 0
+    _done_size = 0
+    _t_loop_start = time.time()
+    _t_last_progress = _t_loop_start
+    _PROGRESS_INTERVAL = float(os.environ.get("PCLOUD_PROGRESS_INTERVAL", "30"))
+    _SAVE_INTERVAL = int(os.environ.get("PCLOUD_INDEX_SAVE_INTERVAL", "100"))
+    _SAVE_INTERVAL_TIME = float(os.environ.get("PCLOUD_INDEX_SAVE_INTERVAL_TIME", "300"))  # 5min
+    _last_saved_count = 0
+    _t_last_index_save = time.time()
+    print(f"[push] Starte Upload: {_total_items} Dateien, {_total_size/1024**3:.2f} GB", flush=True)
+
+    # === Diff-basierte Ordner-Anlage (nur fehlende Ordner) ===
+    # 1. Remote-Ordner sammeln via listfolder (ein API-Call)
+    remote_folders = set()
+    if not dry:
+        try:
+            print(f"[plan] Lade Remote-Ordnerstruktur: {dest_snapshot_dir}", flush=True)
+            result = pc.call_with_backoff(pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
+            def _collect_folders(obj, parent_path=""):
+                if isinstance(obj, dict) and obj.get("isfolder"):
+                    folder_name = obj.get("name", "")
+                    folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
+                    remote_folders.add(folder_path)
+                    for child in obj.get("contents") or []:
+                        _collect_folders(child, folder_path)
+            # Direkt mit contents starten (nicht metadata selbst, das ist der Snapshot-Ordner)
+            metadata = result.get("metadata") or {}
+            for child in metadata.get("contents") or []:
+                _collect_folders(child, "")
+            print(f"[plan] {len(remote_folders)} Remote-Ordner gefunden", flush=True)
+        except Exception as e:
+            # Falls Snapshot-Ordner noch nicht existiert (erstes Upload) → okay
+            if "2005" in str(e) or "not found" in str(e).lower():
+                print(f"[plan] Snapshot-Ordner existiert noch nicht (erstes Upload)", flush=True)
+            else:
+                print(f"[warn] listfolder fehlgeschlagen: {e}", flush=True)
+    
+    # 2. Manifest-Ordner sammeln (leere relpaths filtern - das ist Root selbst)
+    manifest_folders = set()
+    for it in manifest.get("items") or []:
+        if it.get("type") == "dir":
+            relpath = it.get("relpath", "").rstrip("/")
+            if relpath:  # Filter leere Strings (Root-Verzeichnis)
+                manifest_folders.add(relpath)
+    
+    # 3. Differenz berechnen und nur fehlende Ordner anlegen
+    missing_folders = manifest_folders - remote_folders
+    if missing_folders:
+        print(f"[plan] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)", flush=True)
+        # Sortieren nach Tiefe (Parents zuerst)
+        sorted_missing = sorted(missing_folders, key=lambda p: p.count("/"))
+        # Rate-Limiting: kleine Pause zwischen Ordner-Anlage (verhindert pCloud-Blockade)
+        _rate_limit_sleep = float(os.environ.get("PCLOUD_FOLDER_CREATE_SLEEP", "0.05"))
+        for i, reldir in enumerate(sorted_missing, 1):
+            _ensure(f"{dest_snapshot_dir}/{reldir}")
+            if _rate_limit_sleep > 0 and i < len(sorted_missing):
+                time.sleep(_rate_limit_sleep)
+    else:
+        print(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits", flush=True)
+    # === Ende Diff-basierte Ordner-Anlage ===
+
+    for it in manifest.get("items") or []:
+        if it.get("type") == "dir":
+            # Ordner wurden bereits oben in Batch angelegt
+            continue
+        if it.get("type") != "file":
+            continue
+
+        _done_items += 1
+        _done_size += it.get("size") or 0
+        _now = time.time()
+        if _now - _t_last_progress >= _PROGRESS_INTERVAL:
+            _elapsed = _now - _t_loop_start
+            _pct = _done_items / _total_items * 100 if _total_items else 0
+            _pct_b = _done_size / _total_size * 100 if _total_size else 0
+            _eta = (_elapsed / _done_size * (_total_size - _done_size)) if _done_size else 0
+            _eta_str = f"~{int(_eta/60)}min" if _eta > 60 else f"~{int(_eta)}s"
+            print(
+                f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
+                f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
+                f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend",
+                file=sys.stderr, flush=True
+            )
+            _t_last_progress = _now
+
+        relpath = it.get("relpath") or ""
+        src_abs = it.get("source_path") or ""
+        sha = it.get("sha256") or ""
+        inode = it.get("inode") or {}
+        dev = int(inode.get("dev") or 0)
+        ino = int(inode.get("ino") or 0)
+        ino_key = (dev, ino)
+
+        dst_path = f"{dest_snapshot_dir}/{relpath}"
+
+        node = items.setdefault(sha, {"holders": []})
+        
+        # === Index-Driven Skip: Prüfen ob bereits im Index für diesen Snapshot ===
+        already_in_snapshot = any(
+            h.get("snapshot") == snapshot_name and h.get("relpath") == relpath
+            for h in node.get("holders", [])
+        )
+        if already_in_snapshot:
+            # Bereits verarbeitet → skip
+            # WICHTIG: Inode registrieren, damit weitere Hardlinks erkannt werden
+            seen_inodes[ino_key] = relpath
+            resumed += 1
+            continue
+        # === Ende Index-Driven Skip ===
+        
+        # --- NEU: Content-SHA auch als Feld im Node mitführen (Denormalisierung) ---
+        # Der Index nutzt die SHA bereits als Key; das Feld erhöht Lesbarkeit/Tooling
+        # und macht SHA-Checks im Quick-Checker robuster.
+        if sha and node.get("sha256") != sha:
+            node["sha256"] = sha
+            index_changed = True
+        
+        if sha in known_anchors:
+            anchor_path, anchor_fid = known_anchors[sha]
+            if not node.get("anchor_path"):
+                node["anchor_path"] = anchor_path
+            if not node.get("fileid"):
+                node["fileid"] = anchor_fid
+        else:
+            anchor_path = node.get("anchor_path") or ""
+        
+        is_anchor_here = (anchor_path == dst_path)
+
+        if ino_key in seen_inodes:
+            if not is_anchor_here:
+                _queue_stub(relpath, it, node)
+            else:
+                _delete_if_exists(f"{dst_path}.meta.json")
+            continue
+
+        fid = None
+        pcloud_hash = None
+        if not anchor_path:
+            fid, pcloud_hash = _upload_real_file(src_abs, dst_path)
+            if node.get("anchor_path") != dst_path:
+                node["anchor_path"] = dst_path
+                index_changed = True
+            if fid and node.get("fileid") != fid:
+                node["fileid"] = fid
+                index_changed = True
+            if pcloud_hash and node.get("pcloud_hash") != pcloud_hash:
+                node["pcloud_hash"] = pcloud_hash
+                index_changed = True
+            uploaded += 1
+            _delete_if_exists(f"{dst_path}.meta.json")
+        else:
+            if is_anchor_here:
+                _delete_if_exists(f"{dst_path}.meta.json")
+            else:
+                _queue_stub(relpath, it, node)
+
+        h = {"snapshot": snapshot_name, "relpath": relpath}
+        if h not in node["holders"]:
+            node["holders"].append(h)
+            index_changed = True
+
+        seen_inodes[ino_key] = relpath
+
+        # Periodisches lokales Index-Save (Hybrid: Anzahl ODER Zeit)
+        _now_save = time.time()
+        _count_trigger = _SAVE_INTERVAL > 0 and (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
+        _time_trigger = _SAVE_INTERVAL_TIME > 0 and (_now_save - _t_last_index_save) >= _SAVE_INTERVAL_TIME
+        if not dry and (_count_trigger or _time_trigger):
+            save_content_index_local(_local_index_path, index)
+            _last_saved_count = uploaded + resumed + stubs
+            _t_last_index_save = _now_save
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                _reason = "count" if _count_trigger else "time"
+                print(f"[index] Lokal gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
+
+
+    # --- Batch: Stubs & Index schreiben (einmaliges Ensure + Writes) ---
+    if not dry and stubs_to_write:
+        t0 = time.time()
+        _batch_write_stubs(cfg, stubs_to_write, dry=False)  # sorgt intern für 1x Parent-Ensure
+        write_ms += (time.time() - t0) * 1000.0
+
+
+    # Index schreiben (lokal → pCloud → lokal löschen)
+    if dry:
+        print(f"[dry] write index: {snapshots_root}/_index/content_index.json (items={len(items)})")
+    else:
+        # Finaler lokaler Save (falls noch Änderungen seit letztem periodischen Save)
+        if index_changed:
+            save_content_index_local(_local_index_path, index)
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                print(f"[index] Finaler lokaler Save vor Upload")
+        
+        # Index hochladen nach pCloud
+        if os.path.exists(_local_index_path):
+            t0 = time.time()
+            save_content_index(cfg, snapshots_root, index, dry=False)
+            dt_ms = (time.time() - t0) * 1000.0
+            write_ms += dt_ms 
+            print(f"[timing] index_write_ms={int(dt_ms)}")
+            
+            # Lokale Index-Datei löschen
+            try:
+                os.remove(_local_index_path)
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
+            except Exception as e:
+                print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
+        else:
+            print("[info] index unchanged (no write)")
+
+    # FINALIZE
+    if not dry:
+        do_finalize = (os.environ.get("PCLOUD_SKIP_FINALIZE") in (None, "", "0"))
+        if do_finalize and (uploaded > 0 or stubs > 0 or index_changed):
+            try:
+                finalize_index_fileids(cfg, snapshots_root)
+            except Exception:
+                pass
+
+    # === NEU: Complete-Marker setzen ===
+    if not dry:
+        try:
+            pc.put_textfile(cfg, path=marker_complete,
+                          text=json.dumps({
+                              "snapshot": snapshot_name,
+                              "completed_at": time.time(),
+                              "uploaded": uploaded,
+                              "resumed": resumed,
+                              "stubs": stubs
+                          }))
+            print(f"[success] Upload-Complete-Marker gesetzt")
+        except Exception as e:
+            print(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
+    # === ENDE NEU ===
+
+    if os.environ.get("PCLOUD_TIMING") == "1":
+        total_ms = (time.time() - t_phase_start) * 1000.0
+        print(f"[timing] push_1to1: total={total_ms/1000:.2f}s, ensure={ensure_ms:.0f}ms, upload={upload_ms:.0f}ms, writes={write_ms:.0f}ms")
+
+    print(f"1to1: uploaded={uploaded} resumed={resumed} stubs={stubs} (snapshot={snapshot_name})")
+    return {"uploaded": uploaded, "resumed": resumed, "stubs": stubs}
+
+def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_stubs=True):
+    """
+    Retention/Prune für den 1:1-Modus, index-zentriert.
+
+    Ablauf:
+      - Remote-Snapshots unter <dest>/_snapshots mit lokalen (local_snaps) vergleichen.
+      - Für jeden entfernten Remote-Snapshot:
+          • Holders für gelöschte Snaps entfernen.
+          • Liegt Anchor im gelöschten Snap:
+              - Gibt es verbleibende Holder -> Anchor serverseitig in Pfad des jüngsten Holders moven,
+                Index aktualisieren, Ziel-Stub entfernen, übrige Holder -> Stub (optional).
+              - Keine Holder mehr -> Node entfernen.
+          • Snapshot-Ordner löschen nur, wenn keine Blocker (z. B. fehlende fileid / Move-Fehler).
+      - Index zuletzt schreiben (write-last), aber NUR wenn keine Blocker auftraten.
+      - WICHTIG: am Anchor-Pfad gibt es KEINEN Stub; stale Stubs dort werden gelöscht.
+    """
+    # Timing / Metriken für Stub- und Index-Writes
+    ret_stub_ms = 0.0
+    ret_index_write_ms = 0.0
+    ret_stub_writes = 0
+    ret_index_changed = False
+
+    # --- Hilfsfunktionen -----------------------------------------------------
+
+    def _list_remote_snapshots(snapshots_root: str) -> list[str]:
+        try:
+            top = pc.listfolder(cfg, path=snapshots_root, recursive=False, nofiles=True, showpath=False) or {}
+            contents = (top.get("metadata") or {}).get("contents") or []
+            return sorted(c["name"] for c in contents if c.get("isfolder") and c.get("name") != "_index")
+        except Exception:
+            return []
+
+    def _stat_fileid_safe(path: str):
+        try:
+            md = pc.stat_file(cfg, path=path, with_checksum=False) or {}
+            return md.get("fileid")
+        except Exception:
+            return None
+
+    def _load_index(snapshots_root: str) -> dict:
+        idx_path = f"{snapshots_root}/_index/content_index.json"
+        try:
+            txt = pc.get_textfile(cfg, path=idx_path)
+            j = json.loads(txt)
+            if not isinstance(j, dict):
+                j = {"version": 1, "items": {}}
+        except Exception:
+            j = {"version": 1, "items": {}}
+        if "items" not in j or not isinstance(j["items"], dict):
+            j["items"] = {}
+        if "version" not in j:
+            j["version"] = 1
+        return j
+
+    def _save_index(snapshots_root: str, idx: dict, simulate: bool):
+        nonlocal ret_index_write_ms
+        if simulate:
+            print(f"[dry] save index: items={len(idx.get('items', {}))}")
+        else:
+            t0 = time.time()
+            save_content_index(cfg, snapshots_root, idx, dry=False)
+            dt = (time.time() - t0) * 1000.0
+            ret_index_write_ms += dt
+            if os.environ.get("PCLOUD_TIMING") == "1":
+                print(f"[timing] retention_index_write_ms={int(dt)}")
+
+    def _rewrite_stub(snapshots_root: str, snapshot: str, relpath: str, sha: str, new_anchor_path: str, fileid) -> None:
+        """
+        Stub-JSON effizient neu schreiben:
+          - Parent-Folder per folderid (stat_folderid_fast/ensure_path)
+          - Schreiben via write_json_to_folderid(..., minify=True)
+          - Vorhandenes Stub-JSON (falls vorhanden) übernehmen/aktualisieren
+        """
+        nonlocal ret_stub_ms, ret_stub_writes
+        
+        # relpath in (Unter)ordner + Basisdatei splitten
+        if "/" in relpath:
+            stub_dir, base = relpath.rsplit("/", 1)
+        else:
+            stub_dir, base = "", relpath
+
+        parent_dir = f"{snapshots_root.rstrip('/')}/{snapshot}"
+        if stub_dir:
+            parent_dir = f"{parent_dir}/{stub_dir}"
+        filename = f"{base}.meta.json"
+        meta_path = f"{parent_dir}/{filename}"
+
+        if dry:
+            print(f"[dry] rewrite stub: {meta_path} -> anchor={new_anchor_path}")
+            return
+
+        # 1) Parent-FolderID besorgen (ohne per-File ensure)
+        fid = pc.stat_folderid_fast(cfg, parent_dir)
+        if not fid:
+            fid = pc.ensure_path(cfg, parent_dir)
+        fid = int(fid)
+
+        # 2) Vorhandenes Stub-JSON (best effort) laden
+        try:
+            old_txt = pc.get_textfile(cfg, path=meta_path)
+            payload = json.loads(old_txt)
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+
+        # 3) Pflichtfelder setzen/aktualisieren
+        payload.setdefault("type", "hardlink")
+        payload["sha256"] = sha
+        payload["relpath"] = relpath
+        payload["snapshot"] = snapshot
+        payload["anchor_path"] = new_anchor_path
+        payload["fileid"] = fileid if fileid is not None else None
+
+        # 4) Schreiben per folderid (minified)
+        t0 = time.time()
+        pc.write_json_to_folderid(cfg, folderid=fid, filename=filename, obj=payload, minify=True)
+        dt = (time.time() - t0) * 1000.0
+        ret_stub_ms += dt
+        ret_stub_writes += 1
+
+        if os.environ.get("PCLOUD_TIMING") == "1":
+            print(f"[timing] retention_stub_write_ms={int(dt)} file={meta_path}")
+
+    def _delete_file_if_exists(path: str) -> None:
+        "Best-effort: löscht Datei (z. B. stale Stub) am Pfad, wenn vorhanden."
+        if dry:
+            print(f"[dry] delete-if-exists: {path}")
+            return
+        try:
+            fid = _stat_fileid_safe(path)
+            if fid:
+                pc.delete_file(cfg, fileid=int(fid))
+        except Exception:
+            pass
+
+    # --- Setup & Daten holen -------------------------------------------------
+
+    ensure_snapshots_layout(cfg, dest_root, dry=dry)
+    snapshots_root = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots"
+
+    remote_snaps = set(_list_remote_snapshots(snapshots_root))
+    local_snaps = set(local_snaps or [])
+    to_delete = sorted(s for s in remote_snaps if s not in local_snaps)
+    keep_snaps = remote_snaps & local_snaps
+
+    if not to_delete:
+        if dry:
+            print("[dry] retention: nichts zu löschen")
+        return
+
+    idx = _load_index(snapshots_root)
+    items = idx.setdefault("items", {})
+
+    promoted = 0
+    removed_nodes = 0
+    any_blockers = False
+
+    # --- Hauptlogik pro zu löschendem Snapshot ------------------------------
+
+    for sdel in to_delete:
+        del_prefix = f"{snapshots_root}/{sdel}/"
+        snapshot_blockers = False  # Pro-Snapshot Blocker-Flag
+
+        for sha, node in list(items.items()):
+            if not isinstance(node, dict):
+                continue
+
+            holders = list(node.get("holders") or [])
+            anchor = node.get("anchor_path") or ""
+            anchor_in_deleted = anchor.startswith(del_prefix)
+
+            # Invariante: am Anchor-Pfad KEIN Stub (.meta.json) → best-effort Cleanup
+            if anchor:
+                _delete_file_if_exists(f"{anchor}.meta.json")
+
+            # (A) Node ohne Holder, Anchor im gelöschten Snapshot -> Node weg
+            if not holders and anchor_in_deleted:
+                if dry:
+                    print(f"[dry] drop node (no holders, anchor in {sdel}): {sha[:8]}…")
+                else:
+                    del items[sha]
+                    removed_nodes += 1
+                    ret_index_changed = True
+                continue
+
+            # (B) Holder splitten in keep/drop und im Node setzen
+            keep_holders = [h for h in holders if h.get("snapshot") in keep_snaps]
+            drop_holders = [h for h in holders if h.get("snapshot") in to_delete]
+            if drop_holders or anchor_in_deleted:
+                node["holders"] = keep_holders
+                ret_index_changed = True
+
+            # keine Keeper?
+            if not keep_holders:
+                if anchor_in_deleted:
+                    if dry:
+                        print(f"[dry] drop node (no keepers, anchor in {sdel}): {sha[:8]}…")
+                    else:
+                        del items[sha]
+                        removed_nodes += 1
+                continue
+
+            # (C) Anchor liegt im gelöschten Snapshot -> Promotion (MOVE)
+            if anchor_in_deleted:
+                new_holder = max(keep_holders, key=lambda h: h.get("snapshot") or "")
+                new_path = f"{snapshots_root}/{new_holder['snapshot']}/{new_holder['relpath']}"
+
+                # No-Op-Guard
+                if anchor == new_path:
+                    node["anchor_path"] = new_path
+                    # am Anchor KEIN Stub: ggf. stale Stub löschen
+                    _delete_file_if_exists(f"{new_path}.meta.json")
+                    # optional: Stubs der übrigen Holder neu schreiben
+                    if rewrite_stubs:
+                        for h in keep_holders:
+                            if h is new_holder or (h["snapshot"] == new_holder["snapshot"] and h["relpath"] == new_holder["relpath"]):
+                                _delete_file_if_exists(f"{snapshots_root}/{h['snapshot']}/{h['relpath']}.meta.json")
+                                continue
+                            _rewrite_stub(snapshots_root, h["snapshot"], h["relpath"], sha, node["anchor_path"], node.get("fileid"))
+                    continue
+
+                if dry:
+                    print(f"[dry] promote (move) {sha[:8]}… {anchor} -> {new_path}")
+                    node["anchor_path"] = new_path
+                    promoted += 1
+                else:
+                    fid = node.get("fileid") or _stat_fileid_safe(anchor)
+                    if not fid:
+                        print(f"[warn] retention: fehlende fileid für Anchor {anchor}; Snapshot {sdel} wird NICHT gelöscht.", file=sys.stderr)
+                        snapshot_blockers = True
+                        any_blockers = True  # === NEU ===
+                        continue
+
+                    pc.ensure_parent_dirs(cfg, new_path)
+                    # am Ziel darf kein Stub bleiben
+                    _delete_file_if_exists(f"{new_path}.meta.json")
+
+                    try:
+                        pc.move(cfg, from_fileid=int(fid), to_path=new_path)
+                    except Exception as e:
+                        print(f"[warn] retention: move failed for fileid={fid} -> {new_path}: {e}", file=sys.stderr)
+                        snapshot_blockers = True
+                        any_blockers = True  # === NEU ===
+                        continue
+
+                    node["anchor_path"] = new_path
+                    node["fileid"] = int(fid)
+                    promoted += 1
+                    ret_index_changed = True
+
+                # übrige Holder: Stubs neu schreiben (Ziel-Holder auslassen)
+                if rewrite_stubs:
+                    for h in keep_holders:
+                        if h is new_holder or (h["snapshot"] == new_holder["snapshot"] and h["relpath"] == new_holder["relpath"]):
+                            _delete_file_if_exists(f"{snapshots_root}/{h['snapshot']}/{h['relpath']}.meta.json")
+                            continue
+                        _rewrite_stub(snapshots_root, h["snapshot"], h["relpath"], sha, node["anchor_path"], node.get("fileid"))
+
+        # Snapshot nur löschen, wenn keine Blocker auftraten
+        rmpath = f"{snapshots_root}/{sdel}"
+        if snapshot_blockers:
+            print(f"[warn] retention: Snapshot {sdel} bleibt bestehen (Blocker vorhanden).")
+            continue
+
+        if dry:
+            print(f"[dry] delete snapshot dir: {rmpath}")
+        else:
+            pc.delete_folder(cfg, path=rmpath, recursive=True)
+
+    # === NEU: Index nur schreiben wenn KEINE Blocker ===
+    if any_blockers:
+        print(f"[warn] retention: Index NICHT geschrieben wegen Blocker(n) in einem oder mehreren Snapshots")
+    else:
+        if ret_index_changed:
+            _save_index(snapshots_root, idx, simulate=dry)
+        else:
+            print("[retention] no index changes")
+    # === ENDE NEU ===
+
+    if os.environ.get("PCLOUD_TIMING") == "1":
+        print(f"[timing] retention: stubs_ms={int(ret_stub_ms)} index_ms={int(ret_index_write_ms)} stubs_written={ret_stub_writes}")
+
+    msg = f"[retention] promoted={promoted} removed_nodes={removed_nodes}"
+    print(msg if not dry else "[dry] " + msg[1:])
+    # Metrics
+    globals()["MET_PROMOTED"] += int(promoted)
+    globals()["MET_REMOVED_NODES"] += int(removed_nodes)
+
+
+# ----------------- CLI -----------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Pusht ein JSON-Manifest nach pCloud (Object-Store- oder 1:1-Snapshot-Modus).")
+    ap.add_argument("--manifest", required=True, help="Pfad zur Manifest-JSON (schema=2)")
+    ap.add_argument("--dest-root", required=True, help="Remote-Wurzel, z.B. /Backup/pcloud-snapshots")
+    ap.add_argument("--snapshot-mode", choices=["objects","1to1"], default="objects",
+                    help="Upload-Strategie: objects (Hash-Object-Store + Stubs) oder 1to1 (Materialisieren + Stubs)")
+    ap.add_argument("--objects-layout", choices=["two-level"], default="two-level",
+                    help="Layout für Object-Store (aktuell nur two-level).")
+    ap.add_argument("--retention-sync", action="store_true",
+                    help="Vor dem Upload: entfernte Snapshots, die lokal fehlen, sauber promoten/löschen (nur relevant für --snapshot-mode 1to1).")
+    ap.add_argument("--dry-run", action="store_true")
+
+
+    # pCloud Config
+    ap.add_argument("--env-file")
+    ap.add_argument("--profile")
+    ap.add_argument("--env-dir")
+    ap.add_argument("--host")
+    ap.add_argument("--port", type=int)
+    ap.add_argument("--timeout", type=int)
+    ap.add_argument("--device")
+    ap.add_argument("--token")
+
+    args = ap.parse_args()
+
+    # Config
+    cfg = pc.effective_config(
+        env_file=args.env_file,
+        overrides={"host": args.host, "port": args.port, "timeout": args.timeout,
+                   "device": args.device, "token": args.token},
+        profile=args.profile,
+        env_dir=args.env_dir
+    )
+
+    # --- Neu: Plausibilisierung & Preflight ---
+    # Zielpfad normieren (führt führenden "/")
+    args.dest_root = pc._norm_remote_path(args.dest_root)
+    # ENV-File rein informativ: effective_config hat bereits geprüft, ob Token existiert
+    try:
+        pc.preflight_or_raise(cfg)   # → raise bei Auth/Quota/API down
+    except Exception as e:
+        print(f"[preflight][FAIL] {e}", file=sys.stderr)
+        sys.exit(12)
+    # --- Ende Neu ---
+
+    # Manifest lesen
+    with open(args.manifest, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    if int(manifest.get("schema", 0)) < 2:
+        print("Manifest schema>=2 erwartet (mit inode/ext/sha256).", file=sys.stderr)
+        sys.exit(2)
+
+    dest_root = pc._norm_remote_path(args.dest_root)
+
+    # Optional: Retention-Sync (nur sinnvoll im 1:1-Modus)
+    if args.retention_sync and args.snapshot_mode == "1to1":
+        local_snaps = list_local_snapshot_names(manifest["root"])
+        retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
+
+    if args.snapshot_mode == "objects":
+        push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
+    else:
+        push_1to1_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
+
+
+    # --- metrics summary (einheitlich, greppbar) ---
+    try:
+        print(f"[metrics] uploaded_files={MET_UPLOADED_FILES} stubs_written={MET_STUBS_WRITTEN} "
+              f"promoted={MET_PROMOTED} removed_nodes={MET_REMOVED_NODES} "
+              f"fid_cache_hits={fid_cache_hits} fid_lookups={fid_lookups} fid_rest_ms={int(fid_rest_ms)} "
+              f"api_retries={MET_API_RETRIES}")
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
