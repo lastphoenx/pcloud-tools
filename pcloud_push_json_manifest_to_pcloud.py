@@ -404,7 +404,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             mtime = payload.get("mtime")
             if mtime and "mtime_iso" not in payload:
                 try:
-                    payload["mtime_iso"] = datetime.datetime.utcfromtimestamp(float(mtime)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    payload["mtime_iso"] = datetime.datetime.fromtimestamp(float(mtime), datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                 except Exception:
                     pass
             
@@ -870,6 +870,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False):
             _delete_if_exists(f"{dst_path}.meta.json")
         else:
             if is_anchor_here:
+                resumed += 1
                 _delete_if_exists(f"{dst_path}.meta.json")
             else:
                 _queue_stub(relpath, it, node)
