@@ -731,30 +731,29 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False):
     print(f"[push] Starte Upload: {_total_items} Dateien, {_total_size/1024**3:.2f} GB", flush=True)
 
     # === Diff-basierte Ordner-Anlage (nur fehlende Ordner) ===
-    # 1. Remote-Ordner sammeln via listfolder (ein API-Call)
+    # 1. Remote-Ordner sammeln via listfolder (ein API-Call, auch im Dry-Run)
     remote_folders = set()
-    if not dry:
-        try:
-            print(f"[plan] Lade Remote-Ordnerstruktur: {dest_snapshot_dir}", flush=True)
-            result = pc.call_with_backoff(pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
-            def _collect_folders(obj, parent_path=""):
-                if isinstance(obj, dict) and obj.get("isfolder"):
-                    folder_name = obj.get("name", "")
-                    folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
-                    remote_folders.add(folder_path)
-                    for child in obj.get("contents") or []:
-                        _collect_folders(child, folder_path)
-            # Direkt mit contents starten (nicht metadata selbst, das ist der Snapshot-Ordner)
-            metadata = result.get("metadata") or {}
-            for child in metadata.get("contents") or []:
-                _collect_folders(child, "")
-            print(f"[plan] {len(remote_folders)} Remote-Ordner gefunden", flush=True)
-        except Exception as e:
-            # Falls Snapshot-Ordner noch nicht existiert (erstes Upload) → okay
-            if "2005" in str(e) or "not found" in str(e).lower():
-                print(f"[plan] Snapshot-Ordner existiert noch nicht (erstes Upload)", flush=True)
-            else:
-                print(f"[warn] listfolder fehlgeschlagen: {e}", flush=True)
+    try:
+        print(f"[plan] Lade Remote-Ordnerstruktur: {dest_snapshot_dir}", flush=True)
+        result = pc.call_with_backoff(pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
+        def _collect_folders(obj, parent_path=""):
+            if isinstance(obj, dict) and obj.get("isfolder"):
+                folder_name = obj.get("name", "")
+                folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
+                remote_folders.add(folder_path)
+                for child in obj.get("contents") or []:
+                    _collect_folders(child, folder_path)
+        # Direkt mit contents starten (nicht metadata selbst, das ist der Snapshot-Ordner)
+        metadata = result.get("metadata") or {}
+        for child in metadata.get("contents") or []:
+            _collect_folders(child, "")
+        print(f"[plan] {len(remote_folders)} Remote-Ordner gefunden", flush=True)
+    except Exception as e:
+        # Falls Snapshot-Ordner noch nicht existiert (erstes Upload) → okay
+        if "2005" in str(e) or "not found" in str(e).lower():
+            print(f"[plan] Snapshot-Ordner existiert noch nicht (erstes Upload)", flush=True)
+        else:
+            print(f"[warn] listfolder fehlgeschlagen: {e}", flush=True)
     
     # 2. Manifest-Ordner sammeln (leere relpaths filtern - das ist Root selbst)
     manifest_folders = set()
