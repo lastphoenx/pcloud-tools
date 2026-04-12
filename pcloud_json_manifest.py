@@ -382,6 +382,15 @@ def main() -> None:
          f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
          f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
          f"calculated={ref_cache.stats['calculated_sha256']}")
+    
+    # Manifest schreiben (stdout oder Datei)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        _log(f"[manifest] ✓ Geschrieben: {args.out}")
+    else:
+        json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+        print(file=sys.stdout)  # Trailing newline
 
 if __name__ == "__main__":
     main()
