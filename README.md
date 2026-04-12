@@ -336,6 +336,20 @@ Recent hardening improvements ensure robust long-term operation:
         print(f"[retention] Manifest gelöscht: {snapshot}.json")
     ```
   - **Why:** 1:1 parity (snapshot deleted = manifest deleted), no orphans, no extra cronjob, Smart-Mode safety
+* **Intelligent Gap-Backfilling** (Commit: 84d907d) - Automatic upload of missing snapshots
+  - **Problem:** Old logic only uploaded `latest` snapshot → If pCloud blocked for days, intermediate snapshots never uploaded → Gaps in cloud history after RTB retention
+  - **Solution:** Wrapper now iterates ALL local snapshots, checks each against remote, uploads missing ones chronologically (old → new)
+  - **Self-Healing:** Gaps automatically filled on next successful run (e.g., pCloud down 4 days → 4 snapshots backfilled)
+  - **Efficient:** Smart-Mode deduplication → subsequent snapshots only upload stubs (~5min each vs. 20min full upload)
+  - **Example Output:**
+    ```bash
+    [check] Prüfe auf fehlende Snapshots...
+    [gap] Snapshot 2026-04-08-120000 fehlt remote – hole nach...
+    [gap] Snapshot 2026-04-09-120000 fehlt remote – hole nach...
+    [gap] Snapshot 2026-04-10-120000 fehlt remote – hole nach...
+    [done] 3 Snapshot(s) hochgeladen
+    ```
+  - **Why:** Ensures complete cloud history, immune to temporary pCloud outages/blockages
 
 #### **Smart-Manifest Performance** (Commit: 8b16b1c)
 * **Schema v3 with mtime/size Cache** - 600× speedup via reference manifest
