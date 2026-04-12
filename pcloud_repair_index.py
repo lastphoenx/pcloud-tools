@@ -10,7 +10,7 @@ Workflow:
   1. Delta-Report einlesen (missing_anchors)
   2. Remote content_index.json laden
   3. Für jeden missing_anchor: Holder-Eintrag entfernen
-  4. Bereinigten Index lokal speichern unter /tmp/pcloud_index_{snapshot}.json
+  4. Bereinigten Index lokal speichern unter /srv/pcloud-temp/pcloud_index_{snapshot}.json
   5. Beim nächsten Upload: Resume überspringt echte Dateien, lädt fehlende nach
 
 Benötigt: pcloud_bin_lib.py
@@ -135,12 +135,12 @@ def save_local_index(index: dict, snapshot_name: str, output_path: str | None = 
     """
     Speichert den bereinigten Index lokal.
     
-    Falls output_path nicht angegeben: /tmp/pcloud_index_{snapshot}.json
+    Falls output_path nicht angegeben: /srv/pcloud-temp/pcloud_index_{snapshot}.json
     """
     if output_path:
         out = output_path
     else:
-        tmp_dir = tempfile.gettempdir()
+        tmp_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
         out = os.path.join(tmp_dir, f"pcloud_index_{snapshot_name}.json")
     
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -158,10 +158,10 @@ def main():
         epilog="""
 Workflow:
   1. Erzeuge Delta-Report:
-     python pcloud_quick_delta.py --dest-root /backup-nas --json-out /tmp/delta.json
+     python pcloud_quick_delta.py --dest-root /backup-nas --json-out /srv/pcloud-temp/delta.json
   
   2. Index reparieren:
-     python pcloud_repair_index.py --delta-report /tmp/delta.json --dest-root /backup-nas
+     python pcloud_repair_index.py --delta-report /srv/pcloud-temp/delta.json --dest-root /backup-nas
   
   3. Upload starten (nutzt automatisch den reparierten lokalen Index):
      python pcloud_push_json_manifest_to_pcloud.py ...
@@ -178,7 +178,7 @@ Workflow:
     ap.add_argument("--profile",
                     help="pCloud-Profil (optional)")
     ap.add_argument("--output",
-                    help="Ausgabepfad für reparierten Index (default: /tmp/pcloud_index_{snapshot}.json)")
+                    help="Ausgabepfad für reparierten Index (default: /srv/pcloud-temp/pcloud_index_{snapshot}.json)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Nur Report, keine Änderungen")
     
@@ -261,7 +261,7 @@ Workflow:
         print(f"  Upload-Befehl:")
         print(f"    /opt/apps/pcloud-tools/venv-.../bin/python \\")
         print(f"      /opt/apps/pcloud-tools/main/pcloud_push_json_manifest_to_pcloud.py \\")
-        print(f"      --manifest /tmp/manifest.json \\")
+        print(f"      --manifest /srv/pcloud-temp/manifest.json \\")
         print(f"      --dest-root {dest_root} \\")
         print(f"      --snapshot-mode 1to1 \\")
         print(f"      --env-file /opt/apps/pcloud-tools/main/.env")

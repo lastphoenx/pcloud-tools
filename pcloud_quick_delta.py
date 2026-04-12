@@ -457,7 +457,7 @@ Beispiele:
   python pcloud_quick_delta.py --dest-root /backup-nas --backfill-check --backfill-sample 50
 
   # Report als JSON speichern:
-  python pcloud_quick_delta.py --dest-root /backup-nas --json-out /tmp/delta-report.json
+  python pcloud_quick_delta.py --dest-root /backup-nas --json-out /srv/pcloud-temp/delta-report.json
 """)
     ap.add_argument("--dest-root", required=True,
                     help="pCloud-Basispfad (z.B. /backup-nas)")

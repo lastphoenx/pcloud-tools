@@ -32,12 +32,21 @@ if [[ -f "${ENV_FILE:-}" ]]; then
     # Kommentare und Leerzeilen überspringen
     [[ "$key" =~ ^[[:space:]]*# ]] && continue
     [[ -z "$key" ]] && continue
-    # PCLOUD_PRETTY_JSON exportieren falls im .env gesetzt
-    if [[ "$key" == "PCLOUD_PRETTY_JSON" ]]; then
-      export PCLOUD_PRETTY_JSON="${val}"
+    # PCLOUD_* vars exportieren
+    if [[ "$key" =~ ^PCLOUD_ ]]; then
+      # Quotes entfernen falls vorhanden
+      val="${val%\"}"; val="${val#\"}"
+      export "${key}=${val}"
     fi
   done < "${ENV_FILE}"
 fi
+
+# Temp-Pfad aus Env oder Default
+export PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
+export PCLOUD_ARCHIVE_DIR="${PCLOUD_ARCHIVE_DIR:-/srv/pcloud-archive}"
+
+# Verzeichnisse erstellen falls nicht vorhanden
+mkdir -p "${PCLOUD_TEMP_DIR}" "${PCLOUD_ARCHIVE_DIR}/manifests" 2>/dev/null || true
 
 # ========= Globales Lock =========
 LOCKFILE=${LOCKFILE:-/run/backup_pipeline.lock}
@@ -176,7 +185,8 @@ build_and_push() {
   local SNAP="$1" SNAPNAME; SNAPNAME="$(basename "$SNAP")"
   log "[info] push snapshot: $SNAPNAME"
 
-  local mani; mani="$(mktemp -t "pcloud_mani.${SNAPNAME}.XXXXXX.json")"
+  # Manifest im PCLOUD_TEMP_DIR erstellen (statt system /tmp)
+  local mani; mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.$$.json"
   trap 'rm -f "$mani"' RETURN
 
   local T0=$(date +%s)
@@ -269,4 +279,11 @@ if [[ "$(remote_snapshot_exists "$SNAPNAME")" == "YES" ]]; then
 fi
 
 build_and_push "$SNAP"
+
+# Cleanup: Alte Temp-Dateien löschen (>7 Tage)
+if [[ -d "${PCLOUD_TEMP_DIR}" ]]; then
+  find "${PCLOUD_TEMP_DIR}" -maxdepth 1 -type f \( -name "pcloud_mani.*.json" -o -name "pcloud_index_*.json" -o -name "delta*.json" \) -mtime +7 -delete 2>/dev/null || true
+  log "[cleanup] Alte Temp-Dateien (>7d) aus ${PCLOUD_TEMP_DIR} gelöscht"
+fi
+
 log "[done] pcloud_sync_1to1"

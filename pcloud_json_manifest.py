@@ -12,7 +12,7 @@ Beispiel
   SNAP=$(readlink -f /mnt/backup/rtb_nas/latest)
   python pcloud_json_manifest.py \
     --root "$SNAP" \
-    --out /tmp/snap.json \
+    --out /srv/pcloud-temp/snap.json \
     --hash sha256 \
     --no-follow-hardlinks \
     --store-hardlink-target \

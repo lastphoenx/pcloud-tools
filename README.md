@@ -168,6 +168,11 @@ Umgebungsvariablen (.env):
   PCLOUD_REGION                              Region (eu|us)
   LOCAL_BACKUP_ROOT                          Local source directory
   PCLOUD_BACKUP_ROOT                         Cloud destination directory
+  PCLOUD_TEMP_DIR                            Temporary files (index, manifests, delta reports)
+                                             Default: /tmp (recommend: /srv/pcloud-temp on SSD)
+  PCLOUD_ARCHIVE_DIR                         Long-term manifest archive after successful upload
+                                             Default: /srv/pcloud-archive
+  PCLOUD_ARCHIVE_INDEX                       Archive index files (set to "1" to enable)
 ```
 
 ## Features
@@ -415,14 +420,14 @@ python pcloud_push_json_manifest_to_pcloud.py \
 ```bash
 python pcloud_json_manifest.py \
   --source /mnt/backup/latest \
-  --output /tmp/manifest_$(date +%Y%m%d).json
+  --output /srv/pcloud-temp/manifest_$(date +%Y%m%d).json
 ```
 
 * **Deduplizierter Upload in pCloud:**
 
 ```bash
 python pcloud_push_json_manifest_to_pcloud.py \
-  --manifest /tmp/manifest_20251214.json \
+  --manifest /srv/pcloud-temp/manifest_20251214.json \
   --pool-dir /pCloudBackups/file_pool \
   --manifest-dir /pCloudBackups/manifests
 ```
@@ -512,11 +517,32 @@ fi
 
 ## Best Practices
 
+* **SSD-Pfade nutzen** - `PCLOUD_TEMP_DIR=/srv/pcloud-temp` auf SSD statt `/tmp` (Micro-SD wear-leveling!)
+  - Index-Dateien: Mehrere MB bei 20k+ Dateien
+  - Manifeste: 50+ MB bei großen Snapshots
+  - Delta-Reports: Wird bei jedem Integrity-Check geschrieben
+  - Archivierung: `PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive` für erfolgreiche Uploads
+
+* **Verzeichnisstruktur einrichten:**
+  ```bash
+  mkdir -p /srv/pcloud-temp /srv/pcloud-archive/{manifests,indexes}
+  chmod 750 /srv/pcloud-temp /srv/pcloud-archive
+  ```
+
+* **Manifest-Archivierung** - Erfolgreiche Manifeste werden automatisch nach `/srv/pcloud-archive/manifests/` verschoben
+  - Wertvoll für Forensik, Audits, Delta-Checks zwischen Snapshots
+  - Optional: Index auch archivieren mit `PCLOUD_ARCHIVE_INDEX=1`
+
+* **Cleanup alter Temp-Files** - `/srv/pcloud-temp` regelmäßig aufräumen (z.B. >7 Tage alte Dateien)
+
 * **Manifest-Naming** - Zeitstempel verwenden: `manifest_$(date +%Y%m%d_%H%M%S).json`
 
 * **Pool-Cleanup** - Alte SHA256-Dateien nur löschen, wenn kein Manifest mehr darauf verweist
 
 * **Integrity Checks** - Regelmäßig nach Upload ausführen (wöchentlich empfohlen)
+  ```bash
+  python pcloud_quick_delta.py --snapshot <name> --dest-root /Backup/rtb_1to1 --json-out /srv/pcloud-temp/delta.json
+  ```
 
 * **Bandwidth** - Bei großen Uploads: `--rate-limit` in pCloud-API nutzen
 

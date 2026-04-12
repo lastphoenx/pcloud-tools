@@ -269,7 +269,7 @@ Beispiele:
   %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /tmp/restore
 
   # Download mit SHA256-Verifikation
-  %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /tmp/restore --download --verify
+  %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /srv/pcloud-temp/restore --download --verify
         """
     )
     

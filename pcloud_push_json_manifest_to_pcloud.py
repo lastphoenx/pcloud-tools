@@ -520,12 +520,13 @@ def ensure_snapshots_layout(cfg: dict, dest_root: str, *, dry: bool = False) -> 
     pc.ensure_path(cfg, snapshots_root)
     pc.ensure_path(cfg, index_dir)
 
-def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False):
+def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None):
     """
     1:1-Modus mit Resume-Unterstützung:
       - .upload_started Marker beim Start
       - .upload_complete Marker beim erfolgreichen Abschluss
       - Unvollständige Snapshots werden erkannt und neu gestartet
+      - Nach Upload: Manifest-Archivierung (falls manifest_path gegeben)
     """
     t_phase_start = time.time()
     ensure_ms = 0.0
@@ -608,8 +609,9 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False):
 
     # Lokaler Index-Cache-Pfad (nur während Upload, wird am Ende hochgeladen)
     import tempfile
-    _local_index_dir = tempfile.gettempdir()
+    _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
     _local_index_path = os.path.join(_local_index_dir, f"pcloud_index_{snapshot_name}.json")
+    os.makedirs(_local_index_dir, exist_ok=True)
 
     # Index laden: erst lokal (falls vorhanden), sonst von pCloud
     if os.path.exists(_local_index_path):
@@ -927,6 +929,29 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False):
                     print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
             except Exception as e:
                 print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
+            
+            # Manifest archivieren (falls Pfad gegeben und Upload erfolgreich)
+            if manifest_path and not dry:
+                try:
+                    archive_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
+                    os.makedirs(archive_dir, exist_ok=True)
+                    archive_path = os.path.join(archive_dir, f"{snapshot_name}.json")
+                    
+                    import shutil
+                    shutil.copy2(manifest_path, archive_path)
+                    print(f"[archive] Manifest archiviert: {archive_path}")
+                    
+                    # Optional: Index auch archivieren
+                    if os.environ.get("PCLOUD_ARCHIVE_INDEX") == "1":
+                        index_archive_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes")
+                        os.makedirs(index_archive_dir, exist_ok=True)
+                        index_src = os.path.join(_local_index_dir, f"pcloud_index_{snapshot_name}.json")
+                        if os.path.exists(index_src):
+                            index_archive_path = os.path.join(index_archive_dir, f"{snapshot_name}_index.json")
+                            shutil.copy2(index_src, index_archive_path)
+                            print(f"[archive] Index archiviert: {index_archive_path}")
+                except Exception as e:
+                    print(f"[warn] Manifest-Archivierung fehlgeschlagen: {e}")
         else:
             print("[info] index unchanged (no write)")
 
@@ -1316,7 +1341,7 @@ def main() -> None:
     if args.snapshot_mode == "objects":
         push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
     else:
-        push_1to1_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
+        push_1to1_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
 
 
     # --- metrics summary (einheitlich, greppbar) ---
