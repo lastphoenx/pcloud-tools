@@ -4,13 +4,40 @@
 
 set -e
 
-SNAPSHOT_NAME="${1:-2026-04-12-141849}"
+# === Argument-Handling ===
+if [ -z "$1" ]; then
+    echo "❌ FEHLER: Bitte Snapshot-Namen angeben!"
+    echo ""
+    echo "Usage:"
+    echo "  $0 SNAPSHOT_NAME [--remote]"
+    echo ""
+    echo "Beispiele:"
+    echo "  $0 2026-04-12-141849              # Nur lokaler Cleanup"
+    echo "  $0 2026-04-12-141849 --remote     # Auch pCloud-Snapshot löschen"
+    echo ""
+    echo "Standard: Nur lokaler Cleanup (pCloud manuell via UI prüfen)"
+    exit 1
+fi
+
+SNAPSHOT_NAME="$1"
+DO_REMOTE_DELETE=false
+
+# Optional: --remote Flag
+if [ "$2" = "--remote" ]; then
+    DO_REMOTE_DELETE=true
+fi
+
 RTB_BASE="/mnt/backup/rtb_nas"
 ARCHIVE_BASE="/srv/pcloud-archive"
 PCLOUD_DEST="/Backup/rtb_1to1/_snapshots"
 
 echo "═══════════════════════════════════════════════════════════"
 echo "Cleanup für abgebrochenen Upload: $SNAPSHOT_NAME"
+if [ "$DO_REMOTE_DELETE" = true ]; then
+    echo "Modus: Lokal + Remote (pCloud-Snapshot wird gelöscht)"
+else
+    echo "Modus: Nur lokal (pCloud manuell prüfen)"
+fi
 echo "═══════════════════════════════════════════════════════════"
 
 # 1. RTB-Snapshot löschen (lokal)
@@ -52,9 +79,10 @@ else
     echo "  ○ Kein Index-Cache gefunden"
 fi
 
-# 5. pCloud-Snapshot löschen (remote)
-echo "[5/6] Lösche pCloud-Snapshot (wenn vorhanden)"
-python3 -c "
+# 5. pCloud-Snapshot löschen (remote - optional)
+if [ "$DO_REMOTE_DELETE" = true ]; then
+    echo "[5/6] Lösche pCloud-Snapshot (remote)"
+    python3 -c "
 import pcloud_bin_lib as pc
 cfg = pc.effective_config()
 try:
@@ -66,6 +94,12 @@ except Exception as e:
     else:
         print(f'  ⚠ Fehler: {e}')
 "
+else
+    echo "[5/6] pCloud-Snapshot (remote) NICHT gelöscht (--remote Flag nicht gesetzt)"
+    echo "  ℹ️  Bitte manuell via pCloud Web-UI prüfen und löschen:"
+    echo "  ℹ️  https://my.pcloud.com → $PCLOUD_DEST/$SNAPSHOT_NAME"
+    echo "  ℹ️  Vorteil: Du siehst, was wirklich hochgeladen wurde"
+fi
 
 # 6. Verify
 echo "[6/6] Verify Cleanup"
@@ -77,10 +111,21 @@ ls -lh "$ARCHIVE_BASE/manifests/" 2>/dev/null | tail -3 || echo "  (Ordner noch 
 
 echo ""
 echo "═══════════════════════════════════════════════════════════"
-echo "✓ Cleanup abgeschlossen!"
+echo "✓ Lokaler Cleanup abgeschlossen!"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
+
+if [ "$DO_REMOTE_DELETE" = true ]; then
+    echo "ℹ️  pCloud-Snapshot wurde remote gelöscht"
+else
+    echo "⚠️  pCloud-Snapshot wurde NICHT gelöscht (nur lokal)"
+    echo "   → Bitte manuell via pCloud Web-UI prüfen und löschen:"
+    echo "   → https://my.pcloud.com"
+    echo "   → Pfad: $PCLOUD_DEST/$SNAPSHOT_NAME"
+    echo ""
+fi
+
 echo "Nächste Schritte:"
-echo "  1. git pull origin main  # Neue Features (Timestamps + Retry)"
+echo "  1. git pull origin main  # Neue Features (Hardening + Timestamps)"
 echo "  2. sudo bash /opt/apps/rtb/rtb_wrapper.sh  # Neues Backup starten"
 echo ""
