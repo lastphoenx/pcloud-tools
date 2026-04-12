@@ -68,7 +68,8 @@ fi
 # 2. Latest-Symlink zurücksetzen
 echo "[2/6] Setze Latest-Symlink zurück"
 # Alphabetische Sortierung (robuster bei ISO-Datum) + Error-Handling
-PREVIOUS_SNAPSHOT=$(ls -1 "$RTB_BASE" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$' | tail -1)
+# WICHTIG: Zu löschenden Snapshot ausschließen (grep -v)
+PREVIOUS_SNAPSHOT=$(ls -1 "$RTB_BASE" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$' | grep -v "^$SNAPSHOT_NAME$" | tail -1)
 if [ -n "$PREVIOUS_SNAPSHOT" ]; then
     if [ "$DRY_RUN" = true ]; then
         echo "  [dry-run] Würde setzen: Latest → $PREVIOUS_SNAPSHOT"
