@@ -808,14 +808,65 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     missing_folders = manifest_folders - remote_folders
     if missing_folders:
         print(f"[plan] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)", flush=True)
-        # Sortieren nach Tiefe (Parents zuerst)
-        sorted_missing = sorted(missing_folders, key=lambda p: p.count("/"))
-        # Rate-Limiting: kleine Pause zwischen Ordner-Anlage (verhindert pCloud-Blockade)
-        _rate_limit_sleep = float(os.environ.get("PCLOUD_FOLDER_CREATE_SLEEP", "0.05"))
-        for i, reldir in enumerate(sorted_missing, 1):
-            _ensure(f"{dest_snapshot_dir}/{reldir}")
-            if _rate_limit_sleep > 0 and i < len(sorted_missing):
-                time.sleep(_rate_limit_sleep)
+        
+        # Nach Tiefe gruppieren (Parents zuerst, dann parallel innerhalb Ebene)
+        from collections import defaultdict
+        import threading
+        
+        folders_by_depth = defaultdict(list)
+        for reldir in missing_folders:
+            depth = reldir.count("/")
+            folders_by_depth[depth].append(reldir)
+        
+        max_depth = max(folders_by_depth.keys()) if folders_by_depth else 0
+        threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
+        
+        _folders_created = 0
+        _folders_lock = threading.Lock()
+        _last_progress_pct = 0
+        total_folders = len(missing_folders)
+        
+        def _create_folder(reldir: str) -> bool:
+            nonlocal _folders_created, _last_progress_pct
+            try:
+                _ensure(f"{dest_snapshot_dir}/{reldir}")
+                
+                # Progress-Tracking (thread-safe)
+                with _folders_lock:
+                    _folders_created += 1
+                    current_pct = int((_folders_created / total_folders) * 100)
+                    
+                    # Alle 100 Ordner ODER bei Prozent-Änderung (10%, 20%, ...)
+                    show_progress = (
+                        _folders_created % 100 == 0 or
+                        _folders_created == total_folders or
+                        (current_pct % 10 == 0 and current_pct != _last_progress_pct)
+                    )
+                    
+                    if show_progress:
+                        _last_progress_pct = current_pct
+                        remaining_s = (total_folders - _folders_created) * 0.05 / threads
+                        eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
+                        print(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend", 
+                              flush=True)
+                return True
+            except Exception as e:
+                print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
+                return False
+        
+        # Ebenen nacheinander abarbeiten (innerhalb parallel)
+        print(f"[folders] {max_depth + 1} Ebenen, {threads} Threads pro Ebene", flush=True)
+        for depth in sorted(folders_by_depth.keys()):
+            folders_at_depth = folders_by_depth[depth]
+            
+            if threads > 1 and len(folders_at_depth) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                    list(ex.map(_create_folder, folders_at_depth))
+            else:
+                for folder in folders_at_depth:
+                    _create_folder(folder)
+        
+        print(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt", flush=True)
     else:
         print(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits", flush=True)
     # === Ende Diff-basierte Ordner-Anlage ===
