@@ -229,12 +229,11 @@ build_and_push() {
   fi
   
   # === Delta-Check nach erfolgreichem Upload ===
-  log "[verify] Starte Delta-Check für Snapshot: $SNAPNAME"
+  log "[verify] Starte Delta-Check für alle Snapshots..."
   local delta_report="${PCLOUD_TEMP_DIR}/delta_verify_${SNAPNAME}.json"
   
   if "${PY}" "$DELTA_CHECK" \
     --dest-root "$PCLOUD_DEST" \
-    --snapshot "$SNAPNAME" \
     --env-file "$ENV_FILE" \
     --json-out "$delta_report" 2>&1 | tee -a "$PCLOUD_LOG"; then
     
