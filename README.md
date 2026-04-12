@@ -282,6 +282,73 @@ PCLOUD_VERBOSE=1                           # Show detailed logs
 
 **Real-world Impact:** Successfully uploaded 19,808 files / 89.66 GB including 910MB video files that previously failed with connection errors.
 
+### April 2026 Hardening & Production-Readiness (Commits: bfdd8b3, aa1cdcb)
+
+Recent hardening improvements ensure robust long-term operation:
+
+#### **Logging & Observability**
+* **RTB-Style Timestamps** - All log output now includes timestamps (`2026-04-12 16:35:19 [push] ...`)
+  - Applies to: `pcloud_json_manifest.py`, `pcloud_push_json_manifest_to_pcloud.py` 
+  - `_log()` helper function replaces raw `print()` calls
+  - **Progress Tracking** - Upload progress now timestamped for post-mortem analysis
+    - Before: `[push] 4902/19811 (25%) | 13.08/89.66 GB (15%) | ~34min verbleibend`
+    - After: `2026-04-12 17:00:17 [push] 4902/19811 (25%) | 13.08/89.66 GB (15%) | ~34min verbleibend`
+  - **Why:** Essential for debugging long-running uploads ("When exactly did the rate drop?")
+
+#### **Robustness Improvements**
+* **Retry Logic for Stub-Writes** - Graceful failure handling with 5 retry attempts (exponential backoff)
+  - `call_with_backoff()` wraps stub JSON writes (30s max sleep between attempts)
+  - Continues on failure (logs error, counts in stats)
+  - Final output: `19810/19810 Stubs erfolgreich (100.0%)`
+* **Folder Creation 2004-Handling** - Parallel folder creation no longer crashes on "already exists" errors
+  - Fallback to `stat_folderid_fast()` when `ensure_path()` throws API Error 2004
+  - Allows 4-thread parallelism without race conditions
+  - ~4× speedup (1,101 folders in ~5min 20s)
+* **Timeout Protection** - Default timeout increased from 30s → 60s for mass-upload scenarios
+  - Configurable via `cfg["timeout"]` in `pcloud_push_json_manifest_to_pcloud.py`
+* **Stub Write Error Statistics** - Thread-safe counter tracks failed stub writes
+  - Displayed at end: `[stubs] Fehler-Statistik: 19810/19810 (100.00%)` (graceful degradation)
+
+#### **Bug Fixes (Critical)**
+* **Manifest Write Bug** (Commit: dab62de) - `json.dump()` was missing after refactoring
+  - **Symptom:** `FileNotFoundError: pcloud_mani.*.json` (manifest created in RAM but never written to disk)
+  - **Fix:** Restored `json.dump(payload, f)` after stats output
+* **total_files Scope Bug** (Commit: bfdd8b3) - Variable only defined in `if ref_cache:` block
+  - **Symptom:** `NameError: name 'total_files' is not defined` in Full-Mode
+  - **Fix:** Calculate `total_files` before if-block, stats output only when `ref_cache` exists
+* **trap RETURN Trap** (Commit: bfdd8b3) - Shell trap deleted manifests on any Python error
+  - **Symptom:** Manifest deleted immediately after Python crash → `FileNotFoundError` in push script
+  - **Fix:** Removed `trap 'rm -f "$mani"' RETURN`, replaced with explicit cleanup at function end
+* **Latest-Symlink Bug** (Commit: b661514) - Cleanup script pointed to deleted snapshot instead of previous
+  - **Symptom:** `Latest → 2026-04-12-141849` (snapshot being deleted) instead of `2026-04-12-121042`
+  - **Fix:** `grep -v "^$SNAPSHOT_NAME$"` filters deleted snapshot from list before `tail -1`
+
+#### **Operational Improvements**
+* **Paritäts-Cleanup for Manifests** (Commit: aa1cdcb) - Automatic manifest deletion during retention sync
+  - **Problem:** RTB retention deletes old snapshots → Remote snapshot deleted via `retention_sync` → Local manifest orphaned in `/srv/pcloud-archive/manifests/`
+  - **Solution:** `retention_sync_1to1()` now deletes manifest immediately after `pc.delete_folder()`
+  - **Code:**
+    ```python
+    pc.delete_folder(cfg, path=rmpath, recursive=True)
+    manifest_file = f"{PCLOUD_ARCHIVE_DIR}/manifests/{snapshot}.json"
+    if os.path.exists(manifest_file):
+        os.remove(manifest_file)
+        print(f"[retention] Manifest gelöscht: {snapshot}.json")
+    ```
+  - **Why:** 1:1 parity (snapshot deleted = manifest deleted), no orphans, no extra cronjob, Smart-Mode safety
+
+#### **Smart-Manifest Performance** (Commit: 8b16b1c)
+* **Schema v3 with mtime/size Cache** - 600× speedup via reference manifest
+  - Full-Mode: 20min (19,811 SHA256 calculations)
+  - Smart-Mode: ~2s (19,810 cached, 1 new file)
+  - Cache hit rate: 99.99% for incremental backups
+* **Parallel Folder Creation** (Commit: bd7f4eb) - 4 threads per depth level
+  - Sequential: ~55s for 1,101 folders
+  - Parallel: ~14s (4× speedup)
+  - Depth-based sorting prevents parent-before-child errors
+
+**Production Status:** All critical bugs fixed, hardening features active, tested with 19,810 files / 89.66 GB uploads.
+
 ## Diagnostic & Repair Tools
 
 ### Fast Tamper Detection (`pcloud_quick_delta.py`)
@@ -412,6 +479,112 @@ python pcloud_push_json_manifest_to_pcloud.py \
 | `pcloud_quick_delta.py` | 2s | 1 | Hash + Fileid + Size |
 | Traditional checksumfile | 2+ hours | 20,000+ | SHA256 only |
 | Manual index rebuild | N/A | N/A | Loses dedup info |
+
+---
+
+## Maintenance Scripts
+
+### Cleanup Orphaned Manifests (`cleanup_orphaned_manifests.sh`)
+
+**Purpose:** Find and delete "orphaned" manifests - JSON files without corresponding RTB snapshots. Useful after manual snapshot deletions or as a safety-net for retention issues.
+
+**When to use:**
+- After manual RTB interventions (snapshots deleted by hand)
+- After retention runs (monthly sanity check)
+- Debugging (when manifest counts look suspicious)
+- Migration/cleanup (one-time removal of old test data)
+
+**Note:** As of commit `aa1cdcb`, parity cleanup runs automatically during `retention_sync`. This script is only needed for:
+- Legacy cleanup (manifests created before automatic parity cleanup)
+- Manual interventions (snapshots deleted outside of normal retention)
+- Debugging (verify manifest-snapshot parity)
+
+**How it works:**
+1. Lists all `.json` files in `/srv/pcloud-archive/manifests/`
+2. For each manifest: checks if RTB snapshot exists in `/mnt/backup/rtb_nas/<TIMESTAMP>/`
+3. If snapshot missing → manifest is "orphaned" → delete (or dry-run)
+4. Reports: Total manifests, valid (snapshot exists), orphaned (snapshot missing)
+
+**Advantages:**
+- ✅ One-time cleanup for "zombie manifests"
+- ✅ Ad-hoc maintenance after manual changes
+- ✅ Safety-net (debugging tool)
+- ✅ Dry-run mode (safe testing with `--dry-run`)
+- ✅ Shows which manifests are affected
+
+**Disadvantages:**
+- ⚠️ Extra script to maintain
+- ⚠️ Can mask problems (better: fix root cause)
+- ⚠️ One-time solution (not for automation)
+
+**Usage:**
+```bash
+# Test run (shows what would be deleted)
+./cleanup_orphaned_manifests.sh --dry-run
+
+# Actually delete orphaned manifests
+./cleanup_orphaned_manifests.sh
+```
+
+**Example output:**
+```
+═══════════════════════════════════════════════════════════
+Orphaned Manifest Cleanup
+═══════════════════════════════════════════════════════════
+RTB-Snapshots:  /mnt/backup/rtb_nas
+Manifeste:      /srv/pcloud-archive/manifests
+
+  ✓ Gelöscht: 2026-04-05-120000.json (orphan)
+  ✓ Gelöscht: 2026-04-08-143000.json (orphan)
+
+═══════════════════════════════════════════════════════════
+✓ Cleanup abgeschlossen
+═══════════════════════════════════════════════════════════
+Gesamt:   5 Manifeste
+Valid:    3 (RTB-Snapshot existiert)
+Orphaned: 2 (RTB-Snapshot fehlt)
+
+✓ 2 orphaned Manifeste gelöscht
+```
+
+**Recommended frequency:** 
+- Monthly (after retention runs)
+- Ad-hoc (after manual interventions)
+- Not needed for normal operation (automatic parity cleanup handles this)
+
+---
+
+### Cleanup Aborted Upload (`cleanup_aborted_upload.sh`)
+
+**Purpose:** Clean up artifacts after a failed or aborted backup upload (e.g., Ctrl+C during upload, script crash).
+
+**What it cleans:**
+- RTB snapshot directory (`/mnt/backup/rtb_nas/<SNAPSHOT>/`)
+- Latest symlink (resets to previous successful snapshot)
+- Manifest file (if created in `/srv/pcloud-archive/manifests/`)
+- Index cache (if created in `/srv/pcloud-temp/`)
+- Remote snapshot (optional with `--remote` flag)
+
+**Usage:**
+```bash
+# Test run (shows what would be deleted)
+./cleanup_aborted_upload.sh 2026-04-12-161214 --dry-run
+
+# Local cleanup only (keeps remote snapshot for manual inspection)
+./cleanup_aborted_upload.sh 2026-04-12-161214
+
+# Full cleanup (includes remote pCloud snapshot)
+./cleanup_aborted_upload.sh 2026-04-12-161214 --remote
+```
+
+**Key features:**
+- ✅ Mandatory snapshot name argument (no dangerous defaults)
+- ✅ `--dry-run` mode (safety first)
+- ✅ `--remote` flag (opt-in remote deletion)
+- ✅ Latest-symlink handling (critical bug fix in `b661514`)
+- ✅ Verbose output (shows what's being cleaned)
+
+**Safety:** Snapshot name is required (no hardcoded defaults). After 3 weeks, you'd have to remember the exact name - prevents accidental deletions.
 
 ---
 
