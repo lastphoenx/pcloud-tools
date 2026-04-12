@@ -10,6 +10,7 @@ PCLOUD_DEST=${PCLOUD_DEST:-/Backup/rtb_1to1}
 
 MANI=${MANI:-${MAIN_DIR}/pcloud_json_manifest.py}
 PUSH=${PUSH:-${MAIN_DIR}/pcloud_push_json_manifest_to_pcloud.py}
+DELTA_CHECK=${DELTA_CHECK:-${MAIN_DIR}/pcloud_quick_delta.py}
 
 # Python-Interpreter (venv bevorzugt)
 if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
@@ -46,7 +47,7 @@ export PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
 export PCLOUD_ARCHIVE_DIR="${PCLOUD_ARCHIVE_DIR:-/srv/pcloud-archive}"
 
 # Verzeichnisse erstellen falls nicht vorhanden
-mkdir -p "${PCLOUD_TEMP_DIR}" "${PCLOUD_ARCHIVE_DIR}/manifests" 2>/dev/null || true
+mkdir -p "${PCLOUD_TEMP_DIR}" "${PCLOUD_ARCHIVE_DIR}/manifests" "${PCLOUD_ARCHIVE_DIR}/deltas" 2>/dev/null || true
 
 # ========= Globales Lock =========
 LOCKFILE=${LOCKFILE:-/run/backup_pipeline.lock}
@@ -200,6 +201,28 @@ build_and_push() {
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start push"
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE"
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] done push (Δ=$(( $(date +%s)-T1 ))s), total=$(( $(date +%s)-T0 ))s)"
+
+  # === Delta-Check nach erfolgreichem Upload ===
+  log "[verify] Starte Delta-Check für Snapshot: $SNAPNAME"
+  local delta_report="${PCLOUD_TEMP_DIR}/delta_verify_${SNAPNAME}.json"
+  
+  if "${PY}" "$DELTA_CHECK" \
+    --dest-root "$PCLOUD_DEST" \
+    --snapshot "$SNAPNAME" \
+    --env-file "$ENV_FILE" \
+    --json-out "$delta_report" 2>&1 | tee -a "$PCLOUD_LOG"; then
+    
+    log "[verify] Delta-Check erfolgreich abgeschlossen"
+    
+    # Delta-Report archivieren
+    if [[ -f "$delta_report" ]]; then
+      mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
+      log "[verify] Delta-Report archiviert: ${PCLOUD_ARCHIVE_DIR}/deltas/delta_verify_${SNAPNAME}.json"
+    fi
+  else
+    log "[warn] Delta-Check fehlgeschlagen (nicht kritisch, Upload war erfolgreich)"
+  fi
+  # === Ende Delta-Check ===
 }
 
 # ========= Start =========

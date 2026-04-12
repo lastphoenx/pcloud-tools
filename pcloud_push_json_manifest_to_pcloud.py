@@ -57,6 +57,7 @@ _fid_cache_shared: dict = {}
 
 # --- Metrics (Prometheus-freundlich) ---
 MET_UPLOADED_FILES = 0
+MET_RESUMED_FILES  = 0
 MET_STUBS_WRITTEN  = 0
 MET_PROMOTED       = 0
 MET_REMOVED_NODES  = 0
@@ -984,6 +985,9 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         total_ms = (time.time() - t_phase_start) * 1000.0
         print(f"[timing] push_1to1: total={total_ms/1000:.2f}s, ensure={ensure_ms:.0f}ms, upload={upload_ms:.0f}ms, writes={write_ms:.0f}ms")
 
+    # Update global metrics
+    globals()["MET_RESUMED_FILES"] += resumed
+
     print(f"1to1: uploaded={uploaded} resumed={resumed} stubs={stubs} (snapshot={snapshot_name})")
     return {"uploaded": uploaded, "resumed": resumed, "stubs": stubs}
 
@@ -1346,8 +1350,8 @@ def main() -> None:
 
     # --- metrics summary (einheitlich, greppbar) ---
     try:
-        print(f"[metrics] uploaded_files={MET_UPLOADED_FILES} stubs_written={MET_STUBS_WRITTEN} "
-              f"promoted={MET_PROMOTED} removed_nodes={MET_REMOVED_NODES} "
+        print(f"[metrics] uploaded_files={MET_UPLOADED_FILES} resumed_files={MET_RESUMED_FILES} "
+              f"stubs_written={MET_STUBS_WRITTEN} promoted={MET_PROMOTED} removed_nodes={MET_REMOVED_NODES} "
               f"fid_cache_hits={fid_cache_hits} fid_lookups={fid_lookups} fid_rest_ms={int(fid_rest_ms)} "
               f"api_retries={MET_API_RETRIES}")
     except Exception:
