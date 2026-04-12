@@ -31,10 +31,16 @@ Benötigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
 """
 
 from __future__ import annotations
-import os, sys, json, argparse, time
+import os, sys, json, argparse, time, datetime
 import concurrent.futures
 from typing import Dict, Any, Optional, Tuple
 
+
+# ---- Logging mit Timestamp (RTB-Stil) ----
+def _log(msg: str, *, file=sys.stderr) -> None:
+    """Log-Ausgabe mit Timestamp"""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} {msg}", file=file, flush=True)
 
 
 # ---- Lib laden ----
@@ -425,7 +431,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     total_tasks = len(tasks)
     
     # Start-Meldung
-    print(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads} Threads...", flush=True)
+    _log(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads} Threads...")
 
     def _upload_one(args: tuple[str, str, dict]):
         nonlocal _stubs_written, _last_progress_pct
@@ -440,11 +446,21 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 print(f"[dry] stub write: {parent}/{name}")
             return True
         
-        ret = pc.write_json_to_folderid(cfg,
-                                        folderid=parent_fids[parent],
-                                        filename=name,
-                                        obj=payload,
-                                        minify=(not pretty))
+        # Retry-Logik für robuste Stub-Writes (Timeout-Protection)
+        try:
+            ret = pc.call_with_backoff(
+                pc.write_json_to_folderid,
+                cfg,
+                folderid=parent_fids[parent],
+                filename=name,
+                obj=payload,
+                minify=(not pretty),
+                attempts=5,
+                max_sleep=30.0
+            )
+        except Exception as e:
+            print(f"[warn] Stub-Write fehlgeschlagen für {parent}/{name}: {e}", file=sys.stderr)
+            return False
         
         # --- metriken: nur bei erfolgreichem write inkrementieren
         try:
@@ -470,20 +486,14 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 eta_per_stub = 0.5  # Schätzung: ~0.5s pro Stub
                 remaining = (total_tasks - _stubs_written) * eta_per_stub / threads
                 eta_str = f"~{int(remaining/60)}min" if remaining > 60 else f"~{int(remaining)}s"
-                print(f"[stubs] {_stubs_written}/{total_tasks} ({current_pct}%) | {eta_str} verbleibend", 
-                      flush=True)
-        
-        return ret
-
-    if threads > 1 and len(tasks) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                        _log(f"[stubs] {_stubs_written}/{total_tasks} ({current_pct}%) | {eta_str} verbleibend")
             list(ex.map(_upload_one, tasks))
     else:
         for t in tasks:
             _upload_one(t)
     
     # Abschluss-Meldung
-    print(f"[stubs] ✓ {total_tasks} Stubs erfolgreich geschrieben", flush=True)
+    _log(f"[stubs] ✓ {total_tasks} Stubs erfolgreich geschrieben")
 
 # ----------------- Haupt-Logik -----------------
 
@@ -496,7 +506,7 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
 
     uploaded = 0; skipped = 0; stubs = 0
 
-    print(f"[plan] objects={objects_root} snapshot={snapshots_root}/{snapshot}")
+    _log(f"[plan] objects={objects_root} snapshot={snapshots_root}/{snapshot}")
 
     # 1) echte Objekte sicherstellen
     for it in items:
@@ -589,22 +599,22 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         try:
             pc.stat_file(cfg, path=marker_complete, with_checksum=False)
             # Complete-Marker auch da → Upload war erfolgreich
-            print(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+            _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
             return {"uploaded": 0, "stubs": 0, "resumed": False}
         except:
             # Nur Started, kein Complete → unvollständig!
             incomplete_upload = True
-            print(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
+            _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
     except:
         # Kein Started-Marker → frischer Upload
         pass
     
     # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
     if incomplete_upload:
-        print(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
+        _log(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
     # === ENDE NEU ===
 
-    print(f"[plan] 1to1 snapshot={dest_snapshot_dir}")
+    _log(f"[plan] 1to1 snapshot={dest_snapshot_dir}")
 
     # === NEU: Started-Marker setzen ===
     if not dry:
@@ -654,7 +664,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
 
     # Index laden: erst lokal (falls vorhanden), sonst von pCloud
     if os.path.exists(_local_index_path):
-        print(f"[resume] Lade lokalen Index: {_local_index_path}")
+        _log(f"[resume] Lade lokalen Index: {_local_index_path}")
         index = load_content_index_local(_local_index_path)
     else:
         index = load_content_index(cfg, snapshots_root)
@@ -769,13 +779,13 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     _SAVE_INTERVAL_TIME = float(os.environ.get("PCLOUD_INDEX_SAVE_INTERVAL_TIME", "300"))  # 5min
     _last_saved_count = 0
     _t_last_index_save = time.time()
-    print(f"[push] Starte Upload: {_total_items} Dateien, {_total_size/1024**3:.2f} GB", flush=True)
+    _log(f"[push] Starte Upload: {_total_items} Dateien, {_total_size/1024**3:.2f} GB")
 
     # === Diff-basierte Ordner-Anlage (nur fehlende Ordner) ===
     # 1. Remote-Ordner sammeln via listfolder (ein API-Call, auch im Dry-Run)
     remote_folders = set()
     try:
-        print(f"[plan] Lade Remote-Ordnerstruktur: {dest_snapshot_dir}", flush=True)
+        _log(f"[plan] Lade Remote-Ordnerstruktur: {dest_snapshot_dir}")
         result = pc.call_with_backoff(pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
         def _collect_folders(obj, parent_path=""):
             if isinstance(obj, dict) and obj.get("isfolder"):
@@ -788,13 +798,13 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         metadata = result.get("metadata") or {}
         for child in metadata.get("contents") or []:
             _collect_folders(child, "")
-        print(f"[plan] {len(remote_folders)} Remote-Ordner gefunden", flush=True)
+        _log(f"[plan] {len(remote_folders)} Remote-Ordner gefunden")
     except Exception as e:
         # Falls Snapshot-Ordner noch nicht existiert (erstes Upload) → okay
         if "2005" in str(e) or "not found" in str(e).lower():
-            print(f"[plan] Snapshot-Ordner existiert noch nicht (erstes Upload)", flush=True)
+            _log(f"[plan] Snapshot-Ordner existiert noch nicht (erstes Upload)")
         else:
-            print(f"[warn] listfolder fehlgeschlagen: {e}", flush=True)
+            _log(f"[warn] listfolder fehlgeschlagen: {e}")
     
     # 2. Manifest-Ordner sammeln (leere relpaths filtern - das ist Root selbst)
     manifest_folders = set()
@@ -807,7 +817,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     # 3. Differenz berechnen und nur fehlende Ordner anlegen
     missing_folders = manifest_folders - remote_folders
     if missing_folders:
-        print(f"[plan] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)", flush=True)
+        _log(f"[plan] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)")
         
         # Nach Tiefe gruppieren (Parents zuerst, dann parallel innerhalb Ebene)
         from collections import defaultdict
@@ -847,15 +857,14 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                         _last_progress_pct = current_pct
                         remaining_s = (total_folders - _folders_created) * 0.05 / threads
                         eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
-                        print(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend", 
-                              flush=True)
+                        _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
                 return True
             except Exception as e:
                 print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
                 return False
         
         # Ebenen nacheinander abarbeiten (innerhalb parallel)
-        print(f"[folders] {max_depth + 1} Ebenen, {threads} Threads pro Ebene", flush=True)
+        _log(f"[folders] {max_depth + 1} Ebenen, {threads} Threads pro Ebene")
         for depth in sorted(folders_by_depth.keys()):
             folders_at_depth = folders_by_depth[depth]
             
@@ -866,9 +875,9 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                 for folder in folders_at_depth:
                     _create_folder(folder)
         
-        print(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt", flush=True)
+        _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
     else:
-        print(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits", flush=True)
+        _log(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits")
     # === Ende Diff-basierte Ordner-Anlage ===
 
     for it in manifest.get("items") or []:
@@ -1029,7 +1038,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                     
                     import shutil
                     shutil.copy2(manifest_path, archive_path)
-                    print(f"[archive] Manifest archiviert: {archive_path}")
+                    _log(f"[archive] Manifest archiviert: {archive_path}")
                     
                     # Optional: Index auch archivieren
                     if os.environ.get("PCLOUD_ARCHIVE_INDEX") == "1":
@@ -1039,7 +1048,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                         if os.path.exists(index_src):
                             index_archive_path = os.path.join(index_archive_dir, f"{snapshot_name}_index.json")
                             shutil.copy2(index_src, index_archive_path)
-                            print(f"[archive] Index archiviert: {index_archive_path}")
+                            _log(f"[archive] Index archiviert: {index_archive_path}")
                 except Exception as e:
                     print(f"[warn] Manifest-Archivierung fehlgeschlagen: {e}")
         else:
@@ -1065,7 +1074,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                               "resumed": resumed,
                               "stubs": stubs
                           }))
-            print(f"[success] Upload-Complete-Marker gesetzt")
+            _log(f"[success] Upload-Complete-Marker gesetzt")
         except Exception as e:
             print(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
     # === ENDE NEU ===

@@ -29,8 +29,14 @@ Beispiel (Smart Mode - mtime/size-Cache gegen Vorgänger)
 """
 
 from __future__ import annotations
-import os, sys, json, argparse, hashlib, time
+import os, sys, json, argparse, hashlib, time, datetime
 from typing import Dict, Any, List, Tuple, Optional
+
+# ---- Logging mit Timestamp (RTB-Stil) ----
+def _log(msg: str, *, file=sys.stderr) -> None:
+    """Log-Ausgabe mit Timestamp"""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} {msg}", file=file, flush=True)
 
 # ---------------- reference manifest cache ----------------
 
@@ -58,7 +64,7 @@ class ReferenceCache:
                 ref = json.load(f)
             
             self.ref_snapshot = ref.get("snapshot", "?")
-            print(f"[ref] Lade Referenz-Manifest: {self.ref_snapshot} ({path})", file=sys.stderr)
+            _log(f"[ref] Lade Referenz-Manifest: {self.ref_snapshot} ({path})")
             
             loaded_count = 0
             for item in ref.get("items", []):
@@ -90,7 +96,7 @@ class ReferenceCache:
                 
                 loaded_count += 1
             
-            print(f"[ref] ✓ {loaded_count} Dateien im Cache (mtime/size + inode)", file=sys.stderr)
+            _log(f"[ref] ✓ {loaded_count} Dateien im Cache (mtime/size + inode)")
         
         except FileNotFoundError:
             print(f"[ref] ⚠ Referenz-Manifest nicht gefunden: {path}", file=sys.stderr)
@@ -267,11 +273,10 @@ def walk(root: str,
                 pct_bytes = done_bytes / total_bytes * 100 if total_bytes else 0
                 eta_s = (elapsed / done_bytes * (total_bytes - done_bytes)) if done_bytes else 0
                 eta_str = f"~{int(eta_s/60)}min" if eta_s > 60 else f"~{int(eta_s)}s"
-                print(
+                _log(
                     f"[manifest] {done_files}/{total_files} Dateien ({pct_files:.0f}%) | "
                     f"{_fmt_bytes(done_bytes)} / {_fmt_bytes(total_bytes)} ({pct_bytes:.0f}%) | "
-                    f"{eta_str} verbleibend",
-                    file=sys.stderr, flush=True
+                    f"{eta_str} verbleibend"
                 )
                 t_last_progress = now
 
@@ -373,20 +378,10 @@ def main() -> None:
             "calculated_sha256": ref_cache.stats["calculated_sha256"],
         }
         
-        print(f"[stats] total={total_files} | "
-              f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
-              f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
-              f"calculated={ref_cache.stats['calculated_sha256']}",
-              file=sys.stderr)
-
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    else:
-        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
-        print()
-
-    print(f"Manifest OK: snapshot={snap} items={len(payload['items'])}", file=sys.stderr)
+    _log(f"[stats] total={total_files} | "
+         f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
+         f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
+         f"calculated={ref_cache.stats['calculated_sha256']}")
 
 if __name__ == "__main__":
     main()
