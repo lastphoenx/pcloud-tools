@@ -198,9 +198,9 @@ build_and_push() {
   local ref_manifest_arg=""
   
   if [[ "$MANIFEST_MODE" == "smart" ]]; then
-    # Suche letztes Manifest in PCLOUD_ARCHIVE_DIR (nach Datum sortiert, neuestes zuerst)
+    # Suche letztes Manifest im manifests/-Unterordner (Push-Tool archiviert dort)
     local last_manifest
-    last_manifest="$(find "${PCLOUD_ARCHIVE_DIR}" -maxdepth 1 -type f -name '*.manifest.json' 2>/dev/null | sort -r | head -n1)"
+    last_manifest="$(find "${PCLOUD_ARCHIVE_DIR}/manifests" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort -r | head -n1)"
     
     if [[ -n "$last_manifest" && -f "$last_manifest" ]]; then
       ref_manifest_arg="--ref-manifest $last_manifest"
@@ -222,11 +222,8 @@ build_and_push() {
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE"
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] done push (Δ=$(( $(date +%s)-T1 ))s), total=$(( $(date +%s)-T0 ))s)"
 
-  # === Manifest archivieren (für Smart-Mode Referenz) ===
-  local archived_manifest="${PCLOUD_ARCHIVE_DIR}/${SNAPNAME}.manifest.json"
-  if cp "$mani" "$archived_manifest" 2>/dev/null; then
-    log "[manifest] Archiviert: ${SNAPNAME}.manifest.json (für zukünftige Smart-Mode Nutzung)"
-  fi
+  # Manifest-Archivierung wird bereits vom Push-Tool erledigt
+  # (nach /srv/pcloud-archive/manifests/)
   
   # === Delta-Check nach erfolgreichem Upload ===
   log "[verify] Starte Delta-Check für alle Snapshots..."
