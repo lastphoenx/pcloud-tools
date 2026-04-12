@@ -376,6 +376,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     
     # Progress-Tracking für Stub-Writing (thread-safe)
     _stubs_written = 0
+    _stubs_failed = 0
     _stubs_lock = threading.Lock()
     _progress_interval = int(os.environ.get("PCLOUD_STUB_PROGRESS_INTERVAL", "500"))
     _last_progress_pct = 0
@@ -387,7 +388,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         name = os.path.basename(stub_path)
         by_parent.setdefault(parent, []).append((name, payload))
 
-    # 2) parent-fids auflösen
+    # 2) parent-fids auflösen (mit 2004-Fallback)
     parent_fids: dict[str, int] = {}
     for parent in by_parent.keys():
         if dry:
@@ -398,7 +399,20 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             fid = pc.ensure_path(cfg, path=parent)  # returns folderid (idempotent)
             parent_fids[parent] = int(fid)
         except Exception as e:
-            print(f"[warn] cannot resolve/ensure folderid for {parent}: {e}", file=sys.stderr)
+            # Bei 2004 (Already exists): FolderID via stat nachziehen
+            if "2004" in str(e):
+                try:
+                    fid = pc.stat_folderid_fast(cfg, parent)
+                    if fid:
+                        parent_fids[parent] = int(fid)
+                        if os.environ.get("PCLOUD_VERBOSE") == "1":
+                            _log(f"[info] Folder {parent} existiert bereits (2004) - FolderID via stat geholt: {fid}")
+                    else:
+                        _log(f"[warn] Folder {parent} existiert (2004), aber FolderID nicht auflösbar - Stubs werden übersprungen")
+                except Exception as e2:
+                    _log(f"[warn] cannot resolve folderid for {parent}: {e} (fallback failed: {e2})")
+            else:
+                _log(f"[warn] cannot resolve/ensure folderid for {parent}: {e}")
 
     # 3) Schreibjobs bauen (nur Parents mit bekannter fid) + Payload anreichern
     tasks: list[tuple[str, str, dict]] = []
@@ -434,7 +448,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     _log(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads} Threads...")
 
     def _upload_one(args: tuple[str, str, dict]):
-        nonlocal _stubs_written, _last_progress_pct
+        nonlocal _stubs_written, _stubs_failed, _last_progress_pct
         parent, name, payload = args
         
         if dry:
@@ -459,7 +473,9 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 max_sleep=30.0
             )
         except Exception as e:
-            print(f"[warn] Stub-Write fehlgeschlagen für {parent}/{name}: {e}", file=sys.stderr)
+            with _stubs_lock:
+                _stubs_failed += 1
+            _log(f"[warn] Stub-Write fehlgeschlagen ({_stubs_failed}): {parent}/{name}: {e}")
             return False
         
         # --- metriken: nur bei erfolgreichem write inkrementieren
@@ -486,14 +502,21 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 eta_per_stub = 0.5  # Schätzung: ~0.5s pro Stub
                 remaining = (total_tasks - _stubs_written) * eta_per_stub / threads
                 eta_str = f"~{int(remaining/60)}min" if remaining > 60 else f"~{int(remaining)}s"
-                        _log(f"[stubs] {_stubs_written}/{total_tasks} ({current_pct}%) | {eta_str} verbleibend")
+                _log(f"[stubs] {_stubs_written}/{total_tasks} ({current_pct}%) | {eta_str} verbleibend")
+        
+        return ret
+
+    if threads > 1 and len(tasks) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
             list(ex.map(_upload_one, tasks))
     else:
         for t in tasks:
             _upload_one(t)
     
-    # Abschluss-Meldung
-    _log(f"[stubs] ✓ {total_tasks} Stubs erfolgreich geschrieben")
+    # Abschluss-Meldung mit Fehler-Statistik
+    if _stubs_failed > 0:
+        _log(f"[warn] {_stubs_failed} Stubs fehlgeschlagen (von {total_tasks})")
+    _log(f"[stubs] ✓ {_stubs_written}/{total_tasks} Stubs erfolgreich ({(_stubs_written/total_tasks*100):.1f}%)")
 
 # ----------------- Haupt-Logik -----------------
 
@@ -586,6 +609,13 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     dest_root = pc._norm_remote_path(dest_root)
     snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
     dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+    
+    # === Timeout-Protection für Mass-Uploads ===
+    # Ensure minimum timeout (kritisch bei 19k+ Stub-Writes)
+    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
+        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
+        if os.environ.get("PCLOUD_VERBOSE") == "1":
+            _log(f"[config] Timeout auf {cfg['timeout']}s gesetzt (Mass-Upload-Protection)")
 
     # === NEU: Upload-Status-Marker ===
     marker_started = f"{dest_snapshot_dir}/.upload_started"
