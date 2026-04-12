@@ -361,11 +361,18 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     Erweitert Payload um menschenlesbare Felder: format_version, kind, holder_type, mtime_iso
     """
     import datetime
+    import threading
 
     if not stubs:
         return
 
     pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
+    
+    # Progress-Tracking für Stub-Writing (thread-safe)
+    _stubs_written = 0
+    _stubs_lock = threading.Lock()
+    _progress_interval = int(os.environ.get("PCLOUD_STUB_PROGRESS_INTERVAL", "500"))
+    _last_progress_pct = 0
 
     # 1) nach Parent gruppieren
     by_parent: dict[str, list[tuple[str, dict]]] = {}
@@ -415,9 +422,15 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         return
 
     threads = int(os.environ.get("PCLOUD_STUB_THREADS", "4") or "4")
+    total_tasks = len(tasks)
+    
+    # Start-Meldung
+    print(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads} Threads...", flush=True)
 
     def _upload_one(args: tuple[str, str, dict]):
+        nonlocal _stubs_written, _last_progress_pct
         parent, name, payload = args
+        
         if dry:
             # Pretty-Print auch im Dry-Run für Debug
             if pretty:
@@ -432,12 +445,34 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                                         filename=name,
                                         obj=payload,
                                         minify=(not pretty))
+        
         # --- metriken: nur bei erfolgreichem write inkrementieren
         try:
             if ret:
                 globals()["MET_STUBS_WRITTEN"] += 1
         except Exception:
             pass
+        
+        # Progress-Tracking (thread-safe)
+        with _stubs_lock:
+            _stubs_written += 1
+            current_pct = int((_stubs_written / total_tasks) * 100)
+            
+            # Alle _progress_interval Stubs ODER bei Prozent-Änderung (10%, 20%, ...)
+            show_progress = (
+                _stubs_written % _progress_interval == 0 or 
+                _stubs_written == total_tasks or
+                (current_pct % 10 == 0 and current_pct != _last_progress_pct)
+            )
+            
+            if show_progress:
+                _last_progress_pct = current_pct
+                eta_per_stub = 0.5  # Schätzung: ~0.5s pro Stub
+                remaining = (total_tasks - _stubs_written) * eta_per_stub / threads
+                eta_str = f"~{int(remaining/60)}min" if remaining > 60 else f"~{int(remaining)}s"
+                print(f"[stubs] {_stubs_written}/{total_tasks} ({current_pct}%) | {eta_str} verbleibend", 
+                      flush=True)
+        
         return ret
 
     if threads > 1 and len(tasks) > 1:
@@ -446,6 +481,9 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     else:
         for t in tasks:
             _upload_one(t)
+    
+    # Abschluss-Meldung
+    print(f"[stubs] ✓ {total_tasks} Stubs erfolgreich geschrieben", flush=True)
 
 # ----------------- Haupt-Logik -----------------
 
