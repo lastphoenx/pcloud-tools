@@ -706,8 +706,7 @@ A: The current implementation does NOT use stat_file checks! All resume logic is
 - Check 1: File in index for this snapshot? → resumed
 - Check 2: anchor_path == None? → uploaded
 - No API calls during resume decision → very fast
-
-Future enhancement: Optional stat_file verification via `PCLOUD_VERIFY_ANCHORS=1` (expensive but fail-safe).
+- Post-upload verification via `pcloud_quick_delta.py` ensures integrity without slowing down uploads
 
 ---
 

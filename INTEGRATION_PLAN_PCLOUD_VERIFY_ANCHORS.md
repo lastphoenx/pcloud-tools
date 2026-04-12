@@ -1,5 +1,13 @@
 # Integration Plan: PCLOUD_VERIFY_ANCHORS=1
 
+> **⚠️ STATUS: NOT IMPLEMENTED**
+> 
+> This feature was analyzed but **NOT implemented**. Reason: Post-upload verification via `pcloud_quick_delta.py` provides equivalent safety without performance overhead during uploads.
+> 
+> This document is kept for reference in case future requirements change.
+
+---
+
 ## Kontext
 
 **Aktuelles Verhalten (Index-driven Resume):**
