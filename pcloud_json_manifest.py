@@ -167,7 +167,8 @@ def walk(root: str,
                 t_last_progress = now
 
             # Hardlink-Ziel optional festhalten
-            if store_hardlink_target and nlink > 1:                key = (dev, ino)
+            if store_hardlink_target and nlink > 1:
+                key = (dev, ino)
                 if key in first_seen:
                     entry["hardlink_of"] = first_seen[key]  # relpath der ersten Sicht
                 else:
