@@ -926,11 +926,10 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             _pct_b = _done_size / _total_size * 100 if _total_size else 0
             _eta = (_elapsed / _done_size * (_total_size - _done_size)) if _done_size else 0
             _eta_str = f"~{int(_eta/60)}min" if _eta > 60 else f"~{int(_eta)}s"
-            print(
+            _log(
                 f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
                 f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
-                f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend",
-                file=sys.stderr, flush=True
+                f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend"
             )
             _t_last_progress = _now
 
@@ -1386,8 +1385,19 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
         if dry:
             print(f"[dry] delete snapshot dir: {rmpath}")
+            print(f"[dry] delete manifest: /srv/pcloud-archive/manifests/{sdel}.json")
         else:
             pc.delete_folder(cfg, path=rmpath, recursive=True)
+            
+            # Paritäts-Cleanup: Manifest löschen wenn Remote-Snapshot gelöscht wird
+            manifest_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
+            manifest_file = os.path.join(manifest_dir, f"{sdel}.json")
+            if os.path.exists(manifest_file):
+                try:
+                    os.remove(manifest_file)
+                    print(f"[retention] Manifest gelöscht: {sdel}.json")
+                except Exception as e:
+                    print(f"[warn] Konnte Manifest nicht löschen: {manifest_file} ({e})", file=sys.stderr)
 
     # === NEU: Index nur schreiben wenn KEINE Blocker ===
     if any_blockers:
