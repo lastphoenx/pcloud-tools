@@ -110,19 +110,20 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
                 node["holders"] = new_holders
                 cleaned_nodes += 1
             
-            # If no holders left, remove anchor_path and fileid
-            if not new_holders:
+            # CRITICAL: If the anchor_path itself is missing, remove it immediately
+            # (independent of how many holders remain)
+            if anchor_path in missing_lookup:
                 if "anchor_path" in node:
                     del node["anchor_path"]
                 if "fileid" in node:
                     del node["fileid"]
                 if "pcloud_hash" in node:
                     del node["pcloud_hash"]
-                
-                # If node is now completely empty (no holders, no anchor), remove it
-                if not node.get("holders") and not node.get("anchor_path"):
-                    del items[sha]
-                    removed_nodes += 1
+            
+            # If no holders left AND no anchor, remove node completely
+            if not new_holders and not node.get("anchor_path"):
+                del items[sha]
+                removed_nodes += 1
     
     return {
         "removed_holders": removed_holders,
