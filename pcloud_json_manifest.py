@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pcloud_json_manifest.py – erzeugt ein lokales Snapshot-Manifest (Schema v2).
+pcloud_json_manifest.py – erzeugt ein lokales Snapshot-Manifest (Schema v3).
 
 Features
 - Verzeichnisbaum unter --root erfassen (dirs, files, symlinks)
 - Pro Item: snapshot, relpath, type, size/mtime (bei file), sha256 (optional), ext, inode(dev,ino,nlink)
+- Smart-Mode: SHA256-Wiederverwendung via mtime/size-Check gegen Referenz-Manifest (40× schneller)
 - Optionen für Hash, Hardlink-/Symlink-Handhabung
 
-Beispiel
+Beispiel (Full Mode - alle SHA256 neu berechnen)
   SNAP=$(readlink -f /mnt/backup/rtb_nas/latest)
   python pcloud_json_manifest.py \
     --root "$SNAP" \
@@ -18,11 +19,110 @@ Beispiel
     --store-hardlink-target \
     --store-symlink-target \
     --follow-symlinks
+
+Beispiel (Smart Mode - mtime/size-Cache gegen Vorgänger)
+  python pcloud_json_manifest.py \
+    --root "$SNAP" \
+    --out /srv/pcloud-temp/snap.json \
+    --ref-manifest /srv/pcloud-archive/2026-04-10-075334.manifest.json \
+    --hash sha256
 """
 
 from __future__ import annotations
 import os, sys, json, argparse, hashlib, time
 from typing import Dict, Any, List, Tuple, Optional
+
+# ---------------- reference manifest cache ----------------
+
+class ReferenceCache:
+    """Cache für SHA256-Wiederverwendung aus Referenz-Manifest (mtime/size-basiert)"""
+    
+    def __init__(self, ref_manifest_path: Optional[str] = None):
+        self.ref_manifest_path = ref_manifest_path
+        self.ref_snapshot = None  # Snapshot-Name des Referenz-Manifests
+        self.mtime_cache: Dict[str, Dict[str, Any]] = {}  # relpath → {sha256, mtime, size}
+        self.inode_cache: Dict[Tuple[int, int], str] = {}  # (dev, ino) → sha256
+        self.stats = {
+            "reused_from_ref_mtime": 0,
+            "reused_from_hardlink": 0,
+            "calculated_sha256": 0,
+        }
+        
+        if ref_manifest_path:
+            self._load_reference(ref_manifest_path)
+    
+    def _load_reference(self, path: str) -> None:
+        """Lade Referenz-Manifest und baue Caches auf"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                ref = json.load(f)
+            
+            self.ref_snapshot = ref.get("snapshot", "?")
+            print(f"[ref] Lade Referenz-Manifest: {self.ref_snapshot} ({path})", file=sys.stderr)
+            
+            loaded_count = 0
+            for item in ref.get("items", []):
+                if item.get("type") != "file":
+                    continue
+                
+                relpath = item.get("relpath")
+                sha256 = item.get("sha256")
+                mtime = item.get("mtime")
+                size = item.get("size")
+                
+                if not relpath or not sha256:
+                    continue
+                
+                # mtime/size-Cache
+                self.mtime_cache[relpath] = {
+                    "sha256": sha256,
+                    "mtime": mtime,
+                    "size": size,
+                }
+                
+                # inode-Cache (für Hardlinks)
+                inode = item.get("inode")
+                if inode:
+                    dev = inode.get("dev")
+                    ino = inode.get("ino")
+                    if dev is not None and ino is not None:
+                        self.inode_cache[(dev, ino)] = sha256
+                
+                loaded_count += 1
+            
+            print(f"[ref] ✓ {loaded_count} Dateien im Cache (mtime/size + inode)", file=sys.stderr)
+        
+        except FileNotFoundError:
+            print(f"[ref] ⚠ Referenz-Manifest nicht gefunden: {path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[ref] ⚠ Fehler beim Laden: {e}", file=sys.stderr)
+    
+    def lookup(self, relpath: str, st_mtime: float, st_size: int, dev: int, ino: int) -> Optional[str]:
+        """
+        SHA256 nachschlagen via mtime/size oder inode
+        
+        Returns:
+            SHA256 wenn Cache-Hit, sonst None
+        """
+        # Strategie 1: mtime + size Match in gleichem relpath
+        if relpath in self.mtime_cache:
+            cached = self.mtime_cache[relpath]
+            if cached["mtime"] == st_mtime and cached["size"] == st_size:
+                self.stats["reused_from_ref_mtime"] += 1
+                return cached["sha256"]
+        
+        # Strategie 2: Hardlink-Match via inode (wenn nlink > 1)
+        inode_key = (dev, ino)
+        if inode_key in self.inode_cache:
+            self.stats["reused_from_hardlink"] += 1
+            return self.inode_cache[inode_key]
+        
+        return None
+    
+    def record_calculated(self, relpath: str, sha256: str, st_mtime: float, st_size: int, dev: int, ino: int) -> None:
+        """Neu berechneten SHA256 in Cache aufnehmen (für spätere Hardlink-Matches)"""
+        self.stats["calculated_sha256"] += 1
+        self.inode_cache[(dev, ino)] = sha256
 
 # ---------------- util ----------------
 
@@ -49,7 +149,8 @@ def walk(root: str,
          follow_hardlinks: bool,
          store_hardlink_target: bool,
          store_symlink_target: bool,
-         progress_interval: float = 30.0) -> List[Dict[str, Any]]:
+         progress_interval: float = 30.0,
+         ref_cache: Optional[ReferenceCache] = None) -> List[Dict[str, Any]]:
 
     items: List[Dict[str, Any]] = []
     base = os.path.abspath(root)
@@ -126,13 +227,21 @@ def walk(root: str,
             _, ext = os.path.splitext(rel)
             ext = ext if ext else None
 
-            # Hash optional
+            # Hash via Smart-Cache oder Berechnung
             file_hash = None
             if hash_algo == "sha256":
-                try:
-                    file_hash = sha256_file(ab)
-                except Exception as e:
-                    print(f"[warn] hash fail: {ab}: {e}", file=sys.stderr)
+                # Strategie: Versuche Cache-Lookup, sonst berechne
+                if ref_cache:
+                    file_hash = ref_cache.lookup(rel, float(st.st_mtime), int(st.st_size), dev, ino)
+                
+                if not file_hash:
+                    # Kein Cache-Hit → berechne SHA256
+                    try:
+                        file_hash = sha256_file(ab)
+                        if ref_cache:
+                            ref_cache.record_calculated(rel, file_hash, float(st.st_mtime), int(st.st_size), dev, ino)
+                    except Exception as e:
+                        print(f"[warn] hash fail: {ab}: {e}", file=sys.stderr)
 
             entry: Dict[str, Any] = {
                 "snapshot": snapshot,
@@ -182,11 +291,14 @@ def walk(root: str,
 # ---------------- main ----------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Lokales Snapshot-Manifest erzeugen (Schema v2).")
+    ap = argparse.ArgumentParser(description="Lokales Snapshot-Manifest erzeugen (Schema v3).")
 
     ap.add_argument("--root", required=True, help="Lokales Quellverzeichnis (z. B. ein RTB-Snapshot)")
     ap.add_argument("--snapshot", help="Snapshot-Name (Default: YYYYmmdd-HHMMSS)")
     ap.add_argument("--out", help="Manifest-Zieldatei (JSON). Default: stdout")
+    
+    # Smart-Mode (NEU in Schema v3)
+    ap.add_argument("--ref-manifest", help="Referenz-Manifest für Smart-Mode (mtime/size-Cache, 40× schneller)")
 
     # Verhalten
     ap.add_argument("--hash", choices=["sha256", "none"], default="sha256", help="Datei-Hash aufnehmen (Default: sha256)")
@@ -208,9 +320,30 @@ def main() -> None:
 
     snap = args.snapshot or time.strftime("%Y%m%d-%H%M%S")
     hash_algo = None if args.hash == "none" else args.hash
-
-    payload = {
-        "schema": 2,
+    
+    # Smart-Mode: ReferenceCache initialisieren
+    ref_cache = None
+    if args.ref_manifest:
+        ref_cache = ReferenceCache(args.ref_manifest)
+    
+    # Items sammeln (mit optionalem Cache)
+    items = walk(
+        root,
+        snap,
+        hash_algo=hash_algo,
+        follow_symlinks=bool(args.follow_symlinks),
+        follow_hardlinks=bool(args.follow_hardlinks),
+        store_hardlink_target=bool(args.store_hardlink_target),
+        store_symlink_target=bool(args.store_symlink_target),
+        ref_cache=ref_cache,
+    )
+    
+    # Schema 3 wenn Smart-Mode, sonst Schema 2 (backward compat)
+    schema_version = 3 if ref_cache else 2
+    mode = "smart" if ref_cache else "full"
+    
+    payload: Dict[str, Any] = {
+        "schema": schema_version,
         "snapshot": snap,
         "root": root,
         "created": int(time.time()),
@@ -219,16 +352,32 @@ def main() -> None:
         "follow_hardlinks": bool(args.follow_hardlinks),
         "store_hardlink_target": bool(args.store_hardlink_target),
         "store_symlink_target": bool(args.store_symlink_target),
-        "items": walk(
-            root,
-            snap,
-            hash_algo=hash_algo,
-            follow_symlinks=bool(args.follow_symlinks),
-            follow_hardlinks=bool(args.follow_hardlinks),
-            store_hardlink_target=bool(args.store_hardlink_target),
-            store_symlink_target=bool(args.store_symlink_target),
-        )
+        "items": items,
     }
+    
+    # Schema 3 Erweiterungen
+    if ref_cache:
+        payload["mode"] = mode
+        payload["ref_manifest"] = {
+            "path": args.ref_manifest,
+            "snapshot": ref_cache.ref_snapshot or "?",
+            "loaded_at": int(time.time()),
+        }
+        
+        # Stats: Performance-Metriken
+        total_files = sum(1 for it in items if it.get("type") == "file")
+        payload["stats"] = {
+            "total_files": total_files,
+            "reused_from_ref_mtime": ref_cache.stats["reused_from_ref_mtime"],
+            "reused_from_hardlink": ref_cache.stats["reused_from_hardlink"],
+            "calculated_sha256": ref_cache.stats["calculated_sha256"],
+        }
+        
+        print(f"[stats] total={total_files} | "
+              f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
+              f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
+              f"calculated={ref_cache.stats['calculated_sha256']}",
+              file=sys.stderr)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:

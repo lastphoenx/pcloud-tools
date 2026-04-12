@@ -192,7 +192,27 @@ build_and_push() {
 
   local T0=$(date +%s)
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start manifest"
-  "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256
+  
+  # Smart-Mode: Auto-detect letztes Manifest als Referenz (Schema v3)
+  local MANIFEST_MODE="${PCLOUD_MANIFEST_MODE:-smart}"  # smart|full
+  local ref_manifest_arg=""
+  
+  if [[ "$MANIFEST_MODE" == "smart" ]]; then
+    # Suche letztes Manifest in PCLOUD_ARCHIVE_DIR (nach Datum sortiert, neuestes zuerst)
+    local last_manifest
+    last_manifest="$(find "${PCLOUD_ARCHIVE_DIR}" -maxdepth 1 -type f -name '*.manifest.json' 2>/dev/null | sort -r | head -n1)"
+    
+    if [[ -n "$last_manifest" && -f "$last_manifest" ]]; then
+      ref_manifest_arg="--ref-manifest $last_manifest"
+      log "[manifest] Smart-Mode: Nutze Referenz-Manifest $(basename "$last_manifest")"
+    else
+      log "[manifest] Smart-Mode: Kein Referenz-Manifest gefunden (Full-Mode für ersten Snapshot)"
+    fi
+  else
+    log "[manifest] Full-Mode: Berechne alle SHA256 neu (PCLOUD_MANIFEST_MODE=full)"
+  fi
+  
+  "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256 $ref_manifest_arg
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && { log "[t] done manifest (Δ=$(( $(date +%s)-T0 ))s)"; T1=$(date +%s); }
 
   local RET=""
@@ -202,6 +222,12 @@ build_and_push() {
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE"
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] done push (Δ=$(( $(date +%s)-T1 ))s), total=$(( $(date +%s)-T0 ))s)"
 
+  # === Manifest archivieren (für Smart-Mode Referenz) ===
+  local archived_manifest="${PCLOUD_ARCHIVE_DIR}/${SNAPNAME}.manifest.json"
+  if cp "$mani" "$archived_manifest" 2>/dev/null; then
+    log "[manifest] Archiviert: ${SNAPNAME}.manifest.json (für zukünftige Smart-Mode Nutzung)"
+  fi
+  
   # === Delta-Check nach erfolgreichem Upload ===
   log "[verify] Starte Delta-Check für Snapshot: $SNAPNAME"
   local delta_report="${PCLOUD_TEMP_DIR}/delta_verify_${SNAPNAME}.json"
