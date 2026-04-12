@@ -188,7 +188,8 @@ build_and_push() {
 
   # Manifest im PCLOUD_TEMP_DIR erstellen (statt system /tmp)
   local mani; mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.$$.json"
-  trap 'rm -f "$mani"' RETURN
+  # TRAP ENTFERNT: Würde Manifest bei jedem Fehler löschen (FileNotFoundError!)  
+  # Cleanup erfolgt explizit am Ende
 
   local T0=$(date +%s)
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start manifest"
@@ -245,6 +246,9 @@ build_and_push() {
     log "[warn] Delta-Check fehlgeschlagen (nicht kritisch, Upload war erfolgreich)"
   fi
   # === Ende Delta-Check ===
+  
+  # Explizites Cleanup (statt trap RETURN)
+  rm -f "$mani" 2>/dev/null || true
 }
 
 # ========= Start =========

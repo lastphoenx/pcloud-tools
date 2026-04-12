@@ -347,6 +347,9 @@ def main() -> None:
     schema_version = 3 if ref_cache else 2
     mode = "smart" if ref_cache else "full"
     
+    # total_files VOR if-Block berechnen (nicht nur im ref_cache-Block!)
+    total_files = sum(1 for it in items if it.get("type") == "file")
+    
     payload: Dict[str, Any] = {
         "schema": schema_version,
         "snapshot": snap,
@@ -369,8 +372,7 @@ def main() -> None:
             "loaded_at": int(time.time()),
         }
         
-        # Stats: Performance-Metriken
-        total_files = sum(1 for it in items if it.get("type") == "file")
+        # Stats: Performance-Metriken (nur bei Smart-Mode)
         payload["stats"] = {
             "total_files": total_files,
             "reused_from_ref_mtime": ref_cache.stats["reused_from_ref_mtime"],
@@ -378,10 +380,13 @@ def main() -> None:
             "calculated_sha256": ref_cache.stats["calculated_sha256"],
         }
         
-    _log(f"[stats] total={total_files} | "
-         f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
-         f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
-         f"calculated={ref_cache.stats['calculated_sha256']}")
+        _log(f"[stats] total={total_files} | "
+             f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
+             f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
+             f"calculated={ref_cache.stats['calculated_sha256']}")
+    else:
+        # Full-Mode: keine Cache-Stats
+        _log(f"[stats] total={total_files} | mode=full (kein Cache)")
     
     # Manifest schreiben (stdout oder Datei)
     if args.out:
