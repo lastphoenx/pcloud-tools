@@ -314,20 +314,23 @@ PY
   exit 0
 fi
 
-# Normalfall: latest
-SNAP="$(readlink -f "${RTB}/latest" 2>/dev/null || true)"
-if [[ -z "$SNAP" || ! -d "$SNAP" ]]; then
-  log "[skip] kein lokaler Snapshot gefunden."
-  exit 0
-fi
-SNAPNAME="$(basename "$SNAP")"
+# Intelligentes Gap-Backfilling (statt nur latest)
+log "[check] Prüfe auf fehlende Snapshots..."
+uploaded_count=0
 
-if [[ "$(remote_snapshot_exists "$SNAPNAME")" == "YES" ]]; then
-  log "[skip] Snapshot $SNAPNAME bereits auf pCloud vorhanden."
-  exit 0
-fi
+for s in $(local_snapshot_names); do
+  if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+    log "[gap] Snapshot $s fehlt remote – hole nach..."
+    build_and_push "$RTB/$s"
+    uploaded_count=$((uploaded_count + 1))
+  fi
+done
 
-build_and_push "$SNAP"
+if [[ $uploaded_count -eq 0 ]]; then
+  log "[skip] Alle Snapshots bereits auf pCloud vorhanden"
+else
+  log "[done] $uploaded_count Snapshot(s) hochgeladen"
+fi
 
 # Cleanup: Alte Temp-Dateien löschen (>7 Tage)
 if [[ -d "${PCLOUD_TEMP_DIR}" ]]; then
