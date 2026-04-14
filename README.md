@@ -8,6 +8,7 @@ Funktioniert auf Linux/Debian. Hauptvorteil: **Content-based Deduplication** (SH
 
 ## 📚 Table of Contents
 
+- [⚡ Quickstart](#-quickstart-5-minute-setup)
 - [🏗️ Projekt-Übersicht](#️-projekt-übersicht-secure-nas--backup-ecosystem)
   - [📦 Repositories](#-repositories)
   - [🎯 Die Entstehungsgeschichte](#-die-entstehungsgeschichte)
@@ -22,6 +23,78 @@ Funktioniert auf Linux/Debian. Hauptvorteil: **Content-based Deduplication** (SH
 - [Best Practices](#best-practices)
 - [Contributing](#contributing)
 - [License](#license)
+
+---
+
+# ⚡ Quickstart (5-Minute Setup)
+
+## Prerequisites
+- Debian/Ubuntu Linux (tested on Raspberry Pi 5)
+- MariaDB installed (`sudo apt install mariadb-server`)
+- pCloud account with OAuth2 token ([get one here](https://docs.pcloud.com/))
+- RTB snapshots in `/mnt/backup/rtb_nas/` (or similar)
+
+## Installation
+
+```bash
+# 1. Clone repo
+git clone https://github.com/lastphoenx/pcloud-tools.git /opt/apps/pcloud-tools/main
+cd /opt/apps/pcloud-tools/main
+
+# 2. Setup MariaDB
+sudo mysql -u root -p << 'EOF'
+CREATE DATABASE pcloud_backup CHARACTER SET utf8mb4;
+CREATE USER 'pcloud_backup'@'localhost' IDENTIFIED BY 'YOUR_PASSWORD';
+GRANT ALL ON pcloud_backup.* TO 'pcloud_backup'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+mysql -u pcloud_backup -p pcloud_backup < sql/init_pcloud_db.sql
+
+# 3. Configure
+cp .env.example .env
+nano .env
+# Edit: PCLOUD_TOKEN, PCLOUD_DB_PASS, paths
+
+# 4. Create directories
+sudo mkdir -p /srv/pcloud-temp /srv/pcloud-archive /var/log/backup
+sudo chown -R $USER:$USER /srv/pcloud-temp /srv/pcloud-archive /var/log/backup
+
+# 5. Set permissions
+chmod +x *.sh
+
+# 6. Test database connection
+./pcloud_status.sh --stats
+```
+
+## First Backup
+
+```bash
+# Run backup (replace with your latest RTB snapshot)
+./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-14__22-00-01 /Backups/NAS
+
+# Monitor progress (in second terminal)
+tail -f /var/log/backup/pcloud_sync.log
+
+# Check status
+./pcloud_status.sh recent
+```
+
+## Health Monitoring
+
+```bash
+# Run health check
+./pcloud_health_check.sh --verbose
+
+# Automate (cron)
+crontab -e
+# Add: */15 * * * * /opt/apps/pcloud-tools/main/pcloud_health_check.sh
+```
+
+## 📖 Full Documentation
+- **[Complete Setup Guide](docs/SETUP.md)** - Step-by-step installation with MariaDB
+- **[Update Instructions](docs/PI_UPDATE.md)** - How to update on Raspberry Pi
+- **Architecture & Integration** - See below
 
 ---
 
