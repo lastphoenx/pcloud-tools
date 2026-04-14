@@ -107,21 +107,19 @@ _db_init() {
   local db_dir; db_dir="$(dirname "$PCLOUD_DB")"
   mkdir -p "$db_dir" 2>/dev/null || true
   
-  # Create schema if DB doesn't exist
-  if [[ ! -f "$PCLOUD_DB" ]]; then
-    local schema_file="${MAIN_DIR}/sql/init_pcloud_db.sql"
-    if [[ -f "$schema_file" ]]; then
-      _log INFO "Initializing database: $PCLOUD_DB"
-      sqlite3 "$PCLOUD_DB" < "$schema_file" 2>/dev/null || {
-        _log WARN "Failed to initialize database (sqlite3 missing?)"
-        PCLOUD_ENABLE_DB=0
-        return 1
-      }
-    else
-      _log WARN "Schema file not found: $schema_file (DB disabled)"
+  # Use migration framework to initialize/upgrade schema
+  local migrate_script="${MAIN_DIR}/sql/migrate.sh"
+  if [[ -x "$migrate_script" ]]; then
+    _log INFO "Running database migrations: $PCLOUD_DB"
+    "$migrate_script" 2>/dev/null || {
+      _log WARN "Failed to run migrations (sqlite3 missing?)"
       PCLOUD_ENABLE_DB=0
       return 1
-    fi
+    }
+  else
+    _log WARN "Migration script not found or not executable: $migrate_script (DB disabled)"
+    PCLOUD_ENABLE_DB=0
+    return 1
   fi
 }
 

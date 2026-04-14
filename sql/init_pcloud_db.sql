@@ -2,13 +2,24 @@
 -- pCloud Backup Run History Database Schema (SQLite)
 -- =====================================================
 -- Purpose: Track backup runs, metrics, performance, and errors
--- Usage: sqlite3 /var/lib/pcloud-backup/runs.db < init_pcloud_db.sql
+-- Usage: 
+--   Fresh install: ./sql/migrate.sh
+--   Manual init:   sqlite3 /var/lib/pcloud-backup/runs.db < init_pcloud_db.sql
+--
+-- IMPORTANT: This script is SAFE (CREATE IF NOT EXISTS)
+--            For destructive recreate: ./sql/migrate.sh --force-recreate
 -- =====================================================
 
--- Drop existing tables (for fresh init)
-DROP TABLE IF EXISTS backup_runs;
-DROP TABLE IF EXISTS backup_phases;
-DROP TABLE IF EXISTS gap_backfills;
+-- Schema version tracking (created first!)
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    description TEXT
+);
+
+-- Insert version 1 if not exists
+INSERT OR IGNORE INTO schema_version (version, description) 
+VALUES (1, 'Initial schema - backup runs tracking');
 
 -- =====================================================
 -- Main backup runs table
@@ -178,15 +189,8 @@ WHERE start_time >= datetime('now', '-30 days');
 -- ORDER BY b.start_time DESC;
 
 -- =====================================================
--- Version Tracking
+-- End of Schema (Version 1)
 -- =====================================================
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+-- Schema version is tracked at the top of this file
+-- Use ./sql/migrate.sh for version management
 
-INSERT INTO schema_version (version) VALUES (1);
-
--- =====================================================
--- End of Schema
--- =====================================================
