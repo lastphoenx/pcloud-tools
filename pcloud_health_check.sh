@@ -259,22 +259,27 @@ check_pcloud_quota() {
   
   quota_free=$((quota_total - quota_used))
   
-  # Convert to GB
+  # Convert to GB and TB (with decimal)
   local quota_free_gb=$((quota_free / 1073741824))
   local quota_total_gb=$((quota_total / 1073741824))
   local quota_used_gb=$((quota_used / 1073741824))
   
-  [[ $VERBOSE -eq 1 ]] && echo "  Total: ${quota_total_gb} GB | Used: ${quota_used_gb} GB | Free: ${quota_free_gb} GB"
+  # Calculate TB with one decimal place (using awk for floating point)
+  local quota_total_tb=$(awk "BEGIN {printf \"%.1f\", $quota_total_gb / 1024}")
+  local quota_used_tb=$(awk "BEGIN {printf \"%.1f\", $quota_used_gb / 1024}")
+  local quota_free_tb=$(awk "BEGIN {printf \"%.1f\", $quota_free_gb / 1024}")
+  
+  [[ $VERBOSE -eq 1 ]] && echo "  Total: ${quota_total_tb} TB (${quota_total_gb} GB) | Used: ${quota_used_tb} TB (${quota_used_gb} GB) | Free: ${quota_free_tb} TB (${quota_free_gb} GB)"
   
   # Check thresholds
   if [[ $quota_free_gb -lt $QUOTA_CRITICAL_GB ]]; then
-    log_issue "CRITICAL" "pCloud quota critically low: ${quota_free_gb} GB free (threshold: ${QUOTA_CRITICAL_GB} GB)"
+    log_issue "CRITICAL" "pCloud quota critically low: ${quota_free_tb} TB (${quota_free_gb} GB) free (threshold: ${QUOTA_CRITICAL_GB} GB)"
     set_status 2
   elif [[ $quota_free_gb -lt $QUOTA_WARNING_GB ]]; then
-    log_issue "WARNING" "pCloud quota running low: ${quota_free_gb} GB free (threshold: ${QUOTA_WARNING_GB} GB)"
+    log_issue "WARNING" "pCloud quota running low: ${quota_free_tb} TB (${quota_free_gb} GB) free (threshold: ${QUOTA_WARNING_GB} GB)"
     set_status 1
   else
-    log_issue "OK" "pCloud quota healthy: ${quota_free_gb} GB free"
+    log_issue "OK" "pCloud quota healthy: ${quota_free_tb} TB (${quota_free_gb} GB) free"
   fi
 }
 
