@@ -127,12 +127,24 @@ check_backup_age() {
     return
   fi
   
-  # Parse RTB snapshot timestamp (format: 2026-04-14__22-00-01)
-  # Split into date and time, only replace dashes in time portion
-  local rtb_date="${latest_rtb_snapshot%%__*}"  # 2026-04-14
-  local rtb_time="${latest_rtb_snapshot##*__}"  # 22-00-01
-  rtb_time="${rtb_time//-/:}"                    # 22:00:01
-  local rtb_timestamp="$rtb_date $rtb_time"      # 2026-04-14 22:00:01
+  # Parse RTB snapshot timestamp (format: 2026-04-14__22-00-01 or 2026-04-12-163517)
+  local rtb_timestamp
+  if [[ "$latest_rtb_snapshot" == *__* ]]; then
+    # Format with double underscore
+    local rtb_date="${latest_rtb_snapshot%%__*}"
+    local rtb_time="${latest_rtb_snapshot##*__}"
+    rtb_time="${rtb_time//-/:}"
+    rtb_timestamp="$rtb_date $rtb_time"
+  else
+    # Format with single dashes (e.g. 2026-04-12-163517)
+    # Extract YYYY-MM-DD (first 10 chars) and HHMMSS
+    local rtb_date="${latest_rtb_snapshot:0:10}"
+    local rtb_time_raw="${latest_rtb_snapshot:11}"
+    rtb_time_raw="${rtb_time_raw//-/}" # remove any remaining dashes
+    # Insert colons for HH:MM:SS
+    local rtb_time="${rtb_time_raw:0:2}:${rtb_time_raw:2:2}:${rtb_time_raw:4:2}"
+    rtb_timestamp="$rtb_date $rtb_time"
+  fi
   
   local rtb_epoch
   rtb_epoch=$(date -d "$rtb_timestamp" +%s 2>/dev/null || echo "0")
@@ -274,8 +286,22 @@ check_disk_space() {
   
   # Check parent directory /srv (where mergerfs is typically mounted)
   # PCLOUD_TEMP_DIR might be /srv/pcloud-temp which is a subdirectory of /srv/nas
+  # Fallback to other common mount points if PCLOUD_TEMP_DIR is on /
   local check_path="/srv"
   [[ -d "$PCLOUD_TEMP_DIR" ]] && check_path="$PCLOUD_TEMP_DIR"
+  
+  # If the detected mount is still /, try to find a more specific SSD/HDD mount
+  local current_mount
+  current_mount=$(df "$check_path" | tail -n 1 | awk '{print $6}')
+  
+  if [[ "$current_mount" == "/" ]]; then
+    for fallback in "/mnt/ssd" "/mnt/backup" "/srv/nas" "/mnt/pcloud"; do
+      if [[ -d "$fallback" ]] && [[ "$(df "$fallback" | tail -n 1 | awk '{print $6}')" != "/" ]]; then
+        check_path="$fallback"
+        break
+      fi
+    done
+  fi
   
   # Get disk usage via df
   local disk_info
