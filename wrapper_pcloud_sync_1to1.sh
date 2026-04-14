@@ -105,12 +105,11 @@ PCLOUD_DB_PASS=${PCLOUD_DB_PASS:-}
 PCLOUD_ENABLE_DB=${PCLOUD_ENABLE_DB:-0}  # 0=disabled (default), 1=enabled
 RUN_ID=""  # Will be set at start
 
-# MySQL helper function
+# MySQL helper function (SECURE: password via env, not visible in ps aux)
 _mysql() {
-  mysql -h "$PCLOUD_DB_HOST" \
+  MYSQL_PWD="$PCLOUD_DB_PASS" mysql -h "$PCLOUD_DB_HOST" \
         -P "$PCLOUD_DB_PORT" \
         -u "$PCLOUD_DB_USER" \
-        -p"$PCLOUD_DB_PASS" \
         -D "$PCLOUD_DB_NAME" \
         -sN \
         -e "$@" 2>/dev/null

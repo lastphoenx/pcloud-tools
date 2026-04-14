@@ -42,12 +42,11 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
-# MySQL helper
+# MySQL helper (SECURE: password via env, not visible in ps aux)
 _mysql() {
-  mysql -h "$PCLOUD_DB_HOST" \
+  MYSQL_PWD="$PCLOUD_DB_PASS" mysql -h "$PCLOUD_DB_HOST" \
         -P "$PCLOUD_DB_PORT" \
         -u "$PCLOUD_DB_USER" \
-        -p"$PCLOUD_DB_PASS" \
         -D "$PCLOUD_DB_NAME" \
         -sN \
         -e "$@" 2>/dev/null
