@@ -142,7 +142,7 @@ check_backup_age() {
   # Format age display (show days if >= 24h)
   local rtb_age_display
   if [[ $rtb_age_hours -ge 24 ]]; then
-    rtb_age_display="${rtb_age_days}d ${((rtb_age_hours % 24))}h ago"
+    rtb_age_display="${rtb_age_days}d $((rtb_age_hours % 24))h ago"
   else
     rtb_age_display="${rtb_age_hours}h ago"
   fi
@@ -165,7 +165,7 @@ check_backup_age() {
       local pcloud_age_display
       local pcloud_age_days=$(( pcloud_backup_age_hours / 24 ))
       if [[ $pcloud_backup_age_hours -ge 24 ]]; then
-        pcloud_age_display="${pcloud_age_days}d ${((pcloud_backup_age_hours % 24))}h ago"
+        pcloud_age_display="${pcloud_age_days}d $((pcloud_backup_age_hours % 24))h ago"
       else
         pcloud_age_display="${pcloud_backup_age_hours}h ago"
       fi
