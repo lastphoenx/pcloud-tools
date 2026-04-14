@@ -128,13 +128,26 @@ check_backup_age() {
   fi
   
   # Parse RTB snapshot timestamp (format: 2026-04-14__22-00-01)
-  local rtb_timestamp="${latest_rtb_snapshot//__/ }"
-  rtb_timestamp="${rtb_timestamp//-/:}"
+  # Split into date and time, only replace dashes in time portion
+  local rtb_date="${latest_rtb_snapshot%%__*}"  # 2026-04-14
+  local rtb_time="${latest_rtb_snapshot##*__}"  # 22-00-01
+  rtb_time="${rtb_time//-/:}"                    # 22:00:01
+  local rtb_timestamp="$rtb_date $rtb_time"      # 2026-04-14 22:00:01
+  
   local rtb_epoch
   rtb_epoch=$(date -d "$rtb_timestamp" +%s 2>/dev/null || echo "0")
   local rtb_age_hours=$(( ($(date +%s) - rtb_epoch) / 3600 ))
+  local rtb_age_days=$(( rtb_age_hours / 24 ))
   
-  [[ $VERBOSE -eq 1 ]] && echo "  Latest RTB snapshot: $latest_rtb_snapshot (${rtb_age_hours}h ago)"
+  # Format age display (show days if >= 24h)
+  local rtb_age_display
+  if [[ $rtb_age_hours -ge 24 ]]; then
+    rtb_age_display="${rtb_age_days}d ${((rtb_age_hours % 24))}h ago"
+  else
+    rtb_age_display="${rtb_age_hours}h ago"
+  fi
+  
+  [[ $VERBOSE -eq 1 ]] && echo "  Latest RTB snapshot: $latest_rtb_snapshot ($rtb_age_display)"
   
   # Get latest successful pCloud backup from DB (if enabled)
   local pcloud_backup_age_hours=999999
@@ -147,7 +160,17 @@ check_backup_age() {
     if [[ -n "$last_success" ]]; then
       pcloud_snapshot=$(echo "$last_success" | cut -f1)
       pcloud_backup_age_hours=$(echo "$last_success" | cut -f2)
-      [[ $VERBOSE -eq 1 ]] && echo "  Latest pCloud backup: $pcloud_snapshot (${pcloud_backup_age_hours}h ago)"
+      
+      # Format age display
+      local pcloud_age_display
+      local pcloud_age_days=$(( pcloud_backup_age_hours / 24 ))
+      if [[ $pcloud_backup_age_hours -ge 24 ]]; then
+        pcloud_age_display="${pcloud_age_days}d ${((pcloud_backup_age_hours % 24))}h ago"
+      else
+        pcloud_age_display="${pcloud_backup_age_hours}h ago"
+      fi
+      
+      [[ $VERBOSE -eq 1 ]] && echo "  Latest pCloud backup: $pcloud_snapshot ($pcloud_age_display)"
     else
       [[ $VERBOSE -eq 1 ]] && echo "  No successful pCloud backups in database"
     fi
@@ -162,27 +185,27 @@ check_backup_age() {
     
     if [[ $gap_hours -gt 24 ]]; then
       # pCloud backup is significantly older than RTB → GAP!
-      log_issue "CRITICAL" "Backup gap detected! RTB has new snapshot ($latest_rtb_snapshot, ${rtb_age_hours}h ago) but pCloud backup is old ($pcloud_snapshot, ${pcloud_backup_age_hours}h ago)"
+      log_issue "CRITICAL" "Backup gap detected! RTB has new snapshot ($latest_rtb_snapshot, $rtb_age_display) but pCloud backup is old ($pcloud_snapshot, $pcloud_age_display)"
       set_status 2
     elif [[ $pcloud_backup_age_hours -gt $BACKUP_AGE_CRITICAL_HOURS ]]; then
-      log_issue "CRITICAL" "Last pCloud backup too old: ${pcloud_backup_age_hours}h (threshold: ${BACKUP_AGE_CRITICAL_HOURS}h)"
+      log_issue "CRITICAL" "Last pCloud backup too old: $pcloud_age_display (threshold: ${BACKUP_AGE_CRITICAL_HOURS}h)"
       set_status 2
     elif [[ $pcloud_backup_age_hours -gt $BACKUP_AGE_WARNING_HOURS ]]; then
-      log_issue "WARNING" "Last pCloud backup aging: ${pcloud_backup_age_hours}h (threshold: ${BACKUP_AGE_WARNING_HOURS}h)"
+      log_issue "WARNING" "Last pCloud backup aging: $pcloud_age_display (threshold: ${BACKUP_AGE_WARNING_HOURS}h)"
       set_status 1
     else
-      log_issue "OK" "Backup age healthy (${pcloud_backup_age_hours}h ago)"
+      log_issue "OK" "Backup age healthy ($pcloud_age_display)"
     fi
   else
     # Fallback: Just check RTB age if DB disabled
     if [[ $rtb_age_hours -gt $BACKUP_AGE_CRITICAL_HOURS ]]; then
-      log_issue "CRITICAL" "Last RTB snapshot too old: ${rtb_age_hours}h (threshold: ${BACKUP_AGE_CRITICAL_HOURS}h)"
+      log_issue "CRITICAL" "Last RTB snapshot too old: $rtb_age_display (threshold: ${BACKUP_AGE_CRITICAL_HOURS}h)"
       set_status 2
     elif [[ $rtb_age_hours -gt $BACKUP_AGE_WARNING_HOURS ]]; then
-      log_issue "WARNING" "Last RTB snapshot aging: ${rtb_age_hours}h (threshold: ${BACKUP_AGE_WARNING_HOURS}h)"
+      log_issue "WARNING" "Last RTB snapshot aging: $rtb_age_display (threshold: ${BACKUP_AGE_WARNING_HOURS}h)"
       set_status 1
     else
-      log_issue "OK" "RTB snapshot age healthy (${rtb_age_hours}h ago)"
+      log_issue "OK" "RTB snapshot age healthy ($rtb_age_display)"
     fi
   fi
 }
@@ -201,7 +224,7 @@ check_pcloud_quota() {
   
   # Query pCloud API for quota info
   local quota_response
-  quota_response=$(curl -s "https://${PCLOUD_API_HOST}/userinfo?auth=${PCLOUD_TOKEN}" 2>/dev/null || echo "")
+  quota_response=$(curl -s "https://${PCLOUD_API_HOST}/userinfo?getauth=1&access_token=${PCLOUD_TOKEN}" 2>/dev/null || echo "")
   
   if [[ -z "$quota_response" ]]; then
     log_issue "WARNING" "Failed to query pCloud API for quota"
@@ -210,14 +233,16 @@ check_pcloud_quota() {
   fi
   
   # Parse JSON (requires jq, fallback to grep if not available)
+  # Fields are nested in .userinfo when getauth=1 is used
   local quota_total quota_used quota_free
   if command -v jq &>/dev/null; then
-    quota_total=$(echo "$quota_response" | jq -r '.quota // 0')
-    quota_used=$(echo "$quota_response" | jq -r '.usedquota // 0')
+    quota_total=$(echo "$quota_response" | jq -r '.userinfo.quota // .quota // 0')
+    quota_used=$(echo "$quota_response" | jq -r '.userinfo.usedquota // .usedquota // 0')
   else
     # Fallback: grep parsing (fragile but works)
-    quota_total=$(echo "$quota_response" | grep -oP '"quota":\s*\K[0-9]+' || echo "0")
-    quota_used=$(echo "$quota_response" | grep -oP '"usedquota":\s*\K[0-9]+' || echo "0")
+    # Try nested first, then root
+    quota_total=$(echo "$quota_response" | grep -oP '"userinfo":\{.*?"quota":\s*\K[0-9]+' || echo "$quota_response" | grep -oP '"quota":\s*\K[0-9]+' || echo "0")
+    quota_used=$(echo "$quota_response" | grep -oP '"userinfo":\{.*?"usedquota":\s*\K[0-9]+' || echo "$quota_response" | grep -oP '"usedquota":\s*\K[0-9]+' || echo "0")
   fi
   
   quota_free=$((quota_total - quota_used))
@@ -245,17 +270,20 @@ check_pcloud_quota() {
 # CHECK 3: Disk Space (/srv - mergerfs)
 # =====================================================
 check_disk_space() {
-  [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[3] Disk Space (/srv/pcloud-temp)${NC}"
+  [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[3] Disk Space (temp storage)${NC}"
   
-  if [[ ! -d "$PCLOUD_TEMP_DIR" ]]; then
-    log_issue "WARNING" "pCloud temp directory not found: $PCLOUD_TEMP_DIR"
-    set_status 1
-    return
-  fi
+  # Check parent directory /srv (where mergerfs is typically mounted)
+  # PCLOUD_TEMP_DIR might be /srv/pcloud-temp which is a subdirectory of /srv/nas
+  local check_path="/srv"
+  [[ -d "$PCLOUD_TEMP_DIR" ]] && check_path="$PCLOUD_TEMP_DIR"
   
   # Get disk usage via df
   local disk_info
-  disk_info=$(df -h "$PCLOUD_TEMP_DIR" | tail -n 1)
+  disk_info=$(df -h "$check_path" | tail -n 1)
+  
+  # Extract mount point to show user which filesystem we're checking
+  local mount_point
+  mount_point=$(echo "$disk_info" | awk '{print $6}')
   
   local disk_used_percent
   disk_used_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%')
@@ -263,7 +291,7 @@ check_disk_space() {
   local disk_avail
   disk_avail=$(echo "$disk_info" | awk '{print $4}')
   
-  [[ $VERBOSE -eq 1 ]] && echo "  Usage: ${disk_used_percent}% | Available: ${disk_avail}"
+  [[ $VERBOSE -eq 1 ]] && echo "  Mount: $mount_point | Usage: ${disk_used_percent}% | Available: ${disk_avail}"
   
   # Check thresholds (inverted: high usage = problem)
   local disk_free_percent=$((100 - disk_used_percent))
