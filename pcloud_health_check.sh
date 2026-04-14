@@ -289,19 +289,14 @@ check_pcloud_quota() {
 check_disk_space() {
   [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[3] Disk Space (temp storage)${NC}"
   
-  # Check parent directory /srv (where mergerfs is typically mounted)
-  # PCLOUD_TEMP_DIR might be /srv/pcloud-temp which is a subdirectory of /srv/nas
-  # Fallback to other common mount points if PCLOUD_TEMP_DIR is on /
-  local check_path="/srv"
-  [[ -d "$PCLOUD_TEMP_DIR" ]] && check_path="$PCLOUD_TEMP_DIR"
+  # Check mergerfs pool /srv/nas (Samsung SSDs 1:2 pool)
+  # Priority: Monitor the SSDs where backups will be staged, not external USB drives
+  local check_path="/srv/nas"
   
-  # If the detected mount is still /, try to find a more specific SSD/HDD mount
-  local current_mount
-  current_mount=$(df "$check_path" | tail -n 1 | awk '{print $6}')
-  
-  if [[ "$current_mount" == "/" ]]; then
-    for fallback in "/mnt/ssd" "/mnt/backup" "/srv/nas" "/mnt/pcloud"; do
-      if [[ -d "$fallback" ]] && [[ "$(df "$fallback" | tail -n 1 | awk '{print $6}')" != "/" ]]; then
+  # Fallback to individual SSD mounts if mergerfs is not available
+  if [[ ! -d "$check_path" ]]; then
+    for fallback in "/mnt/ssd1" "/mnt/ssd2" "/srv"; do
+      if [[ -d "$fallback" ]]; then
         check_path="$fallback"
         break
       fi
