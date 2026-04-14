@@ -56,20 +56,165 @@ SAFETY_DELAY_SEC=${SAFETY_DELAY_SEC:-120}
 
 # ========= Logging =========
 PCLOUD_LOG=${PCLOUD_LOG:-/var/log/backup/pcloud_sync.log}
+PCLOUD_JSONL_LOG=${PCLOUD_JSONL_LOG:-${PCLOUD_LOG%.log}.jsonl}
+PCLOUD_ENABLE_JSONL=${PCLOUD_ENABLE_JSONL:-1}  # 1=enabled, 0=disabled
+
 mkdir -p "$(dirname "$PCLOUD_LOG")"
 exec > >(tee -a "$PCLOUD_LOG") 2>&1
 
-log(){ printf "%s %s\n" "$(date '+%F %T')" "$*"; }
+# Legacy log function (for backwards compatibility)
+log(){ _log INFO "$@"; }
+
+# Enhanced structured logging with levels
+_log() {
+  local level="${1:-INFO}"
+  shift
+  local msg="$*"
+  local ts; ts="$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
+  
+  # Human-readable output (to stdout/file)
+  printf "%s [%s] %s\n" "$ts" "$level" "$msg"
+  
+  # JSONL output (for monitoring/parsing)
+  if [[ "${PCLOUD_ENABLE_JSONL}" == "1" ]]; then
+    # Use jq if available, otherwise simple JSON
+    if command -v jq &>/dev/null; then
+      jq -nc \
+        --arg ts "$ts" \
+        --arg level "$level" \
+        --arg msg "$msg" \
+        --arg run_id "${RUN_ID:-}" \
+        '{timestamp: $ts, level: $level, message: $msg, run_id: $run_id}' \
+        >> "$PCLOUD_JSONL_LOG" 2>/dev/null || true
+    else
+      # Fallback: Manual JSON escaping
+      printf '{"timestamp":"%s","level":"%s","message":"%s","run_id":"%s"}\n' \
+        "$ts" "$level" "${msg//\"/\\\"}" "${RUN_ID:-}" \
+        >> "$PCLOUD_JSONL_LOG" 2>/dev/null || true
+    fi
+  fi
+}
+
+# ========= SQLite Run-History Tracking =========
+PCLOUD_DB=${PCLOUD_DB:-/var/lib/pcloud-backup/runs.db}
+PCLOUD_ENABLE_DB=${PCLOUD_ENABLE_DB:-1}  # 1=enabled, 0=disabled
+RUN_ID=""  # Will be set at start
+
+# Initialize database if needed
+_db_init() {
+  [[ "${PCLOUD_ENABLE_DB}" != "1" ]] && return 0
+  
+  local db_dir; db_dir="$(dirname "$PCLOUD_DB")"
+  mkdir -p "$db_dir" 2>/dev/null || true
+  
+  # Create schema if DB doesn't exist
+  if [[ ! -f "$PCLOUD_DB" ]]; then
+    local schema_file="${MAIN_DIR}/sql/init_pcloud_db.sql"
+    if [[ -f "$schema_file" ]]; then
+      _log INFO "Initializing database: $PCLOUD_DB"
+      sqlite3 "$PCLOUD_DB" < "$schema_file" 2>/dev/null || {
+        _log WARN "Failed to initialize database (sqlite3 missing?)"
+        PCLOUD_ENABLE_DB=0
+        return 1
+      }
+    else
+      _log WARN "Schema file not found: $schema_file (DB disabled)"
+      PCLOUD_ENABLE_DB=0
+      return 1
+    fi
+  fi
+}
+
+# Log backup run start
+_db_run_start() {
+  [[ "${PCLOUD_ENABLE_DB}" != "1" ]] && return 0
+  
+  local snapshot="$1"
+  local snapshot_path="$2"
+  RUN_ID="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-$$")"
+  
+  sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
+INSERT INTO backup_runs (
+  run_id, start_time, status, snapshot_name, snapshot_path, hostname
+) VALUES (
+  '${RUN_ID}',
+  datetime('now'),
+  'RUNNING',
+  '${snapshot}',
+  '${snapshot_path}',
+  '$(hostname)'
+);
+SQL
+  
+  export RUN_ID
+  _log INFO "Run ID: $RUN_ID"
+}
+
+# Log backup run end
+_db_run_end() {
+  [[ "${PCLOUD_ENABLE_DB}" != "1" || -z "$RUN_ID" ]] && return 0
+  
+  local status="$1"
+  local exit_code="${2:-0}"
+  local error_msg="${3:-}"
+  
+  sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
+UPDATE backup_runs SET
+  end_time = datetime('now'),
+  duration_seconds = CAST((julianday('now') - julianday(start_time)) * 86400 AS INTEGER),
+  status = '${status}',
+  exit_code = ${exit_code},
+  error_message = '${error_msg//\'/\'\'}'
+WHERE run_id = '${RUN_ID}';
+SQL
+}
+
+# Log phase timing
+_db_phase_log() {
+  [[ "${PCLOUD_ENABLE_DB}" != "1" || -z "$RUN_ID" ]] && return 0
+  
+  local phase="$1"
+  local action="${2:-start}"  # start/end
+  local status="${3:-RUNNING}"
+  local metrics="${4:-}"
+  
+  if [[ "$action" == "start" ]]; then
+    sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
+INSERT INTO backup_phases (run_id, phase_name, start_time, status)
+VALUES ('${RUN_ID}', '${phase}', datetime('now'), 'RUNNING');
+SQL
+  else
+    sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
+UPDATE backup_phases SET
+  end_time = datetime('now'),
+  duration_seconds = CAST((julianday('now') - julianday(start_time)) * 86400 AS INTEGER),
+  status = '${status}',
+  metrics = '${metrics//\'/\'\'}'
+WHERE run_id = '${RUN_ID}' AND phase_name = '${phase}' AND end_time IS NULL;
+SQL
+  fi
+}
+
+# Update run metrics
+_db_update_metrics() {
+  [[ "${PCLOUD_ENABLE_DB}" != "1" || -z "$RUN_ID" ]] && return 0
+  
+  local updates="$*"
+  
+  sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
+UPDATE backup_runs SET ${updates} WHERE run_id = '${RUN_ID}';
+SQL
+}
 
 require_file(){
-  [[ -f "$1" ]] || { log "[error] Datei fehlt: $1"; exit 2; }
+  [[ -f "$1" ]] || { _log ERROR "Datei fehlt: $1"; exit 2; }
 }
 
 validate_inputs_or_exit() {
   require_file "$ENV_FILE"
   # Zielpfad prüfen/normalisieren
   if [[ -z "${PCLOUD_DEST:-}" || "${PCLOUD_DEST:0:1}" != "/" ]]; then
-    log "[error] Ungültiger PCLOUD_DEST (muss mit / beginnen): '${PCLOUD_DEST:-<leer>}'"
+    _log ERROR "Ungültiger PCLOUD_DEST (muss mit / beginnen): '${PCLOUD_DEST:-<leer>}'"
     exit 2
   fi
   PCLOUD_DEST="${PCLOUD_DEST%/}"
@@ -184,7 +329,12 @@ need_retention_sync() {
 
 build_and_push() {
   local SNAP="$1" SNAPNAME; SNAPNAME="$(basename "$SNAP")"
-  log "[info] push snapshot: $SNAPNAME"
+  _log INFO "Uploading snapshot: $SNAPNAME"
+  
+  # Log run start (only once per wrapper invocation)
+  if [[ -z "$RUN_ID" ]]; then
+    _db_run_start "$SNAPNAME" "$SNAP"
+  fi
 
   # Manifest im PCLOUD_TEMP_DIR erstellen (statt system /tmp)
   local mani; mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.$$.json"
@@ -192,7 +342,7 @@ build_and_push() {
   # Cleanup erfolgt explizit am Ende
 
   local T0=$(date +%s)
-  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start manifest"
+  _db_phase_log "manifest" "start"
   
   # Smart-Mode: Auto-detect letztes Manifest als Referenz (Schema v3)
   local MANIFEST_MODE="${PCLOUD_MANIFEST_MODE:-smart}"  # smart|full
@@ -205,45 +355,70 @@ build_and_push() {
     
     if [[ -n "$last_manifest" && -f "$last_manifest" ]]; then
       ref_manifest_arg="--ref-manifest $last_manifest"
-      log "[manifest] Smart-Mode: Nutze Referenz-Manifest $(basename "$last_manifest")"
+      _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$last_manifest")"
     else
-      log "[manifest] Smart-Mode: Kein Referenz-Manifest gefunden (Full-Mode für ersten Snapshot)"
+      _log INFO "Manifest: Full-Mode (kein Referenz-Manifest)"
     fi
   else
-    log "[manifest] Full-Mode: Berechne alle SHA256 neu (PCLOUD_MANIFEST_MODE=full)"
+    _log INFO "Manifest: Full-Mode (PCLOUD_MANIFEST_MODE=full)"
   fi
   
-  "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256 $ref_manifest_arg
-  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && { log "[t] done manifest (Δ=$(( $(date +%s)-T0 ))s)"; T1=$(date +%s); }
+  "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256 $ref_manifest_arg || {
+    _db_phase_log "manifest" "end" "FAILED"
+    return 1
+  }
+  
+  local manifest_duration=$(( $(date +%s) - T0 ))
+  _db_phase_log "manifest" "end" "SUCCESS"
+  _db_update_metrics "manifest_duration_sec = $manifest_duration"
+  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && _log INFO "Manifest done (${manifest_duration}s)"
 
   local RET=""
   [[ "$(need_retention_sync)" == "YES" ]] && RET="--retention-sync"
 
-  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] start push"
-  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE"
-  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && log "[t] done push (Δ=$(( $(date +%s)-T1 ))s), total=$(( $(date +%s)-T0 ))s)"
+  # Upload phase
+  T0=$(date +%s)
+  _db_phase_log "upload" "start"
+  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE" || {
+    _db_phase_log "upload" "end" "FAILED"
+    rm -f "$mani" 2>/dev/null || true
+    return 1
+  }
+  
+  local upload_duration=$(( $(date +%s) - T0 ))
+  _db_phase_log "upload" "end" "SUCCESS"
+  _db_update_metrics "upload_duration_sec = $upload_duration"
+  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && _log INFO "Upload done (${upload_duration}s)"
 
   # Manifest-Archivierung wird bereits vom Push-Tool erledigt
   # (nach /srv/pcloud-archive/manifests/)
   
   # === Delta-Check nach erfolgreichem Upload ===
-  log "[verify] Starte Delta-Check für alle Snapshots..."
+  _log INFO "Starting delta verification..."
   local delta_report="${PCLOUD_TEMP_DIR}/delta_verify_${SNAPNAME}.json"
+  
+  T0=$(date +%s)
+  _db_phase_log "verify" "start"
   
   if "${PY}" "$DELTA_CHECK" \
     --dest-root "$PCLOUD_DEST" \
     --env-file "$ENV_FILE" \
     --json-out "$delta_report" 2>&1 | tee -a "$PCLOUD_LOG"; then
     
-    log "[verify] Delta-Check erfolgreich abgeschlossen"
+    local verify_duration=$(( $(date +%s) - T0 ))
+    _db_phase_log "verify" "end" "SUCCESS"
+    _db_update_metrics "verify_duration_sec = $verify_duration"
+    _log INFO "Delta-Check successful (${verify_duration}s)"
     
     # Delta-Report archivieren
     if [[ -f "$delta_report" ]]; then
       mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
-      log "[verify] Delta-Report archiviert: ${PCLOUD_ARCHIVE_DIR}/deltas/delta_verify_${SNAPNAME}.json"
+      _log INFO "Delta report archived: delta_verify_${SNAPNAME}.json"
     fi
   else
-    log "[warn] Delta-Check fehlgeschlagen (nicht kritisch, Upload war erfolgreich)"
+    local verify_duration=$(( $(date +%s) - T0 ))
+    _db_phase_log "verify" "end" "FAILED"
+    _log WARN "Delta-Check failed (non-critical, upload succeeded)"
   fi
   # === Ende Delta-Check ===
   
@@ -256,22 +431,28 @@ build_and_push() {
 if [[ "${BACKUP_PIPELINE_LOCKED:-0}" != "1" ]]; then
   exec 9>"$LOCKFILE"
   if ! flock -w "$WAIT_SEC" 9; then
-    log "[skip] Konnte Lock innerhalb ${WAIT_SEC}s nicht bekommen."
+    _log WARN "Konnte Lock innerhalb ${WAIT_SEC}s nicht bekommen"
     exit 0
   fi
 fi
 
-log "[start] pcloud_sync_1to1"
+_log INFO "========== pCloud Sync 1to1 Start =========="
 
 validate_inputs_or_exit
+
+# Initialize database
+_db_init
+
+# Trap for cleanup on exit
+trap '_db_run_end FAILED $? "Script interrupted or failed"; exit' INT TERM ERR
 
 # Preflight (Status) + Policy im Wrapper
 PF="$(preflight_or_mark_down)"
 case "$PF" in
-  OK)        log "[ok] pCloud Preflight ok" ;;
-  OVERQUOTA) log "[warn] pCloud Preflight: Konto über Quota – Sync wird übersprungen."; exit 0 ;;
-  DOWN)      log "[warn] pCloud Preflight: API/Auth nicht erreichbar – Sync wird übersprungen."; exit 0 ;;
-  *)         log "[warn] pCloud Preflight: unbekannter Status '$PF' – Sync wird übersprungen."; exit 0 ;;
+  OK)        _log INFO "pCloud Preflight: OK" ;;
+  OVERQUOTA) _log WARN "pCloud Preflight: Konto über Quota – Sync wird übersprungen."; exit 0 ;;
+  DOWN)      _log WARN "pCloud Preflight: API/Auth nicht erreichbar – Sync wird übersprungen."; exit 0 ;;
+  *)         _log WARN "pCloud Preflight: unbekannter Status '$PF' – Sync wird übersprungen."; exit 0 ;;
 esac
 
 # Safety-Delay nach RTB
@@ -281,7 +462,7 @@ if [[ -L "${RTB}/latest" || -d "${RTB}/latest" ]]; then
     now=$(date +%s); lm=$(stat -c '%Y' "$latest_dir" 2>/dev/null || echo 0)
     if (( lm > 0 && now - lm < SAFETY_DELAY_SEC )); then
       wait=$(( SAFETY_DELAY_SEC - (now - lm) ))
-      log "[info] safety-delay ${wait}s (warte nach RTB)"
+      _log INFO "Safety-delay ${wait}s (waiting after RTB)"
       sleep "$wait"
     fi
   fi
@@ -289,10 +470,11 @@ fi
 
 # Bootstrap (remote leer)
 if [[ "$(remote_has_snapshots)" == "NO" ]]; then
-  log "[bootstrap] Remote leer – backfill aller lokalen Snapshots (alt → neu)"
+  _log INFO "Bootstrap: Remote empty – backfilling all local snapshots (old → new)"
   mapfile -t SNAPS < <(find "$RTB" -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' | sort)
   if [[ ${#SNAPS[@]} -eq 0 ]]; then
-    log "[skip] keine lokalen Snapshots gefunden."
+    _log WARN "No local snapshots found"
+    _db_run_end SUCCESS 0
     exit 0
   fi
   export PCLOUD_SKIP_FINALIZE=1
@@ -310,32 +492,39 @@ snapshots_root = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots"
 fixed = finalize_index_fileids(cfg, snapshots_root)
 print(f"[finalize] index fileids fixed={fixed}")
 PY
-  log "[done] bootstrap/backfill abgeschlossen."
+  _db_run_end SUCCESS 0
+  _log INFO "Bootstrap/backfill completed successfully"
   exit 0
 fi
 
 # Intelligentes Gap-Backfilling (statt nur latest)
-log "[check] Prüfe auf fehlende Snapshots..."
+_log INFO "Checking for missing snapshots..."
 uploaded_count=0
 
 for s in $(local_snapshot_names); do
   if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    log "[gap] Snapshot $s fehlt remote – hole nach..."
-    build_and_push "$RTB/$s"
+    _log WARN "Gap detected: Snapshot $s missing remote – backfilling..."
+    build_and_push "$RTB/$s" || {
+      _db_run_end FAILED 1 "Gap backfill failed for $s"
+      exit 1
+    }
     uploaded_count=$((uploaded_count + 1))
   fi
 done
 
 if [[ $uploaded_count -eq 0 ]]; then
-  log "[skip] Alle Snapshots bereits auf pCloud vorhanden"
+  _log INFO "All snapshots already on pCloud"
 else
-  log "[done] $uploaded_count Snapshot(s) hochgeladen"
+  _log INFO "Successfully uploaded $uploaded_count snapshot(s)"
+  _db_update_metrics "gaps_backfilled = $uploaded_count"
 fi
 
 # Cleanup: Alte Temp-Dateien löschen (>7 Tage)
 if [[ -d "${PCLOUD_TEMP_DIR}" ]]; then
   find "${PCLOUD_TEMP_DIR}" -maxdepth 1 -type f \( -name "pcloud_mani.*.json" -o -name "pcloud_index_*.json" -o -name "delta*.json" \) -mtime +7 -delete 2>/dev/null || true
-  log "[cleanup] Alte Temp-Dateien (>7d) aus ${PCLOUD_TEMP_DIR} gelöscht"
+  _log INFO "Cleaned up old temp files (>7d) from ${PCLOUD_TEMP_DIR}"
 fi
 
-log "[done] pcloud_sync_1to1"
+# Success!
+_db_run_end SUCCESS 0
+_log INFO "========== pCloud Sync 1to1 Complete =========="

@@ -1,0 +1,62 @@
+# =====================================================
+# logrotate Configuration for pCloud Backup Tools
+# =====================================================
+# Installation:
+#   sudo cp logrotate.d/pcloud-backup /etc/logrotate.d/
+#   sudo chown root:root /etc/logrotate.d/pcloud-backup
+#   sudo chmod 644 /etc/logrotate.d/pcloud-backup
+#
+# Test:
+#   sudo logrotate -d /etc/logrotate.d/pcloud-backup
+#   sudo logrotate -f /etc/logrotate.d/pcloud-backup
+# =====================================================
+
+# Main wrapper log (human-readable)
+/var/log/backup/pcloud_sync.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        # Optional: Notify admins after rotation
+        # echo "pCloud backup log rotated" | mail -s "Log Rotation" admin@example.com
+    endscript
+}
+
+# Structured JSON logs (for parsing/monitoring)
+/var/log/backup/pcloud_sync.jsonl {
+    daily
+    rotate 90
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    # Keep JSONL logs longer (90 days) for historical analysis
+}
+
+# Delta verification reports
+/var/log/backup/pcloud_delta.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+
+# Python script logs (if any)
+/var/log/backup/pcloud_*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
