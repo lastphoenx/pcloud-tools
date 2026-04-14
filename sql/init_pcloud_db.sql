@@ -1,196 +1,154 @@
 -- =====================================================
--- pCloud Backup Run History Database Schema (SQLite)
+-- pCloud Backup Run History - MariaDB Schema
 -- =====================================================
--- Purpose: Track backup runs, metrics, performance, and errors
--- Usage: 
---   Fresh install: ./sql/migrate.sh
---   Manual init:   sqlite3 /var/lib/pcloud-backup/runs.db < init_pcloud_db.sql
---
--- IMPORTANT: This script is SAFE (CREATE IF NOT EXISTS)
---            For destructive recreate: ./sql/migrate.sh --force-recreate
+-- Purpose: Track backup runs, phases, gaps, and metrics
+-- Database: Separate pcloud_backup schema (standalone mode)
+-- Usage:
+--   1. CREATE DATABASE pcloud_backup;
+--   2. CREATE USER 'pcloud_backup'@'localhost' IDENTIFIED BY 'PASSWORD';
+--   3. GRANT ALL ON pcloud_backup.* TO 'pcloud_backup'@'localhost';
+--   4. mysql -u pcloud_backup -p pcloud_backup < init_pcloud_db.sql
 -- =====================================================
 
--- Schema version tracking (created first!)
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    description TEXT
-);
-
--- Insert version 1 if not exists
-INSERT OR IGNORE INTO schema_version (version, description) 
-VALUES (1, 'Initial schema - backup runs tracking');
+CREATE DATABASE IF NOT EXISTS pcloud_backup CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE pcloud_backup;
 
 -- =====================================================
--- Main backup runs table
+-- TABLE: backup_runs
 -- =====================================================
+-- Tracks individual backup runs (one per snapshot upload)
 CREATE TABLE IF NOT EXISTS backup_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT UNIQUE NOT NULL,              -- UUID for this run
+    run_id CHAR(36) NOT NULL PRIMARY KEY COMMENT 'UUID v4',
+    snapshot_name VARCHAR(255) NOT NULL COMMENT 'RTB snapshot identifier (e.g., 2026-04-14__22-00-01)',
     
-    -- Timestamps
-    start_time TIMESTAMP NOT NULL,            -- ISO 8601 format
-    end_time TIMESTAMP,                       -- NULL if still running/failed
-    duration_seconds INTEGER,                 -- Total runtime
+    status ENUM('RUNNING', 'SUCCESS', 'FAILED') NOT NULL DEFAULT 'RUNNING',
+    started_at DATETIME NOT NULL,
+    finished_at DATETIME NULL,
+    duration_sec INT UNSIGNED NULL COMMENT 'Total run duration in seconds',
     
-    -- Status & Result
-    status TEXT NOT NULL DEFAULT 'RUNNING',   -- RUNNING/SUCCESS/FAILED/PARTIAL
-    exit_code INTEGER,                        -- Shell exit code
-    error_message TEXT,                       -- Error details if failed
+    files_uploaded INT UNSIGNED DEFAULT 0,
+    bytes_uploaded BIGINT UNSIGNED DEFAULT 0,
+    files_total INT UNSIGNED DEFAULT 0,
+    bytes_total BIGINT UNSIGNED DEFAULT 0,
     
-    -- Snapshot Info
-    snapshot_name TEXT NOT NULL,              -- e.g., 2026-04-14-183517
-    snapshot_path TEXT,                       -- /mnt/backup/rtb_nas/...
+    error_message TEXT NULL,
+    gap_backfill_mode TINYINT(1) DEFAULT 0 COMMENT '1 if this run backfilled gaps',
     
-    -- File Metrics
-    files_total INTEGER DEFAULT 0,            -- Total files in snapshot
-    files_uploaded INTEGER DEFAULT 0,         -- Newly uploaded (not dedup)
-    files_stubbed INTEGER DEFAULT 0,          -- Deduplicated (stub JSON)
-    files_failed INTEGER DEFAULT 0,           -- Failed uploads
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     
-    -- Byte Metrics
-    bytes_uploaded INTEGER DEFAULT 0,         -- Actual bytes sent to pCloud
-    bytes_total INTEGER DEFAULT 0,            -- Total snapshot size
-    
-    -- Performance Metrics
-    manifest_duration_sec INTEGER,            -- Manifest generation time
-    folders_duration_sec INTEGER,             -- Folder creation time
-    upload_duration_sec INTEGER,              -- File/stub upload time
-    verify_duration_sec INTEGER,              -- Delta check time
-    
-    -- Gap Backfilling
-    gaps_detected INTEGER DEFAULT 0,          -- How many missing snapshots found
-    gaps_backfilled INTEGER DEFAULT 0,        -- How many successfully uploaded
-    
-    -- pCloud API Stats
-    api_calls_total INTEGER DEFAULT 0,        -- Total API requests
-    api_errors INTEGER DEFAULT 0,             -- Failed API calls
-    
-    -- System Context
-    retention_sync BOOLEAN DEFAULT 0,         -- Was retention cleaning triggered?
-    bootstrap_mode BOOLEAN DEFAULT 0,         -- Was this a bootstrap (empty pCloud)?
-    hostname TEXT,                            -- Which machine ran this
-    
-    -- Indexes for fast queries
-    UNIQUE(run_id)
-);
-
--- Index for common queries
-CREATE INDEX idx_backup_runs_start_time ON backup_runs(start_time DESC);
-CREATE INDEX idx_backup_runs_status ON backup_runs(status);
-CREATE INDEX idx_backup_runs_snapshot ON backup_runs(snapshot_name);
+    INDEX idx_status (status),
+    INDEX idx_started (started_at),
+    INDEX idx_snapshot (snapshot_name),
+    INDEX idx_duration (duration_sec)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Backup run tracking';
 
 -- =====================================================
--- Backup phases (for detailed timing breakdown)
+-- TABLE: backup_phases
 -- =====================================================
+-- Tracks individual phases within a backup run (manifest, upload, verify)
 CREATE TABLE IF NOT EXISTS backup_phases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL,                     -- FK to backup_runs.run_id
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    run_id CHAR(36) NOT NULL,
     
-    phase_name TEXT NOT NULL,                 -- manifest/folders/upload/verify/retention
-    start_time TIMESTAMP NOT NULL,
-    end_time TIMESTAMP,
-    duration_seconds INTEGER,
-    status TEXT DEFAULT 'RUNNING',            -- RUNNING/SUCCESS/FAILED/SKIPPED
+    phase_name ENUM('manifest', 'folder_creation', 'upload', 'verify', 'retention_sync') NOT NULL,
+    status ENUM('RUNNING', 'SUCCESS', 'FAILED') NOT NULL DEFAULT 'RUNNING',
     
-    -- Phase-specific metrics (JSON for flexibility)
-    metrics TEXT,                             -- JSON: {"folders_created": 1101, ...}
-    error_message TEXT,
+    started_at DATETIME NOT NULL,
+    finished_at DATETIME NULL,
+    duration_sec INT UNSIGNED NULL,
     
-    FOREIGN KEY (run_id) REFERENCES backup_runs(run_id) ON DELETE CASCADE
-);
-
-CREATE INDEX idx_backup_phases_run_id ON backup_phases(run_id);
+    files_processed INT UNSIGNED DEFAULT 0,
+    bytes_processed BIGINT UNSIGNED DEFAULT 0,
+    
+    error_message TEXT NULL,
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (run_id) REFERENCES backup_runs(run_id) ON DELETE CASCADE,
+    INDEX idx_run_phase (run_id, phase_name),
+    INDEX idx_status (status),
+    INDEX idx_duration (duration_sec)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Phase-level tracking';
 
 -- =====================================================
--- Gap backfill details (track each missing snapshot)
+-- TABLE: gap_backfills
 -- =====================================================
+-- Tracks gaps backfilled (missing snapshots uploaded via intelligent loop)
 CREATE TABLE IF NOT EXISTS gap_backfills (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL,                     -- FK to backup_runs.run_id
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    run_id CHAR(36) NOT NULL,
     
-    snapshot_name TEXT NOT NULL,              -- The missing snapshot being backfilled
-    start_time TIMESTAMP NOT NULL,
-    end_time TIMESTAMP,
-    duration_seconds INTEGER,
-    status TEXT DEFAULT 'RUNNING',            -- RUNNING/SUCCESS/FAILED
+    gap_snapshot_name VARCHAR(255) NOT NULL COMMENT 'Snapshot that was missing',
+    backfilled_at DATETIME NOT NULL,
+    files_uploaded INT UNSIGNED DEFAULT 0,
+    bytes_uploaded BIGINT UNSIGNED DEFAULT 0,
     
-    files_uploaded INTEGER DEFAULT 0,
-    files_stubbed INTEGER DEFAULT 0,
-    bytes_uploaded INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
-    error_message TEXT,
-    
-    FOREIGN KEY (run_id) REFERENCES backup_runs(run_id) ON DELETE CASCADE
-);
-
-CREATE INDEX idx_gap_backfills_run_id ON gap_backfills(run_id);
-CREATE INDEX idx_gap_backfills_snapshot ON gap_backfills(snapshot_name);
+    FOREIGN KEY (run_id) REFERENCES backup_runs(run_id) ON DELETE CASCADE,
+    INDEX idx_run (run_id),
+    INDEX idx_snapshot (gap_snapshot_name),
+    INDEX idx_backfilled (backfilled_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Gap backfilling history';
 
 -- =====================================================
--- Utility Views for common queries
+-- VIEWS: Analytics and Dashboards
 -- =====================================================
 
--- Last 10 successful backups
-CREATE VIEW IF NOT EXISTS v_recent_backups AS
+-- Recent backups (last 30 days)
+CREATE OR REPLACE VIEW v_recent_backups AS
 SELECT 
-    start_time,
+    run_id,
     snapshot_name,
-    duration_seconds,
-    files_total,
+    status,
+    started_at,
+    finished_at,
+    duration_sec,
     files_uploaded,
-    files_stubbed,
-    gaps_backfilled,
-    ROUND(bytes_uploaded / 1024.0 / 1024.0, 2) AS mb_uploaded
+    ROUND(bytes_uploaded / 1024 / 1024 / 1024, 2) AS gb_uploaded,
+    gap_backfill_mode,
+    error_message
 FROM backup_runs
-WHERE status = 'SUCCESS'
-ORDER BY start_time DESC
-LIMIT 10;
+WHERE started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+ORDER BY started_at DESC;
 
--- Failure history
-CREATE VIEW IF NOT EXISTS v_failed_backups AS
+-- Failed backups (last 7 days)
+CREATE OR REPLACE VIEW v_failed_backups AS
 SELECT 
-    start_time,
+    run_id,
     snapshot_name,
-    error_message,
-    exit_code
+    started_at,
+    finished_at,
+    duration_sec,
+    error_message
 FROM backup_runs
 WHERE status = 'FAILED'
-ORDER BY start_time DESC;
+  AND started_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+ORDER BY started_at DESC;
 
--- Performance stats (last 30 days)
-CREATE VIEW IF NOT EXISTS v_performance_stats AS
+-- Performance statistics (last 30 days)
+CREATE OR REPLACE VIEW v_performance_stats AS
 SELECT 
     COUNT(*) AS total_runs,
-    SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS successful,
-    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
-    ROUND(AVG(duration_seconds), 1) AS avg_duration_sec,
-    ROUND(AVG(files_total), 0) AS avg_files,
-    ROUND(SUM(bytes_uploaded) / 1024.0 / 1024.0 / 1024.0, 2) AS total_gb_uploaded
+    SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS successful_runs,
+    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_runs,
+    ROUND(AVG(duration_sec) / 60, 2) AS avg_duration_min,
+    ROUND(SUM(bytes_uploaded) / 1024 / 1024 / 1024, 2) AS total_gb_uploaded,
+    ROUND(AVG(bytes_uploaded) / 1024 / 1024 / 1024, 2) AS avg_gb_per_run,
+    SUM(gap_backfill_mode) AS gap_backfill_count
 FROM backup_runs
-WHERE start_time >= datetime('now', '-30 days');
+WHERE started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY);
 
 -- =====================================================
--- Sample Queries (for documentation)
+-- INITIAL DATA
 -- =====================================================
-
--- Find all runs that took >1 hour:
--- SELECT start_time, snapshot_name, duration_seconds/60 AS minutes 
--- FROM backup_runs WHERE duration_seconds > 3600;
-
--- Total data uploaded per day (last 7 days):
--- SELECT DATE(start_time) AS day, SUM(bytes_uploaded)/1024/1024/1024 AS gb
--- FROM backup_runs WHERE start_time >= datetime('now', '-7 days')
--- GROUP BY day ORDER BY day;
-
--- Gap backfilling history:
--- SELECT b.start_time, g.snapshot_name, g.duration_seconds, g.files_stubbed
--- FROM gap_backfills g JOIN backup_runs b ON g.run_id = b.run_id
--- ORDER BY b.start_time DESC;
+-- (None - tables start empty)
 
 -- =====================================================
--- End of Schema (Version 1)
+-- PERMISSIONS (Reminder)
 -- =====================================================
--- Schema version is tracked at the top of this file
--- Use ./sql/migrate.sh for version management
+-- Run manually after sourcing this file:
+-- GRANT SELECT, INSERT, UPDATE, DELETE ON pcloud_backup.* TO 'pcloud_backup'@'localhost';
+-- FLUSH PRIVILEGES;
 

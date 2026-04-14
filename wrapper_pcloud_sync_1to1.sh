@@ -95,32 +95,48 @@ _log() {
   fi
 }
 
-# ========= SQLite Run-History Tracking =========
-PCLOUD_DB=${PCLOUD_DB:-/var/lib/pcloud-backup/runs.db}
-PCLOUD_ENABLE_DB=${PCLOUD_ENABLE_DB:-1}  # 1=enabled, 0=disabled
+# ========= MariaDB Run-History Tracking =========
+# Config (loaded from .env via source)
+PCLOUD_DB_HOST=${PCLOUD_DB_HOST:-localhost}
+PCLOUD_DB_PORT=${PCLOUD_DB_PORT:-3306}
+PCLOUD_DB_NAME=${PCLOUD_DB_NAME:-pcloud_backup}
+PCLOUD_DB_USER=${PCLOUD_DB_USER:-pcloud_backup}
+PCLOUD_DB_PASS=${PCLOUD_DB_PASS:-}
+PCLOUD_ENABLE_DB=${PCLOUD_ENABLE_DB:-0}  # 0=disabled (default), 1=enabled
 RUN_ID=""  # Will be set at start
 
-# Initialize database if needed
+# MySQL helper function
+_mysql() {
+  mysql -h "$PCLOUD_DB_HOST" \
+        -P "$PCLOUD_DB_PORT" \
+        -u "$PCLOUD_DB_USER" \
+        -p"$PCLOUD_DB_PASS" \
+        -D "$PCLOUD_DB_NAME" \
+        -sN \
+        -e "$@" 2>/dev/null
+}
+
+# Initialize database connection
 _db_init() {
   [[ "${PCLOUD_ENABLE_DB}" != "1" ]] && return 0
   
-  local db_dir; db_dir="$(dirname "$PCLOUD_DB")"
-  mkdir -p "$db_dir" 2>/dev/null || true
-  
-  # Use migration framework to initialize/upgrade schema
-  local migrate_script="${MAIN_DIR}/sql/migrate.sh"
-  if [[ -x "$migrate_script" ]]; then
-    _log INFO "Running database migrations: $PCLOUD_DB"
-    "$migrate_script" 2>/dev/null || {
-      _log WARN "Failed to run migrations (sqlite3 missing?)"
-      PCLOUD_ENABLE_DB=0
-      return 1
-    }
-  else
-    _log WARN "Migration script not found or not executable: $migrate_script (DB disabled)"
+  # Test connection
+  if ! _mysql "SELECT 1" >/dev/null 2>&1; then
+    _log WARN "Failed to connect to MariaDB (host=$PCLOUD_DB_HOST, db=$PCLOUD_DB_NAME) - DB tracking disabled"
     PCLOUD_ENABLE_DB=0
     return 1
   fi
+  
+  # Check if tables exist
+  local table_count; table_count=$(_mysql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$PCLOUD_DB_NAME' AND table_name='backup_runs'" 2>/dev/null || echo "0")
+  
+  if [[ "$table_count" == "0" ]]; then
+    _log WARN "Table backup_runs not found in database $PCLOUD_DB_NAME - run: mysql < sql/init_pcloud_db.sql"
+    PCLOUD_ENABLE_DB=0
+    return 1
+  fi
+  
+  _log INFO "MariaDB connection OK (database: $PCLOUD_DB_NAME)"
 }
 
 # Log backup run start
@@ -128,21 +144,12 @@ _db_run_start() {
   [[ "${PCLOUD_ENABLE_DB}" != "1" ]] && return 0
   
   local snapshot="$1"
-  local snapshot_path="$2"
   RUN_ID="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-$$")"
   
-  sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
-INSERT INTO backup_runs (
-  run_id, start_time, status, snapshot_name, snapshot_path, hostname
-) VALUES (
-  '${RUN_ID}',
-  datetime('now'),
-  'RUNNING',
-  '${snapshot}',
-  '${snapshot_path}',
-  '$(hostname)'
-);
-SQL
+  _mysql "INSERT INTO backup_runs (run_id, snapshot_name, status, started_at) VALUES ('${RUN_ID}', '${snapshot}', 'RUNNING', NOW());" || {
+    _log WARN "Failed to log run start to database"
+    return 1
+  }
   
   export RUN_ID
   _log INFO "Run ID: $RUN_ID"
@@ -153,18 +160,15 @@ _db_run_end() {
   [[ "${PCLOUD_ENABLE_DB}" != "1" || -z "$RUN_ID" ]] && return 0
   
   local status="$1"
-  local exit_code="${2:-0}"
-  local error_msg="${3:-}"
+  local error_msg="${2:-}"
   
-  sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
-UPDATE backup_runs SET
-  end_time = datetime('now'),
-  duration_seconds = CAST((julianday('now') - julianday(start_time)) * 86400 AS INTEGER),
-  status = '${status}',
-  exit_code = ${exit_code},
-  error_message = '${error_msg//\'/\'\'}'
-WHERE run_id = '${RUN_ID}';
-SQL
+  # Escape single quotes for SQL
+  error_msg="${error_msg//\'/\'\\''}"
+  
+  _mysql "UPDATE backup_runs SET status='${status}', finished_at=NOW(), duration_sec=TIMESTAMPDIFF(SECOND, started_at, NOW()), error_message='${error_msg}' WHERE run_id='${RUN_ID}';" || {
+    _log WARN "Failed to log run end to database"
+    return 1
+  }
 }
 
 # Log phase timing
@@ -173,35 +177,22 @@ _db_phase_log() {
   
   local phase="$1"
   local action="${2:-start}"  # start/end
-  local status="${3:-RUNNING}"
-  local metrics="${4:-}"
+  local status="${3:-SUCCESS}"
   
   if [[ "$action" == "start" ]]; then
-    sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
-INSERT INTO backup_phases (run_id, phase_name, start_time, status)
-VALUES ('${RUN_ID}', '${phase}', datetime('now'), 'RUNNING');
-SQL
+    _mysql "INSERT INTO backup_phases (run_id, phase_name, status, started_at) VALUES ('${RUN_ID}', '${phase}', 'RUNNING', NOW());" 2>/dev/null || true
   else
-    sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
-UPDATE backup_phases SET
-  end_time = datetime('now'),
-  duration_seconds = CAST((julianday('now') - julianday(start_time)) * 86400 AS INTEGER),
-  status = '${status}',
-  metrics = '${metrics//\'/\'\'}'
-WHERE run_id = '${RUN_ID}' AND phase_name = '${phase}' AND end_time IS NULL;
-SQL
+    _mysql "UPDATE backup_phases SET finished_at=NOW(), duration_sec=TIMESTAMPDIFF(SECOND, started_at, NOW()), status='${status}' WHERE run_id='${RUN_ID}' AND phase_name='${phase}' AND finished_at IS NULL;" 2>/dev/null || true
   fi
 }
 
-# Update run metrics
+# Update run metrics (pass SQL SET clause fragments)
 _db_update_metrics() {
   [[ "${PCLOUD_ENABLE_DB}" != "1" || -z "$RUN_ID" ]] && return 0
   
   local updates="$*"
   
-  sqlite3 "$PCLOUD_DB" <<SQL 2>/dev/null || true
-UPDATE backup_runs SET ${updates} WHERE run_id = '${RUN_ID}';
-SQL
+  _mysql "UPDATE backup_runs SET ${updates} WHERE run_id='${RUN_ID}';" 2>/dev/null || true
 }
 
 require_file(){

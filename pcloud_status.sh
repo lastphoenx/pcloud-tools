@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =====================================================
-# pCloud Backup Status Dashboard
+# pCloud Backup Status Dashboard (MariaDB)
 # =====================================================
-# Purpose: Query run history from SQLite DB and display status
+# Purpose: Query run history from MariaDB and display status
 # Usage:
 #   ./pcloud_status.sh                  # Show last 10 runs
 #   ./pcloud_status.sh --last-n 20      # Show last 20 runs
@@ -15,7 +15,21 @@
 set -euo pipefail
 
 # Configuration
-PCLOUD_DB="${PCLOUD_DB:-/var/lib/pcloud-backup/runs.db}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+
+# Load .env if exists
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+PCLOUD_DB_HOST="${PCLOUD_DB_HOST:-localhost}"
+PCLOUD_DB_PORT="${PCLOUD_DB_PORT:-3306}"
+PCLOUD_DB_NAME="${PCLOUD_DB_NAME:-pcloud_backup}"
+PCLOUD_DB_USER="${PCLOUD_DB_USER:-pcloud_backup}"
+PCLOUD_DB_PASS="${PCLOUD_DB_PASS:-}"
+
 MODE="${1:-recent}"
 ARG="${2:-10}"
 
@@ -28,224 +42,206 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
-# Check if DB exists
-if [[ ! -f "$PCLOUD_DB" ]]; then
-  echo "⚠️  Database not found: $PCLOUD_DB"
-  echo "Run at least one backup to initialize the database."
+# MySQL helper
+_mysql() {
+  mysql -h "$PCLOUD_DB_HOST" \
+        -P "$PCLOUD_DB_PORT" \
+        -u "$PCLOUD_DB_USER" \
+        -p"$PCLOUD_DB_PASS" \
+        -D "$PCLOUD_DB_NAME" \
+        -sN \
+        -e "$@" 2>/dev/null
+}
+
+# Check if DB connection works
+if ! _mysql "SELECT 1" >/dev/null 2>&1; then
+  echo -e "${RED}ERROR: Cannot connect to MariaDB${NC}"
+  echo ""
+  echo "Database: $PCLOUD_DB_NAME@$PCLOUD_DB_HOST:$PCLOUD_DB_PORT"
+  echo "User: $PCLOUD_DB_USER"
+  echo ""
+  echo "Checks:"
+  echo "  1. Is MariaDB running? (sudo systemctl status mariadb)"
+  echo "  2. Does database exist? (mysql -u root -p -e 'SHOW DATABASES;')"
+  echo "  3. Are credentials in .env correct?"
+  echo "  4. Has schema been initialized? (mysql < sql/init_pcloud_db.sql)"
   exit 1
 fi
 
-# Check if sqlite3 is available
-if ! command -v sqlite3 &>/dev/null; then
-  echo "⚠️  sqlite3 command not found. Install with: sudo apt install sqlite3"
-  exit 1
-fi
+# Helper: Format bytes to human-readable
+format_bytes() {
+  local bytes="$1"
+  if [[ "$bytes" -lt 1024 ]]; then
+    echo "${bytes} B"
+  elif [[ "$bytes" -lt 1048576 ]]; then
+    echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1024}") KB"
+  elif [[ "$bytes" -lt 1073741824 ]]; then
+    echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1048576}") MB"
+  else
+    echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1073741824}") GB"
+  fi
+}
 
-# Helper: Format duration
+# Helper: Format duration to human-readable
 format_duration() {
   local seconds="$1"
   if [[ -z "$seconds" || "$seconds" == "NULL" ]]; then
     echo "N/A"
-  elif (( seconds < 60 )); then
-    echo "${seconds}s"
-  elif (( seconds < 3600 )); then
-    printf "%dm %ds" $((seconds / 60)) $((seconds % 60))
+    return
+  fi
+  
+  local hours=$((seconds / 3600))
+  local mins=$(((seconds % 3600) / 60))
+  local secs=$((seconds % 60))
+  
+  if [[ $hours -gt 0 ]]; then
+    printf "%dh %dm %ds" "$hours" "$mins" "$secs"
+  elif [[ $mins -gt 0 ]]; then
+    printf "%dm %ds" "$mins" "$secs"
   else
-    printf "%dh %dm" $((seconds / 3600)) $(( (seconds % 3600) / 60 ))
+    printf "%ds" "$secs"
   fi
 }
 
-# Helper: Format bytes
-format_bytes() {
-  local bytes="$1"
-  if [[ -z "$bytes" || "$bytes" == "NULL" || "$bytes" == "0" ]]; then
-    echo "0 B"
-  elif (( bytes < 1024 )); then
-    echo "${bytes} B"
-  elif (( bytes < 1048576 )); then
-    printf "%.1f KB" "$(bc -l <<< "$bytes / 1024")"
-  elif (( bytes < 1073741824 )); then
-    printf "%.1f MB" "$(bc -l <<< "$bytes / 1048576")"
-  else
-    printf "%.2f GB" "$(bc -l <<< "$bytes / 1073741824")"
-  fi
-}
-
-# Helper: Status color
-status_color() {
-  case "$1" in
-    SUCCESS) echo -e "${GREEN}✓ SUCCESS${NC}" ;;
-    RUNNING) echo -e "${CYAN}⏳ RUNNING${NC}" ;;
-    FAILED) echo -e "${RED}✗ FAILED${NC}" ;;
-    PARTIAL) echo -e "${YELLOW}⚠ PARTIAL${NC}" ;;
-    *) echo "$1" ;;
+# Helper: Colorize status
+colorize_status() {
+  local status="$1"
+  case "$status" in
+    SUCCESS) echo -e "${GREEN}${status}${NC}" ;;
+    FAILED) echo -e "${RED}${status}${NC}" ;;
+    RUNNING) echo -e "${CYAN}${status}${NC}" ;;
+    *) echo "$status" ;;
   esac
 }
 
-# ==================================================
-# MODE: recent (default - show last N runs)
-# ==================================================
-show_recent() {
-  local limit="${1:-10}"
+# =====================================================
+# MODE: Recent Backups
+# =====================================================
+if [[ "$MODE" == "recent" || "$MODE" == "--last-n" ]]; then
+  LIMIT="${ARG}"
   
-  echo -e "${BOLD}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}║          pCloud Backup Status - Last $limit Runs                                 ║${NC}"
-  echo -e "${BOLD}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
+  echo -e "${BOLD}pCloud Backup Status - Last ${LIMIT} Runs${NC}"
+  echo "========================================"
+  echo ""
   
-  # Header
-  printf "${BOLD}%-20s %-10s %-25s %-10s %-8s %-10s${NC}\n" \
-    "Start Time" "Status" "Snapshot" "Duration" "Files" "Uploaded"
-  echo -e "${BOLD}────────────────────────────────────────────────────────────────────────────${NC}"
-  
- sqlite3 "$PCLOUD_DB" <<SQL | while IFS='|' read -r start status snapshot duration files uploaded gaps; do
-SELECT 
-  datetime(start_time, 'localtime') AS start,
-  status,
-  snapshot_name,
-  COALESCE(duration_seconds, 0) AS duration,
-  COALESCE(files_total, 0) AS files,
-  COALESCE(bytes_uploaded, 0) AS bytes,
-  COALESCE(gaps_backfilled, 0) AS gaps
-FROM backup_runs
-ORDER BY start_time DESC
-LIMIT $limit;
-SQL
-    local status_col; status_col="$(status_color "$status")"
-    local duration_fmt; duration_fmt="$(format_duration "$duration")"
-    local uploaded_fmt; uploaded_fmt="$(format_bytes "$uploaded")"
+  # Query recent runs
+  _mysql "SELECT run_id, snapshot_name, status, started_at, finished_at, duration_sec, files_uploaded, bytes_uploaded 
+    FROM backup_runs 
+    ORDER BY started_at DESC 
+    LIMIT $LIMIT" | while IFS=$'\t' read -r run_id snapshot status started finished duration files bytes; do
     
-    # Highlight gaps
-    local gap_info=""
-    if [[ "$gaps" != "0" && "$gaps" != "NULL" ]]; then
-      gap_info=" ${YELLOW}(+$gaps gaps)${NC}"
-    fi
+    echo -e "${BOLD}Run ID:${NC} $run_id"
+    echo "  Snapshot: $snapshot"
+    echo -e "  Status: $(colorize_status "$status")"
+    echo "  Started: $started"
+    echo "  Finished: ${finished:-N/A}"
+    echo "  Duration: $(format_duration "$duration")"
+    echo "  Files: ${files:-0}"
+    echo "  Bytes: $(format_bytes "${bytes:-0}")"
+    echo ""
+  done
+
+# =====================================================
+# MODE: Failures Only
+# =====================================================
+elif [[ "$MODE" == "--failures" ]]; then
+  echo -e "${BOLD}pCloud Backup Status - Recent Failures${NC}"
+  echo "========================================"
+  echo ""
+  
+  _mysql "SELECT run_id, snapshot_name, started_at, error_message 
+    FROM backup_runs 
+    WHERE status='FAILED' 
+    ORDER BY started_at DESC 
+    LIMIT 20" | while IFS=$'\t' read -r run_id snapshot started error; do
     
-    printf "%-20s %-22s %-25s %-10s %-8s %-10s%s\n" \
-      "${start:0:16}" "$status_col" "${snapshot:0:25}" \
-      "$duration_fmt" "$files" "$uploaded_fmt" "$gap_info"
+    echo -e "${RED}✗${NC} ${BOLD}$snapshot${NC} ($(date -d "$started" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$started"))"
+    echo "  Run ID: $run_id"
+    echo "  Error: ${error:-Unknown error}"
+    echo ""
   done
-  
-  echo -e "${BOLD}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-}
 
-# ==================================================
-# MODE: failures (show only failed backups)
-# ==================================================
-show_failures() {
-  echo -e "${BOLD}${RED}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${RED}║                    pCloud Backup Failures                                  ║${NC}"
-  echo -e "${BOLD}${RED}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
-  
-  local count; count=$(sqlite3 "$PCLOUD_DB" "SELECT COUNT(*) FROM backup_runs WHERE status = 'FAILED';")
-  
-  if [[ "$count" == "0" ]]; then
-    echo -e "${GREEN}✓ No failures recorded!${NC}"
-    echo -e "${BOLD}${RED}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-    return
-  fi
-  
-  printf "${BOLD}%-20s %-25s %-10s %s${NC}\n" \
-    "Timestamp" "Snapshot" "Exit Code" "Error"
-  echo -e "${BOLD}────────────────────────────────────────────────────────────────────────────${NC}"
-  
-  sqlite3 "$PCLOUD_DB" <<SQL | while IFS='|' read -r ts snapshot code error; do
-SELECT 
-  datetime(start_time, 'localtime') AS ts,
-  snapshot_name,
-  COALESCE(exit_code, 'N/A') AS code,
-  COALESCE(SUBSTR(error_message, 1, 40), 'No error message') AS error
-FROM backup_runs
-WHERE status = 'FAILED'
-ORDER BY start_time DESC;
-SQL
-    printf "${RED}%-20s %-25s %-10s %s${NC}\n" \
-      "${ts:0:16}" "${snapshot:0:25}" "$code" "${error:0:40}"
-  done
-  
-  echo -e "${BOLD}${RED}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-}
-
-# ==================================================
-# MODE: stats (30-day statistics)
-# ==================================================
-show_stats() {
-  echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║          pCloud Backup Statistics (Last 30 Days)                           ║${NC}"
-  echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
+# =====================================================
+# MODE: Statistics
+# =====================================================
+elif [[ "$MODE" == "--stats" ]]; then
+  echo -e "${BOLD}pCloud Backup Statistics (Last 30 Days)${NC}"
+  echo "========================================"
+  echo ""
   
   # Query stats
-  sqlite3 "$PCLOUD_DB" <<SQL | while IFS='|' read -r total success failed avg_dur avg_files total_gb; do
-SELECT 
-  COUNT(*) AS total,
-  SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS success,
-  SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
-  ROUND(AVG(duration_seconds), 1) AS avg_dur,
-  ROUND(AVG(files_total), 0) AS avg_files,
-  ROUND(SUM(bytes_uploaded) / 1024.0 / 1024.0 / 1024.0, 2) AS total_gb
-FROM backup_runs
-WHERE start_time >= datetime('now', '-30 days');
-SQL
-    local success_rate=0
-    if [[ "$total" != "0" ]]; then
-      success_rate=$(bc -l <<< "scale=1; ($success / $total) * 100")
-    fi
+  read -r total success failed avg_dur total_gb avg_gb gaps < <(_mysql "SELECT 
+    COUNT(*) AS total_runs,
+    SUM(CASE WHEN status='SUCCESS' THEN 1 ELSE 0 END) AS successful,
+    SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed,
+    ROUND(AVG(duration_sec)/60, 2) AS avg_duration_min,
+    ROUND(SUM(bytes_uploaded)/1073741824, 2) AS total_gb,
+    ROUND(AVG(bytes_uploaded)/1073741824, 2) AS avg_gb,
+    SUM(gap_backfill_mode) AS gaps
+    FROM backup_runs 
+    WHERE started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")
+  
+  echo "  Total Runs: $total"
+  echo -e "  Successful: ${GREEN}$success${NC}"
+  echo -e "  Failed: ${RED}$failed${NC}"
+  echo "  Success Rate: $(awk "BEGIN {printf \"%.1f%%\", ($success/$total)*100}" 2>/dev/null || echo "N/A")"
+  echo ""
+  echo "  Average Duration: ${avg_dur} minutes"
+  echo "  Total Data: ${total_gb} GB"
+  echo "  Average per Run: ${avg_gb} GB"
+  echo "  Gap Backfills: $gaps"
+  echo ""
+
+# =====================================================
+# MODE: Current Running Backup
+# =====================================================
+elif [[ "$MODE" == "--current" ]]; then
+  echo -e "${BOLD}pCloud Backup Status - Currently Running${NC}"
+  echo "========================================"
+  echo ""
+  
+  running=$(_mysql "SELECT run_id, snapshot_name, started_at, TIMESTAMPDIFF(SECOND, started_at, NOW()) AS elapsed 
+    FROM backup_runs 
+    WHERE status='RUNNING' 
+    ORDER BY started_at DESC 
+    LIMIT 1" || echo "")
+  
+  if [[ -z "$running" ]]; then
+    echo "No backup currently running."
+  else
+    read -r run_id snapshot started elapsed <<< "$running"
+    echo -e "${CYAN}●${NC} ${BOLD}Backup in progress${NC}"
+    echo "  Snapshot: $snapshot"
+    echo "  Run ID: $run_id"
+    echo "  Started: $started"
+    echo "  Elapsed: $(format_duration "$elapsed")"
+    echo ""
     
-    echo -e "Total Runs:          ${BOLD}$total${NC}"
-    echo -e "Successful:          ${GREEN}$success${NC} (${success_rate}%)"
-    echo -e "Failed:              ${RED}$failed${NC}"
-    echo -e "Avg Duration:        $(format_duration "${avg_dur%.*}")"
-    echo -e "Avg Files/Backup:    ${BOLD}$avg_files${NC}"
-    echo -e "Total Data Uploaded: ${BOLD}${total_gb} GB${NC}"
-  done
-  
-  echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-}
-
-# ==================================================
-# MODE: current (show running backup)
-# ==================================================
-show_current() {
-  echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║                    Currently Running Backup                                ║${NC}"
-  echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
-  
-  local running; running=$(sqlite3 "$PCLOUD_DB" "SELECT COUNT(*) FROM backup_runs WHERE status = 'RUNNING';")
-  
-  if [[ "$running" == "0" ]]; then
-    echo -e "${YELLOW}⏸  No backup currently running${NC}"
-    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-    return
+    # Show phases
+    echo "Phases:"
+    _mysql "SELECT phase_name, status, started_at, finished_at 
+      FROM backup_phases 
+      WHERE run_id='$run_id' 
+      ORDER BY started_at" | while IFS=$'\t' read -r phase status phase_start phase_end; do
+      
+      if [[ "$status" == "RUNNING" ]]; then
+        echo -e "  ${CYAN}▶${NC} $phase (running...)"
+      elif [[ "$status" == "SUCCESS" ]]; then
+        echo -e "  ${GREEN}✓${NC} $phase (done)"
+      else
+        echo -e "  ${RED}✗${NC} $phase (failed)"
+      fi
+    done
   fi
-  
-  sqlite3 "$PCLOUD_DB" <<SQL | while IFS='|' read -r run_id start snapshot elapsed phases; do
-SELECT 
-  run_id,
-  datetime(start_time, 'localtime') AS start,
-  snapshot_name,
-  CAST((julianday('now') - julianday(start_time)) * 86400 AS INTEGER) AS elapsed,
-  (SELECT GROUP_CONCAT(phase_name || ':' || status, ', ') FROM backup_phases WHERE run_id = backup_runs.run_id) AS phases
-FROM backup_runs
-WHERE status = 'RUNNING'
-ORDER BY start_time DESC
-LIMIT 1;
-SQL
-    echo -e "Run ID:      ${BOLD}$run_id${NC}"
-    echo -e "Snapshot:    ${BOLD}$snapshot${NC}"
-    echo -e "Started:     $start"
-    echo -e "Elapsed:     $(format_duration "$elapsed")"
-    echo -e "Phases:      $phases"
-  done
-  
-  echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-}
+  echo ""
 
-# ==================================================
-# MODE: html (generate HTML dashboard)
-# ==================================================
-generate_html() {
-  local output="$1"
+# =====================================================
+# MODE: HTML Dashboard
+# =====================================================
+elif [[ "$MODE" == "html" ]]; then
+  OUTPUT="${ARG:-dashboard.html}"
   
-  cat > "$output" <<'HTML_HEADER'
+  cat > "$OUTPUT" <<'HTML_HEADER'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -254,84 +250,68 @@ generate_html() {
   <meta http-equiv="refresh" content="300">
   <title>pCloud Backup Dashboard</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background: #0a0e1a; color: #e2e8f0; margin: 0; padding: 2rem; }
-    h1 { background: linear-gradient(135deg, #10b981 0%, #3b82f6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    table { width: 100%; border-collapse: collapse; background: #111827; border-radius: 8px; overflow: hidden; margin: 1rem 0; }
-    th { background: #1a1f2e; padding: 0.75rem; text-align: left; color: #10b981; font-weight: 600; }
-    td { padding: 0.75rem; border-bottom: 1px solid #1e2530; }
-    tr:last-child td { border-bottom: none; }
-    .success { color: #10b981; }
-    .failed { color: #ef4444; }
-    .running { color: #60a5fa; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 2rem 0; }
-    .stat-card { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 1rem; }
-    .stat-value { font-size: 2rem; font-weight: 700; background: linear-gradient(135deg, #10b981 0%, #3b82f6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .stat-label { color: #9ca3af; font-size: 0.85rem; text-transform: uppercase; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px; }
+    h1 { margin-bottom: 20px; color: #4CAF50; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+    .stat-card { background: #2a2a2a; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+    .stat-card h3 { font-size: 14px; color: #999; margin-bottom: 10px; }
+    .stat-card .value { font-size: 32px; font-weight: bold; color: #4CAF50; }
+    table { width: 100%; border-collapse: collapse; background: #2a2a2a; border-radius: 8px; overflow: hidden; }
+    th { background: #333; color: #4CAF50; padding: 15px; text-align: left; font-weight: 600; }
+    td { padding: 12px 15px; border-bottom: 1px solid #3a3a3a; }
+    tr:hover { background: #333; }
+    .status-success { color: #4CAF50; font-weight: bold; }
+    .status-failed { color: #f44336; font-weight: bold; }
+    .status-running { color: #2196F3; font-weight: bold; }
   </style>
 </head>
 <body>
+  <h1>📊 pCloud Backup Dashboard</h1>
 HTML_HEADER
 
-  # Stats
-  sqlite3 "$PCLOUD_DB" <<SQL >> "$output"
-.mode html
-SELECT '<h1>pCloud Backup Dashboard</h1>';
-SELECT '<p style="color: #9ca3af;">Last updated: ' || datetime('now', 'localtime') || '</p>';
+  # Stats cards
+  read -r total success failed avg_dur total_gb < <(_mysql "SELECT COUNT(*), SUM(CASE WHEN status='SUCCESS' THEN 1 ELSE 0 END), SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END), ROUND(AVG(duration_sec)/60,1), ROUND(SUM(bytes_uploaded)/1073741824,2) FROM backup_runs WHERE started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")
+  
+  cat >> "$OUTPUT" <<EOF
+  <div class="stats">
+    <div class="stat-card"><h3>Total Runs (30d)</h3><div class="value">$total</div></div>
+    <div class="stat-card"><h3>Successful</h3><div class="value" style="color:#4CAF50">$success</div></div>
+    <div class="stat-card"><h3>Failed</h3><div class="value" style="color:#f44336">$failed</div></div>
+    <div class="stat-card"><h3>Avg Duration</h3><div class="value">${avg_dur}m</div></div>
+    <div class="stat-card"><h3>Total Data</h3><div class="value">${total_gb} GB</div></div>
+  </div>
+  
+  <h2>Recent Backups</h2>
+  <table>
+    <tr><th>Snapshot</th><th>Status</th><th>Started</th><th>Duration</th><th>Files</th><th>Size</th></tr>
+EOF
 
-SELECT '<div class="stats">';
-SELECT '<div class="stat-card"><div class="stat-label">Total Runs (30d)</div><div class="stat-value">' || COUNT(*) || '</div></div>' FROM backup_runs WHERE start_time >= datetime('now', '-30 days');
-SELECT '<div class="stat-card"><div class="stat-label">Success Rate</div><div class="stat-value">' || ROUND((CAST(SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*)) * 100, 1) || '%</div></div>' FROM backup_runs WHERE start_time >= datetime('now', '-30 days');
-SELECT '<div class="stat-card"><div class="stat-label">Total Uploaded (30d)</div><div class="stat-value">' || ROUND(SUM(bytes_uploaded) / 1024.0 / 1024.0 / 1024.0, 1) || ' GB</div></div>' FROM backup_runs WHERE start_time >= datetime('now', '-30 days');
-SELECT '<div class="stat-card"><div class="stat-label">Avg Duration</div><div class="stat-value">' || ROUND(AVG(duration_seconds) / 60, 0) || ' min</div></div>' FROM backup_runs WHERE start_time >= datetime('now', '-30 days');
-SELECT '</div>';
-
-SELECT '<h2>Recent Backups (Last 20)</h2>';
-SELECT '<table><tr><th>Timestamp</th><th>Status</th><th>Snapshot</th><th>Duration</th><th>Files</th><th>Uploaded</th></tr>';
-SELECT 
-  '<tr><td>' || datetime(start_time, 'localtime') || '</td>' ||
-  '<td class="' || LOWER(status) || '">' || status || '</td>' ||
-  '<td>' || snapshot_name || '</td>' ||
-  '<td>' || COALESCE(ROUND(duration_seconds / 60.0, 1) || ' min', 'N/A') || '</td>' ||
-  '<td>' || COALESCE(files_total, 0) || '</td>' ||
-  '<td>' || ROUND(COALESCE(bytes_uploaded, 0) / 1024.0 / 1024.0, 1) || ' MB</td></tr>'
-FROM backup_runs
-ORDER BY start_time DESC
-LIMIT 20;
-SELECT '</table>';
-SQL
-
-  cat >> "$output" <<'HTML_FOOTER'
+  # Recent runs table
+  _mysql "SELECT snapshot_name, status, started_at, duration_sec, files_uploaded, bytes_uploaded FROM backup_runs ORDER BY started_at DESC LIMIT 20" | while IFS=$'\t' read -r snapshot status started duration files bytes; do
+    status_class="status-${status,,}"
+    cat >> "$OUTPUT" <<EOF
+    <tr>
+      <td>$snapshot</td>
+      <td class="$status_class">$status</td>
+      <td>$started</td>
+      <td>$(format_duration "$duration")</td>
+      <td>${files:-0}</td>
+      <td>$(format_bytes "${bytes:-0}")</td>
+    </tr>
+EOF
+  done
+  
+  cat >> "$OUTPUT" <<'HTML_FOOTER'
+  </table>
+  <p style="margin-top:20px; color:#666; font-size:12px;">Auto-refresh every 5 minutes</p>
 </body>
 </html>
 HTML_FOOTER
 
-  echo "✓ HTML dashboard generated: $output"
-}
+  echo "HTML dashboard generated: $OUTPUT"
 
-# ==================================================
-# Main
-# ==================================================
-case "$MODE" in
-  --last-n)
-    show_recent "$ARG"
-    ;;
-  --failures)
-    show_failures
-    ;;
-  --stats)
-    show_stats
-    ;;
-  --current)
-    show_current
-    ;;
-  html)
-    if [[ -z "$ARG" ]]; then
-      echo "Usage: $0 html OUTPUT.html"
-      exit 1
-    fi
-    generate_html "$ARG"
-    ;;
-  recent|*)
-    show_recent 10
-    ;;
-esac
+else
+  echo "Usage: $0 [recent|--last-n N|--failures|--stats|--current|html OUTPUT.html]"
+  exit 1
+fi
