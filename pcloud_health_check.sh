@@ -328,29 +328,34 @@ check_disk_space() {
     
     # --- Individual SSDs with folder breakdown ---
     if [[ $VERBOSE -eq 1 ]]; then
-      # Get top-level folders in /srv/nas
-      local nas_folders
-      nas_folders=$(ls -1 /srv/nas 2>/dev/null | head -n 5 | tr '\n' ', ' | sed 's/, $//')
-      [[ -z "$nas_folders" ]] && nas_folders="(empty)"
-      
-      # SSD1
+      # SSD1 - show actual physical folders on this SSD
       if [[ -d "/mnt/ssd1" ]]; then
         local ssd1_info
         ssd1_info=$(df -h /mnt/ssd1 | tail -n 1)
         local ssd1_used_pct=$(echo "$ssd1_info" | awk '{print $5}' | tr -d '%')
         local ssd1_avail=$(echo "$ssd1_info" | awk '{print $4}')
+        
+        local ssd1_folders
+        ssd1_folders=$(ls -1 /mnt/ssd1 2>/dev/null | head -n 5 | tr '\n' ', ' | sed 's/, $//')
+        [[ -z "$ssd1_folders" ]] && ssd1_folders="(empty)"
+        
         echo "    ├─ SSD1 (/mnt/ssd1): ${ssd1_used_pct}% used, ${ssd1_avail} available"
-        echo "    │  (/srv/nas/: $nas_folders)"
+        echo "    │  Physical folders: $ssd1_folders"
       fi
       
-      # SSD2
+      # SSD2 - show actual physical folders on this SSD
       if [[ -d "/mnt/ssd2" ]]; then
         local ssd2_info
         ssd2_info=$(df -h /mnt/ssd2 | tail -n 1)
         local ssd2_used_pct=$(echo "$ssd2_info" | awk '{print $5}' | tr -d '%')
         local ssd2_avail=$(echo "$ssd2_info" | awk '{print $4}')
+        
+        local ssd2_folders
+        ssd2_folders=$(ls -1 /mnt/ssd2 2>/dev/null | head -n 5 | tr '\n' ', ' | sed 's/, $//')
+        [[ -z "$ssd2_folders" ]] && ssd2_folders="(empty)"
+        
         echo "    └─ SSD2 (/mnt/ssd2): ${ssd2_used_pct}% used, ${ssd2_avail} available"
-        echo "       (/srv/nas/: $nas_folders)"
+        echo "       Physical folders: $ssd2_folders"
       fi
     fi
   fi
