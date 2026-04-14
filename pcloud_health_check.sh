@@ -284,52 +284,80 @@ check_pcloud_quota() {
 }
 
 # =====================================================
-# CHECK 3: Disk Space (/srv - mergerfs)
+# CHECK 3: Disk Space (RTB Source + Staging Pool)
 # =====================================================
 check_disk_space() {
-  [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[3] Disk Space (temp storage)${NC}"
+  [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[3] Disk Space${NC}"
   
-  # Check mergerfs pool /srv/nas (Samsung SSDs 1:2 pool)
-  # Priority: Monitor the SSDs where backups will be staged, not external USB drives
-  local check_path="/srv/nas"
+  local overall_status=0
   
-  # Fallback to individual SSD mounts if mergerfs is not available
-  if [[ ! -d "$check_path" ]]; then
-    for fallback in "/mnt/ssd1" "/mnt/ssd2" "/srv"; do
-      if [[ -d "$fallback" ]]; then
-        check_path="$fallback"
-        break
-      fi
-    done
+  # --- RTB Source ---
+  if [[ -d "/mnt/backup" ]]; then
+    local rtb_info
+    rtb_info=$(df -h /mnt/backup | tail -n 1)
+    local rtb_used_pct=$(echo "$rtb_info" | awk '{print $5}' | tr -d '%')
+    local rtb_avail=$(echo "$rtb_info" | awk '{print $4}')
+    
+    [[ $VERBOSE -eq 1 ]] && echo "  RTB Source (/mnt/backup): ${rtb_used_pct}% used, ${rtb_avail} available"
+    
+    if [[ $((100 - rtb_used_pct)) -lt 5 ]]; then
+      log_issue "WARNING" "RTB source space low: ${rtb_used_pct}% used"
+      overall_status=1
+    fi
   fi
   
-  # Get disk usage via df
-  local disk_info
-  disk_info=$(df -h "$check_path" | tail -n 1)
+  # --- Staging Pool (mergerfs) ---
+  if [[ -d "/srv/nas" ]]; then
+    local staging_info
+    staging_info=$(df -h /srv/nas | tail -n 1)
+    local staging_used_pct=$(echo "$staging_info" | awk '{print $5}' | tr -d '%')
+    local staging_avail=$(echo "$staging_info" | awk '{print $4}')
+    
+    [[ $VERBOSE -eq 1 ]] && echo "  Staging Pool (/srv/nas mergerfs 1:2): ${staging_used_pct}% used, ${staging_avail} available"
+    
+    # Check threshold for staging area
+    local staging_free_pct=$((100 - staging_used_pct))
+    if [[ $staging_free_pct -lt 5 ]]; then
+      log_issue "CRITICAL" "Staging pool critically low: ${staging_free_pct}% free (${staging_avail} available)"
+      set_status 2
+      overall_status=2
+    elif [[ $staging_free_pct -lt $DISK_WARNING_PERCENT ]]; then
+      log_issue "WARNING" "Staging pool running low: ${staging_free_pct}% free (${staging_avail} available)"
+      [[ $overall_status -lt 1 ]] && set_status 1 && overall_status=1
+    fi
+    
+    # --- Individual SSDs with folder breakdown ---
+    if [[ $VERBOSE -eq 1 ]]; then
+      # Get top-level folders in /srv/nas
+      local nas_folders
+      nas_folders=$(ls -1 /srv/nas 2>/dev/null | head -n 5 | tr '\n' ', ' | sed 's/, $//')
+      [[ -z "$nas_folders" ]] && nas_folders="(empty)"
+      
+      # SSD1
+      if [[ -d "/mnt/ssd1" ]]; then
+        local ssd1_info
+        ssd1_info=$(df -h /mnt/ssd1 | tail -n 1)
+        local ssd1_used_pct=$(echo "$ssd1_info" | awk '{print $5}' | tr -d '%')
+        local ssd1_avail=$(echo "$ssd1_info" | awk '{print $4}')
+        echo "    ├─ SSD1 (/mnt/ssd1): ${ssd1_used_pct}% used, ${ssd1_avail} available"
+        echo "    │  (/srv/nas/: $nas_folders)"
+      fi
+      
+      # SSD2
+      if [[ -d "/mnt/ssd2" ]]; then
+        local ssd2_info
+        ssd2_info=$(df -h /mnt/ssd2 | tail -n 1)
+        local ssd2_used_pct=$(echo "$ssd2_info" | awk '{print $5}' | tr -d '%')
+        local ssd2_avail=$(echo "$ssd2_info" | awk '{print $4}')
+        echo "    └─ SSD2 (/mnt/ssd2): ${ssd2_used_pct}% used, ${ssd2_avail} available"
+        echo "       (/srv/nas/: $nas_folders)"
+      fi
+    fi
+  fi
   
-  # Extract mount point to show user which filesystem we're checking
-  local mount_point
-  mount_point=$(echo "$disk_info" | awk '{print $6}')
-  
-  local disk_used_percent
-  disk_used_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%')
-  
-  local disk_avail
-  disk_avail=$(echo "$disk_info" | awk '{print $4}')
-  
-  [[ $VERBOSE -eq 1 ]] && echo "  Mount: $mount_point | Usage: ${disk_used_percent}% | Available: ${disk_avail}"
-  
-  # Check thresholds (inverted: high usage = problem)
-  local disk_free_percent=$((100 - disk_used_percent))
-  
-  if [[ $disk_free_percent -lt 5 ]]; then
-    log_issue "CRITICAL" "Disk space critically low: ${disk_free_percent}% free (${disk_avail} available)"
-    set_status 2
-  elif [[ $disk_free_percent -lt $DISK_WARNING_PERCENT ]]; then
-    log_issue "WARNING" "Disk space running low: ${disk_free_percent}% free (${disk_avail} available)"
-    set_status 1
-  else
-    log_issue "OK" "Disk space healthy: ${disk_free_percent}% free (${disk_avail} available)"
+  # Final status if everything healthy
+  if [[ $overall_status -eq 0 ]]; then
+    log_issue "OK" "Disk space healthy on all volumes"
   fi
 }
 
