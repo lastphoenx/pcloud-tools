@@ -106,7 +106,7 @@ check_systemd_service() {
   # Get next run time (for timer-based services)
   local next_run="N/A"
   if systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | grep -q "${service_name}.timer"; then
-    next_run=$(systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | awk '{print $1, $2}' | head -1 || echo "N/A")
+    next_run=$(systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | awk '{print $1, $2, $3, $4}' | head -1 || echo "N/A")
   fi
   
   # Escape message for JSON
@@ -224,9 +224,9 @@ check_rtb_wrapper() {
   
   # Optional: Live Safety-Gate check (current status, not historical)
   local live_safety_gate="N/A"
-  if [[ -x "/opt/apps/entropywatcher/safety_gate.sh" ]] && [[ "$status" != "running" ]]; then
+  if [[ -x "/opt/apps/entropywatcher/main/safety_gate.sh" ]] && [[ "$status" != "running" ]]; then
     # Only check if not currently running to avoid conflicts
-    if /opt/apps/entropywatcher/safety_gate.sh &>/dev/null; then
+    if /opt/apps/entropywatcher/main/safety_gate.sh &>/dev/null; then
       live_safety_gate="GREEN"
     else
       local sg_exit=$?
