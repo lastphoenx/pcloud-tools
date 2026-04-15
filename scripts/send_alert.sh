@@ -16,6 +16,11 @@
 #   3. ../apprise.yml                    (tool-local fallback)
 #   4. /etc/apprise/apprise.yml          (system-level)
 #
+#   Notification tags (defined in NOTIFICATION_TAGS array):
+#   - telegram, discord, ntfy (customize as needed)
+#   - Each tag must have a corresponding entry in apprise.yml
+#   - Script loops through all tags to send to multiple services
+#
 # Setup:
 #   1. sudo cp /opt/apps/pcloud-tools/main/apprise.yml.example /opt/apps/apprise.yml
 #   2. sudo nano /opt/apps/apprise.yml   (configure Telegram/Discord/ntfy)
@@ -29,6 +34,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HEALTH_CHECK="${SCRIPT_DIR}/../pcloud_health_check.sh"
 STATE_FILE="${SCRIPT_DIR}/.status_last"
+
+# Define notification tags to use (one apprise call per tag)
+# Add/remove tags based on your apprise.yml configuration
+NOTIFICATION_TAGS=("telegram" "discord" "ntfy")
 
 # Auto-discover Apprise config location
 APPRISE_CONFIG=""
@@ -84,12 +93,16 @@ TEST=0
 # TEST MODE: Send test notification
 # =====================================================
 if [[ $TEST -eq 1 ]]; then
-  echo "Sending test notification..."
-  apprise --config="$APPRISE_CONFIG" \
-    --title="🧪 Test Alert - pCloud Backup" \
-    --body="This is a test notification from your Raspberry Pi monitoring system. If you received this, Apprise is configured correctly! ✅" \
-    --notification-type=info
-  echo "Test notification sent!"
+  echo "Sending test notification to all configured services..."
+  for tag in "${NOTIFICATION_TAGS[@]}"; do
+    echo "  → Sending to: $tag"
+    apprise --config="$APPRISE_CONFIG" \
+      --tag="$tag" \
+      --title="🧪 Test Alert - pCloud Backup" \
+      --body="This is a test notification from your Raspberry Pi monitoring system. If you received this, Apprise is configured correctly! ✅" \
+      --notification-type=info
+  done
+  echo "Test notifications sent to all services!"
   exit 0
 fi
 
@@ -157,14 +170,18 @@ $ISSUES
 Timestamp: $(date '+%Y-%m-%d %H:%M:%S')
 Run: ./pcloud_health_check.sh --verbose for details"
 
-  # Send via Apprise
+  # Send via Apprise to all configured services
   echo "Sending alert: $STATUS_TEXT"
-  apprise --config="$APPRISE_CONFIG" \
-    --title="$TITLE" \
-    --body="$BODY" \
-    --notification-type="$NOTIF_TYPE"
+  for tag in "${NOTIFICATION_TAGS[@]}"; do
+    echo "  → Sending to: $tag"
+    apprise --config="$APPRISE_CONFIG" \
+      --tag="$tag" \
+      --title="$TITLE" \
+      --body="$BODY" \
+      --notification-type="$NOTIF_TYPE"
+  done
   
-  echo "Alert sent successfully!"
+  echo "Alerts sent to all services!"
 else
   echo "Status unchanged ($STATUS_TEXT) - no alert sent"
 fi
