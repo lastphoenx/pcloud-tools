@@ -270,7 +270,8 @@ check_backup_age() {
   CHECK_RESULTS[pcloud_snapshot]="${pcloud_snapshot:-none}"
   CHECK_RESULTS[pcloud_age_hours]=${pcloud_backup_age_hours}
   CHECK_RESULTS[backup_age_status]=$GLOBAL_STATUS
-  CHECK_RESULTS[backup_age_message]="$(echo "${ISSUES[@]}" | grep -o 'Backup\|RTB\|pCloud' | tail -n1 || echo 'Healthy')"
+  # Get the LAST (most recent) issue message for this check
+  CHECK_RESULTS[backup_age_message]="$(echo "${ISSUES[@]}" | grep -E 'OK:|WARNING:|CRITICAL:' | tail -n1 || echo 'No status available')"
 }
 
 # =====================================================
