@@ -11,9 +11,11 @@ config/.env
 **/*.env
 .env
 .env.* 
+apprise.yml  # Contains sensitive tokens
 
 # ABER: .env.example Dateien PUSHEN (anonymisierte Beispieldateien)
 !*.env.example
+!apprise.yml.example
 
 # ABER: .server-config/example/ Dateien PUSHEN (anonymisierte Templates)
 !*.timer.example
