@@ -226,8 +226,8 @@ PCLOUD_JSON=$(check_pcloud)
 OVERALL_STATUS="OK"
 EXIT_CODE=0
 
-# Parse pCloud status
-PCLOUD_STATUS_CODE=$(echo "$PCLOUD_JSON" | grep -oP '"status_code":\s*\K[0-9]+' || echo "3")
+# Parse pCloud status (trim newlines)
+PCLOUD_STATUS_CODE=$(echo "$PCLOUD_JSON" | grep -oP '"status_code":\s*\K[0-9]+' | head -1 | tr -d '\n' || echo "3")
 if [[ "$PCLOUD_STATUS_CODE" -eq 2 ]]; then
   OVERALL_STATUS="CRITICAL"
   EXIT_CODE=2
@@ -236,8 +236,8 @@ elif [[ "$PCLOUD_STATUS_CODE" -eq 1 && "$OVERALL_STATUS" != "CRITICAL" ]]; then
   EXIT_CODE=1
 fi
 
-# Parse RTB status
-RTB_STATUS=$(echo "$RTB_JSON" | grep -oP '"status":\s*"\K[^"]+' || echo "unknown")
+# Parse RTB status (trim newlines)
+RTB_STATUS=$(echo "$RTB_JSON" | grep -oP '"status":\s*"\K[^"]+' | head -1 | tr -d '\n' || echo "unknown")
 if [[ "$RTB_STATUS" == "failed" ]]; then
   OVERALL_STATUS="CRITICAL"
   EXIT_CODE=2

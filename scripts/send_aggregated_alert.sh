@@ -78,8 +78,8 @@ if [[ $TEST -eq 1 ]]; then
     exit 1
   fi
   
-  OVERALL_STATUS=$(grep -oP '"overall_status":\s*"\K[^"]+' "$STATUS_JSON" || echo "UNKNOWN")
-  HOSTNAME=$(grep -oP '"hostname":\s*"\K[^"]+' "$STATUS_JSON" || hostname)
+  OVERALL_STATUS=$(grep -oP '"overall_status":\s*"\K[^"]+' "$STATUS_JSON" | head -1 | tr -d '\n' || echo "UNKNOWN")
+  HOSTNAME=$(grep -oP '"hostname":\s*"\K[^"]+' "$STATUS_JSON" | head -1 | tr -d '\n' || hostname)
   
   # Determine emoji
   case $OVERALL_STATUS in
@@ -124,9 +124,9 @@ if [[ ! -f "$STATUS_JSON" ]]; then
 fi
 
 # Extract status
-OVERALL_STATUS=$(grep -oP '"overall_status":\s*"\K[^"]+' "$STATUS_JSON" || echo "UNKNOWN")
-EXIT_CODE=$(grep -oP '"exit_code":\s*\K[0-9]+' "$STATUS_JSON" || echo "3")
-HOSTNAME=$(grep -oP '"hostname":\s*"\K[^"]+' "$STATUS_JSON" || hostname)
+OVERALL_STATUS=$(grep -oP '"overall_status":\s*"\K[^"]+' "$STATUS_JSON" | head -1 | tr -d '\n' || echo "UNKNOWN")
+EXIT_CODE=$(grep -oP '"exit_code":\s*\K[0-9]+' "$STATUS_JSON" | head -1 | tr -d '\n' || echo "3")
+HOSTNAME=$(grep -oP '"hostname":\s*"\K[^"]+' "$STATUS_JSON" | head -1 | tr -d '\n' || hostname)
 
 # Read last status
 LAST_STATUS="UNKNOWN"
