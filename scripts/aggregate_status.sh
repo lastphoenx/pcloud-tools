@@ -118,13 +118,15 @@ check_rtb_wrapper() {
   local last_run="never"
   local message="N/A"
   local snapshot_count="0"
+  local safety_gate="N/A"
+  local details=""
   
   if [[ ! -f "$rtb_log" ]]; then
     echo "{\"status\":\"no_log\",\"last_run\":\"never\",\"snapshot_count\":0,\"message\":\"Log file not found: $rtb_log\"}"
     return
   fi
   
-  # Get last 100 lines for parsing
+  # Get last 200 lines for parsing
   local log_tail
   log_tail=$(tail -200 "$rtb_log" 2>/dev/null || echo "")
   
@@ -136,19 +138,68 @@ check_rtb_wrapper() {
   # Extract last run timestamp (format: 2026-04-15 14:30:00)
   last_run=$(echo "$log_tail" | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' | tail -1 || echo "never")
   
-  # Determine status from last messages
-  if echo "$log_tail" | tail -20 | grep -q '\[success\]'; then
+  # Check for ABORT (Safety-Gate RED block)
+  if echo "$log_tail" | tail -30 | grep -q '\[ABORT\]'; then
+    status="blocked"
+    local abort_line
+    abort_line=$(echo "$log_tail" | grep '\[ABORT\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "")
+    message="Safety-Gate BLOCKED backup: $abort_line"
+    
+    # Extract Safety-Gate status details
+    if echo "$log_tail" | tail -50 | grep -q 'SAFETY-GATE: RED'; then
+      safety_gate="RED"
+      # Get detailed service status
+      local nas_status nas_av_status honeyfile_status
+      nas_status=$(echo "$log_tail" | grep -oP 'nas: (RED|YELLOW|GREEN)' | tail -1 | grep -oP '(RED|YELLOW|GREEN)' || echo "unknown")
+      nas_av_status=$(echo "$log_tail" | grep -oP 'nas-av: (RED|YELLOW|GREEN)' | tail -1 | grep -oP '(RED|YELLOW|GREEN)' || echo "unknown")
+      
+      if echo "$log_tail" | tail -50 | grep -q 'Honeyfiles: kein verdächtiger Zugriff'; then
+        honeyfile_status="OK"
+      elif echo "$log_tail" | tail -50 | grep -q 'Honeyfile.*ALARM'; then
+        honeyfile_status="ALARM"
+      else
+        honeyfile_status="unknown"
+      fi
+      
+      details="Safety-Gate: RED | Honeyfiles: $honeyfile_status | nas: $nas_status | nas-av: $nas_av_status"
+    elif echo "$log_tail" | tail -50 | grep -q 'SAFETY-GATE: YELLOW'; then
+      safety_gate="YELLOW"
+      details="Safety-Gate: YELLOW - Warning conditions detected"
+    fi
+  # Check for success
+  elif echo "$log_tail" | tail -20 | grep -q '\[success\]'; then
     status="success"
     message=$(echo "$log_tail" | grep '\[success\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Backup completed")
+    safety_gate=$(echo "$log_tail" | tail -50 | grep -oP 'SAFETY-GATE: (GREEN|YELLOW|RED)' | tail -1 | grep -oP '(GREEN|YELLOW|RED)' || echo "GREEN")
+  # Check for skip (no changes, lock unavailable, etc.)
   elif echo "$log_tail" | tail -20 | grep -q '\[skip\]'; then
     status="skipped"
-    message=$(echo "$log_tail" | grep '\[skip\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Backup skipped")
+    local skip_line
+    skip_line=$(echo "$log_tail" | grep '\[skip\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "")
+    
+    # Determine skip reason
+    if echo "$skip_line" | grep -qi 'keine.*änderungen\|no.*changes\|dry-run'; then
+      details="No changes detected (rsync --dry-run)"
+    elif echo "$skip_line" | grep -qi 'lock\|gesperrt'; then
+      details="Lock unavailable - another backup running"
+    elif echo "$skip_line" | grep -qi 'safety.*yellow'; then
+      details="Safety-Gate: YELLOW - Skipped as precaution"
+    else
+      details="$skip_line"
+    fi
+    message="Skipped: $details"
+  # Check for error
   elif echo "$log_tail" | tail -20 | grep -qi '\[error\]\|fail'; then
     status="failed"
     message=$(echo "$log_tail" | grep -iE '\[error\]|fail' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Error detected")
+  # Check for running
   elif echo "$log_tail" | tail -20 | grep -q '\[start\]'; then
     status="running"
     message="Backup currently running"
+    # Check if safety gate check is in progress
+    if echo "$log_tail" | tail -10 | grep -q 'Safety-Gate prüft'; then
+      message="Running: Safety-Gate checks in progress"
+    fi
   else
     status="unknown"
     message="No status markers found in recent log entries"
@@ -159,10 +210,21 @@ check_rtb_wrapper() {
     snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
   fi
   
-  # Escape message
+  # Escape message and details
   message=$(escape_json "$message")
+  details=$(escape_json "$details")
   
-  echo "{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"message\":\"$message\"}"
+  # Build JSON with optional details field
+  local json="{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"message\":\"$message\""
+  if [[ -n "$details" ]]; then
+    json="$json,\"details\":\"$details\""
+  fi
+  if [[ "$safety_gate" != "N/A" ]]; then
+    json="$json,\"safety_gate\":\"$safety_gate\""
+  fi
+  json="$json}"
+  
+  echo "$json"
 }
 
 # =====================================================
