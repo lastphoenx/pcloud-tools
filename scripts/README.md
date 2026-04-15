@@ -4,9 +4,94 @@ Helper scripts for monitoring and alerting.
 
 ## Available Scripts
 
+### `aggregate_status.sh` ⭐ NEW
+
+Collects monitoring data from all backup and monitoring services into a unified JSON file.
+
+**Monitored Components:**
+- **Systemd Services**: entropy-watcher (nas/os), clamav, honeyfile-monitor, cleanup-samba-recycle, backup-pipeline
+- **RTB Wrapper**: Parses `/var/log/backup/rtb_wrapper.log` for last run status
+- **pCloud Backup**: Uses `pcloud_health_check.sh --json`
+
+**Output:** `/opt/apps/monitoring/status.json` (configurable)
+
+**Usage:**
+```bash
+# Run aggregation (silent)
+./aggregate_status.sh
+
+# Verbose mode (shows progress)
+./aggregate_status.sh --verbose
+
+# Custom output location
+MONITORING_OUTPUT=/tmp/status.json ./aggregate_status.sh
+```
+
+**Exit Codes:**
+- `0`: All OK
+- `1`: Warnings detected
+- `2`: Critical issues found
+
+**Automation:**
+```bash
+# Cron: Every 5 minutes
+*/5 * * * * /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
+
+# Systemd: See dashboard/README.md for timer setup
+```
+
+---
+
+### `send_aggregated_alert.sh` ⭐ NEW
+
+Sends push notifications based on aggregated system status (all services combined).
+
+**Features:**
+- Uses `aggregate_status.sh` to collect status from all services
+- Sends alerts only when overall status changes (OK → WARNING → CRITICAL)
+- State tracking in `.aggregated_status_last`
+- Supports multi-service notifications (Telegram, Discord, ntfy)
+
+**Usage:**
+```bash
+# Normal mode (only alerts on status change)
+./send_aggregated_alert.sh
+
+# Send test notification with current status
+./send_aggregated_alert.sh --test
+
+# Force alert even if status unchanged
+./send_aggregated_alert.sh --force
+```
+
+**Automation:**
+```bash
+# Cron: Check every 5 minutes, alert on changes
+*/5 * * * * /opt/apps/pcloud-tools/main/scripts/send_aggregated_alert.sh
+```
+
+**Example Alert:**
+```
+🚨 CRITICAL - System Monitoring (pi-nas)
+
+Overall Status: CRITICAL
+Reason: Status changed: OK → CRITICAL
+
+Summary:
+  • Failed Services: 2
+  • Inactive Services: 1
+
+Timestamp: 2026-04-15 14:30:22
+
+View detailed status:
+  cat /opt/apps/monitoring/status.json
+```
+
+---
+
 ### `send_alert.sh`
 
-Intelligent alerting script with status change detection using Apprise.
+Intelligent alerting script for **pCloud-specific** status with change detection using Apprise.
 
 **Features:**
 - Runs health check in JSON mode

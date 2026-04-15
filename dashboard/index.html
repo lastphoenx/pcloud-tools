@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Backup & Monitoring Dashboard</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    
+    .header {
+      background: white;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    
+    .header h1 {
+      font-size: 28px;
+      color: #1a202c;
+      margin-bottom: 8px;
+    }
+    
+    .header .meta {
+      color: #718096;
+      font-size: 14px;
+    }
+    
+    .overall-status {
+      background: white;
+      border-radius: 12px;
+      padding: 32px;
+      margin-bottom: 24px;
+      text-align: center;
+      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    
+    .overall-status .status-badge {
+      display: inline-block;
+      font-size: 48px;
+      font-weight: bold;
+      padding: 16px 32px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+    
+    .overall-status .status-badge.ok {
+      background: #c6f6d5;
+      color: #22543d;
+    }
+    
+    .overall-status .status-badge.warning {
+      background: #feebc8;
+      color: #7c2d12;
+    }
+    
+    .overall-status .status-badge.critical {
+      background: #fed7d7;
+      color: #742a2a;
+    }
+    
+    .overall-status .status-badge.running {
+      background: #bee3f8;
+      color: #2c5282;
+    }
+    
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 2px solid #e2e8f0;
+    }
+    
+    .card-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: #2d3748;
+    }
+    
+    .status-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    
+    .status-indicator.active { background: #48bb78; }
+    .status-indicator.inactive { background: #cbd5e0; }
+    .status-indicator.failed { background: #f56565; }
+    .status-indicator.running { background: #4299e1; }
+    .status-indicator.success { background: #48bb78; }
+    .status-indicator.skipped { background: #ed8936; }
+    .status-indicator.unknown { background: #a0aec0; }
+    
+    .card-content {
+      font-size: 14px;
+      color: #4a5568;
+    }
+    
+    .card-content .info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid #f7fafc;
+    }
+    
+    .card-content .info-row:last-child {
+      border-bottom: none;
+    }
+    
+    .info-label {
+      font-weight: 500;
+      color: #718096;
+    }
+    
+    .info-value {
+      color: #2d3748;
+      text-align: right;
+      max-width: 60%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    
+    .section-title {
+      color: white;
+      font-size: 24px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      margin-top: 32px;
+    }
+    
+    .loading {
+      text-align: center;
+      padding: 48px;
+      color: white;
+      font-size: 18px;
+    }
+    
+    .error {
+      background: #fed7d7;
+      border: 2px solid #fc8181;
+      border-radius: 8px;
+      padding: 16px;
+      color: #742a2a;
+      margin: 20px 0;
+    }
+    
+    .auto-refresh {
+      background: white;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 12px;
+      color: #718096;
+      text-align: center;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+    
+    .last-updated {
+      font-weight: 600;
+      color: #2d3748;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🖥️ Backup & Monitoring Dashboard</h1>
+      <div class="meta">
+        <span id="hostname">Loading...</span> • 
+        <span class="last-updated" id="timestamp">--</span>
+      </div>
+    </div>
+    
+    <div class="overall-status">
+      <div class="status-badge ok" id="overall-badge">
+        <span id="overall-status">Loading...</span>
+      </div>
+      <div class="meta">Overall System Status</div>
+    </div>
+    
+    <div id="content-area">
+      <div class="loading">⏳ Loading monitoring data...</div>
+    </div>
+    
+    <div class="auto-refresh">
+      Auto-refresh: <span id="countdown">30</span>s • 
+      Last update: <span class="last-updated" id="last-update">--</span>
+    </div>
+  </div>
+  
+  <script>
+    const STATUS_JSON_URL = '/monitoring/status.json';
+    const REFRESH_INTERVAL = 30000; // 30 seconds
+    let countdownTimer;
+    let countdown = 30;
+    
+    // Fetch and display status
+    async function fetchStatus() {
+      try {
+        const response = await fetch(STATUS_JSON_URL + '?t=' + Date.now());
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        const data = await response.json();
+        renderStatus(data);
+        resetCountdown();
+      } catch (error) {
+        console.error('Failed to fetch status:', error);
+        document.getElementById('content-area').innerHTML = `
+          <div class="error">
+            <strong>❌ Failed to load monitoring data</strong><br>
+            ${error.message}<br>
+            Retrying in 30 seconds...
+          </div>
+        `;
+      }
+    }
+    
+    // Render status data
+    function renderStatus(data) {
+      // Update header
+      document.getElementById('hostname').textContent = data.hostname || 'Unknown';
+      document.getElementById('timestamp').textContent = formatTimestamp(data.timestamp);
+      document.getElementById('last-update').textContent = new Date().toLocaleTimeString('de-DE');
+      
+      // Update overall status
+      const overallStatus = data.overall_status || 'UNKNOWN';
+      document.getElementById('overall-status').textContent = overallStatus;
+      
+      const badge = document.getElementById('overall-badge');
+      badge.className = 'status-badge ' + overallStatus.toLowerCase();
+      
+      // Render services and scripts
+      let html = '';
+      
+      // Systemd Services
+      if (data.services && Object.keys(data.services).length > 0) {
+        html += '<h2 class="section-title">📋 Systemd Services</h2>';
+        html += '<div class="grid">';
+        
+        for (const [name, service] of Object.entries(data.services)) {
+          html += renderServiceCard(name, service);
+        }
+        
+        html += '</div>';
+      }
+      
+      // Scripts (RTB + pCloud)
+      if (data.scripts) {
+        html += '<h2 class="section-title">🔧 Backup Scripts</h2>';
+        html += '<div class="grid">';
+        
+        if (data.scripts.rtb_wrapper) {
+          html += renderRTBCard(data.scripts.rtb_wrapper);
+        }
+        
+        if (data.scripts.pcloud_backup) {
+          html += renderPCloudCard(data.scripts.pcloud_backup);
+        }
+        
+        html += '</div>';
+      }
+      
+      document.getElementById('content-area').innerHTML = html;
+    }
+    
+    // Render systemd service card
+    function renderServiceCard(name, service) {
+      const statusClass = service.status || 'unknown';
+      const displayName = name.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      
+      return `
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">${displayName}</span>
+            <span class="status-indicator ${statusClass}"></span>
+          </div>
+          <div class="card-content">
+            <div class="info-row">
+              <span class="info-label">Status</span>
+              <span class="info-value">${service.status || 'unknown'}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Enabled</span>
+              <span class="info-value">${service.enabled || 'unknown'}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Last Run</span>
+              <span class="info-value">${formatTimestamp(service.last_start)}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Exit Code</span>
+              <span class="info-value">${service.exit_code || 'N/A'}</span>
+            </div>
+            ${service.message && service.message !== 'N/A' ? `
+            <div class="info-row">
+              <span class="info-label">Message</span>
+              <span class="info-value" title="${service.message}">${truncate(service.message, 40)}</span>
+            </div>
+            ` : ''}
+          </div>
+        </div>
+      `;
+    }
+    
+    // Render RTB wrapper card
+    function renderRTBCard(rtb) {
+      const statusClass = rtb.status || 'unknown';
+      
+      return `
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">🔄 RTB Wrapper</span>
+            <span class="status-indicator ${statusClass}"></span>
+          </div>
+          <div class="card-content">
+            <div class="info-row">
+              <span class="info-label">Status</span>
+              <span class="info-value">${rtb.status || 'unknown'}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Last Run</span>
+              <span class="info-value">${formatTimestamp(rtb.last_run)}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Snapshots</span>
+              <span class="info-value">${rtb.snapshot_count || 0}</span>
+            </div>
+            ${rtb.message ? `
+            <div class="info-row">
+              <span class="info-label">Message</span>
+              <span class="info-value" title="${rtb.message}">${truncate(rtb.message, 50)}</span>
+            </div>
+            ` : ''}
+          </div>
+        </div>
+      `;
+    }
+    
+    // Render pCloud card
+    function renderPCloudCard(pcloud) {
+      const statusCode = pcloud.status_code || 3;
+      const statusText = pcloud.status_text || 'UNKNOWN';
+      const statusClass = statusCode === 0 ? 'success' : statusCode === 1 ? 'warning' : 'failed';
+      
+      return `
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">☁️ pCloud Backup</span>
+            <span class="status-indicator ${statusClass}"></span>
+          </div>
+          <div class="card-content">
+            <div class="info-row">
+              <span class="info-label">Status</span>
+              <span class="info-value">${statusText}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Hostname</span>
+              <span class="info-value">${pcloud.hostname || 'N/A'}</span>
+            </div>
+            ${pcloud.checks ? renderPCloudChecks(pcloud.checks) : ''}
+          </div>
+        </div>
+      `;
+    }
+    
+    // Render pCloud checks details
+    function renderPCloudChecks(checks) {
+      let html = '';
+      
+      if (checks.backup_age) {
+        html += `
+          <div class="info-row">
+            <span class="info-label">Backup Age</span>
+            <span class="info-value">${checks.backup_age.status || 'N/A'}</span>
+          </div>
+        `;
+      }
+      
+      if (checks.pcloud_quota) {
+        html += `
+          <div class="info-row">
+            <span class="info-label">Quota</span>
+            <span class="info-value">${checks.pcloud_quota.status || 'N/A'}</span>
+          </div>
+        `;
+      }
+      
+      return html;
+    }
+    
+    // Utility: Format timestamp
+    function formatTimestamp(ts) {
+      if (!ts || ts === 'never' || ts === 'unknown') return ts || 'N/A';
+      
+      try {
+        const date = new Date(ts);
+        return date.toLocaleString('de-DE', { 
+          year: 'numeric', 
+          month: '2-digit', 
+          day: '2-digit',
+          hour: '2-digit', 
+          minute: '2-digit'
+        });
+      } catch (e) {
+        return ts;
+      }
+    }
+    
+    // Utility: Truncate string
+    function truncate(str, maxLen) {
+      if (!str || str.length <= maxLen) return str;
+      return str.substring(0, maxLen) + '...';
+    }
+    
+    // Countdown timer
+    function resetCountdown() {
+      countdown = 30;
+      updateCountdown();
+      
+      if (countdownTimer) clearInterval(countdownTimer);
+      countdownTimer = setInterval(() => {
+        countdown--;
+        updateCountdown();
+        
+        if (countdown <= 0) {
+          fetchStatus();
+        }
+      }, 1000);
+    }
+    
+    function updateCountdown() {
+      document.getElementById('countdown').textContent = countdown;
+    }
+    
+    // Initial load
+    fetchStatus();
+    
+    // Auto-refresh every 30 seconds
+    setInterval(fetchStatus, REFRESH_INTERVAL);
+  </script>
+</body>
+</html>

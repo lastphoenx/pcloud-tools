@@ -16,6 +16,10 @@ Funktioniert auf Linux/Debian. Hauptvorteil: **Content-based Deduplication** (SH
 - [Installation](#installation)
 - [Usage](#usage)
 - [Features](#features)
+- [📊 Monitoring & Alerting](#-monitoring--alerting)
+  - [Web Dashboard (Phase 3)](#web-dashboard-phase-3)
+  - [Push Notifications (Phase 4)](#push-notifications-phase-4)
+  - [Status Aggregator (Phase 2)](#status-aggregator-phase-2)
 - [Examples](#examples)
 - [How It Works](#how-it-works)
 - [Integration with Backup Pipeline](#integration-with-backup-pipeline)
@@ -268,6 +272,190 @@ PCLOUD_VERBOSE=1                           # Show detailed logs
 ```
 
 **Real-world Impact:** Successfully uploaded 19,808 files / 89.66 GB including 910MB video files that previously failed with connection errors.
+
+---
+
+## 📊 Monitoring & Alerting
+
+### Web Dashboard (Phase 3)
+
+**Real-time monitoring dashboard** for all backup and security services:
+
+📍 **Location:** `dashboard/index.html`  
+🎨 **Tech Stack:** Vanilla HTML/CSS/JavaScript (no dependencies)  
+📡 **Data Source:** `/opt/apps/monitoring/status.json` (auto-refresh every 30s)
+
+**Features:**
+- ✅ **Systemd Service Status** - entropy-watcher, clamav, honeyfile-monitor, cleanup-samba-recycle, backup-pipeline
+- 📦 **Backup Script Status** - RTB wrapper, pCloud sync
+- 🎯 **Color-coded Status Cards** - Green (OK), Yellow (WARNING), Red (CRITICAL)
+- 📱 **Responsive Design** - Works on desktop, tablet, mobile
+- 🔄 **Auto-refresh** - Updates every 30 seconds
+- 🔒 **nginx + Authentik Ready** - SSO integration support
+
+**Quick Setup:**
+```bash
+# 1. Deploy dashboard
+sudo mkdir -p /var/www/monitoring
+sudo cp dashboard/index.html /var/www/monitoring/
+
+# 2. Configure nginx
+sudo nano /etc/nginx/sites-available/monitoring
+# See dashboard/README.md for nginx config
+
+# 3. Setup aggregator (collects status)
+sudo crontab -e
+# Add: */5 * * * * /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
+```
+
+**Screenshot Example:**
+```
+┌─────────────────────────────────────────────────────┐
+│ 🖥️ Backup & Monitoring Dashboard                   │
+│ pi-nas • 2026-04-15 14:30:00                        │
+└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│              ✅ OK                                  │
+│        Overall System Status                         │
+└─────────────────────────────────────────────────────┘
+
+📋 Systemd Services               🔧 Backup Scripts
+┌──────────────────────┐          ┌──────────────────────┐
+│ Entropywatcher Nas   │          │ RTB Wrapper          │
+│ ● Active             │          │ ● Success            │
+│ Last: 14:00          │          │ Snapshots: 12        │
+└──────────────────────┘          └──────────────────────┘
+```
+
+**See:** [dashboard/README.md](dashboard/README.md) for full setup instructions.
+
+### Push Notifications (Phase 4)
+
+**Intelligent alerting** with status change detection via [Apprise](https://github.com/caronc/apprise).
+
+**Scripts:**
+- **`send_alert.sh`** - pCloud-specific alerts
+- **`send_aggregated_alert.sh`** - Multi-service alerts (all backups + monitoring)
+
+**Features:**
+- 🔔 **100+ Services** - Telegram, Discord, ntfy.sh, Gotify, Pushover, Email...
+- 🎯 **Smart Detection** - Only alerts on status CHANGES (no spam!)
+- 🎨 **Severity Levels** - ✅ OK, ⚠️ WARNING, 🚨 CRITICAL
+- 🔄 **State Tracking** - Remembers last known status
+- 📝 **Detailed Issues** - Shows failed services, error messages
+
+**Example Alert (Telegram):**
+```
+🚨 CRITICAL - System Monitoring (pi-nas)
+
+Overall Status: CRITICAL
+Reason: Status changed: OK → CRITICAL
+
+Summary:
+  • Failed Services: 2
+  • Inactive Services: 1
+
+Timestamp: 2026-04-15 14:30:22
+
+View detailed status:
+  cat /opt/apps/monitoring/status.json
+```
+
+**Quick Setup:**
+```bash
+# 1. Install Apprise
+sudo apt install apprise  # Debian/Ubuntu
+
+# 2. Configure services
+sudo cp apprise.yml.example /opt/apps/apprise.yml
+sudo nano /opt/apps/apprise.yml
+# Add Telegram bot token, Discord webhook, etc.
+
+# 3. Test
+./scripts/send_aggregated_alert.sh --test
+
+# 4. Automate (cron)
+*/5 * * * * /opt/apps/pcloud-tools/main/scripts/send_aggregated_alert.sh
+```
+
+**Supported Services (via tags):**
+- **Telegram** (`tag: telegram`) - Bot via @BotFather
+- **Discord** (`tag: discord`) - Server webhook
+- **ntfy.sh** (`tag: ntfy`) - Self-hosted or cloud
+
+**See:** [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md) for detailed configuration.
+
+### Status Aggregator (Phase 2)
+
+**Central status collector** that monitors all backup and monitoring services.
+
+📍 **Script:** `scripts/aggregate_status.sh`  
+📊 **Output:** `/opt/apps/monitoring/status.json`
+
+**Monitored Components:**
+```bash
+# Systemd Services
+- entropywatcher-nas
+- entropywatcher-os
+- entropywatcher-nas-av
+- entropywatcher-os-av
+- honeyfile-monitor
+- cleanup-samba-recycle
+- backup-pipeline
+
+# Backup Scripts
+- RTB Wrapper (via /var/log/backup/rtb_wrapper.log)
+- pCloud Backup (via pcloud_health_check.sh --json)
+```
+
+**JSON Output Example:**
+```json
+{
+  "timestamp": "2026-04-15T14:30:00Z",
+  "hostname": "pi-nas",
+  "overall_status": "OK",
+  "exit_code": 0,
+  "services": {
+    "entropywatcher-nas": {
+      "status": "active",
+      "enabled": "yes",
+      "last_start": "2026-04-15T14:00:00Z",
+      "exit_code": "0",
+      "message": "Scan completed successfully"
+    }
+  },
+  "scripts": {
+    "rtb_wrapper": {
+      "status": "success",
+      "last_run": "2026-04-15 14:00:00",
+      "snapshot_count": 12
+    },
+    "pcloud_backup": {
+      "status_code": 0,
+      "status_text": "OK"
+    }
+  }
+}
+```
+
+**Usage:**
+```bash
+# Run manually (verbose)
+./scripts/aggregate_status.sh --verbose
+
+# Automation (cron - every 5 minutes)
+*/5 * * * * /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
+
+# Custom output location
+MONITORING_OUTPUT=/tmp/status.json ./scripts/aggregate_status.sh
+```
+
+**Exit Codes:**
+- `0` = All OK
+- `1` = Warnings detected
+- `2` = Critical issues found
+
+---
 
 ## Examples
 

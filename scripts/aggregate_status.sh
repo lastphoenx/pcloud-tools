@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# =====================================================
+# Status Aggregator - Collect all monitoring data
+# =====================================================
+# Purpose: Aggregate health status from all backup/monitoring services
+# Output: JSON file with combined status for dashboard consumption
+#
+# Monitored Components:
+#   - Systemd Services (entropy-watcher, clamav, honeyfile, cleanup, backup-pipeline)
+#   - RTB Wrapper (via log parsing)
+#   - pCloud Backup (via pcloud_health_check.sh)
+#
+# Output Location:
+#   /opt/apps/monitoring/status.json (default)
+#   Override with: MONITORING_OUTPUT=/path/to/status.json
+#
+# Usage:
+#   ./aggregate_status.sh [--verbose]
+# =====================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PCLOUD_HEALTH_CHECK="${SCRIPT_DIR}/../pcloud_health_check.sh"
+
+# Output configuration
+MONITORING_OUTPUT="${MONITORING_OUTPUT:-/opt/apps/monitoring/status.json}"
+VERBOSE=0
+[[ "${1:-}" == "--verbose" ]] && VERBOSE=1
+
+# Ensure output directory exists
+mkdir -p "$(dirname "$MONITORING_OUTPUT")"
+
+# =====================================================
+# Helper Functions
+# =====================================================
+
+log() {
+  [[ $VERBOSE -eq 1 ]] && echo "[$(date '+%H:%M:%S')] $*" >&2
+}
+
+escape_json() {
+  local str="$1"
+  str="${str//\\/\\\\}"  # Backslash
+  str="${str//\"/\\\"}"  # Quote
+  str="${str//$'\n'/\\n}" # Newline
+  str="${str//$'\r'/}"    # Carriage return
+  str="${str//$'\t'/ }"   # Tab to space
+  echo "$str"
+}
+
+# =====================================================
+# Systemd Service Check
+# =====================================================
+# Returns: status (active|inactive|failed), last_start, exit_code, last_message
+check_systemd_service() {
+  local service_name="$1"
+  local status="unknown"
+  local last_start="never"
+  local exit_code="unknown"
+  local last_message="N/A"
+  local enabled="unknown"
+  
+  # Check if service exists
+  if ! systemctl list-unit-files "${service_name}.service" &>/dev/null; then
+    echo "{\"status\":\"not_installed\",\"enabled\":\"no\",\"last_start\":\"never\",\"exit_code\":\"N/A\",\"message\":\"Service not found\"}"
+    return
+  fi
+  
+  # Get service status
+  if systemctl is-active "${service_name}.service" &>/dev/null; then
+    status="active"
+  elif systemctl is-failed "${service_name}.service" &>/dev/null; then
+    status="failed"
+  else
+    status="inactive"
+  fi
+  
+  # Check if enabled
+  if systemctl is-enabled "${service_name}.service" &>/dev/null; then
+    enabled="yes"
+  else
+    enabled="no"
+  fi
+  
+  # Get last start time and messages from journal
+  if command -v journalctl &>/dev/null; then
+    # Get last 3 lines from service journal
+    local journal_output
+    journal_output=$(journalctl -u "${service_name}.service" -n 3 --no-pager --output=short-iso 2>/dev/null || echo "")
+    
+    if [[ -n "$journal_output" ]]; then
+      # Extract timestamp from last line
+      last_start=$(echo "$journal_output" | tail -1 | awk '{print $1}' || echo "unknown")
+      
+      # Get exit code from journal
+      exit_code=$(journalctl -u "${service_name}.service" -n 50 --no-pager 2>/dev/null | grep -oP 'code=exited, status=\K[0-9]+' | tail -1 || echo "unknown")
+      [[ "$exit_code" == "0" || "$exit_code" == "unknown" ]] && exit_code="${exit_code}" || exit_code="${exit_code} (error)"
+      
+      # Get last meaningful message (skip systemd boilerplate)
+      last_message=$(echo "$journal_output" | tail -1 | sed -E 's/^[^ ]+ [^ ]+ [^ ]+ //' | head -c 200 || echo "N/A")
+    fi
+  fi
+  
+  # Escape message for JSON
+  last_message=$(escape_json "$last_message")
+  
+  echo "{\"status\":\"$status\",\"enabled\":\"$enabled\",\"last_start\":\"$last_start\",\"exit_code\":\"$exit_code\",\"message\":\"$last_message\"}"
+}
+
+# =====================================================
+# RTB Wrapper Log Parser
+# =====================================================
+# Parses /var/log/backup/rtb_wrapper.log for last run status
+check_rtb_wrapper() {
+  local rtb_log="/var/log/backup/rtb_wrapper.log"
+  local status="unknown"
+  local last_run="never"
+  local message="N/A"
+  local snapshot_count="0"
+  
+  if [[ ! -f "$rtb_log" ]]; then
+    echo "{\"status\":\"no_log\",\"last_run\":\"never\",\"snapshot_count\":0,\"message\":\"Log file not found: $rtb_log\"}"
+    return
+  fi
+  
+  # Get last 100 lines for parsing
+  local log_tail
+  log_tail=$(tail -200 "$rtb_log" 2>/dev/null || echo "")
+  
+  if [[ -z "$log_tail" ]]; then
+    echo "{\"status\":\"empty_log\",\"last_run\":\"never\",\"snapshot_count\":0,\"message\":\"Log file is empty\"}"
+    return
+  fi
+  
+  # Extract last run timestamp (format: 2026-04-15 14:30:00)
+  last_run=$(echo "$log_tail" | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' | tail -1 || echo "never")
+  
+  # Determine status from last messages
+  if echo "$log_tail" | tail -20 | grep -q '\[success\]'; then
+    status="success"
+    message=$(echo "$log_tail" | grep '\[success\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Backup completed")
+  elif echo "$log_tail" | tail -20 | grep -q '\[skip\]'; then
+    status="skipped"
+    message=$(echo "$log_tail" | grep '\[skip\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Backup skipped")
+  elif echo "$log_tail" | tail -20 | grep -qi '\[error\]\|fail'; then
+    status="failed"
+    message=$(echo "$log_tail" | grep -iE '\[error\]|fail' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Error detected")
+  elif echo "$log_tail" | tail -20 | grep -q '\[start\]'; then
+    status="running"
+    message="Backup currently running"
+  else
+    status="unknown"
+    message="No status markers found in recent log entries"
+  fi
+  
+  # Count snapshots in RTB destination (if accessible)
+  if [[ -d "/mnt/backup/rtb_nas" ]]; then
+    snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
+  fi
+  
+  # Escape message
+  message=$(escape_json "$message")
+  
+  echo "{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"message\":\"$message\"}"
+}
+
+# =====================================================
+# pCloud Health Check Integration
+# =====================================================
+check_pcloud() {
+  if [[ ! -x "$PCLOUD_HEALTH_CHECK" ]]; then
+    echo "{\"status\":\"not_available\",\"message\":\"pcloud_health_check.sh not found or not executable\"}"
+    return
+  fi
+  
+  # Run health check in JSON mode
+  local pcloud_json
+  pcloud_json=$("$PCLOUD_HEALTH_CHECK" --json 2>/dev/null || echo "{\"status_code\":3,\"status_text\":\"ERROR\"}")
+  
+  # Return as-is (already JSON)
+  echo "$pcloud_json"
+}
+
+# =====================================================
+# Main Aggregation Logic
+# =====================================================
+
+log "Starting status aggregation..."
+
+# Define services to monitor
+SYSTEMD_SERVICES=(
+  "entropywatcher-nas"
+  "entropywatcher-os"
+  "entropywatcher-nas-av"
+  "entropywatcher-os-av"
+  "honeyfile-monitor"
+  "cleanup-samba-recycle"
+  "backup-pipeline"
+)
+
+# Start building JSON
+TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+HOSTNAME=$(hostname)
+
+log "Checking systemd services..."
+
+# Check all systemd services
+SERVICES_JSON=""
+for service in "${SYSTEMD_SERVICES[@]}"; do
+  log "  → $service"
+  service_status=$(check_systemd_service "$service")
+  SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status},\n"
+done
+# Remove trailing comma
+SERVICES_JSON=$(echo -e "$SERVICES_JSON" | sed '$ s/,$//')
+
+log "Checking RTB wrapper..."
+RTB_JSON=$(check_rtb_wrapper)
+
+log "Checking pCloud backup..."
+PCLOUD_JSON=$(check_pcloud)
+
+# Determine overall status
+# Priority: failed > running > skipped > success > unknown
+OVERALL_STATUS="OK"
+EXIT_CODE=0
+
+# Parse pCloud status
+PCLOUD_STATUS_CODE=$(echo "$PCLOUD_JSON" | grep -oP '"status_code":\s*\K[0-9]+' || echo "3")
+if [[ "$PCLOUD_STATUS_CODE" -eq 2 ]]; then
+  OVERALL_STATUS="CRITICAL"
+  EXIT_CODE=2
+elif [[ "$PCLOUD_STATUS_CODE" -eq 1 && "$OVERALL_STATUS" != "CRITICAL" ]]; then
+  OVERALL_STATUS="WARNING"
+  EXIT_CODE=1
+fi
+
+# Parse RTB status
+RTB_STATUS=$(echo "$RTB_JSON" | grep -oP '"status":\s*"\K[^"]+' || echo "unknown")
+if [[ "$RTB_STATUS" == "failed" ]]; then
+  OVERALL_STATUS="CRITICAL"
+  EXIT_CODE=2
+elif [[ "$RTB_STATUS" == "running" && "$OVERALL_STATUS" != "CRITICAL" ]]; then
+  OVERALL_STATUS="RUNNING"
+fi
+
+# Check systemd service failures
+if echo -e "$SERVICES_JSON" | grep -q '"status":"failed"'; then
+  if [[ "$OVERALL_STATUS" != "CRITICAL" ]]; then
+    OVERALL_STATUS="WARNING"
+    EXIT_CODE=1
+  fi
+fi
+
+# Build final JSON
+log "Writing output to: $MONITORING_OUTPUT"
+
+cat > "$MONITORING_OUTPUT" <<EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "hostname": "$HOSTNAME",
+  "overall_status": "$OVERALL_STATUS",
+  "exit_code": $EXIT_CODE,
+  "services": {
+$(echo -e "$SERVICES_JSON")
+  },
+  "scripts": {
+    "rtb_wrapper": $RTB_JSON,
+    "pcloud_backup": $PCLOUD_JSON
+  }
+}
+EOF
+
+# Set permissions (readable by web server)
+chmod 644 "$MONITORING_OUTPUT"
+
+log "Aggregation complete. Status: $OVERALL_STATUS"
+
+exit $EXIT_CODE
