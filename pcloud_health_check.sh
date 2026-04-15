@@ -513,8 +513,8 @@ if [[ $JSON_MODE -eq 1 ]]; then
   echo "  \"issues\": ["
   
   # Output issues array
-  local issue_count=${#ISSUES[@]}
-  local i=0
+  issue_count=${#ISSUES[@]}
+  i=0
   for issue in "${ISSUES[@]}"; do
     severity=$(echo "$issue" | cut -d: -f1)
     message=$(echo "$issue" | cut -d: -f2-)
