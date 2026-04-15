@@ -8,14 +8,40 @@
 # Options:
 #   --force   Send alert even if status hasn't changed
 #   --test    Send test notification
+#
+# Configuration:
+#   Apprise config is searched in this order:
+#   1. /opt/apps/apprise.yml             (shared, recommended)
+#   2. ~/.config/apprise/apprise.yml     (user-level)
+#   3. ../apprise.yml                    (tool-local fallback)
+#   4. /etc/apprise/apprise.yml          (system-level)
+#
+# Setup:
+#   1. sudo cp /opt/apps/pcloud-tools/main/apprise.yml.example /opt/apps/apprise.yml
+#   2. sudo nano /opt/apps/apprise.yml   (configure Telegram/Discord/ntfy)
+#   3. sudo chown root:root /opt/apps/apprise.yml
+#   4. sudo chmod 600 /opt/apps/apprise.yml
+#   5. ./send_alert.sh --test
 # =====================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HEALTH_CHECK="${SCRIPT_DIR}/../pcloud_health_check.sh"
-APPRISE_CONFIG="${SCRIPT_DIR}/../apprise.yml"
 STATE_FILE="${SCRIPT_DIR}/.status_last"
+
+# Auto-discover Apprise config location
+APPRISE_CONFIG=""
+for config_path in \
+  "/opt/apps/apprise.yml" \
+  "${HOME}/.config/apprise/apprise.yml" \
+  "${SCRIPT_DIR}/../apprise.yml" \
+  "/etc/apprise/apprise.yml"; do
+  if [[ -f "$config_path" ]]; then
+    APPRISE_CONFIG="$config_path"
+    break
+  fi
+done
 
 # Ensure health check exists
 if [[ ! -f "$HEALTH_CHECK" ]]; then
@@ -26,16 +52,27 @@ fi
 # Check if apprise is installed
 if ! command -v apprise &>/dev/null; then
   echo "ERROR: apprise is not installed"
-  echo "Install: pip3 install apprise"
+  echo "Install: sudo apt install apprise"
   exit 1
 fi
 
 # Check if config exists
-if [[ ! -f "$APPRISE_CONFIG" ]]; then
-  echo "ERROR: Apprise config not found: $APPRISE_CONFIG"
-  echo "Copy apprise.yml.example to apprise.yml and configure your endpoints"
+if [[ -z "$APPRISE_CONFIG" ]]; then
+  echo "ERROR: No Apprise config found!"
+  echo "Searched locations:"
+  echo "  - /opt/apps/apprise.yml (recommended)"
+  echo "  - ~/.config/apprise/apprise.yml"
+  echo "  - ${SCRIPT_DIR}/../apprise.yml"
+  echo "  - /etc/apprise/apprise.yml"
+  echo ""
+  echo "Setup:"
+  echo "  sudo cp ${SCRIPT_DIR}/../apprise.yml.example /opt/apps/apprise.yml"
+  echo "  sudo nano /opt/apps/apprise.yml"
+  echo "  sudo chmod 600 /opt/apps/apprise.yml"
   exit 1
 fi
+
+echo "Using config: $APPRISE_CONFIG"
 
 # Parse arguments
 FORCE=0

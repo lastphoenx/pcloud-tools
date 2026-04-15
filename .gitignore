@@ -11,7 +11,7 @@ config/.env
 **/*.env
 .env
 .env.* 
-apprise.yml  # Contains sensitive tokens
+apprise.yml  # Contains sensitive tokens (use /opt/apps/apprise.yml instead)
 
 # ABER: .env.example Dateien PUSHEN (anonymisierte Beispieldateien)
 !*.env.example

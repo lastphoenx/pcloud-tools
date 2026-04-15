@@ -15,7 +15,18 @@ Dieses Dokument beschreibt die Installation und Konfiguration von **Apprise** f�
 
 ## 🚀 Installation (Raspberry Pi)
 
-### Option A: Via pip (Empfohlen)
+### Option A: Via apt (Empfohlen - Debian/Raspberry Pi OS)
+
+```bash
+# Apprise aus offiziellen Repos installieren
+sudo apt update
+sudo apt install -y apprise
+
+# Test ob installiert
+apprise --version
+```
+
+### Option B: Via pip (falls nicht im Repo)
 
 ```bash
 # Python3 und pip installieren (falls nicht vorhanden)
@@ -29,12 +40,37 @@ pip3 install --user apprise
 apprise --version
 ```
 
-### Option B: Via apt (Debian/Ubuntu)
+---
+
+## 📁 Zentrale Konfiguration
+
+Die Apprise-Config liegt **zentral** unter `/opt/apps/apprise.yml` und wird von **allen Monitoring-Tools** geteilt (pCloud-Tools, Entropy-Watcher, RTB, etc.).
+
+### Erstmalige Einrichtung
 
 ```bash
-sudo apt update
-sudo apt install -y apprise
+# Template kopieren
+sudo cp /opt/apps/pcloud-tools/main/apprise.yml.example /opt/apps/apprise.yml
+
+# Bearbeiten (Telegram/Discord Token eintragen)
+sudo nano /opt/apps/apprise.yml
+
+# Berechtigungen setzen (nur root lesbar)
+sudo chown root:root /opt/apps/apprise.yml
+sudo chmod 600 /opt/apps/apprise.yml
 ```
+
+**Warum `/opt/apps/`?**
+- ✅ Zentral für alle Monitoring-Tools
+- ✅ Eine Config → Alle Tools nutzen gleiche Benachrichtigungen
+- ✅ Einfache Verwaltung
+- ✅ Kein Git (Security!)
+
+**Auto-Discovery:** Das `send_alert.sh` Script sucht automatisch in dieser Reihenfolge:
+1. `/opt/apps/apprise.yml` (shared, empfohlen)
+2. `~/.config/apprise/apprise.yml` (user-level)
+3. `../apprise.yml` (tool-local fallback)
+4. `/etc/apprise/apprise.yml` (system-level)
 
 ---
 
@@ -62,9 +98,8 @@ Telegram ist kostenlos, einfach einzurichten und liefert zuverlässige Push-Bena
 ### 3. Konfiguration
 
 ```bash
-cd /opt/apps/pcloud-tools/main
-cp apprise.yml.example apprise.yml
-nano apprise.yml
+# Zentrale Config bearbeiten
+sudo nano /opt/apps/apprise.yml
 ```
 
 Ersetze die Telegram-Zeile mit deinen Werten:
@@ -72,6 +107,12 @@ Ersetze die Telegram-Zeile mit deinen Werten:
 urls:
   - tgram://123456789:ABCdefGHIjklMNOpqrsTUVwxyz/987654321/:
       tag: telegram
+```
+
+**Testen:**
+```bash
+cd /opt/apps/pcloud-tools/main
+./scripts/send_alert.sh --test
 ```
 
 ---
