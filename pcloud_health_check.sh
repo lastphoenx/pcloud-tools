@@ -243,35 +243,23 @@ check_backup_age() {
     [[ $VERBOSE -eq 1 ]] && echo "  Database tracking disabled - cannot check pCloud backup age"
   fi
   
-  # Gap Detection Logic
+  # Gap Detection Logic (RTB is change-only backup!)
+  # IMPORTANT: RTB only creates snapshots on changes, so age-based checks are WRONG
+  # Correct approach: Check if RTB and pCloud are SYNCHRONIZED (same latest snapshot)
   if [[ "$PCLOUD_ENABLE_DB" == "1" && -n "$pcloud_snapshot" ]]; then
-    # Compare RTB vs pCloud timestamps
-    local gap_hours=$((pcloud_backup_age_hours - rtb_age_hours))
-    
-    if [[ $gap_hours -gt 24 ]]; then
-      # pCloud backup is significantly older than RTB → GAP!
-      log_issue "CRITICAL" "Backup gap detected! RTB has new snapshot ($latest_rtb_snapshot, $rtb_age_display) but pCloud backup is old ($pcloud_snapshot, $pcloud_age_display)"
-      set_status 2
-    elif [[ $pcloud_backup_age_hours -gt $BACKUP_AGE_CRITICAL_HOURS ]]; then
-      log_issue "CRITICAL" "Last pCloud backup too old: $pcloud_age_display (threshold: ${BACKUP_AGE_CRITICAL_HOURS}h)"
-      set_status 2
-    elif [[ $pcloud_backup_age_hours -gt $BACKUP_AGE_WARNING_HOURS ]]; then
-      log_issue "WARNING" "Last pCloud backup aging: $pcloud_age_display (threshold: ${BACKUP_AGE_WARNING_HOURS}h)"
-      set_status 1
+    # Compare snapshot NAMES, not timestamps
+    if [[ "$latest_rtb_snapshot" == "$pcloud_snapshot" ]]; then
+      # RTB and pCloud are in sync → ALL GOOD (age doesn't matter!)
+      log_issue "OK" "pCloud in sync with RTB (both: $latest_rtb_snapshot)"
     else
-      log_issue "OK" "Backup age healthy ($pcloud_age_display)"
+      # Different snapshots → GAP detected!
+      log_issue "CRITICAL" "Backup GAP detected! RTB has newer snapshot ($latest_rtb_snapshot, $rtb_age_display) but pCloud backup is older ($pcloud_snapshot, $pcloud_age_display)"
+      set_status 2
     fi
   else
-    # Fallback: Just check RTB age if DB disabled
-    if [[ $rtb_age_hours -gt $BACKUP_AGE_CRITICAL_HOURS ]]; then
-      log_issue "CRITICAL" "Last RTB snapshot too old: $rtb_age_display (threshold: ${BACKUP_AGE_CRITICAL_HOURS}h)"
-      set_status 2
-    elif [[ $rtb_age_hours -gt $BACKUP_AGE_WARNING_HOURS ]]; then
-      log_issue "WARNING" "Last RTB snapshot aging: $rtb_age_display (threshold: ${BACKUP_AGE_WARNING_HOURS}h)"
-      set_status 1
-    else
-      log_issue "OK" "RTB snapshot age healthy ($rtb_age_display)"
-    fi
+    # Fallback: DB disabled or no pCloud backups yet
+    log_issue "WARNING" "pCloud backup tracking not available (enable PCLOUD_ENABLE_DB=1 for proper monitoring)"
+    set_status 1
   fi
   
   # Store results for JSON output
