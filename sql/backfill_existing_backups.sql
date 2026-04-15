@@ -4,6 +4,13 @@
 -- Purpose: Insert historical backup runs for the 3 existing snapshots
 -- These backups were completed before DB tracking (PCLOUD_ENABLE_DB) was enabled
 -- 
+-- PREREQUISITES:
+--   1. pcloud_backup database must exist
+--   2. backup_runs table must exist (created by init_pcloud_db.sql)
+--   
+--   If table doesn't exist, run first:
+--     mysql -u pcloud_backup -p pcloud_backup < sql/init_pcloud_db.sql
+--
 -- Evidence:
 --   RTB Snapshots:
 --     /mnt/backup/rtb_nas/2026-04-10-075334 (exists)
@@ -24,9 +31,24 @@
 
 USE pcloud_backup;
 
--- Check if table exists
-SELECT 'Checking backup_runs table...' AS Info;
-SELECT COUNT(*) AS existing_runs FROM backup_runs;
+-- Preflight check: Verify table exists
+SELECT 'Checking if backup_runs table exists...' AS '';
+SELECT 
+    CASE 
+        WHEN COUNT(*) > 0 THEN 
+            CONCAT('✓ backup_runs table found with ', COUNT(*), ' existing entries')
+        ELSE 
+            '✓ backup_runs table exists (empty)'
+    END AS status
+FROM information_schema.tables
+WHERE table_schema = 'pcloud_backup' 
+  AND table_name = 'backup_runs'
+INTO @table_check;
+
+-- Show existing runs count
+SELECT COUNT(*) AS existing_runs_count FROM backup_runs;
+
+SELECT '=== Inserting Backfill Entries ===' AS '';
 
 -- Backup 1: 2026-04-10-075334
 -- Manifest created: Apr 10 08:52 (completion time)
