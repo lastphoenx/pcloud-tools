@@ -496,19 +496,53 @@
       let html = '';
       
       if (checks.backup_age) {
+        let value = 'N/A';
+        
+        // Try message first, then format details
+        if (checks.backup_age.message) {
+          value = checks.backup_age.message;
+        } else if (checks.backup_age.details) {
+          const d = checks.backup_age.details;
+          if (d.rtb_age_hours !== undefined) {
+            const hours = d.rtb_age_hours;
+            if (hours < 24) {
+              value = `${hours}h ago`;
+            } else {
+              const days = Math.floor(hours / 24);
+              value = `${days}d ${hours % 24}h ago`;
+            }
+          }
+        }
+        
         html += `
           <div class="info-row">
             <span class="info-label">Backup Age</span>
-            <span class="info-value">${checks.backup_age.status || 'N/A'}</span>
+            <span class="info-value">${value}</span>
           </div>
         `;
       }
       
       if (checks.pcloud_quota) {
+        let value = 'N/A';
+        
+        // Try message first, then format details
+        if (checks.pcloud_quota.message) {
+          value = checks.pcloud_quota.message;
+        } else if (checks.pcloud_quota.details) {
+          const d = checks.pcloud_quota.details;
+          if (d.free_gb !== undefined && d.usage_percent !== undefined) {
+            value = `${d.free_gb} GB free (${d.usage_percent}%)`;
+          } else if (d.free_gb !== undefined) {
+            value = `${d.free_gb} GB free`;
+          } else if (d.usage_percent !== undefined) {
+            value = `${d.usage_percent}% used`;
+          }
+        }
+        
         html += `
           <div class="info-row">
             <span class="info-label">Quota</span>
-            <span class="info-value">${checks.pcloud_quota.status || 'N/A'}</span>
+            <span class="info-value">${value}</span>
           </div>
         `;
       }
