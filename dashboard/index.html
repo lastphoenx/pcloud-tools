@@ -325,6 +325,12 @@
               <span class="info-label">Exit Code</span>
               <span class="info-value">${service.exit_code || 'N/A'}</span>
             </div>
+            ${service.next_run && service.next_run !== 'N/A' ? `
+            <div class="info-row">
+              <span class="info-label">Next Run</span>
+              <span class="info-value">${service.next_run}</span>
+            </div>
+            ` : ''}
             ${service.message && service.message !== 'N/A' ? `
             <div class="info-row">
               <span class="info-label">Message</span>
@@ -359,6 +365,18 @@
               <span class="info-label">Snapshots</span>
               <span class="info-value">${rtb.snapshot_count || 0}</span>
             </div>
+            ${rtb.safety_gate ? `
+            <div class="info-row">
+              <span class="info-label">Safety-Gate</span>
+              <span class="info-value">${rtb.safety_gate}</span>
+            </div>
+            ` : ''}
+            ${rtb.live_safety_gate ? `
+            <div class="info-row">
+              <span class="info-label">Live Status</span>
+              <span class="info-value" style="font-weight: bold; color: ${rtb.live_safety_gate === 'GREEN' ? '#22c55e' : rtb.live_safety_gate === 'YELLOW' ? '#f59e0b' : '#ef4444'}">${rtb.live_safety_gate}</span>
+            </div>
+            ` : ''}
             ${rtb.message ? `
             <div class="info-row">
               <span class="info-label">Message</span>

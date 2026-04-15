@@ -94,7 +94,8 @@ check_systemd_service() {
       last_start=$(echo "$journal_output" | tail -1 | awk '{print $1}' || echo "unknown")
       
       # Get exit code from journal
-      exit_code=$(journalctl -u "${service_name}.service" -n 50 --no-pager 2>/dev/null | grep -oP 'code=exited, status=\K[0-9]+' | tail -1 || echo "unknown")
+      exit_code=$(journalctl -u "${service_name}.service" -n 50 --no-pager 2>/dev/null | grep -oP 'code=exited, status=\K[0-9]+' | tail -1)
+      [[ -z "$exit_code" ]] && exit_code="unknown"
       [[ "$exit_code" == "0" || "$exit_code" == "unknown" ]] && exit_code="${exit_code}" || exit_code="${exit_code} (error)"
       
       # Get last meaningful message (skip systemd boilerplate)
@@ -102,10 +103,17 @@ check_systemd_service() {
     fi
   fi
   
+  # Get next run time (for timer-based services)
+  local next_run="N/A"
+  if systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | grep -q "${service_name}.timer"; then
+    next_run=$(systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | awk '{print $1, $2}' | head -1 || echo "N/A")
+  fi
+  
   # Escape message for JSON
   last_message=$(escape_json "$last_message")
+  next_run=$(escape_json "$next_run")
   
-  echo "{\"status\":\"$status\",\"enabled\":\"$enabled\",\"last_start\":\"$last_start\",\"exit_code\":\"$exit_code\",\"message\":\"$last_message\"}"
+  echo "{\"status\":\"$status\",\"enabled\":\"$enabled\",\"last_start\":\"$last_start\",\"exit_code\":\"$exit_code\",\"next_run\":\"$next_run\",\"message\":\"$last_message\"}"
 }
 
 # =====================================================
@@ -214,6 +222,22 @@ check_rtb_wrapper() {
   message=$(escape_json "$message")
   details=$(escape_json "$details")
   
+  # Optional: Live Safety-Gate check (current status, not historical)
+  local live_safety_gate="N/A"
+  if [[ -x "/opt/apps/entropywatcher/safety_gate.sh" ]] && [[ "$status" != "running" ]]; then
+    # Only check if not currently running to avoid conflicts
+    if /opt/apps/entropywatcher/safety_gate.sh &>/dev/null; then
+      live_safety_gate="GREEN"
+    else
+      local sg_exit=$?
+      case $sg_exit in
+        1) live_safety_gate="YELLOW" ;;
+        2) live_safety_gate="RED" ;;
+        *) live_safety_gate="UNKNOWN" ;;
+      esac
+    fi
+  fi
+  
   # Build JSON with optional details field
   local json="{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"message\":\"$message\""
   if [[ -n "$details" ]]; then
@@ -221,6 +245,9 @@ check_rtb_wrapper() {
   fi
   if [[ "$safety_gate" != "N/A" ]]; then
     json="$json,\"safety_gate\":\"$safety_gate\""
+  fi
+  if [[ "$live_safety_gate" != "N/A" ]]; then
+    json="$json,\"live_safety_gate\":\"$live_safety_gate\""
   fi
   json="$json}"
   
