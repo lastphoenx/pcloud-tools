@@ -444,6 +444,40 @@
             <span class="info-value">${value}</span>
           </div>
         `;
+        
+        // Display snapshot/manifest counts
+        const snapshotCount = checks.backup_age.snapshot_count !== undefined ? checks.backup_age.snapshot_count : 'N/A';
+        const manifestCount = checks.backup_age.manifest_count !== undefined ? checks.backup_age.manifest_count : 'N/A';
+        
+        html += `
+          <div class="info-row">
+            <span class="info-label">RTB Snapshots</span>
+            <span class="info-value">${snapshotCount}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">pCloud Manifests</span>
+            <span class="info-value">${manifestCount}</span>
+          </div>
+        `;
+        
+        // Display last successful pCloud backup
+        if (checks.backup_age.pcloud_snapshot && checks.backup_age.pcloud_snapshot !== 'none' && checks.backup_age.pcloud_snapshot !== 'unknown') {
+          const pcloudAgeHours = checks.backup_age.pcloud_age_hours || 0;
+          let pcloudAge;
+          if (pcloudAgeHours < 24) {
+            pcloudAge = `${pcloudAgeHours}h ago`;
+          } else {
+            const days = Math.floor(pcloudAgeHours / 24);
+            pcloudAge = `${days}d ${pcloudAgeHours % 24}h ago`;
+          }
+          
+          html += `
+            <div class="info-row">
+              <span class="info-label">Last Success</span>
+              <span class="info-value">${checks.backup_age.pcloud_snapshot} (${pcloudAge})</span>
+            </div>
+          `;
+        }
       }
       
       if (checks.pcloud_quota) {

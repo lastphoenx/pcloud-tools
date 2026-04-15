@@ -190,6 +190,30 @@ check_backup_age() {
   
   [[ $VERBOSE -eq 1 ]] && echo "  Latest RTB snapshot: $latest_rtb_snapshot ($rtb_age_display)"
   
+  # Count RTB snapshots and pCloud manifests (validation)
+  local snapshot_count=0
+  local manifest_count=0
+  
+  snapshot_count=$(find "$RTB_SNAPSHOT_DIR" -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
+  
+  local manifest_dir="${PCLOUD_ARCHIVE_DIR:-/srv/pcloud-archive}/manifests"
+  if [[ -d "$manifest_dir" ]]; then
+    manifest_count=$(find "$manifest_dir" -maxdepth 1 -type f -name "*.json" 2>/dev/null | wc -l || echo "0")
+  fi
+  
+  [[ $VERBOSE -eq 1 ]] && echo "  RTB snapshots: $snapshot_count | pCloud manifests: $manifest_count"
+  
+  # Validate: manifest count should match snapshot count (or be close)
+  if [[ $manifest_count -lt $snapshot_count ]]; then
+    local missing_manifests=$((snapshot_count - manifest_count))
+    [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  ⚠ Warning: $missing_manifests RTB snapshots lack corresponding pCloud manifests${NC}"
+  elif [[ $manifest_count -gt $snapshot_count ]]; then
+    local orphan_manifests=$((manifest_count - snapshot_count))
+    [[ $VERBOSE -eq 1 ]] && echo -e "${YELLOW}  ⚠ Warning: $orphan_manifests pCloud manifests without corresponding RTB snapshots${NC}"
+  else
+    [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}  ✓ Manifest/snapshot count matches${NC}"
+  fi
+  
   # Get latest successful pCloud backup from DB (if enabled)
   local pcloud_backup_age_hours=999999
   local pcloud_snapshot=""
@@ -253,6 +277,8 @@ check_backup_age() {
   # Store results for JSON output
   CHECK_RESULTS[rtb_snapshot]="$latest_rtb_snapshot"
   CHECK_RESULTS[rtb_age_hours]=$rtb_age_hours
+  CHECK_RESULTS[snapshot_count]=$snapshot_count
+  CHECK_RESULTS[manifest_count]=$manifest_count
   CHECK_RESULTS[pcloud_snapshot]="${pcloud_snapshot:-none}"
   CHECK_RESULTS[pcloud_age_hours]=${pcloud_backup_age_hours}
   CHECK_RESULTS[backup_age_status]=$GLOBAL_STATUS
@@ -477,6 +503,8 @@ if [[ $JSON_MODE -eq 1 ]]; then
   echo "    \"backup_age\": {"
   echo "      \"status\": ${CHECK_RESULTS[backup_age_status]:-3},"
   echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[backup_age_message]:-Check not run}")\","
+  echo "      \"snapshot_count\": ${CHECK_RESULTS[snapshot_count]:-0},"
+  echo "      \"manifest_count\": ${CHECK_RESULTS[manifest_count]:-0},"
   echo "      \"rtb_snapshot\": \"${CHECK_RESULTS[rtb_snapshot]:-unknown}\","
   echo "      \"rtb_age_hours\": ${CHECK_RESULTS[rtb_age_hours]:-0},"
   echo "      \"pcloud_snapshot\": \"${CHECK_RESULTS[pcloud_snapshot]:-unknown}\","
