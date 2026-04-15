@@ -7,11 +7,13 @@
 #   ./pcloud_health_check.sh            # Run all checks, exit with status code
 #   ./pcloud_health_check.sh --verbose  # Detailed output
 #   ./pcloud_health_check.sh --nagios   # Nagios/Zabbix compatible output
+#   ./pcloud_health_check.sh --json     # JSON output for aggregation
 # 
 # Exit Codes:
 #   0 = All healthy (no issues)
 #   1 = Warning (degraded, action recommended)
 #   2 = Critical (requires immediate action)
+#   3 = Unknown (check failed to run)
 # =====================================================
 
 set -euo pipefail
@@ -49,11 +51,15 @@ DISK_WARNING_PERCENT="${DISK_WARNING_PERCENT:-10}"
 # Mode
 MODE="${1:-normal}"
 VERBOSE=0
-[[ "$MODE" == "--verbose" ]] && VERBOSE=1
-[[ "$MODE" == "--nagios" ]] && NAGIOS=1 || NAGIOS=0
+NAGIOS=0
+JSON_MODE=0
 
-# Colors (only for non-nagios mode)
-if [[ $NAGIOS -eq 0 ]]; then
+[[ "$MODE" == "--verbose" ]] && VERBOSE=1
+[[ "$MODE" == "--nagios" ]] && NAGIOS=1
+[[ "$MODE" == "--json" ]] && JSON_MODE=1
+
+# Colors (only for interactive modes)
+if [[ $NAGIOS -eq 0 && $JSON_MODE -eq 0 ]]; then
   RED='\033[0;31m'
   GREEN='\033[0;32m'
   YELLOW='\033[1;33m'
@@ -66,8 +72,19 @@ else
 fi
 
 # Status tracking
-GLOBAL_STATUS=0  # 0=OK, 1=WARNING, 2=CRITICAL
+GLOBAL_STATUS=0  # 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
 ISSUES=()
+
+# JSON data accumulator (for --json mode)
+declare -A CHECK_RESULTS
+CHECK_RESULTS[backup_age_status]=0
+CHECK_RESULTS[backup_age_message]=""
+CHECK_RESULTS[quota_status]=0
+CHECK_RESULTS[quota_message]=""
+CHECK_RESULTS[disk_status]=0
+CHECK_RESULTS[disk_message]=""
+CHECK_RESULTS[database_status]=0
+CHECK_RESULTS[database_message]=""
 
 # Helper: Set status (keep highest severity)
 set_status() {
@@ -75,6 +92,18 @@ set_status() {
   if [[ $new_status -gt $GLOBAL_STATUS ]]; then
     GLOBAL_STATUS=$new_status
   fi
+}
+
+# Helper: Store check result for JSON output
+store_check_result() {
+  local check_name="$1"
+  local status="$2"
+  local message="$3"
+  local details="${4:-}"
+  
+  CHECK_RESULTS["${check_name}_status"]=$status
+  CHECK_RESULTS["${check_name}_message"]="$message"
+  [[ -n "$details" ]] && CHECK_RESULTS["${check_name}_details"]="$details"
 }
 
 # Helper: Log issue
@@ -220,6 +249,14 @@ check_backup_age() {
       log_issue "OK" "RTB snapshot age healthy ($rtb_age_display)"
     fi
   fi
+  
+  # Store results for JSON output
+  CHECK_RESULTS[rtb_snapshot]="$latest_rtb_snapshot"
+  CHECK_RESULTS[rtb_age_hours]=$rtb_age_hours
+  CHECK_RESULTS[pcloud_snapshot]="${pcloud_snapshot:-none}"
+  CHECK_RESULTS[pcloud_age_hours]=${pcloud_backup_age_hours}
+  CHECK_RESULTS[backup_age_status]=$GLOBAL_STATUS
+  CHECK_RESULTS[backup_age_message]="$(echo "${ISSUES[@]}" | grep -o 'Backup\|RTB\|pCloud' | tail -n1 || echo 'Healthy')"
 }
 
 # =====================================================
@@ -281,6 +318,14 @@ check_pcloud_quota() {
   else
     log_issue "OK" "pCloud quota healthy: ${quota_free_tb} TB (${quota_free_gb} GB) free"
   fi
+  
+  # Store results for JSON output
+  CHECK_RESULTS[quota_total_gb]=${quota_total_gb:-0}
+  CHECK_RESULTS[quota_used_gb]=${quota_used_gb:-0}
+  CHECK_RESULTS[quota_free_gb]=${quota_free_gb:-0}
+  local quota_status_before_this_check=$GLOBAL_STATUS
+  CHECK_RESULTS[quota_status]=$quota_status_before_this_check
+  CHECK_RESULTS[quota_message]="Healthy"
 }
 
 # =====================================================
@@ -364,6 +409,14 @@ check_disk_space() {
   if [[ $overall_status -eq 0 ]]; then
     log_issue "OK" "Disk space healthy on all volumes"
   fi
+  
+  # Store results for JSON output
+  CHECK_RESULTS[rtb_used_pct]=${rtb_used_pct:-0}
+  CHECK_RESULTS[rtb_avail]="${rtb_avail:-unknown}"
+  CHECK_RESULTS[staging_used_pct]=${staging_used_pct:-0}
+  CHECK_RESULTS[staging_avail]="${staging_avail:-unknown}"
+  CHECK_RESULTS[disk_status]=$overall_status
+  CHECK_RESULTS[disk_message]="$([[ $overall_status -eq 0 ]] && echo 'Healthy' || echo 'Check issues')"
 }
 
 # =====================================================
@@ -384,6 +437,12 @@ check_database() {
   else
     log_issue "OK" "Database connection healthy"
   fi
+  
+  # Store results for JSON output
+  local db_status_code=0
+  [[ "$PCLOUD_ENABLE_DB" != "1" ]] && db_status_code=3
+  CHECK_RESULTS[database_status]=$db_status_code
+  CHECK_RESULTS[database_message]="$([[ "$PCLOUD_ENABLE_DB" == "1" ]] && echo 'Connected' || echo 'Disabled')"
 }
 
 # =====================================================
@@ -399,7 +458,80 @@ check_database
 # =====================================================
 # Output Summary
 # =====================================================
-if [[ $NAGIOS -eq 1 ]]; then
+if [[ $JSON_MODE -eq 1 ]]; then
+  # JSON output for aggregation
+  # Escapes: Replace " with \" and newlines with \n
+  escape_json() {
+    echo "$1" | sed 's/"/\\"/g' | tr '\n' ' ' | sed 's/  */ /g'
+  }
+  
+  # Build JSON manually (avoid jq dependency)
+  echo "{"
+  echo "  \"hostname\": \"$(hostname)\","
+  echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+  echo "  \"status_code\": $GLOBAL_STATUS,"
+  echo "  \"status_text\": \"$(case $GLOBAL_STATUS in 0) echo "OK";; 1) echo "WARNING";; 2) echo "CRITICAL";; 3) echo "UNKNOWN";; esac)\","
+  echo "  \"checks\": {"
+  
+  # Backup Age Check
+  echo "    \"backup_age\": {"
+  echo "      \"status\": ${CHECK_RESULTS[backup_age_status]:-3},"
+  echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[backup_age_message]:-Check not run}")\","
+  echo "      \"rtb_snapshot\": \"${CHECK_RESULTS[rtb_snapshot]:-unknown}\","
+  echo "      \"rtb_age_hours\": ${CHECK_RESULTS[rtb_age_hours]:-0},"
+  echo "      \"pcloud_snapshot\": \"${CHECK_RESULTS[pcloud_snapshot]:-unknown}\","
+  echo "      \"pcloud_age_hours\": ${CHECK_RESULTS[pcloud_age_hours]:-0}"
+  echo "    },"
+  
+  # pCloud Quota Check
+  echo "    \"pcloud_quota\": {"
+  echo "      \"status\": ${CHECK_RESULTS[quota_status]:-3},"
+  echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[quota_message]:-Check not run}")\","
+  echo "      \"total_gb\": ${CHECK_RESULTS[quota_total_gb]:-0},"
+  echo "      \"used_gb\": ${CHECK_RESULTS[quota_used_gb]:-0},"
+  echo "      \"free_gb\": ${CHECK_RESULTS[quota_free_gb]:-0}"
+  echo "    },"
+  
+  # Disk Space Check
+  echo "    \"disk_space\": {"
+  echo "      \"status\": ${CHECK_RESULTS[disk_status]:-3},"
+  echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[disk_message]:-Check not run}")\","
+  echo "      \"rtb_used_pct\": ${CHECK_RESULTS[rtb_used_pct]:-0},"
+  echo "      \"rtb_avail\": \"${CHECK_RESULTS[rtb_avail]:-unknown}\","
+  echo "      \"staging_used_pct\": ${CHECK_RESULTS[staging_used_pct]:-0},"
+  echo "      \"staging_avail\": \"${CHECK_RESULTS[staging_avail]:-unknown}\""
+  echo "    },"
+  
+  # Database Check
+  echo "    \"database\": {"
+  echo "      \"status\": ${CHECK_RESULTS[database_status]:-3},"
+  echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[database_message]:-Check not run}")\","
+  echo "      \"enabled\": \"${PCLOUD_ENABLE_DB}\""
+  echo "    }"
+  
+  echo "  },"
+  echo "  \"issues\": ["
+  
+  # Output issues array
+  local issue_count=${#ISSUES[@]}
+  local i=0
+  for issue in "${ISSUES[@]}"; do
+    severity=$(echo "$issue" | cut -d: -f1)
+    message=$(echo "$issue" | cut -d: -f2-)
+    echo "    {"
+    echo "      \"severity\": \"$severity\","
+    echo "      \"message\": \"$(escape_json "$message")\""
+    if [[ $((++i)) -lt $issue_count ]]; then
+      echo "    },"
+    else
+      echo "    }"
+    fi
+  done
+  
+  echo "  ]"
+  echo "}"
+
+elif [[ $NAGIOS -eq 1 ]]; then
   # Nagios format: STATUS_TEXT | performance_data
   case $GLOBAL_STATUS in
     0) echo "OK - All backup health checks passed" ;;
