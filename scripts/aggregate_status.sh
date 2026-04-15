@@ -170,16 +170,23 @@ check_rtb_wrapper() {
 # =====================================================
 check_pcloud() {
   if [[ ! -x "$PCLOUD_HEALTH_CHECK" ]]; then
-    echo "{\"status\":\"not_available\",\"message\":\"pcloud_health_check.sh not found or not executable\"}"
+    echo "{\"status_code\":3,\"status_text\":\"UNKNOWN\",\"message\":\"pcloud_health_check.sh not found or not executable\"}"
     return
   fi
   
-  # Run health check in JSON mode
+  # Run health check in JSON mode (don't use || because CRITICAL status exits with code 2)
   local pcloud_json
-  pcloud_json=$("$PCLOUD_HEALTH_CHECK" --json 2>/dev/null || echo "{\"status_code\":3,\"status_text\":\"ERROR\"}")
+  pcloud_json=$("$PCLOUD_HEALTH_CHECK" --json 2>&1)
+  local exit_code=$?
   
-  # Return as-is (already JSON)
-  echo "$pcloud_json"
+  # Check if we got valid JSON output (starts with { and has status_code)
+  if [[ "$pcloud_json" =~ ^\{.*\"status_code\" ]]; then
+    # Valid JSON - return as-is
+    echo "$pcloud_json"
+  else
+    # Script failed before producing valid JSON - return error
+    echo "{\"status_code\":3,\"status_text\":\"ERROR\",\"message\":\"Health check failed with exit code $exit_code\"}"
+  fi
 }
 
 # =====================================================
