@@ -207,13 +207,21 @@ log "Checking systemd services..."
 
 # Check all systemd services
 SERVICES_JSON=""
+service_count=0
+total_services=${#SYSTEMD_SERVICES[@]}
+
 for service in "${SYSTEMD_SERVICES[@]}"; do
   log "  → $service"
   service_status=$(check_systemd_service "$service")
-  SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status},\n"
+  service_count=$((service_count + 1))
+  
+  # Add comma only if not last service
+  if [[ $service_count -lt $total_services ]]; then
+    SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status},\n"
+  else
+    SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status}\n"
+  fi
 done
-# Remove trailing comma
-SERVICES_JSON=$(echo -e "$SERVICES_JSON" | sed '$ s/,$//')
 
 log "Checking RTB wrapper..."
 RTB_JSON=$(check_rtb_wrapper)
