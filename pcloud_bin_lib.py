@@ -1692,6 +1692,7 @@ def copyfolder(cfg: Dict[str, Any],
                from_path: str | None = None,
                to_folderid: int | None = None,
                to_path: str | None = None,
+               toname: str | None = None,
                noover: bool = False,
                copycontentonly: bool = False,
                skipexisting: bool = False) -> Dict[str, Any]:
@@ -1705,7 +1706,8 @@ def copyfolder(cfg: Dict[str, Any],
         from_folderid: Quell-Ordner ID
         from_path: Quell-Ordner Pfad (alternativ zu folderid)
         to_folderid: Ziel-Parent-Ordner ID
-        to_path: Ziel-Pfad (alternativ zu tofolderid)
+        to_path: Ziel-Parent-Pfad (alternativ zu tofolderid)
+        toname: Name für die Kopie (optional, sonst wird Quellname verwendet)
         noover: True = keine Überschreibung existierender Dateien
         copycontentonly: True = nur Inhalt kopieren (nicht Ordner selbst)
         skipexisting: True = existierende Dateien überspringen
@@ -1716,10 +1718,11 @@ def copyfolder(cfg: Dict[str, Any],
     Performance: O(1) — Meta-Operation (nur Filesystem-Pointer)
     
     Example:
-        # Snapshot A → B kopieren
+        # Snapshot A → B kopieren (mit neuem Namen)
         copyfolder(cfg, 
                    from_path="/Backups/_snapshots/2026-04-15",
-                   to_path="/Backups/_snapshots/2026-04-16",
+                   to_path="/Backups/_snapshots",
+                   toname="2026-04-16",
                    noover=True)
     """
     params: Dict[str, Any] = {}
@@ -1739,6 +1742,10 @@ def copyfolder(cfg: Dict[str, Any],
         params["topath"] = _norm_remote_path(to_path)
     else:
         raise ValueError("copyfolder: Ziel fehlt (to_folderid oder to_path).")
+    
+    # Optionaler Name für die Kopie
+    if toname:
+        params["toname"] = toname
     
     # Optionale Flags
     if noover:

@@ -1503,15 +1503,51 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     
     basis_path = f"{snapshots_root}/{basis_snapshot}"
     
+    # Sicherstellen dass Parent-Ordner existiert (snapshots_root)
+    if not dry:
+        try:
+            pc.ensure_path(cfg, snapshots_root)
+        except Exception as e:
+            _log(f"[delta-copy][ERROR] Konnte snapshots_root nicht anlegen: {e}")
+            return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    
     if dry:
-        _log(f"[dry] copyfolder: {basis_path} → {dest_snapshot_dir}")
+        _log(f"[dry] copyfolder: {basis_path} → {snapshots_root}/{snapshot_name}")
     else:
         try:
-            # copyfolder(cfg, from_path=..., to_path=..., noover=False)
-            result = pc.copyfolder(cfg, from_path=basis_path, to_path=dest_snapshot_dir, noover=False)
+            # copyfolder(cfg, from_path=..., to_path=parent, toname=new_name)
+            # WICHTIG: to_path ist der PARENT-Ordner, toname der neue Ordner-Name
+            result = pc.copyfolder(cfg, 
+                                   from_path=basis_path, 
+                                   to_path=snapshots_root, 
+                                   toname=snapshot_name, 
+                                   noover=False)
             
             if verbose:
                 _log(f"[delta-copy][2/6] copyfolder result: {json.dumps(result, indent=2)}")
+            
+            # CRITICAL: Warte bis Ordner wirklich existiert (pCloud async)
+            # copyfolder() returned sofort, aber Ordner braucht Zeit bis sichtbar
+            _log(f"[delta-copy][2/6] Warte auf Ordner-Sichtbarkeit...")
+            max_wait_sec = 30
+            poll_interval = 0.5
+            elapsed = 0.0
+            folder_exists = False
+            
+            while elapsed < max_wait_sec:
+                try:
+                    # Prüfe ob Ordner existiert
+                    pc.stat_file(cfg, path=dest_snapshot_dir, with_checksum=False)
+                    folder_exists = True
+                    _log(f"[delta-copy][2/6] ✓ Ordner sichtbar nach {elapsed:.1f}s")
+                    break
+                except Exception:
+                    # Noch nicht sichtbar, warte
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+            
+            if not folder_exists:
+                raise Exception(f"Ordner {dest_snapshot_dir} nach {max_wait_sec}s immer noch nicht sichtbar")
         
         except Exception as e:
             _log(f"[delta-copy][ERROR] copyfolder fehlgeschlagen: {e}")

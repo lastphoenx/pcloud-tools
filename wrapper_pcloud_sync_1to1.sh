@@ -468,9 +468,9 @@ if [[ -L "${RTB}/latest" || -d "${RTB}/latest" ]]; then
   fi
 fi
 
-# Bootstrap (remote leer)
+# Bootstrap (remote leer - Initial Sync)
 if [[ "$(remote_has_snapshots)" == "NO" ]]; then
-  _log INFO "Bootstrap: Remote empty – backfilling all local snapshots (old → new)"
+  _log INFO "Bootstrap: Remote empty – uploading all local snapshots (initial sync)"
   mapfile -t SNAPS < <(find "$RTB" -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' | sort)
   if [[ ${#SNAPS[@]} -eq 0 ]]; then
     _log WARN "No local snapshots found"
@@ -493,19 +493,19 @@ fixed = finalize_index_fileids(cfg, snapshots_root)
 print(f"[finalize] index fileids fixed={fixed}")
 PY
   _db_run_end SUCCESS 0
-  _log INFO "Bootstrap/backfill completed successfully"
+  _log INFO "Bootstrap completed successfully"
   exit 0
 fi
 
-# Intelligentes Gap-Backfilling (statt nur latest)
+# Sync-Check: Fehlende Snapshots erkennen und hochladen
 _log INFO "Checking for missing snapshots..."
 uploaded_count=0
 
 for s in $(local_snapshot_names); do
   if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    _log WARN "Gap detected: Snapshot $s missing remote – backfilling..."
+    _log WARN "Gap detected: Snapshot $s missing remote – uploading..."
     build_and_push "$RTB/$s" || {
-      _db_run_end FAILED 1 "Gap backfill failed for $s"
+      _db_run_end FAILED 1 "Upload failed for $s"
       exit 1
     }
     uploaded_count=$((uploaded_count + 1))
@@ -516,7 +516,7 @@ if [[ $uploaded_count -eq 0 ]]; then
   _log INFO "All snapshots already on pCloud"
 else
   _log INFO "Successfully uploaded $uploaded_count snapshot(s)"
-  _db_update_metrics "gaps_backfilled = $uploaded_count"
+  _db_update_metrics "gaps_synced = $uploaded_count"
 fi
 
 # Cleanup: Alte Temp-Dateien löschen (>7 Tage)
