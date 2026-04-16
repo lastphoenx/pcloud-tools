@@ -364,19 +364,39 @@ View detailed status:
 **Quick Setup:**
 ```bash
 # 1. Install Apprise
-sudo apt install apprise  # Debian/Ubuntu
+sudo apt install python3-apprise
 
-# 2. Configure services
+# 2. Configure Telegram (or other services)
 sudo cp apprise.yml.example /opt/apps/apprise.yml
 sudo nano /opt/apps/apprise.yml
-# Add Telegram bot token, Discord webhook, etc.
+# Add Telegram bot token + chat ID (see docs/TELEGRAM.md)
 
-# 3. Test
+# 3. Secure config
+sudo chown root:root /opt/apps/apprise.yml
+sudo chmod 600 /opt/apps/apprise.yml
+
+# 4. Test notifications
 ./scripts/send_aggregated_alert.sh --test
 
-# 4. Automate (cron)
+# 5. Automate with systemd (recommended)
+sudo cp systemd/monitoring-alert.{service,timer}.example /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now monitoring-alert.timer
+
+# Alternative: Automate with cron
 */5 * * * * /opt/apps/pcloud-tools/main/scripts/send_aggregated_alert.sh
 ```
+
+**Systemd Integration (Recommended):**
+The monitoring-alert.timer automatically triggers after status updates:
+- Runs after `monitoring-status-update.service` completes
+- Fallback: Every 30 minutes
+- Only sends notifications when status changes
+
+**See:**
+- [docs/TELEGRAM.md](docs/TELEGRAM.md) - Complete Telegram bot setup guide
+- [systemd/README.md](systemd/README.md) - Systemd service installation
+- [apprise.yml.example](apprise.yml.example) - Multi-service configuration
 
 **Supported Services (via tags):**
 - **Telegram** (`tag: telegram`) - Bot via @BotFather

@@ -1,0 +1,42 @@
+[Unit]
+Description=Monitoring Alert Notification Service
+Documentation=file:///opt/apps/pcloud-tools/main/scripts/README.md
+After=network-online.target
+Wants=network-online.target
+# Run after monitoring-status-update to ensure fresh data
+After=monitoring-status-update.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/apps/pcloud-tools/main/scripts
+
+# Execute alert script (only sends if status changed)
+ExecStart=/opt/apps/pcloud-tools/main/scripts/send_aggregated_alert.sh
+
+# Environment
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="STATUS_JSON=/opt/apps/monitoring/status.json"
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Read-only access to monitoring data and scripts
+ReadOnlyPaths=/opt/apps/monitoring
+ReadOnlyPaths=/opt/apps/pcloud-tools
+ReadOnlyPaths=/opt/apps/entropywatcher
+
+# Write access for state file (.aggregated_status_last)
+ReadWritePaths=/opt/apps/pcloud-tools/main/scripts
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monitoring-alert
+
+[Install]
+WantedBy=multi-user.target

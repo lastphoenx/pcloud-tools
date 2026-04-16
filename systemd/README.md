@@ -17,6 +17,19 @@ Event-triggered timer with fallback schedule:
 - **Fallback**: Every 15 minutes
 - **Boot**: 2 minutes after system startup
 
+### monitoring-alert.service
+Oneshot service that sends notifications on status changes:
+- Runs send_aggregated_alert.sh
+- Compares current status with previous run
+- Sends Telegram/Discord/ntfy alerts only on changes
+- Uses Apprise for multi-service notifications
+
+### monitoring-alert.timer
+Event-triggered timer for change notifications:
+- **Triggers after**: monitoring-status-update.service
+- **Fallback**: Every 30 minutes
+- **Boot**: 3 minutes after system startup (after status update)
+
 ### monitoring-dashboard.service
 Persistent web server for the monitoring dashboard:
 - **Port**: 8080
@@ -25,6 +38,44 @@ Persistent web server for the monitoring dashboard:
 - **User**: thomas (non-root for security)
 
 ## 🚀 Installation
+
+### 0. Setup Telegram Notifications (Required for monitoring-alert)
+
+Before enabling the alert service, configure Telegram notifications:
+
+```bash
+# 1. Copy example config
+sudo cp /opt/apps/pcloud-tools/main/apprise.yml.example /opt/apps/apprise.yml
+
+# 2. Edit config with your Telegram bot token and chat ID
+sudo nano /opt/apps/apprise.yml
+
+# 3. Secure the config file
+sudo chown root:root /opt/apps/apprise.yml
+sudo chmod 600 /opt/apps/apprise.yml
+
+# 4. Test notifications
+/opt/apps/pcloud-tools/main/scripts/send_aggregated_alert.sh --test
+```
+
+**Telegram Bot Setup:**
+1. Open Telegram, search for `@BotFather`
+2. Send: `/newbot`
+3. Follow prompts to create bot and get token (format: `123456789:ABCdefGHI...`)
+4. Get your chat_id:
+   - Method 1: Search for `@userinfobot` on Telegram, it will show your user ID
+   - Method 2: Send a message to your bot, then visit:
+     ```
+     https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
+     ```
+5. Add token and chat_id to `/opt/apps/apprise.yml`:
+   ```yaml
+   urls:
+     - tgram://YOUR_BOT_TOKEN/YOUR_CHAT_ID/:
+         tag: telegram
+   ```
+
+See [apprise.yml.example](../apprise.yml.example) for full configuration options.
 
 ### 1. Copy example files
 
@@ -35,6 +86,12 @@ sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-status-update.service.exa
 
 sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-status-update.timer.example \
         /etc/systemd/system/monitoring-status-update.timer
+
+sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-alert.service.example \
+        /etc/systemd/system/monitoring-alert.service
+
+sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-alert.timer.example \
+        /etc/systemd/system/monitoring-alert.timer
 
 sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-dashboard.service.example \
         /etc/systemd/system/monitoring-dashboard.service
@@ -61,11 +118,13 @@ sudo systemctl daemon-reload
 ### 4. Enable and start services
 
 ```bash
-# Enable timer (will auto-start on boot)
+# Enable timers (will auto-start on boot)
 sudo systemctl enable monitoring-status-update.timer
+sudo systemctl enable monitoring-alert.timer
 
-# Start timer immediately
+# Start timers immediately
 sudo systemctl start monitoring-status-update.timer
+sudo systemctl start monitoring-alert.timer
 
 # Enable dashboard webserver
 sudo systemctl enable monitoring-dashboard.service
