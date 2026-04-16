@@ -1549,8 +1549,12 @@ def _rest_get(cfg: dict, endpoint: str, params: dict | None = None):
     if tok and "access_token" not in p:
         p["access_token"] = tok
 
+    # WICHTIG: cfg["timeout"] hat VORRANG über session._default_timeout!
+    # (Meta-Operationen wie copyfolder können >60s dauern)
+    effective_timeout = timeout  # cfg["timeout"] bevorzugen
+
     try:
-        r = s.get(f"{base}/{endpoint}", params=p, timeout=getattr(s, "_default_timeout", timeout))
+        r = s.get(f"{base}/{endpoint}", params=p, timeout=effective_timeout)
         r.raise_for_status()  # Raise HTTPError für 4xx/5xx
     except requests.exceptions.HTTPError as e:
         # SECURITY: Entferne access_token aus Error-Message!
