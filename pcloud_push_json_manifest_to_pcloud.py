@@ -1855,8 +1855,17 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             continue
         
         holders = node.setdefault("holders", [])
-        if snapshot_name not in holders:
-            holders.append(snapshot_name)
+        relpath = file_item.get("relpath") or ""
+        holder_entry = {"snapshot": snapshot_name, "relpath": relpath}
+        
+        # Check if this exact holder already exists (robust gegen String-Leichen)
+        holder_exists = any(
+            isinstance(h, dict) and h.get("snapshot") == snapshot_name and h.get("relpath") == relpath
+            for h in holders
+        )
+        
+        if not holder_exists:
+            holders.append(holder_entry)
             index_changed = True
     
     # Index speichern (remote + lokal)
