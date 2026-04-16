@@ -90,6 +90,14 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
             # Find and remove holders that reference this anchor
             new_holders = []
             for h in holders:
+                # === DEBUG: Schema-Prüfung ===
+                if not isinstance(h, dict):
+                    print(f"[DEBUG] Holder ist kein Dict! Type={type(h).__name__}, Content={repr(h)[:200]}")
+                    print(f"[DEBUG]   SHA256: {sha[:16]}... Anchor: {anchor_path}")
+                    print(f"[DEBUG]   Alle holders für diesen Node: {holders}")
+                    continue
+                # === ENDE DEBUG ===
+                
                 h_snap = h.get("snapshot")
                 h_rel = h.get("relpath")
                 

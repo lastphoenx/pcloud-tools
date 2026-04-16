@@ -1050,6 +1050,16 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             write_ms += dt_ms 
             print(f"[timing] index_write_ms={int(dt_ms)}")
             
+            # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
+            try:
+                idx_path = f"{snapshots_root}/_index/content_index.json"
+                archiv_path = f"{snapshots_root}/_index/archiv/{snapshot_name}_index.json"
+                pc.ensure_parent_dirs(cfg, archiv_path)
+                pc.copyfile(cfg, from_path=idx_path, to_path=archiv_path)
+                _log(f"[index] ✓ Content-Index remote archiviert: {archiv_path}")
+            except Exception as e:
+                _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
+            
             # Lokale Index-Datei löschen
             try:
                 os.remove(_local_index_path)
@@ -1860,6 +1870,17 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             os.makedirs(os.path.dirname(archive_index_path), exist_ok=True)
             save_content_index_local(archive_index_path, index)
             _log(f"[delta-copy][6/6] ✓ Content-Index lokal archiviert: {archive_index_path}")
+        
+        # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
+        if not dry:
+            idx_path = f"{snapshots_root}/_index/content_index.json"
+            archiv_path = f"{snapshots_root}/_index/archiv/{snapshot_name}_index.json"
+            try:
+                pc.ensure_parent_dirs(cfg, archiv_path)
+                pc.copyfile(cfg, from_path=idx_path, to_path=archiv_path)
+                _log(f"[delta-copy][6/6] ✓ Content-Index remote archiviert: {archiv_path}")
+            except Exception as e:
+                _log(f"[delta-copy][6/6][warn] Remote-Archivierung fehlgeschlagen: {e}")
     else:
         _log(f"[delta-copy][6/6] Content-Index unverändert")
     
