@@ -1419,6 +1419,457 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
     globals()["MET_REMOVED_NODES"] += int(removed_nodes)
 
 
+# ----------------- Delta-Copy Mode (PoC) -----------------
+
+def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None):
+    """
+    Delta-Copy Mode: Server-seitiges Klonen + Selective Update
+    
+    Workflow:
+      1. Finde letzten vollständigen Snapshot (via content_index.json)
+      2. copyfolder() - Server-seitiges Klonen (2-5s statt 3.5h)
+      3. Manifest-Diff berechnen (10s)
+      4. DELETE-Loop: deleted + changed Dateien löschen
+      5. WRITE-Loop: new + changed Dateien hochladen/stubben
+      6. Content-Index aktualisieren
+      
+    Performance:
+      - Typisch: 60x-210x schneller bei minimalen Änderungen
+      - 100k Dateien, 1 Änderung: 3.5h → <2min
+      
+    Fallback:
+      - Falls kein Basis-Snapshot existiert: Wechsel zu push_1to1_mode()
+    """
+    t_start = time.time()
+    
+    snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
+    dest_root = pc._norm_remote_path(dest_root)
+    snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
+    dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+    
+    _log(f"[delta-copy] Start: {snapshot_name}")
+    _log(f"[delta-copy] Ziel: {dest_snapshot_dir}")
+    
+    # === Config: Timeout Protection ===
+    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
+        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
+    
+    # === Schritt 1: Finde Basis-Snapshot ===
+    _log(f"[delta-copy][1/6] Suche letzten vollständigen Snapshot...")
+    t_find_start = time.time()
+    
+    try:
+        index = load_content_index(cfg, snapshots_root)
+    except Exception as e:
+        _log(f"[delta-copy][FALLBACK] Konnte content_index.json nicht laden: {e}")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    
+    # Finde letzten Snapshot mit .upload_complete Marker
+    basis_snapshot = None
+    remote_snapshots = list_remote_snapshot_names(cfg, snapshots_root)
+    
+    # Sortiere absteigend (neueste zuerst)
+    sorted_snapshots = sorted(remote_snapshots, reverse=True)
+    
+    for candidate in sorted_snapshots:
+        if candidate == snapshot_name:
+            continue  # Überspringe den neuen Snapshot selbst
+        
+        # Prüfe ob .upload_complete existiert
+        marker_complete = f"{snapshots_root}/{candidate}/.upload_complete"
+        try:
+            pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+            basis_snapshot = candidate
+            _log(f"[delta-copy][1/6] Basis gefunden: {basis_snapshot}")
+            break
+        except Exception:
+            # Kein Complete-Marker → überspringe
+            if verbose:
+                _log(f"[delta-copy][1/6] Überspringe {candidate} (kein Complete-Marker)")
+            continue
+    
+    if not basis_snapshot:
+        _log(f"[delta-copy][FALLBACK] Kein vollständiger Basis-Snapshot gefunden")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    
+    t_find_ms = (time.time() - t_find_start) * 1000.0
+    _log(f"[delta-copy][1/6] ✓ Basis: {basis_snapshot} ({t_find_ms:.0f}ms)")
+    
+    # === Schritt 2: copyfolder() - Server-seitiges Klonen ===
+    _log(f"[delta-copy][2/6] Starte Server-Side Copy: {basis_snapshot} → {snapshot_name}")
+    t_copy_start = time.time()
+    
+    basis_path = f"{snapshots_root}/{basis_snapshot}"
+    
+    if dry:
+        _log(f"[dry] copyfolder: {basis_path} → {dest_snapshot_dir}")
+    else:
+        try:
+            # copyfolder(cfg, from_path=..., to_path=..., noover=False)
+            result = pc.copyfolder(cfg, from_path=basis_path, to_path=dest_snapshot_dir, noover=False)
+            
+            if verbose:
+                _log(f"[delta-copy][2/6] copyfolder result: {json.dumps(result, indent=2)}")
+        
+        except Exception as e:
+            _log(f"[delta-copy][ERROR] copyfolder fehlgeschlagen: {e}")
+            _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
+            # Cleanup: Versuche geklonten Snapshot zu löschen
+            try:
+                pc.delete_folder(cfg, path=dest_snapshot_dir, recursive=True)
+            except Exception:
+                pass
+            return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    
+    t_copy_ms = (time.time() - t_copy_start) * 1000.0
+    _log(f"[delta-copy][2/6] ✓ Server-Copy abgeschlossen ({t_copy_ms:.0f}ms = {t_copy_ms/1000:.1f}s)")
+    
+    # === Schritt 3: Manifest-Diff berechnen ===
+    _log(f"[delta-copy][3/6] Berechne Manifest-Diff...")
+    t_diff_start = time.time()
+    
+    # Finde Basis-Manifest (lokal im Archive)
+    archive_base = os.getenv("PCLOUD_MANIFEST_ARCHIVE", "/srv/pcloud-archive")
+    basis_manifest_path = f"{archive_base}/manifests/{basis_snapshot}.json"
+    
+    if not os.path.exists(basis_manifest_path):
+        _log(f"[delta-copy][ERROR] Basis-Manifest nicht gefunden: {basis_manifest_path}")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
+        # Cleanup
+        if not dry:
+            try:
+                pc.delete_folder(cfg, path=dest_snapshot_dir, recursive=True)
+            except Exception:
+                pass
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    
+    # Import pcloud_manifest_diff
+    try:
+        import pcloud_manifest_diff
+    except Exception as e:
+        _log(f"[delta-copy][ERROR] Konnte pcloud_manifest_diff nicht importieren: {e}")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    
+    # Schreibe current manifest temporär (falls noch nicht gespeichert)
+    import tempfile
+    temp_current = None
+    if not manifest_path or not os.path.exists(manifest_path):
+        fd, temp_current = tempfile.mkstemp(suffix=".json", prefix="manifest_current_")
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        current_manifest_path = temp_current
+    else:
+        current_manifest_path = manifest_path
+    
+    try:
+        diff = pcloud_manifest_diff.compare_manifests(current_manifest_path, basis_manifest_path)
+    except Exception as e:
+        _log(f"[delta-copy][ERROR] Manifest-Diff fehlgeschlagen: {e}")
+        if temp_current:
+            os.unlink(temp_current)
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+    finally:
+        if temp_current and os.path.exists(temp_current):
+            os.unlink(temp_current)
+    
+    t_diff_ms = (time.time() - t_diff_start) * 1000.0
+    
+    stats = diff["stats"]
+    _log(f"[delta-copy][3/6] ✓ Manifest-Diff berechnet ({t_diff_ms:.0f}ms)")
+    _log(f"[delta-copy][3/6]   Identisch: {stats['identical_count']}")
+    _log(f"[delta-copy][3/6]   Neu:       {stats['new_count']}")
+    _log(f"[delta-copy][3/6]   Geändert:  {stats['changed_count']}")
+    _log(f"[delta-copy][3/6]   Gelöscht:  {stats['deleted_count']}")
+    
+    # === Schritt 4: DELETE-Loop ===
+    _log(f"[delta-copy][4/6] Lösche geänderte und gelöschte Dateien...")
+    t_delete_start = time.time()
+    
+    delete_count = 0
+    delete_items = diff["deleted"] + diff["changed"]
+    
+    for item in delete_items:
+        relpath = item.get("relpath")
+        if not relpath:
+            continue
+        
+        # Lösche echte Datei
+        file_path = f"{dest_snapshot_dir}/{relpath}"
+        
+        if dry:
+            _log(f"[dry] delete: {file_path}")
+        else:
+            try:
+                pc.delete_file(cfg, path=file_path)
+                delete_count += 1
+            except Exception as e:
+                if "2005" not in str(e) and "not found" not in str(e).lower():
+                    _log(f"[delta-copy][4/6][warn] Konnte {file_path} nicht löschen: {e}")
+        
+        # Lösche auch .meta.json Stub (falls vorhanden)
+        stub_path = f"{file_path}.meta.json"
+        if dry:
+            _log(f"[dry] delete stub: {stub_path}")
+        else:
+            try:
+                pc.delete_file(cfg, path=stub_path)
+            except Exception:
+                pass  # Stub existiert nicht → okay
+    
+    t_delete_ms = (time.time() - t_delete_start) * 1000.0
+    _log(f"[delta-copy][4/6] ✓ {delete_count} Dateien gelöscht ({t_delete_ms:.0f}ms)")
+    
+    # === Schritt 5: WRITE-Loop (new + changed) ===
+    _log(f"[delta-copy][5/6] Schreibe neue und geänderte Dateien...")
+    t_write_start = time.time()
+    
+    write_items = diff["new"] + diff["changed"]
+    uploaded = 0
+    stubs = 0
+    
+    # Hilfstabellen (ähnlich wie push_1to1_mode)
+    seen_inodes: dict[tuple[int,int], str] = {}
+    items_dict = index.setdefault("items", {})
+    known_anchors = {}
+    
+    for sha, node in items_dict.items():
+        ap = node.get("anchor_path")
+        fid = node.get("fileid")
+        if ap and fid:
+            known_anchors[sha] = (ap, fid)
+    
+    # Sortiere nach Extension für bessere Fehlerdiagnose
+    write_items.sort(key=lambda x: (x.get("ext") or "", x.get("relpath") or ""))
+    
+    index_changed = False
+    stubs_to_write = []
+    
+    def _ensure(path: str) -> None:
+        if not path or dry:
+            return
+        pc.call_with_backoff(pc.ensure_path, cfg, path)
+    
+    def _upload_real_file(abs_src: str, dst_path: str) -> tuple:
+        """Returns (fileid, pcloud_hash)"""
+        parent = os.path.dirname(dst_path.rstrip("/"))
+        if parent:
+            _ensure(parent)
+        if dry:
+            _log(f"[dry] upload: {dst_path} <- {abs_src}")
+            return (None, None)
+        
+        res = pc.call_with_backoff(pc.upload_file, cfg, local_path=abs_src, remote_path=dst_path, attempts=12, max_sleep=60.0)
+        
+        try:
+            md = (res or {}).get("metadata") or {}
+            fileid = md.get("fileid")
+            pcloud_hash = md.get("hash")
+        except Exception:
+            fileid = None
+            pcloud_hash = None
+        
+        # Eager FileID
+        if (not fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
+            try:
+                stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=dst_path) or {}
+                if not fileid:
+                    fileid = stat_md.get("fileid")
+                if not pcloud_hash:
+                    pcloud_hash = stat_md.get("hash")
+            except Exception:
+                pass
+        
+        return (fileid, pcloud_hash)
+    
+    def _queue_stub(relpath: str, file_item: dict, node: dict) -> None:
+        nonlocal stubs, index_changed
+        
+        eager = os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0"
+        if eager and (not node.get("fileid")) and node.get("anchor_path"):
+            fid = pc.resolve_fileid_cached(cfg, path=node["anchor_path"], cache=_fid_cache_shared)
+            if fid:
+                node["fileid"] = fid
+                index_changed = True
+        
+        meta_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
+        payload = {
+            "type": "hardlink",
+            "sha256": file_item.get("sha256"),
+            "size": file_item.get("size"),
+            "mtime": file_item.get("mtime"),
+            "snapshot": snapshot_name,
+            "relpath": relpath,
+            "anchor_path": node.get("anchor_path"),
+            "fileid": node.get("fileid") if node.get("fileid") is not None else None,
+            "inode": file_item.get("inode"),
+        }
+        if dry:
+            _log(f"[dry] write stub: {meta_path}")
+        else:
+            stubs_to_write.append((meta_path, payload))
+        stubs += 1
+    
+    # Hauptschleife für WRITE
+    for file_item in write_items:
+        relpath = file_item.get("relpath")
+        if not relpath:
+            continue
+        
+        sha = (file_item.get("sha256") or "").lower()
+        abs_src = file_item.get("source_path")
+        ext = file_item.get("ext", "")
+        
+        if not sha or not abs_src:
+            _log(f"[delta-copy][5/6][warn] Überspringe {relpath} (kein SHA256 oder source_path)")
+            continue
+        
+        # Hardlink-Dedupe (innerhalb desselben Snapshots)
+        ino_data = file_item.get("inode")
+        key = None
+        if ino_data and isinstance(ino_data, dict):
+            dev = ino_data.get("dev")
+            ino = ino_data.get("ino")
+            if dev and ino:
+                key = (dev, ino)
+        
+        if key and key in seen_inodes:
+            # Hardlink zu bereits verarbeitetem File
+            _queue_stub(relpath, file_item, items_dict.get(sha, {}))
+            continue
+        
+        # Prüfe ob SHA256 bereits im Index existiert
+        node = items_dict.get(sha)
+        
+        if node:
+            # Hash existiert bereits → Stub schreiben
+            _queue_stub(relpath, file_item, node)
+            if key:
+                seen_inodes[key] = sha
+        else:
+            # Neue Datei → Upload + Anchor registrieren
+            dst_path = f"{dest_snapshot_dir}/{relpath}"
+            
+            fileid, pcloud_hash = _upload_real_file(abs_src, dst_path)
+            uploaded += 1
+            
+            # Index-Eintrag erstellen
+            node = {
+                "anchor_path": dst_path,
+                "anchor_snapshot": snapshot_name,
+                "holders": [snapshot_name],
+                "ext": ext,
+            }
+            if fileid:
+                node["fileid"] = fileid
+            if pcloud_hash:
+                node["pcloud_hash"] = pcloud_hash
+            
+            items_dict[sha] = node
+            index_changed = True
+            
+            if key:
+                seen_inodes[key] = sha
+    
+    # Stubs schreiben (Batch)
+    if stubs_to_write and not dry:
+        _log(f"[delta-copy][5/6] Schreibe {len(stubs_to_write)} Stubs...")
+        _batch_write_stubs(cfg, stubs_to_write, dry=dry)
+        globals()["MET_STUBS_WRITTEN"] += len(stubs_to_write)
+    
+    t_write_ms = (time.time() - t_write_start) * 1000.0
+    _log(f"[delta-copy][5/6] ✓ WRITE abgeschlossen: {uploaded} uploads, {stubs} stubs ({t_write_ms:.0f}ms)")
+    
+    # === Schritt 6: Content-Index aktualisieren ===
+    _log(f"[delta-copy][6/6] Aktualisiere Content-Index...")
+    t_index_start = time.time()
+    
+    # Holders aktualisieren: Snapshot zu allen verwendeten Hashes hinzufügen
+    for file_item in (manifest.get("items") or []):
+        if file_item.get("type") != "file":
+            continue
+        
+        sha = (file_item.get("sha256") or "").lower()
+        if not sha:
+            continue
+        
+        node = items_dict.get(sha)
+        if not node:
+            _log(f"[delta-copy][6/6][warn] SHA256 {sha} nicht im Index (sollte nicht passieren)")
+            continue
+        
+        holders = node.setdefault("holders", [])
+        if snapshot_name not in holders:
+            holders.append(snapshot_name)
+            index_changed = True
+    
+    # Index speichern
+    if index_changed:
+        save_content_index(cfg, snapshots_root, index, dry=dry)
+        _log(f"[delta-copy][6/6] ✓ Content-Index gespeichert")
+    else:
+        _log(f"[delta-copy][6/6] Content-Index unverändert")
+    
+    t_index_ms = (time.time() - t_index_start) * 1000.0
+    
+    # === Upload-Complete Marker setzen ===
+    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+    if not dry:
+        try:
+            pc.put_textfile(cfg, path=marker_complete, text=json.dumps({
+                "snapshot": snapshot_name,
+                "completed_at": time.time(),
+                "mode": "delta-copy",
+                "basis_snapshot": basis_snapshot,
+            }))
+        except Exception as e:
+            _log(f"[delta-copy][warn] Konnte Complete-Marker nicht setzen: {e}")
+    
+    # === Manifest archivieren ===
+    if manifest_path and not dry:
+        archive_dest = f"{archive_base}/manifests/{snapshot_name}.json"
+        os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
+        
+        try:
+            import shutil
+            shutil.copy2(manifest_path, archive_dest)
+            _log(f"[delta-copy] Manifest archiviert: {archive_dest}")
+        except Exception as e:
+            _log(f"[delta-copy][warn] Konnte Manifest nicht archivieren: {e}")
+    
+    # === Summary ===
+    t_total_ms = (time.time() - t_start) * 1000.0
+    
+    _log(f"[delta-copy] ✓ ABGESCHLOSSEN ({t_total_ms/1000:.1f}s total)")
+    _log(f"[delta-copy]   Server-Copy: {t_copy_ms:.0f}ms")
+    _log(f"[delta-copy]   Manifest-Diff: {t_diff_ms:.0f}ms")
+    _log(f"[delta-copy]   DELETE: {delete_count} Dateien, {t_delete_ms:.0f}ms")
+    _log(f"[delta-copy]   WRITE: {uploaded} uploads, {stubs} stubs, {t_write_ms:.0f}ms")
+    _log(f"[delta-copy]   Index: {t_index_ms:.0f}ms")
+    
+    # Metrics
+    globals()["MET_UPLOADED_FILES"] += uploaded
+    
+    return {
+        "uploaded": uploaded,
+        "stubs": stubs,
+        "deleted": delete_count,
+        "mode": "delta-copy",
+        "basis_snapshot": basis_snapshot,
+        "timings": {
+            "total_ms": t_total_ms,
+            "find_ms": t_find_ms,
+            "copy_ms": t_copy_ms,
+            "diff_ms": t_diff_ms,
+            "delete_ms": t_delete_ms,
+            "write_ms": t_write_ms,
+            "index_ms": t_index_ms,
+        }
+    }
+
+
 # ----------------- CLI -----------------
 
 def main() -> None:
@@ -1427,6 +1878,9 @@ def main() -> None:
     ap.add_argument("--dest-root", required=True, help="Remote-Wurzel, z.B. /Backup/pcloud-snapshots")
     ap.add_argument("--snapshot-mode", choices=["objects","1to1"], default="objects",
                     help="Upload-Strategie: objects (Hash-Object-Store + Stubs) oder 1to1 (Materialisieren + Stubs)")
+    ap.add_argument("--use-delta-copy", action="store_true",
+                    help="Delta-Copy-Modus: Server-seitiges Klonen + selective Updates (nur mit --snapshot-mode 1to1). "
+                         "Erfordert vorherigen vollständigen Snapshot. Fallback zu Full-Mode wenn kein Basis existiert.")
     ap.add_argument("--objects-layout", choices=["two-level"], default="two-level",
                     help="Layout für Object-Store (aktuell nur two-level).")
     ap.add_argument("--retention-sync", action="store_true",
@@ -1483,7 +1937,12 @@ def main() -> None:
     if args.snapshot_mode == "objects":
         push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
     else:
-        push_1to1_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
+        # 1:1-Modus: Delta-Copy oder Full-Mode
+        if args.use_delta_copy:
+            _log("[mode] Delta-Copy-Modus aktiviert")
+            push_1to1_delta_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
+        else:
+            push_1to1_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
 
 
     # --- metrics summary (einheitlich, greppbar) ---

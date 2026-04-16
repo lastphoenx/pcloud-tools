@@ -1,6 +1,15 @@
 #!/bin/bash
-# cleanup_aborted_upload.sh
-# Räumt einen abgebrochenen pCloud-Upload auf und bereitet Neustart vor
+# cleanup_aborted_upload.sh — Cleanup für abgebrochene pCloud-Uploads
+# 
+# Räumt einen abgebrochenen pCloud-Upload auf und bereitet Neustart vor.
+# Funktioniert für beide Upload-Modi:
+#   - Full-Mode: Alle Dateien/Stubs neu schreiben
+#   - Delta-Copy-Mode: Server-Side Clone + Selective Update
+#
+# Bei Delta-Copy PoC Failures:
+#   - Geklonter Snapshot wird gelöscht (remote via --remote)
+#   - Lokaler RTB-Snapshot wird nur gelöscht wenn --local gesetzt
+#   - Latest-Symlink wird auf vorherigen Snapshot gesetzt
 
 set -e
 

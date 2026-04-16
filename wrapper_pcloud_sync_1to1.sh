@@ -364,10 +364,22 @@ build_and_push() {
   local RET=""
   [[ "$(need_retention_sync)" == "YES" ]] && RET="--retention-sync"
 
+  # Delta-Copy-Flag (PoC)
+  local DELTA_FLAG=""
+  [[ "${PCLOUD_USE_DELTA_COPY:-0}" == "1" ]] && DELTA_FLAG="--use-delta-copy"
+
   # Upload phase
   T0=$(date +%s)
   _db_phase_log "upload" "start"
-  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE" || {
+  
+  # Log-Hinweis bei Delta-Copy
+  if [[ "${PCLOUD_USE_DELTA_COPY:-0}" == "1" ]]; then
+    _log INFO "Upload-Modus: Delta-Copy (Server-Side Clone + Selective Update)"
+  else
+    _log INFO "Upload-Modus: Full-Mode (alle Dateien/Stubs neu schreiben)"
+  fi
+  
+  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET $DELTA_FLAG --env-file "$ENV_FILE" || {
     _db_phase_log "upload" "end" "FAILED"
     rm -f "$mani" 2>/dev/null || true
     return 1
