@@ -13,6 +13,10 @@
 
 set -e
 
+# === Script-Verzeichnis ermitteln (für Python-Imports) ===
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SCRIPT_DIR
+
 # === Argument-Handling ===
 if [ -z "$1" ]; then
     echo "❌ FEHLER: Bitte Snapshot-Namen angeben!"
@@ -125,7 +129,16 @@ if [ "$DO_REMOTE_DELETE" = true ]; then
         echo "  [dry-run] Würde löschen: $PCLOUD_DEST/$SNAPSHOT_NAME (remote via API)"
     else
         python3 -c "
+import sys
+import os
+
+# KRITISCH: sys.path für pcloud_bin_lib setzen
+script_dir = os.environ.get('SCRIPT_DIR', '/opt/apps/pcloud-tools/main')
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 import pcloud_bin_lib as pc
+
 cfg = pc.effective_config()
 try:
     pc.delete_folder(cfg, path='$PCLOUD_DEST/$SNAPSHOT_NAME', recursive=True)
