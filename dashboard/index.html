@@ -477,7 +477,7 @@
     
     // Render pCloud card
     function renderPCloudCard(pcloud) {
-      const statusCode = pcloud.status_code || 3;
+      const statusCode = pcloud.status_code !== undefined ? pcloud.status_code : 3;
       const statusText = pcloud.status_text || 'UNKNOWN';
       const statusClass = statusCode === 0 ? 'success' : statusCode === 1 ? 'warning' : 'failed';
       
