@@ -82,6 +82,7 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, c
     invalid_holders_other = 0     # String-Holder bei existierenden Anchors (nur mit --cleanup-all)
     
     verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
+    debug_samples = []  # Erste 3 Samples für Debugging
     
     # Iterate over all index nodes
     for sha, node in list(items.items()):
@@ -93,6 +94,10 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, c
         
         # Check if this node's anchor is missing
         is_missing_anchor = anchor_path and anchor_path in missing_lookup
+        
+        # Skip Nodes ohne Holders (Optimierung)
+        if not holders:
+            continue
         
         # === Schema-Check für ALLE Nodes (nicht nur Missing-Anchors) ===
         new_holders = []
@@ -109,6 +114,16 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, c
                 else:
                     # Bei existierendem Anchor: nur mit --cleanup-all entfernen
                     invalid_holders_other += 1
+                    
+                    # Debug: Erste 3 Samples sammeln
+                    if len(debug_samples) < 3:
+                        debug_samples.append({
+                            "sha": sha[:16],
+                            "anchor": anchor_path or "(none)",
+                            "holder_type": type(h).__name__,
+                            "holder_content": repr(h)[:100]
+                        })
+                    
                     if cleanup_all:
                         if verbose:
                             print(f"[info] Korrupter Holder entfernt (--cleanup-all): {repr(h)[:60]}")
@@ -121,11 +136,6 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, c
             
             # Ab hier: h ist garantiert ein Dict
             
-            # Bei Missing-Anchor: prüfe ob dieser Holder auf den Missing-Anchor zeigt
-            if is_missing_anchor:
-                h_snap = h.get("snapshot")
-                h_rel = h.get("relpath")
-                
             # Bei Missing-Anchor: prüfe ob dieser Holder auf den Missing-Anchor zeigt
             if is_missing_anchor:
                 h_snap = h.get("snapshot")
@@ -170,6 +180,7 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, c
         "removed_nodes": removed_nodes,
         "invalid_holders_missing": invalid_holders_missing,
         "invalid_holders_other": invalid_holders_other,
+        "debug_samples": debug_samples,
     }
 
 
@@ -303,6 +314,17 @@ Schema-Validierung:
         else:
             print(f"[phase 3] ⚠ Korrupte Holder gefunden: {invalid_other} (String statt Dict)")
             print(f"[phase 3]   → Verwende --cleanup-all zum Entfernen")
+            
+            # Debug-Samples anzeigen
+            debug_samples = stats.get('debug_samples', [])
+            if debug_samples:
+                print(f"\n[debug] Beispiele für korrupte Holder:")
+                for i, sample in enumerate(debug_samples, 1):
+                    print(f"  Sample {i}:")
+                    print(f"    SHA: {sample['sha']}...")
+                    print(f"    Anchor: {sample['anchor']}")
+                    print(f"    Holder-Type: {sample['holder_type']}")
+                    print(f"    Holder-Content: {sample['holder_content']}")
     
     # 4. Lokal speichern
     if not args.dry_run:
