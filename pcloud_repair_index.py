@@ -454,6 +454,63 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     }
 
 
+def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: str, 
+                                   manifest_dir: str) -> dict:
+    """
+    Baut Index komplett neu aus Manifesten auf (wenn kein Remote-Index existiert).
+    
+    Achtung: fileid und pcloud_hash fehlen (werden beim Upload ergänzt).
+    
+    Returns: Neuer Index mit {"version": 1, "items": {sha256: node}}
+    """
+    new_index = {"version": 1, "items": {}}
+    
+    print("[rebuild] Baue Index von Grund auf aus Manifesten...")
+    
+    # Lade alle Manifeste
+    for snap_name in snapshot_manifests:
+        manifest_path = os.path.join(manifest_dir, f"{snap_name}.json")
+        
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+                items_dict = manifest.get("items", {})
+                
+                print(f"  [{snap_name}] {len(items_dict)} Dateien")
+                
+                # Für jede Datei im Manifest
+                for sha, relpath in items_dict.items():
+                    holder = {
+                        "snapshot": snap_name,
+                        "relpath": relpath
+                    }
+                    
+                    # Node existiert schon? (Deduplizierung über Snapshots)
+                    if sha in new_index["items"]:
+                        # Holder hinzufügen
+                        new_index["items"][sha]["holders"].append(holder)
+                    else:
+                        # Neuer Node
+                        anchor_path = f"{snapshots_root}/{snap_name}/{relpath}"
+                        new_index["items"][sha] = {
+                            "anchor_path": anchor_path,
+                            "holders": [holder]
+                            # fileid und pcloud_hash fehlen → werden beim Upload ergänzt
+                        }
+        
+        except FileNotFoundError:
+            print(f"  ⚠ Manifest nicht gefunden: {snap_name}")
+            continue
+        except Exception as e:
+            print(f"  ✗ Fehler beim Laden von {snap_name}: {e}")
+            continue
+    
+    total_files = len(new_index["items"])
+    print(f"[rebuild] ✓ Index erstellt: {total_files} Dateien")
+    
+    return new_index
+
+
 def generate_timetravel_archive(cfg: dict, master_index: dict, snapshots_root: str, 
                                   snapshot_order: List[str], archive_dir: str,
                                   *, dry_run: bool = False) -> None:
@@ -517,10 +574,15 @@ def generate_timetravel_archive(cfg: dict, master_index: dict, snapshots_root: s
             # Erstelle Node für diesen Stand
             snap_node = {
                 "anchor_path": anchor_path,
-                "fileid": node.get("fileid"),
-                "pcloud_hash": node.get("pcloud_hash"),
                 "holders": valid_holders
             }
+            
+            # fileid und pcloud_hash optional (fehlen bei Rebuild)
+            if node.get("fileid"):
+                snap_node["fileid"] = node["fileid"]
+            if node.get("pcloud_hash"):
+                snap_node["pcloud_hash"] = node["pcloud_hash"]
+            
             snap_index["items"][sha] = snap_node
         
         n_files = len(snap_index["items"])
@@ -584,17 +646,26 @@ def rebuild_complete_index(args):
     print(f"Manifest-Dir: {manifest_dir}")
     print()
     
-    # === PHASE 1: Remote Master-Index laden ===
+    # === PHASE 1: Remote Master-Index laden (oder neu erstellen) ===
     print("[phase 1] Lade Remote Master-Index...")
     idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
     
     try:
         # WICHTIG: maxbytes=None für große Index-Files (> 1 MB)
         master_index = pc.read_json_at_path(cfg, idx_path, maxbytes=None)
-        print(f"[phase 1] ✓ Index geladen: {len(master_index.get('items', {}))} Nodes")
+        print(f"[phase 1] ✓ Existierender Index geladen: {len(master_index.get('items', {}))} Nodes")
+        index_mode = "repair"
     except Exception as e:
-        print(f"[phase 1] ✗ Fehler beim Laden: {e}")
-        sys.exit(2)
+        error_str = str(e)
+        # Prüfe ob File nicht existiert (result 2002 oder 2009)
+        if "2002" in error_str or "2009" in error_str or "does not exist" in error_str.lower():
+            print(f"[phase 1] ℹ Index existiert noch nicht → wird neu erstellt")
+            master_index = {"version": 1, "items": {}}
+            index_mode = "rebuild"
+        else:
+            # Anderer Fehler (z.B. Netzwerk)
+            print(f"[phase 1] ✗ Fehler beim Laden: {e}")
+            sys.exit(2)
     
     # === PHASE 2: Snapshot-Reihenfolge ermitteln ===
     print()
@@ -619,15 +690,24 @@ def rebuild_complete_index(args):
     print(f"[phase 2]   Ältester: {manifest_files[0]}")
     print(f"[phase 2]   Neuester: {manifest_files[-1]}")
     
-    # === PHASE 3: String-Holder reparieren ===
+    # === PHASE 3: Index aufbauen/reparieren ===
     print()
-    print("[phase 3] Repariere String-Holder...")
+    if index_mode == "rebuild":
+        print("[phase 3] Baue Index von Grund auf aus Manifesten...")
+        master_index = rebuild_index_from_manifests(
+            snapshot_manifests=manifest_files,
+            snapshots_root=snaps_root,
+            manifest_dir=manifest_dir
+        )
+        print(f"[phase 3] ✓ Index erstellt: {len(master_index.get('items', {}))} Dateien")
+        print(f"[phase 3]   ⚠ Hinweis: fileid/pcloud_hash fehlen (werden beim Upload ergänzt)")
     
-    repair_stats = repair_string_holders_to_dict(master_index, manifest_files)
-    
-    print(f"[phase 3] ✓ Reparatur abgeschlossen")
-    print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder")
-    print(f"[phase 3]   Entfernt:  {repair_stats['removed']} Holder")
+    else:  # repair mode
+        print("[phase 3] Repariere String-Holder...")
+        repair_stats = repair_string_holders_to_dict(master_index, manifest_files)
+        print(f"[phase 3] ✓ Reparatur abgeschlossen")
+        print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder")
+        print(f"[phase 3]   Entfernt:  {repair_stats['removed']} Holder")
     
     # === PHASE 4: Time-Travel Archive generieren ===
     print()
