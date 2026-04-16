@@ -1834,7 +1834,14 @@ movefile = move
 # ---- JSON Komfort: remote lesen/schreiben ----
 
 def read_json_at_path(cfg: Dict[str, Any], path: str, maxbytes: int | None = None) -> dict:
-    txt = get_textfile(cfg, path=path, maxbytes=maxbytes or 1024*1024)
+    """
+    Liest JSON von pCloud.
+    
+    Args:
+        maxbytes: Limit in Bytes. Default None = unbegrenzt (sicher für große Index-Files)
+                  Früher: 1MB Default → führte zu truncated JSON bei großen Indexes
+    """
+    txt = get_textfile(cfg, path=path, maxbytes=maxbytes)
     try:
         return _json.loads(txt)
     except Exception as e:
