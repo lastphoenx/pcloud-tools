@@ -1686,6 +1686,70 @@ def copyfile(cfg: Dict[str, Any],
 
     return _rest_get(cfg, "copyfile", params)
 
+def copyfolder(cfg: Dict[str, Any],
+               *,
+               from_folderid: int | None = None,
+               from_path: str | None = None,
+               to_folderid: int | None = None,
+               to_path: str | None = None,
+               noover: bool = False,
+               copycontentonly: bool = False,
+               skipexisting: bool = False) -> Dict[str, Any]:
+    """
+    Server-side Folder Copy (Meta-Operation, sehr schnell).
+    
+    Kopiert einen kompletten Ordner inkl. aller Unterordner/Dateien
+    innerhalb von pCloud (kein Download/Upload).
+    
+    Args:
+        from_folderid: Quell-Ordner ID
+        from_path: Quell-Ordner Pfad (alternativ zu folderid)
+        to_folderid: Ziel-Parent-Ordner ID
+        to_path: Ziel-Pfad (alternativ zu tofolderid)
+        noover: True = keine Überschreibung existierender Dateien
+        copycontentonly: True = nur Inhalt kopieren (nicht Ordner selbst)
+        skipexisting: True = existierende Dateien überspringen
+    
+    Returns:
+        API response mit metadata des kopierten Ordners
+    
+    Performance: O(1) — Meta-Operation (nur Filesystem-Pointer)
+    
+    Example:
+        # Snapshot A → B kopieren
+        copyfolder(cfg, 
+                   from_path="/Backups/_snapshots/2026-04-15",
+                   to_path="/Backups/_snapshots/2026-04-16",
+                   noover=True)
+    """
+    params: Dict[str, Any] = {}
+    
+    # Quelle: folderid ODER path
+    if from_folderid is not None:
+        params["folderid"] = int(from_folderid)
+    elif from_path is not None:
+        params["path"] = _norm_remote_path(from_path)
+    else:
+        raise ValueError("copyfolder: Quelle fehlt (from_folderid oder from_path).")
+    
+    # Ziel: tofolderid ODER topath
+    if to_folderid is not None:
+        params["tofolderid"] = int(to_folderid)
+    elif to_path is not None:
+        params["topath"] = _norm_remote_path(to_path)
+    else:
+        raise ValueError("copyfolder: Ziel fehlt (to_folderid oder to_path).")
+    
+    # Optionale Flags
+    if noover:
+        params["noover"] = 1
+    if copycontentonly:
+        params["copycontentonly"] = 1
+    if skipexisting:
+        params["skipexisting"] = 1
+    
+    return _rest_get(cfg, "copyfolder", params)
+
 def renamefile(cfg: Dict[str, Any], *, fileid: int | None = None,
                path: str | None = None, toname: str = "") -> Dict[str, Any]:
     """REST /renamefile – umbenennen ohne Re-Upload."""
