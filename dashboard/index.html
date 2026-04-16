@@ -119,6 +119,7 @@
     .status-indicator.active { background: #48bb78; }
     .status-indicator.inactive { background: #cbd5e0; }
     .status-indicator.failed { background: #f56565; }
+    .status-indicator.blocked { background: #ed8936; }
     .status-indicator.running { background: #4299e1; }
     .status-indicator.success { background: #48bb78; }
     .status-indicator.skipped { background: #ed8936; }
@@ -208,6 +209,7 @@
         <span id="overall-status">Loading...</span>
       </div>
       <div class="meta">Overall System Status</div>
+      <div id="status-explanation" style="margin-top: 15px; padding: 12px; background: rgba(255,255,255,0.1); border-radius: 8px; font-size: 13px; line-height: 1.6; display: none;"></div>
     </div>
     
     <div id="content-area">
@@ -263,6 +265,16 @@
       const badge = document.getElementById('overall-badge');
       badge.className = 'status-badge ' + overallStatus.toLowerCase();
       
+      // Generate and display status explanation
+      const explanation = generateStatusExplanation(data);
+      const explanationDiv = document.getElementById('status-explanation');
+      if (explanation) {
+        explanationDiv.innerHTML = explanation;
+        explanationDiv.style.display = 'block';
+      } else {
+        explanationDiv.style.display = 'none';
+      }
+      
       // Render services and scripts
       let html = '';
       
@@ -297,9 +309,84 @@
       document.getElementById('content-area').innerHTML = html;
     }
     
+    // Generate status explanation based on current state
+    function generateStatusExplanation(data) {
+      const status = data.overall_status || 'UNKNOWN';
+      const services = data.services || {};
+      const scripts = data.scripts || {};
+      
+      let explanation = '';
+      
+      if (status === 'OK') {
+        explanation = '<strong>✓ Alle Systeme funktionieren normal.</strong><br>Keine Probleme erkannt.';
+      } 
+      else if (status === 'WARNING') {
+        explanation = '<strong>⚠️ Status: WARNING</strong><br>';
+        const issues = [];
+        
+        // Check blocked services (like backup-pipeline with exit code 2)
+        const blockedServices = [];
+        for (const [name, service] of Object.entries(services)) {
+          if (service.exit_code && service.exit_code.includes('(blocked)')) {
+            blockedServices.push(name);
+          }
+        }
+        
+        // Check failed services
+        const failedServices = [];
+        for (const [name, service] of Object.entries(services)) {
+          if (service.status === 'failed' && (!service.exit_code || !service.exit_code.includes('(blocked)'))) {
+            failedServices.push(name);
+          }
+        }
+        
+        // Check scripts status
+        const rtb = scripts.rtb_wrapper || {};
+        const pcloud = scripts.pcloud_backup || {};
+        
+        // Explain blocked services
+        if (blockedServices.length > 0) {
+          issues.push(`<strong>Blockierte Services:</strong> ${blockedServices.join(', ')}<br>` +
+                     `→ Safety-Gate hat vorherigen Backup-Lauf blockiert (Ransomware-Schutz aktiv).`);
+        }
+        
+        // Explain why not GREEN
+        if (blockedServices.includes('backup-pipeline') && rtb.live_safety_gate === 'GREEN') {
+          issues.push(`<strong>Warum nicht GRÜN?</strong><br>` +
+                     `→ backup-pipeline zeigt historischen Exit Code 2 (blocked) vom letzten Lauf.<br>` +
+                     `→ Live Safety-Gate ist aktuell ${rtb.live_safety_gate} - System ist sicher!<br>` +
+                     `→ Status wird GREEN, sobald nächster erfolgreicher Backup-Lauf durchläuft.`);
+        }
+        
+        // Explain pCloud status
+        if (pcloud.status_code === 0) {
+          issues.push(`<strong>pCloud Backup:</strong> ✓ OK (synchronisiert)<br>` +
+                     `→ RTB und pCloud sind auf dem gleichen Stand.`);
+        }
+        
+        // Add failed services
+        if (failedServices.length > 0) {
+          issues.push(`<strong>Fehlerhafte Services:</strong> ${failedServices.join(', ')}<br>` +
+                     `→ Diese Services benötigen Aufmerksamkeit.`);
+        }
+        
+        explanation += issues.join('<br><br>');
+      }
+      else if (status === 'CRITICAL') {
+        explanation = '<strong>🚨 Status: CRITICAL</strong><br>';
+        explanation += 'Kritische Probleme erkannt - sofortige Aktion erforderlich!';
+      }
+      
+      return explanation;
+    }
+    
     // Render systemd service card
     function renderServiceCard(name, service) {
-      const statusClass = service.status || 'unknown';
+      // Check if service is blocked (exit code contains "(blocked)")
+      let statusClass = service.status || 'unknown';
+      if (service.exit_code && service.exit_code.includes('(blocked)')) {
+        statusClass = 'blocked';
+      }
       const displayName = name.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
       
       return `
