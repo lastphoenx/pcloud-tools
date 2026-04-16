@@ -39,9 +39,16 @@ def _flatten_tree(metadata: dict, parent_path: str = "", is_root: bool = True) -
     """
     Flattens a recursive listfolder response into a list of file dicts.
     Each dict gets an extra '_full_path' key with the reconstructed remote path.
+    
+    Marker-Dateien (.upload_started, .upload_complete, etc.) werden NICHT zurückgegeben.
     """
     results: List[dict] = []
     name = metadata.get("name", "")
+    
+    # Marker-Dateien ignorieren
+    MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
+    if name in MARKER_FILES:
+        return []  # Überspringe Marker-Dateien
 
     if is_root:
         current_path = parent_path
@@ -142,6 +149,9 @@ def compare_index_vs_remote(
     Returns: Report-Dict mit allen Kategorien.
     """
     items = index.get("items", {})
+    
+    # Marker-Dateien ignorieren (Upload-Status-Tracking)
+    MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
 
     # Ergebnis-Listen
     ok: List[str] = []
@@ -258,12 +268,22 @@ def find_unknown_files(
     """
     Findet echte Dateien (keine .meta.json Stubs und kein content_index.json)
     auf pCloud, die in keinem Index-Node als Anchor referenziert werden.
+    
+    Ignoriert:
+    - Stubs (.meta.json)
+    - content_index.json
+    - _index/ Ordner komplett
+    - Marker-Dateien (.upload_started, .upload_complete, etc.)
     """
     unknown: List[dict] = []
     idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+    
+    # Upload-Marker-Dateien (diese gehören zum Upload-Tracking, nicht zu Backups)
+    MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
 
     for fid, md in by_fileid.items():
         fp = md.get("_full_path", "")
+        fname = fp.split("/")[-1] if "/" in fp else fp
 
         # Stubs und Index selbst überspringen
         if fp.endswith(".meta.json"):
@@ -272,6 +292,9 @@ def find_unknown_files(
             continue
         # _index-Ordner generell überspringen (Marker files etc.)
         if "/_index/" in fp:
+            continue
+        # Upload-Marker ignorieren
+        if fname in MARKER_FILES:
             continue
 
         if fid not in index_fileids:

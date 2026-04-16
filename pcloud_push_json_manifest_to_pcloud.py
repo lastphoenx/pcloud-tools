@@ -1829,6 +1829,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     t_index_start = time.time()
     
     # Holders aktualisieren: Snapshot zu allen verwendeten Hashes hinzufügen
+    # WICHTIG: Iteriere über items_dict (enthält auch neue Nodes aus Phase 5!)
     for file_item in (manifest.get("items") or []):
         if file_item.get("type") != "file":
             continue
@@ -1839,7 +1840,8 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         
         node = items_dict.get(sha)
         if not node:
-            _log(f"[delta-copy][6/6][warn] SHA256 {sha} nicht im Index (sollte nicht passieren)")
+            # Sollte nicht vorkommen (Phase 5 hätte Node erstellt)
+            _log(f"[delta-copy][6/6][ERROR] SHA256 {sha[:16]}... nicht im Index!")
             continue
         
         holders = node.setdefault("holders", [])
@@ -1847,10 +1849,17 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             holders.append(snapshot_name)
             index_changed = True
     
-    # Index speichern
+    # Index speichern (remote + lokal)
     if index_changed:
         save_content_index(cfg, snapshots_root, index, dry=dry)
-        _log(f"[delta-copy][6/6] ✓ Content-Index gespeichert")
+        _log(f"[delta-copy][6/6] ✓ Content-Index remote gespeichert")
+        
+        # Lokal archivieren
+        if not dry:
+            archive_index_path = f"{archive_base}/indexes/content_index_{snapshot_name}.json"
+            os.makedirs(os.path.dirname(archive_index_path), exist_ok=True)
+            save_content_index_local(archive_index_path, index)
+            _log(f"[delta-copy][6/6] ✓ Content-Index lokal archiviert: {archive_index_path}")
     else:
         _log(f"[delta-copy][6/6] Content-Index unverändert")
     
