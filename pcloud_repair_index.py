@@ -381,7 +381,21 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
         try:
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
-                items_dict = manifest.get("items", {})
+                items_list = manifest.get("items", [])
+                
+                # Manifeste v2/v3: items ist eine Liste von Objekten
+                # Baue Lookup-Dict: {sha256: relpath}
+                items_dict = {}
+                for item in items_list:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "file":
+                        continue
+                    sha = item.get("sha256")
+                    relpath = item.get("relpath")
+                    if sha and relpath:
+                        items_dict[sha] = relpath
+                
                 manifest_lookup[snap_name] = items_dict
                 print(f"  ✓ {snap_name}: {len(items_dict)} Dateien")
         except FileNotFoundError:
@@ -474,12 +488,24 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
         try:
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
-                items_dict = manifest.get("items", {})
+                items_list = manifest.get("items", [])
                 
-                print(f"  [{snap_name}] {len(items_dict)} Dateien")
-                
-                # Für jede Datei im Manifest
-                for sha, relpath in items_dict.items():
+                # Manifeste v2/v3: items ist eine Liste von Objekten
+                file_count = 0
+                for item in items_list:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "file":
+                        continue
+                    
+                    sha = item.get("sha256")
+                    relpath = item.get("relpath")
+                    
+                    if not sha or not relpath:
+                        continue
+                    
+                    file_count += 1
+                    
                     holder = {
                         "snapshot": snap_name,
                         "relpath": relpath
@@ -497,6 +523,8 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
                             "holders": [holder]
                             # fileid und pcloud_hash fehlen → werden beim Upload ergänzt
                         }
+                
+                print(f"  [{snap_name}] {file_count} Dateien")
         
         except FileNotFoundError:
             print(f"  ⚠ Manifest nicht gefunden: {snap_name}")
