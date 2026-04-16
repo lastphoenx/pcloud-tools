@@ -1451,8 +1451,13 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     _log(f"[delta-copy] Ziel: {dest_snapshot_dir}")
     
     # === Config: Timeout Protection (copyfolder kann bei 20k+ Dateien lange dauern) ===
-    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
-        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "180"))  # 3 Minuten für Meta-Operationen
+    # Delta-Copy Meta-Operationen brauchen ~60-120s, Standard-Timeout (30s) ist zu kurz
+    current_timeout = int(cfg.get("timeout", 30))
+    if current_timeout <= 60:  # Erhöhe nur bei Standard/niedrigen Werten
+        cfg["timeout"] = 300  # 5 Minuten Puffer (Test: 67s bei ~20k Dateien)
+        _log(f"[delta-copy] Timeout erhöht: {current_timeout}s → {cfg['timeout']}s (Meta-Operationen)")
+    else:
+        _log(f"[delta-copy] Timeout beibehalten: {current_timeout}s")
     
     # === Schritt 1: Finde Basis-Snapshot ===
     _log(f"[delta-copy][1/6] Suche letzten vollständigen Snapshot...")

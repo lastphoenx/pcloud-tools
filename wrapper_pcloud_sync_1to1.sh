@@ -503,7 +503,7 @@ uploaded_count=0
 
 for s in $(local_snapshot_names); do
   if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    _log WARN "Gap detected: Snapshot $s missing remote – uploading..."
+    _log INFO "New snapshot detected: $s (not yet on pCloud) – uploading..."
     build_and_push "$RTB/$s" || {
       _db_run_end FAILED 1 "Upload failed for $s"
       exit 1
