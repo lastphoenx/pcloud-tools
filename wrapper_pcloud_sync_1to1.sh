@@ -500,10 +500,33 @@ fi
 # Sync-Check: Fehlende Snapshots erkennen und hochladen
 _log INFO "Checking for missing snapshots..."
 uploaded_count=0
+gap_count=0
+new_count=0
 
-for s in $(local_snapshot_names); do
+# Listen für Gap-Erkennung
+mapfile -t local_snaps < <(local_snapshot_names)
+mapfile -t remote_snaps < <(remote_snapshot_names)
+
+for s in "${local_snaps[@]}"; do
   if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    _log INFO "New snapshot detected: $s (not yet on pCloud) – uploading..."
+    # Gap-Erkennung: Gibt es einen SPÄTEREN Snapshot, der remote existiert?
+    is_gap=0
+    for later in "${local_snaps[@]}"; do
+      if [[ "$later" > "$s" ]] && [[ "$(remote_snapshot_exists "$later")" == "YES" ]]; then
+        is_gap=1
+        break
+      fi
+    done
+    
+    # Unterschiedliche Messages für Gap vs. New
+    if [[ $is_gap -eq 1 ]]; then
+      _log WARN "Gap detected: Snapshot $s missing remote – backfilling..."
+      gap_count=$((gap_count + 1))
+    else
+      _log INFO "New snapshot detected: $s (not yet on pCloud) – uploading..."
+      new_count=$((new_count + 1))
+    fi
+    
     build_and_push "$RTB/$s" || {
       _db_run_end FAILED 1 "Upload failed for $s"
       exit 1
@@ -515,8 +538,8 @@ done
 if [[ $uploaded_count -eq 0 ]]; then
   _log INFO "All snapshots already on pCloud"
 else
-  _log INFO "Successfully uploaded $uploaded_count snapshot(s)"
-  _db_update_metrics "gaps_synced = $uploaded_count"
+  _log INFO "Successfully uploaded $uploaded_count snapshot(s) (gaps: $gap_count, new: $new_count)"
+  _db_update_metrics "gaps_synced = $gap_count, new_snapshots = $new_count"
 fi
 
 # Cleanup: Alte Temp-Dateien löschen (>7 Tage)
