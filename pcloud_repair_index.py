@@ -75,6 +75,7 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
     removed_holders = 0
     cleaned_nodes = 0
     removed_nodes = 0
+    invalid_holders = 0  # String-Holder (korrupt)
     
     # Iterate over all index nodes
     for sha, node in list(items.items()):
@@ -90,13 +91,14 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
             # Find and remove holders that reference this anchor
             new_holders = []
             for h in holders:
-                # === DEBUG: Schema-Prüfung ===
+                # === Schema-Validierung: String-Holder entfernen ===
                 if not isinstance(h, dict):
-                    print(f"[DEBUG] Holder ist kein Dict! Type={type(h).__name__}, Content={repr(h)[:200]}")
-                    print(f"[DEBUG]   SHA256: {sha[:16]}... Anchor: {anchor_path}")
-                    print(f"[DEBUG]   Alle holders für diesen Node: {holders}")
+                    invalid_holders += 1
+                    print(f"[warn] Korrupter Holder entfernt (String statt Dict): {repr(h)[:100]}")
+                    print(f"       SHA256: {sha[:16]}... Anchor: {anchor_path}")
+                    # String-Holder wird NICHT in new_holders übernommen → effektiv gelöscht
                     continue
-                # === ENDE DEBUG ===
+                # === ENDE Schema-Validierung ===
                 
                 h_snap = h.get("snapshot")
                 h_rel = h.get("relpath")
@@ -137,6 +139,7 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
         "removed_holders": removed_holders,
         "cleaned_nodes": cleaned_nodes,
         "removed_nodes": removed_nodes,
+        "invalid_holders": invalid_holders,
     }
 
 
@@ -249,6 +252,8 @@ Workflow:
     print(f"[phase 3] Holders entfernt:     {stats['removed_holders']}")
     print(f"[phase 3] Nodes bereinigt:      {stats['cleaned_nodes']}")
     print(f"[phase 3] Nodes komplett gelöscht: {stats['removed_nodes']}")
+    if stats.get('invalid_holders', 0) > 0:
+        print(f"[phase 3] Korrupte Holder:      {stats['invalid_holders']} (String statt Dict)")
     
     # 4. Lokal speichern
     if not args.dry_run:
