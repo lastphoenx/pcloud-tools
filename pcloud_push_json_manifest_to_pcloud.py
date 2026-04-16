@@ -1450,9 +1450,9 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     _log(f"[delta-copy] Start: {snapshot_name}")
     _log(f"[delta-copy] Ziel: {dest_snapshot_dir}")
     
-    # === Config: Timeout Protection ===
+    # === Config: Timeout Protection (copyfolder kann bei 20k+ Dateien lange dauern) ===
     if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
-        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
+        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "180"))  # 3 Minuten für Meta-Operationen
     
     # === Schritt 1: Finde Basis-Snapshot ===
     _log(f"[delta-copy][1/6] Suche letzten vollständigen Snapshot...")
@@ -1503,25 +1503,26 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     
     basis_path = f"{snapshots_root}/{basis_snapshot}"
     
-    # Sicherstellen dass Parent-Ordner existiert (snapshots_root)
+    # KRITISCH: Zielordner VORHER anlegen (copycontentonly erwartet existierenden Container)
     if not dry:
         try:
-            pc.ensure_path(cfg, snapshots_root)
+            pc.ensure_path(cfg, snapshots_root)  # Parent sicherstellen
+            pc.ensure_path(cfg, dest_snapshot_dir)  # Zielordner anlegen!
+            _log(f"[delta-copy][2/6] ✓ Zielordner angelegt: {dest_snapshot_dir}")
         except Exception as e:
-            _log(f"[delta-copy][ERROR] Konnte snapshots_root nicht anlegen: {e}")
+            _log(f"[delta-copy][ERROR] Konnte Zielordner nicht anlegen: {e}")
             return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
     
     if dry:
-        _log(f"[dry] copyfolder: {basis_path} → {snapshots_root}/{snapshot_name}")
+        _log(f"[dry] copyfolder (contentonly): {basis_path} → {dest_snapshot_dir}")
     else:
         try:
-            # copyfolder(cfg, from_path=..., to_path=parent, toname=new_name)
-            # WICHTIG: to_path ist der PARENT-Ordner, toname der neue Ordner-Name
+            # copyfolder mit copycontentonly=True
+            # Kopiert NUR den INHALT von basis_snapshot in den neuen Ordner
             result = pc.copyfolder(cfg, 
                                    from_path=basis_path, 
-                                   to_path=snapshots_root, 
-                                   toname=snapshot_name, 
-                                   noover=False)
+                                   to_path=dest_snapshot_dir, 
+                                   copycontentonly=True)
             
             if verbose:
                 _log(f"[delta-copy][2/6] copyfolder result: {json.dumps(result, indent=2)}")
