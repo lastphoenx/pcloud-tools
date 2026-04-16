@@ -96,10 +96,23 @@ check_systemd_service() {
       # Get exit code from journal
       exit_code=$(journalctl -u "${service_name}.service" -n 50 --no-pager 2>/dev/null | grep -oP 'code=exited, status=\K[0-9]+' | tail -1)
       [[ -z "$exit_code" ]] && exit_code="unknown"
-      [[ "$exit_code" == "0" || "$exit_code" == "unknown" ]] && exit_code="${exit_code}" || exit_code="${exit_code} (error)"
+      
+      # Interpret exit code based on service and code
+      if [[ "$exit_code" == "0" || "$exit_code" == "unknown" ]]; then
+        exit_code="${exit_code}"
+      elif [[ "$exit_code" == "2" ]] && [[ "$service_name" == "backup-pipeline" ]]; then
+        exit_code="${exit_code} (blocked)"
+      else
+        exit_code="${exit_code} (error)"
+      fi
       
       # Get last meaningful message (skip systemd boilerplate)
       last_message=$(echo "$journal_output" | tail -1 | sed -E 's/^[^ ]+ [^ ]+ [^ ]+ //' | head -c 200 || echo "N/A")
+      
+      # Add explanation for backup-pipeline blocked status
+      if [[ "$service_name" == "backup-pipeline" ]] && echo "$exit_code" | grep -q "(blocked)"; then
+        last_message="Safety-Gate blockierte vorherigen Lauf (Ransomware-Schutz). Live Status prüfen via live_safety_gate. Original: ${last_message}"
+      fi
     fi
   fi
   
