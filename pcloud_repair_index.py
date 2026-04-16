@@ -57,11 +57,14 @@ def load_remote_index(cfg: dict, snaps_root: str) -> dict:
     return j
 
 
-def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> Dict[str, Any]:
+def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, cleanup_all: bool = False) -> Dict[str, Any]:
     """
     Entfernt Holder-Einträge für missing_anchors.
     
-    Returns: Stats dict mit removed_holders, cleaned_nodes, removed_nodes
+    Args:
+        cleanup_all: Wenn True, entfernt auch korrupte String-Holder bei existierenden Anchors
+    
+    Returns: Stats dict mit removed_holders, cleaned_nodes, removed_nodes, invalid_holders_*
     """
     items = index.get("items", {})
     
@@ -75,7 +78,10 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
     removed_holders = 0
     cleaned_nodes = 0
     removed_nodes = 0
-    invalid_holders = 0  # String-Holder (korrupt)
+    invalid_holders_missing = 0  # String-Holder bei Missing-Anchors (immer entfernt)
+    invalid_holders_other = 0     # String-Holder bei existierenden Anchors (nur mit --cleanup-all)
+    
+    verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
     
     # Iterate over all index nodes
     for sha, node in list(items.items()):
@@ -86,20 +92,42 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
         holders = node.get("holders", [])
         
         # Check if this node's anchor is missing
-        if anchor_path and anchor_path in missing_lookup:
-            # This anchor is phantom
-            # Find and remove holders that reference this anchor
-            new_holders = []
-            for h in holders:
-                # === Schema-Validierung: String-Holder entfernen ===
-                if not isinstance(h, dict):
-                    invalid_holders += 1
-                    print(f"[warn] Korrupter Holder entfernt (String statt Dict): {repr(h)[:100]}")
-                    print(f"       SHA256: {sha[:16]}... Anchor: {anchor_path}")
-                    # String-Holder wird NICHT in new_holders übernommen → effektiv gelöscht
+        is_missing_anchor = anchor_path and anchor_path in missing_lookup
+        
+        # === Schema-Check für ALLE Nodes (nicht nur Missing-Anchors) ===
+        new_holders = []
+        for h in holders:
+            # Schema-Validierung: String-Holder erkennen und behandeln
+            if not isinstance(h, dict):
+                if is_missing_anchor:
+                    # Bei Missing-Anchor: IMMER entfernen
+                    invalid_holders_missing += 1
+                    if verbose:
+                        print(f"[warn] Korrupter Holder entfernt (Missing-Anchor): {repr(h)[:60]}")
+                        print(f"       SHA256: {sha[:16]}... Anchor: {anchor_path}")
                     continue
-                # === ENDE Schema-Validierung ===
+                else:
+                    # Bei existierendem Anchor: nur mit --cleanup-all entfernen
+                    invalid_holders_other += 1
+                    if cleanup_all:
+                        if verbose:
+                            print(f"[info] Korrupter Holder entfernt (--cleanup-all): {repr(h)[:60]}")
+                            print(f"       SHA256: {sha[:16]}...")
+                        continue
+                    else:
+                        # Behalten, nur zählen (für Reporting)
+                        new_holders.append(h)
+                        continue
+            
+            # Ab hier: h ist garantiert ein Dict
+            
+            # Bei Missing-Anchor: prüfe ob dieser Holder auf den Missing-Anchor zeigt
+            if is_missing_anchor:
+                h_snap = h.get("snapshot")
+                h_rel = h.get("relpath")
                 
+            # Bei Missing-Anchor: prüfe ob dieser Holder auf den Missing-Anchor zeigt
+            if is_missing_anchor:
                 h_snap = h.get("snapshot")
                 h_rel = h.get("relpath")
                 
@@ -112,34 +140,36 @@ def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str) -> D
                     if holder_path == anchor_path:
                         removed_holders += 1
                         continue
-                
-                new_holders.append(h)
             
-            # Update holders
-            if len(new_holders) < len(holders):
-                node["holders"] = new_holders
-                cleaned_nodes += 1
-            
-            # CRITICAL: If the anchor_path itself is missing, remove it immediately
-            # (independent of how many holders remain)
-            if anchor_path in missing_lookup:
-                if "anchor_path" in node:
-                    del node["anchor_path"]
-                if "fileid" in node:
-                    del node["fileid"]
-                if "pcloud_hash" in node:
-                    del node["pcloud_hash"]
-            
-            # If no holders left AND no anchor, remove node completely
-            if not new_holders and not node.get("anchor_path"):
-                del items[sha]
-                removed_nodes += 1
+            # Holder behalten
+            new_holders.append(h)
+        
+        # Update holders wenn sich was geändert hat
+        if len(new_holders) < len(holders):
+            node["holders"] = new_holders
+            cleaned_nodes += 1
+        
+        # CRITICAL: If the anchor_path itself is missing, remove it immediately
+        # (independent of how many holders remain)
+        if is_missing_anchor:
+            if "anchor_path" in node:
+                del node["anchor_path"]
+            if "fileid" in node:
+                del node["fileid"]
+            if "pcloud_hash" in node:
+                del node["pcloud_hash"]
+        
+        # If no holders left AND no anchor, remove node completely
+        if not new_holders and not node.get("anchor_path"):
+            del items[sha]
+            removed_nodes += 1
     
     return {
         "removed_holders": removed_holders,
         "cleaned_nodes": cleaned_nodes,
         "removed_nodes": removed_nodes,
-        "invalid_holders": invalid_holders,
+        "invalid_holders_missing": invalid_holders_missing,
+        "invalid_holders_other": invalid_holders_other,
     }
 
 
@@ -177,6 +207,13 @@ Workflow:
   
   3. Upload starten (nutzt automatisch den reparierten lokalen Index):
      python pcloud_push_json_manifest_to_pcloud.py ...
+
+Schema-Validierung:
+  Das Tool prüft automatisch alle Holder-Einträge auf Schema-Korrektheit (Dict vs. String).
+  
+  - Bei Missing-Anchors: Korrupte String-Holder werden IMMER entfernt
+  - Bei existierenden Anchors: String-Holder werden nur gemeldet
+    → Verwende --cleanup-all zum Entfernen aller korrupten Holder
 """)
     
     ap.add_argument("--delta-report", required=True,
@@ -193,6 +230,8 @@ Workflow:
                     help="Ausgabepfad für reparierten Index (default: /srv/pcloud-temp/pcloud_index_{snapshot}.json)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Nur Report, keine Änderungen")
+    ap.add_argument("--cleanup-all", action="store_true",
+                    help="Entferne auch korrupte Holder außerhalb von Missing-Anchors (String statt Dict)")
     
     args = ap.parse_args()
     
@@ -245,15 +284,25 @@ Workflow:
         # Kopie für Dry-Run
         import copy
         index_copy = copy.deepcopy(index)
-        stats = repair_index(index_copy, missing_anchors, snaps_root)
+        stats = repair_index(index_copy, missing_anchors, snaps_root, cleanup_all=args.cleanup_all)
     else:
-        stats = repair_index(index, missing_anchors, snaps_root)
+        stats = repair_index(index, missing_anchors, snaps_root, cleanup_all=args.cleanup_all)
     
     print(f"[phase 3] Holders entfernt:     {stats['removed_holders']}")
     print(f"[phase 3] Nodes bereinigt:      {stats['cleaned_nodes']}")
     print(f"[phase 3] Nodes komplett gelöscht: {stats['removed_nodes']}")
-    if stats.get('invalid_holders', 0) > 0:
-        print(f"[phase 3] Korrupte Holder:      {stats['invalid_holders']} (String statt Dict)")
+    
+    # Schema-Validierung Report
+    invalid_missing = stats.get('invalid_holders_missing', 0)
+    invalid_other = stats.get('invalid_holders_other', 0)
+    if invalid_missing > 0:
+        print(f"[phase 3] Korrupte Holder entfernt (Missing-Anchors): {invalid_missing}")
+    if invalid_other > 0:
+        if args.cleanup_all:
+            print(f"[phase 3] Korrupte Holder entfernt (--cleanup-all): {invalid_other}")
+        else:
+            print(f"[phase 3] ⚠ Korrupte Holder gefunden: {invalid_other} (String statt Dict)")
+            print(f"[phase 3]   → Verwende --cleanup-all zum Entfernen")
     
     # 4. Lokal speichern
     if not args.dry_run:
