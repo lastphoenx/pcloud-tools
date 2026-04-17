@@ -975,7 +975,9 @@ def rebuild_complete_index(args):
         
         # KRITISCH: Nach Holder-Repair sind alte FileIDs inkonsistent!
         # Lösche FileIDs um Enrichment zu erzwingen
-        if args.force_enrich or (not args.skip_enrich):
+        force_enrich = getattr(args, 'force_enrich', False)
+        skip_enrich = getattr(args, 'skip_enrich', False)
+        if force_enrich or (not skip_enrich):
             print(f"[phase 3]   Lösche alte FileIDs für Re-Enrichment...")
             deleted_fileid = 0
             deleted_hash = 0
@@ -1116,6 +1118,8 @@ Beispiel:
                     help="pCloud-Profil (optional)")
     ap.add_argument("--skip-enrich", action="store_true",
                     help="Überspringe FileID/pcloud_hash API-Enrichment (schneller, aber incomplete)")
+    ap.add_argument("--force-enrich", action="store_true",
+                    help="Erzwinge API-Enrichment auch wenn FileID bereits vorhanden (überschreibt alte FileIDs)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Nur Report, keine Änderungen")
     
