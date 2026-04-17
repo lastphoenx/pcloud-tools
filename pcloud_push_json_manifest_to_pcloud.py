@@ -516,26 +516,53 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         first_parent = next(iter(by_parent.keys()))
         # Format: /.../snapshots_root/snapshot_name/... → extrahiere bis snapshot_name
         parts = first_parent.split("/")
+        snapshot_root = None
         # Finde _snapshots Index
         try:
             snapshots_idx = parts.index("_snapshots")
             # snapshot_root = alles bis einschließlich snapshot_name (snapshots_idx + 2)
-            snapshot_root = "/".join(parts[:snapshots_idx + 2])
+            if len(parts) > snapshots_idx + 1:
+                snapshot_root = "/".join(parts[:snapshots_idx + 2])
+            else:
+                # Zu flache Struktur (kein snapshot_name nach _snapshots)
+                _log(f"[stubs][WARN] Snapshot-Root-Extraktion fehlgeschlagen (zu flach): {first_parent}")
+                snapshot_root = None
         except (ValueError, IndexError):
-            # Fallback: nehme Parent vom ersten Parent
-            snapshot_root = "/".join(parts[:-1]) if len(parts) > 1 else "/"
+            # _snapshots nicht im Pfad gefunden (unerwartete Struktur)
+            _log(f"[stubs][WARN] '_snapshots' nicht im Pfad gefunden: {first_parent}")
+            snapshot_root = None
         
-        _log(f"[stubs] Lade Ordner-Struktur via listfolder: {snapshot_root}")
-        t_cache_start = time.time()
-        folder_cache = _build_folder_cache_from_tree(cfg, snapshot_root)
-        t_cache_ms = (time.time() - t_cache_start) * 1000.0
-        _api_calls += 1  # Ein listfolder-Call
-        _log(f"[stubs] ✓ Folder-Cache geladen: {len(folder_cache)} Ordner in {t_cache_ms:.0f}ms")
+        # Cache-Build nur wenn snapshot_root valide ist
+        if snapshot_root:
+            _log(f"[stubs] Lade Ordner-Struktur via listfolder: {snapshot_root}")
+            t_cache_start = time.time()
+            folder_cache = _build_folder_cache_from_tree(cfg, snapshot_root)
+            t_cache_ms = (time.time() - t_cache_start) * 1000.0
+            _api_calls += 1  # Ein listfolder-Call
+            if folder_cache:
+                _log(f"[stubs] ✓ Folder-Cache geladen: {len(folder_cache)} Ordner in {t_cache_ms:.0f}ms")
+            else:
+                _log(f"[stubs][WARN] Folder-Cache leer nach listfolder (Snapshot existiert noch nicht?)")
+        else:
+            # Snapshot-Root ungültig → Skip Cache-Build (Legacy-Mode wird unten aktiviert)
+            _log(f"[stubs][WARN] Überspringe Cache-Build (ungültige snapshot_root)")
+            folder_cache = {}
     else:
         folder_cache = {}
     
-    # 2b) Parent-FIDs: erst Cache-Lookup, bei Miss ensure_path
-    _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (via Cache + Selective Create)...")
+    # 2b) Fallback-Detection: Wenn Cache leer ABER viele Parents → Legacy-Mode
+    _use_legacy_mode = False
+    if not dry and not folder_cache and _total_parents > 10:
+        _log(f"[stubs][WARN] Folder-Cache leer ({len(folder_cache)} Einträge) trotz {_total_parents} Parents")
+        _log(f"[stubs][WARN] → Fallback zu Legacy-Mode (sequential ensure_path)")
+        _log(f"[stubs][WARN] → Erwartet: ~{int(_total_parents * 0.5 / 60)}min statt <5s")
+        _use_legacy_mode = True
+    
+    # 2c) Parent-FIDs: Cache-Lookup (optimiert) oder Legacy-Mode (sequential)
+    if _use_legacy_mode:
+        _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Legacy-Modus: sequential ensure_path)...")
+    else:
+        _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Cache-Optimiert: {len(folder_cache)} gecacht)...")
     
     for parent in by_parent.keys():
         if dry:
