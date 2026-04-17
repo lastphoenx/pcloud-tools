@@ -417,19 +417,23 @@ build_and_push() {
   local RET=""
   [[ "$(need_retention_sync)" == "YES" ]] && RET="--retention-sync"
 
-  # Delta-Copy-Flag (PoC)
-  local DELTA_FLAG=""
-  [[ "${PCLOUD_USE_DELTA_COPY:-0}" == "1" ]] && DELTA_FLAG="--use-delta-copy"
+  # Delta-Copy: standardmäßig aktiv (Auto-Mode).
+  # Der Stub-Ratio-Check im Push-Tool entscheidet intern:
+  #   - SAFE-MODE:  Basis hat zu wenig Stubs → push_1to1_mode() (Stubs schreiben)
+  #   - TURBO-MODE: Basis stub-ifiziert        → copyfolder + Delta
+  # PCLOUD_USE_DELTA_COPY=0 deaktiviert Delta-Copy explizit (z.B. für Debugging).
+  local DELTA_FLAG="--use-delta-copy"
+  [[ "${PCLOUD_USE_DELTA_COPY:-1}" == "0" ]] && DELTA_FLAG=""
 
   # Upload phase
   T0=$(date +%s)
   _db_phase_log "upload" "start"
-  
-  # Log-Hinweis bei Delta-Copy
-  if [[ "${PCLOUD_USE_DELTA_COPY:-0}" == "1" ]]; then
-    _log INFO "Upload-Modus: Delta-Copy (Server-Side Clone + Selective Update)"
+
+  # Log-Hinweis
+  if [[ -n "$DELTA_FLAG" ]]; then
+    _log INFO "Upload-Modus: Delta-Copy Auto (SAFE/TURBO wird intern via Stub-Ratio entschieden)"
   else
-    _log INFO "Upload-Modus: Full-Mode (alle Dateien/Stubs neu schreiben)"
+    _log INFO "Upload-Modus: Full-Mode (PCLOUD_USE_DELTA_COPY=0)"
   fi
   
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET $DELTA_FLAG --env-file "$ENV_FILE" || {
