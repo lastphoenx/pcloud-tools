@@ -688,6 +688,11 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
                   f"FileID: {enriched_fileid}, Hash: {enriched_pcloud_hash}, "
                   f"Failed: {failed}")
         
+        # DEBUG: Erste 3 Nodes - was hat der geladene Index?
+        if i <= 3:
+            print(f"  [DEBUG #{i}] node.get('fileid')={node.get('fileid')}, node.get('pcloud_hash')={node.get('pcloud_hash')}")
+            print(f"  [DEBUG #{i}] anchor_path={anchor_path[:80]}...")
+        
         # FileID bereits vorhanden?
         if node.get("fileid"):
             skipped_fileid += 1
@@ -702,10 +707,9 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
                 failed += 1
                 continue
             
-            # DEBUG: Zeige was stat_file zurückgibt (nur erste 3 Items)
-            if i <= 3:
-                print(f"    [DEBUG] md keys: {list(md.keys())[:10]}")
-                print(f"    [DEBUG] fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
+            # DEBUG: Zeige was stat_file zurückgibt
+            print(f"    [DEBUG] API Response - md keys: {list(md.keys())[:10]}")
+            print(f"    [DEBUG] API Response - fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
             
             # FileID extrahieren
             fileid = int(md.get("fileid") or md.get("id") or 0)
