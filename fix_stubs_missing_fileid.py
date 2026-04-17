@@ -4,25 +4,41 @@
 fix_stubs_missing_fileid.py
 
 Repariert Stubs (.meta.json), die keine FileID haben:
+
+STANDARD-MODUS:
 1. Lädt Master-Index von pCloud (_snapshots/_index/content_index.json)
-2. Findet alle items ohne "fileid"
+2. Findet items ohne "fileid" im Index
 3. Ermittelt FileID via stat_file() am anchor_path
 4. Aktualisiert Index + schreibt alle betroffenen Stubs neu
 5. Speichert Index zurück nach pCloud (mit remote Backup)
+
+REWRITE-ALL-MODUS (--rewrite-all):
+Nutzen wenn Index FileIDs hat, aber Stubs nicht:
+1. Lädt Master-Index von pCloud
+2. Nimmt ALLE items (egal ob FileID vorhanden)
+3. Schreibt alle Stubs mit FileIDs aus Index neu
+4. Speichert Index nur falls neue FileIDs gefetched wurden
 
 Voraussetzungen:
 - Master-Index remote vorhanden: <dest-root>/_snapshots/_index/content_index.json
 - pcloud_bin_lib.py im selben Verzeichnis
 - pCloud credentials (.env oder ENV)
 
-Beispiel:
+Beispiel (Standard):
     python fix_stubs_missing_fileid.py \\
       --dest-root /Backup/rtb_1to1 \\
       --dry-run
 
+Beispiel (Rewrite-All - Index OK, Stubs kaputt):
     python fix_stubs_missing_fileid.py \\
       --dest-root /Backup/rtb_1to1 \\
+      --rewrite-all \\
       --verbose
+
+Beispiel (Index-Check):
+    python fix_stubs_missing_fileid.py \\
+      --dest-root /Backup/rtb_1to1 \\
+      --check-index 20
 """
 
 from __future__ import annotations
@@ -229,6 +245,8 @@ def main() -> int:
     ap.add_argument("--dest-root", required=True, help="pCloud-Zielroot (z.B. /Backup/rtb_1to1)")
     ap.add_argument("--dry-run", action="store_true", help="Nur anzeigen, nicht schreiben")
     ap.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    ap.add_argument("--check-index", type=int, metavar="N", help="Zeige erste N items aus Index (Debug)")
+    ap.add_argument("--rewrite-all", action="store_true", help="Alle Stubs neu schreiben (nicht nur ohne FileID)")
     args = ap.parse_args()
     
     # Pfade
@@ -249,53 +267,90 @@ def main() -> int:
     _log(f"[index] Items im Index: {len(items)}")
     stats["items_total"] = len(items)
     
+    # Debug: Index-Check
+    if args.check_index:
+        _log(f"[debug] Zeige erste {args.check_index} items aus Index:")
+        count_with_fid = 0
+        count_without_fid = 0
+        for i, (sha256, node) in enumerate(items.items(), 1):
+            if i > args.check_index:
+                break
+            has_fid = node.get("fileid") is not None
+            if has_fid:
+                count_with_fid += 1
+            else:
+                count_without_fid += 1
+            print(f"  [{i}] sha256={sha256[:16]}... fileid={node.get('fileid')} anchor={node.get('anchor_path', 'N/A')[:60]}")
+            if not has_fid:
+                print(f"       HOLDERS: {len(node.get('holders', []))} stubs")
+        _log(f"[debug] Von ersten {args.check_index} items: {count_with_fid} mit FileID, {count_without_fid} ohne FileID")
+        
+        # Gesamtstatistik
+        total_with = sum(1 for n in items.values() if n.get("fileid") is not None)
+        total_without = len(items) - total_with
+        _log(f"[debug] GESAMT: {total_with} items MIT FileID ({total_with*100//len(items)}%), {total_without} items OHNE FileID ({total_without*100//len(items)}%)")
+        return 0
+    
     # FileID-Cache (für Anchor-Wiederverwendung)
     fid_cache: Dict[str, int] = {}
     
-    # Phase 1: Items ohne FileID finden und FileID fetchen
-    _log("[phase1] Suche items ohne FileID...")
+    # Phase 1: Items sammeln (entweder ohne FileID oder alle falls --rewrite-all)
+    _log("[phase1] Sammle items zum Reparieren...")
     items_to_fix: List[Tuple[str, dict]] = []
     
-    for sha256, node in items.items():
-        if node.get("fileid") is None:
+    if args.rewrite_all:
+        # ALLE items neu schreiben (Index hat FileIDs, aber Stubs nicht)
+        for sha256, node in items.items():
             items_to_fix.append((sha256, node))
+        _log(f"[phase1] ✓ --rewrite-all: {len(items_to_fix)} items gefunden")
+    else:
+        # Nur items ohne FileID im Index
+        for sha256, node in items.items():
+            if node.get("fileid") is None:
+                items_to_fix.append((sha256, node))
+        _log(f"[phase1] ✓ {len(items_to_fix)} items ohne FileID im Index gefunden")
     
     stats["items_without_fileid"] = len(items_to_fix)
-    _log(f"[phase1] ✓ {len(items_to_fix)} items ohne FileID gefunden")
     
     if not items_to_fix:
         _log("[done] Keine items zu reparieren")
         return 0
     
-    # Phase 2: FileIDs fetchen
-    _log("[phase2] Fetche FileIDs via stat_file()...")
+    # Phase 2: FileIDs sicherstellen (nur falls im Index fehlen)
+    _log("[phase2] Prüfe FileIDs...")
     t_start = time.time()
+    need_fetch_count = 0
     
     for i, (sha256, node) in enumerate(items_to_fix, 1):
-        anchor_path = node.get("anchor_path")
+        fileid = node.get("fileid")
         
-        if not anchor_path:
-            _log(f"[warn] Item {sha256} hat keinen anchor_path - überspringe")
-            continue
-        
-        # Progress
-        if i % 10 == 0 or args.verbose:
-            elapsed = time.time() - t_start
-            rate = i / elapsed if elapsed > 0 else 0
-            eta = (len(items_to_fix) - i) / rate if rate > 0 else 0
-            _log(f"[phase2] {i}/{len(items_to_fix)} ({i*100//len(items_to_fix)}%) | "
-                 f"{rate:.1f} items/s | ETA: {int(eta)}s")
-        
-        # FileID fetchen
-        fileid = fetch_fileid_for_anchor(cfg, anchor_path, fid_cache, verbose=args.verbose)
-        
-        if fileid:
-            # Index aktualisieren
-            node["fileid"] = fileid
+        # Falls FileID im Index fehlt: fetchen
+        if not fileid:
+            need_fetch_count += 1
+            anchor_path = node.get("anchor_path")
+            
+            if not anchor_path:
+                _log(f"[warn] Item {sha256[:16]}... hat weder FileID noch anchor_path - überspringe")
+                continue
+            
+            # Progress
+            if need_fetch_count % 10 == 0 or args.verbose:
+                _log(f"[phase2] FileID-Fetch {need_fetch_count}/{len([n for _, n in items_to_fix if not n.get('fileid')])}")
+            
+            # FileID fetchen
+            fileid = fetch_fileid_for_anchor(cfg, anchor_path, fid_cache, verbose=args.verbose)
+            
+            if fileid:
+                # Index aktualisieren
+                node["fileid"] = fileid
     
     elapsed = time.time() - t_start
-    _log(f"[phase2] ✓ {stats['fileids_fetched']} neue FileIDs fetched in {elapsed:.1f}s "
-         f"({stats['fileids_cached']} aus Cache, {stats['fileids_failed']} failed)")
+    
+    if need_fetch_count > 0:
+        _log(f"[phase2] ✓ {stats['fileids_fetched']} neue FileIDs gefetched in {elapsed:.1f}s "
+             f"({stats['fileids_cached']} aus Cache, {stats['fileids_failed']} failed)")
+    else:
+        _log(f"[phase2] ✓ Alle items haben bereits FileID im Index - kein Fetch nötig")
     
     # Phase 3: Stubs neu schreiben
     _log("[phase3] Schreibe Stubs neu...")
@@ -332,9 +387,14 @@ def main() -> int:
             stub_count += 1
             
             # Progress
-            if stub_count % 10 == 0 or args.verbose:
-                _log(f"[phase3] {stub_count} Stubs bearbeitet...")
-            
+            if stub_count % 10 (nur falls FileIDs gefetched wurden)
+    if need_fetch_count > 0 and stats['fileids_fetched'] > 0:
+        _log("[phase4] Speichere Index (neue FileIDs wurden hinzugefügt)...")
+        save_index(cfg, index, index_path, dry=args.dry_run)
+    else:
+        _log("[phase4] Index-Speicherung übersprungen (keine Änderungen)")
+        if args.dry_run:
+            stats["index_updated"] = False
             # Stub neu schreiben
             rewrite_stub(
                 cfg, snapshots_root, snapshot, relpath, sha256, anchor_path, fileid,
