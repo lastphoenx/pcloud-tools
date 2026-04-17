@@ -239,6 +239,171 @@ def _compute_snapshot_stub_ratio(index: dict, snapshot_name: str) -> tuple:
     return total, stub_count, ratio
 
 
+# Konstante für den Template-Ordnernamen auf pCloud
+_FOLDER_TEMPLATE_DIRNAME = "_folder_template"
+
+
+def _load_template_manifest(archive_dir: str) -> Optional[dict]:
+    """
+    Lädt das lokale Template-Manifest (gespeichert von create_folder_template.py).
+    Gibt None zurück wenn nicht vorhanden oder ungültig.
+    """
+    path = os.path.join(archive_dir, "folder_template_manifest.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Validierung: muss folders-Liste haben
+        if not isinstance(data.get("folders"), list):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _save_template_manifest(archive_dir: str, template_path: str, folders: set, source_snapshot: str) -> None:
+    """Aktualisiert das lokale Template-Manifest nach einem SAFE-MODE Upload."""
+    path = os.path.join(archive_dir, "folder_template_manifest.json")
+    os.makedirs(archive_dir, exist_ok=True)
+    data = {
+        "template_path": template_path,
+        "source_snapshot": source_snapshot,
+        "updated_at": time.time(),
+        "folder_count": len(folders),
+        "folders": sorted(folders),
+    }
+    try:
+        import tempfile
+        dir_path = os.path.dirname(path)
+        with tempfile.NamedTemporaryFile(mode="w", dir=dir_path, delete=False, suffix=".tmp") as f:
+            json.dump(data, f, separators=(",", ":"))
+            tmp = f.name
+        os.replace(tmp, path)
+    except Exception as e:
+        _log(f"[template] Manifest-Speicherung fehlgeschlagen: {e}")
+
+
+def _sync_folder_template(
+    cfg: dict,
+    dest_root: str,
+    dest_snapshot_dir: str,
+    snapshot_name: str,
+    manifest_folders: set,
+    *,
+    dry: bool = False,
+    threads: int = 4,
+) -> bool:
+    """
+    Versucht die Ordnerstruktur für einen neuen Snapshot via _folder_template
+    anzulegen (statt N einzelner ensure_path-Calls).
+
+    Entscheidungslogik:
+      1. Template-Manifest lokal vorhanden? (→ kennen wir Overlap ohne API-Call)
+      2. overlap_ratio >= threshold UND copyfolder günstiger als einzeln?
+         JA  → copyfolder(template → new_snap) + Delta (add/delete)
+         NEIN → Einzeln anlegen (Fallback)
+      3. Nach erfolgreichem Anlegen: Template-Manifest aktualisieren
+
+    Returns:
+      True  = Template-Methode verwendet (Ordner sind angelegt)
+      False = Fallback (Caller soll Ordner einzeln anlegen)
+    """
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
+
+    # Konfiguration
+    threshold = float(os.environ.get("PCLOUD_FOLDER_TEMPLATE_THRESHOLD", "0.7"))
+    min_folders = int(os.environ.get("PCLOUD_FOLDER_TEMPLATE_MIN_FOLDERS", "50"))
+
+    # Kurz-Check: Lohnt sich Template überhaupt?
+    if len(manifest_folders) < min_folders:
+        _log(f"[template] Zu wenig Ordner ({len(manifest_folders)} < {min_folders}) – Einzeln anlegen")
+        return False
+
+    # Lokales Manifest laden (0 API-Calls)
+    tmpl_manifest = _load_template_manifest(archive_dir)
+    if not tmpl_manifest:
+        _log(f"[template] Kein lokales Manifest gefunden – Einzeln anlegen")
+        _log(f"[template] Tipp: 'python create_folder_template.py' einmalig ausführen")
+        return False
+
+    tmpl_folders = set(tmpl_manifest.get("folders") or [])
+    if not tmpl_folders:
+        return False
+
+    # Overlap berechnen (lokal, 0 API-Calls)
+    shared    = manifest_folders & tmpl_folders
+    to_add    = manifest_folders - tmpl_folders   # nach copyfolder anlegen
+    to_delete = tmpl_folders - manifest_folders   # nach copyfolder löschen
+
+    overlap_ratio = len(shared) / len(manifest_folders) if manifest_folders else 0.0
+
+    # Kosten-Vergleich
+    copy_cost = 1 + len(to_add) + len(to_delete)   # copyfolder + Delta
+    solo_cost = len(manifest_folders)                # N × ensure_path
+
+    _log(f"[template] Overlap: {len(shared)}/{len(manifest_folders)} ({overlap_ratio:.1%}), "
+         f"threshold: {threshold:.0%}")
+    _log(f"[template] Kosten: copyfolder+delta={copy_cost} vs. einzeln={solo_cost}")
+
+    if overlap_ratio < threshold or copy_cost >= solo_cost:
+        _log(f"[template] Schwelle nicht erreicht – Einzeln anlegen")
+        return False
+
+    _log(f"[template] TURBO: copyfolder(template → {snapshot_name}) + {len(to_add)} add, {len(to_delete)} delete")
+
+    if dry:
+        _log(f"[dry] copyfolder: {template_path} → {dest_snapshot_dir}")
+        for f in sorted(to_add)[:5]:
+            _log(f"[dry] add folder: {dest_snapshot_dir}/{f}")
+        for f in sorted(to_delete)[:5]:
+            _log(f"[dry] del folder: {dest_snapshot_dir}/{f}")
+        return True
+
+    # === copyfolder Template → neuer Snapshot ===
+    try:
+        pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
+        pc.copyfolder(cfg, from_path=template_path, to_path=dest_snapshot_dir, copycontentonly=True)
+        _log(f"[template] ✓ copyfolder abgeschlossen")
+    except Exception as e:
+        _log(f"[template] copyfolder fehlgeschlagen: {e} – Fallback zu Einzeln-Anlage")
+        return False
+
+    # === Delta: fehlende Ordner anlegen ===
+    if to_add:
+        from collections import defaultdict
+        by_depth = defaultdict(list)
+        for f in to_add:
+            by_depth[f.count("/")].append(f)
+        for depth in sorted(by_depth.keys()):
+            batch = by_depth[depth]
+            if threads > 1 and len(batch) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                    list(ex.map(lambda p: pc.call_with_backoff(
+                        pc.ensure_path, cfg, f"{dest_snapshot_dir}/{p}"
+                    ), batch))
+            else:
+                for p in batch:
+                    pc.call_with_backoff(pc.ensure_path, cfg, f"{dest_snapshot_dir}/{p}")
+        _log(f"[template] ✓ {len(to_add)} neue Ordner angelegt")
+
+    # === Delta: überflüssige Ordner löschen ===
+    if to_delete:
+        for relpath in sorted(to_delete, key=lambda p: -p.count("/")):
+            try:
+                pc.delete_folder(cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=True)
+            except Exception:
+                pass
+        _log(f"[template] ✓ {len(to_delete)} überflüssige Ordner gelöscht")
+
+    # === Template-Manifest aktualisieren ===
+    _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
+    _log(f"[template] ✓ Manifest aktualisiert ({len(manifest_folders)} Ordner)")
+
+    return True
+
+
 def save_content_index_local(local_path: str, index: dict) -> None:
     """Speichert den Index lokal als JSON."""
     import tempfile
@@ -1040,71 +1205,79 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             if relpath:  # Filter leere Strings (Root-Verzeichnis)
                 manifest_folders.add(relpath)
     
-    # 3. Differenz berechnen und nur fehlende Ordner anlegen
+    # 3. Differenz berechnen und Ordner anlegen
     missing_folders = manifest_folders - remote_folders
     if missing_folders:
         _log(f"[plan] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)")
-        
-        # Nach Tiefe gruppieren (Parents zuerst, dann parallel innerhalb Ebene)
-        from collections import defaultdict
-        import threading
-        
-        folders_by_depth = defaultdict(list)
-        for reldir in missing_folders:
-            depth = reldir.count("/")
-            folders_by_depth[depth].append(reldir)
-        
-        max_depth = max(folders_by_depth.keys()) if folders_by_depth else 0
-        threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
-        
-        _folders_created = 0
-        _folders_lock = threading.Lock()
-        _last_progress_pct = 0
-        total_folders = len(missing_folders)
-        
-        def _create_folder(reldir: str) -> bool:
-            nonlocal _folders_created, _last_progress_pct
-            try:
-                _ensure(f"{dest_snapshot_dir}/{reldir}")
-                
-                # Progress-Tracking (thread-safe)
-                with _folders_lock:
-                    _folders_created += 1
-                    current_pct = int((_folders_created / total_folders) * 100)
-                    
-                    # Alle 100 Ordner ODER bei Prozent-Änderung (10%, 20%, ...)
-                    show_progress = (
-                        _folders_created % 100 == 0 or
-                        _folders_created == total_folders or
-                        (current_pct % 10 == 0 and current_pct != _last_progress_pct)
-                    )
-                    
-                    if show_progress:
-                        _last_progress_pct = current_pct
-                        remaining_s = (total_folders - _folders_created) * 0.05 / threads
-                        eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
-                        _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
-                return True
-            except Exception as e:
-                print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
-                return False
-        
-        # Ebenen nacheinander abarbeiten (innerhalb parallel)
-        _log(f"[folders] {max_depth + 1} Ebenen, {threads} Threads pro Ebene")
-        for depth in sorted(folders_by_depth.keys()):
-            folders_at_depth = folders_by_depth[depth]
-            
-            if threads > 1 and len(folders_at_depth) > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
-                    list(ex.map(_create_folder, folders_at_depth))
-            else:
-                for folder in folders_at_depth:
-                    _create_folder(folder)
-        
-        _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
+
+        # === Template-Beschleunigung (falls _folder_template existiert) ===
+        # Versuche copyfolder(template → new_snap) + Delta statt N einzelner API-Calls
+        _folder_threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
+        _template_used = _sync_folder_template(
+            cfg, dest_root, dest_snapshot_dir, snapshot_name,
+            manifest_folders,
+            dry=dry,
+            threads=_folder_threads,
+        )
+
+        if not _template_used:
+            # Fallback: Einzeln anlegen (Orig-Logik)
+            from collections import defaultdict
+            import threading
+
+            folders_by_depth = defaultdict(list)
+            for reldir in missing_folders:
+                folders_by_depth[reldir.count("/")].append(reldir)
+
+            max_depth = max(folders_by_depth.keys()) if folders_by_depth else 0
+            _folders_created = 0
+            _folders_lock = threading.Lock()
+            _last_progress_pct = 0
+            total_folders = len(missing_folders)
+
+            def _create_folder(reldir: str) -> bool:
+                nonlocal _folders_created, _last_progress_pct
+                try:
+                    _ensure(f"{dest_snapshot_dir}/{reldir}")
+                    with _folders_lock:
+                        _folders_created += 1
+                        current_pct = int((_folders_created / total_folders) * 100)
+                        show_progress = (
+                            _folders_created % 100 == 0 or
+                            _folders_created == total_folders or
+                            (current_pct % 10 == 0 and current_pct != _last_progress_pct)
+                        )
+                        if show_progress:
+                            _last_progress_pct = current_pct
+                            remaining_s = (total_folders - _folders_created) * 0.05 / _folder_threads
+                            eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
+                            _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
+                    return True
+                except Exception as e:
+                    print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
+                    return False
+
+            _log(f"[folders] {max_depth + 1} Ebenen, {_folder_threads} Threads pro Ebene")
+            for depth in sorted(folders_by_depth.keys()):
+                folders_at_depth = folders_by_depth[depth]
+                if _folder_threads > 1 and len(folders_at_depth) > 1:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=_folder_threads) as ex:
+                        list(ex.map(_create_folder, folders_at_depth))
+                else:
+                    for folder in folders_at_depth:
+                        _create_folder(folder)
+
+            _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
+
+            # Template-Manifest anlegen/aktualisieren damit nächstes Mal Template greift
+            _archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+            _template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
+            if not dry:
+                _save_template_manifest(_archive_dir, _template_path, manifest_folders, snapshot_name)
+                _log(f"[template] Manifest für nächsten Lauf gespeichert ({len(manifest_folders)} Ordner)")
     else:
         _log(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits")
-    # === Ende Diff-basierte Ordner-Anlage ===
+    # === Ende Ordner-Anlage ===
 
     for it in manifest.get("items") or []:
         if it.get("type") == "dir":
