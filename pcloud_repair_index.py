@@ -702,6 +702,11 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
                 failed += 1
                 continue
             
+            # DEBUG: Zeige was stat_file zurückgibt (nur erste 3 Items)
+            if i <= 3:
+                print(f"    [DEBUG] md keys: {list(md.keys())[:10]}")
+                print(f"    [DEBUG] fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
+            
             # FileID extrahieren
             fileid = int(md.get("fileid") or md.get("id") or 0)
             if fileid:
