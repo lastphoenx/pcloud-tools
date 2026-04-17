@@ -895,26 +895,6 @@ def rebuild_complete_index(args):
             manifest_dir=manifest_dir
         )
         print(f"[phase 3] ✓ Index erstellt: {len(master_index.get('items', {}))} Dateien")
-        
-        # === PHASE 3b: API-Metadaten ergänzen (FileID + pcloud_hash) ===
-        enrich_enabled = not args.skip_enrich if hasattr(args, 'skip_enrich') else True
-        
-        if enrich_enabled:
-            print()
-            print("[phase 3b] Ergänze FileID + pcloud_hash per API...")
-            enrich_stats = enrich_index_with_api_metadata(
-                cfg=cfg,
-                index=master_index,
-                sample_only=False
-            )
-            if enrich_stats.get('enriched_fileid', 0) > 0:
-                print(f"[phase 3b] ✓ {enrich_stats['enriched_fileid']} FileIDs ergänzt")
-            if enrich_stats.get('enriched_pcloud_hash', 0) > 0:
-                print(f"[phase 3b] ✓ {enrich_stats['enriched_pcloud_hash']} pcloud_hash ergänzt")
-        else:
-            print()
-            print("[phase 3b] ⊘ API-Enrichment übersprungen (--skip-enrich)")
-            print("[phase 3b]   ⚠ Hinweis: fileid/pcloud_hash fehlen (werden beim Upload ergänzt)")
     
     else:  # repair mode
         print("[phase 3] Repariere String-Holder und entferne verwaiste Holder...")
@@ -927,6 +907,29 @@ def rebuild_complete_index(args):
             print(f"[phase 3]   Gelöschte Snapshots entfernt:")
             for snap in repair_stats['orphaned_snapshots']:
                 print(f"[phase 3]     - {snap}")
+    
+    # === PHASE 3b: API-Metadaten ergänzen (FileID + pcloud_hash) ===
+    # Läuft in BEIDEN Modi (rebuild + repair)
+    enrich_enabled = not args.skip_enrich if hasattr(args, 'skip_enrich') else True
+    
+    if enrich_enabled:
+        print()
+        print("[phase 3b] Ergänze FileID + pcloud_hash per API...")
+        enrich_stats = enrich_index_with_api_metadata(
+            cfg=cfg,
+            index=master_index,
+            sample_only=False
+        )
+        if enrich_stats.get('enriched_fileid', 0) > 0:
+            print(f"[phase 3b] ✓ {enrich_stats['enriched_fileid']} FileIDs ergänzt")
+        if enrich_stats.get('enriched_pcloud_hash', 0) > 0:
+            print(f"[phase 3b] ✓ {enrich_stats['enriched_pcloud_hash']} pcloud_hash ergänzt")
+        if enrich_stats.get('skipped_fileid', 0) > 0:
+            print(f"[phase 3b] ⊘ {enrich_stats['skipped_fileid']} items hatten bereits FileID")
+    else:
+        print()
+        print("[phase 3b] ⊘ API-Enrichment übersprungen (--skip-enrich)")
+        print("[phase 3b]   ⚠ Hinweis: fileid/pcloud_hash fehlen möglicherweise")
     
     # === PHASE 4: Time-Travel Archive generieren ===
     print()
