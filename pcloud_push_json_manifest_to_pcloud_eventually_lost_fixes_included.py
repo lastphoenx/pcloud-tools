@@ -1060,15 +1060,6 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             except Exception as e:
                 _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
             
-            # Master-Index aktualisieren (alle Snapshots zusammen)
-            try:
-                master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
-                os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
-                save_content_index_local(master_index_path, index)
-                _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
-            except Exception as e:
-                _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
-            
             # Lokale Index-Datei löschen
             try:
                 os.remove(_local_index_path)
@@ -1891,18 +1882,12 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         save_content_index(cfg, snapshots_root, index, dry=dry)
         _log(f"[delta-copy][6/6] ✓ Content-Index remote gespeichert")
         
-        # Lokal archivieren (Snapshot-spezifisch)
+        # Lokal archivieren
         if not dry:
             archive_index_path = f"{archive_base}/indexes/content_index_{snapshot_name}.json"
             os.makedirs(os.path.dirname(archive_index_path), exist_ok=True)
             save_content_index_local(archive_index_path, index)
             _log(f"[delta-copy][6/6] ✓ Content-Index lokal archiviert: {archive_index_path}")
-        
-        # Master-Index aktualisieren (alle Snapshots zusammen)
-        if not dry:
-            master_index_path = f"{archive_base}/indexes/content_index_master.json"
-            save_content_index_local(master_index_path, index)
-            _log(f"[delta-copy][6/6] ✓ Master-Index aktualisiert: {master_index_path}")
         
         # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
         if not dry:
