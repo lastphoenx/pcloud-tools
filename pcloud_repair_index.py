@@ -378,8 +378,8 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     items = index.get("items", {})
     valid_snapshots = set(snapshot_manifests)  # O(1) lookup
     
-    # Lade alle Manifeste (für Lookup sha256 → [relpaths] per snapshot)
-    manifest_lookup = {}  # {snapshot_name: {sha256: [relpath1, relpath2, ...]}}
+    # Lade alle Manifeste (für Lookup sha256 → [relpaths] + metadata per snapshot)
+    manifest_lookup = {}  # {snapshot_name: {sha256: [{"relpath": ..., "size": ..., "mtime": ..., "inode": ...}]}}
     
     print("[repair] Lade Manifeste für Holder-Reparatur...")
     for snap_name in snapshot_manifests:
@@ -390,7 +390,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                 items_list = manifest.get("items", [])
                 
                 # Manifeste v2/v3: items ist eine Liste von Objekten
-                # Baue Lookup-Dict: {sha256: [relpaths]} (Liste für Hardlinks/Duplikate)
+                # Baue Lookup-Dict: {sha256: [{"relpath": ..., "size": ..., ...}]} (Liste für Hardlinks/Duplikate)
                 items_dict = {}
                 for item in items_list:
                     if not isinstance(item, dict):
@@ -402,7 +402,14 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     if sha and relpath:
                         if sha not in items_dict:
                             items_dict[sha] = []
-                        items_dict[sha].append(relpath)
+                        # Speichere alle Metadaten
+                        items_dict[sha].append({
+                            "relpath": relpath,
+                            "size": item.get("size"),
+                            "mtime": item.get("mtime"),
+                            "inode": item.get("inode"),
+                            "ext": item.get("ext"),
+                        })
                 
                 manifest_lookup[snap_name] = items_dict
                 print(f"  ✓ {snap_name}: {len(items_dict)} Dateien")
@@ -438,13 +445,17 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     
                     # Suche nach SHA256 in diesem Manifest
                     if sha in manifest_items:
-                        relpaths = manifest_items[sha]  # Liste von relpaths
-                        relpath = relpaths[0]  # Nehme ersten Pfad (bei Hardlinks/Duplikaten)
+                        file_infos = manifest_items[sha]  # Liste von {relpath, size, mtime, ...}
+                        file_info = file_infos[0]  # Nehme ersten (bei Hardlinks/Duplikaten)
                         
-                        # Repariere: String → Dict
+                        # Repariere: String → Dict mit allen Metadaten
                         repaired_holder = {
                             "snapshot": snapshot_name,
-                            "relpath": relpath
+                            "relpath": file_info["relpath"],
+                            "size": file_info.get("size"),
+                            "mtime": file_info.get("mtime"),
+                            "inode": file_info.get("inode"),
+                            "ext": file_info.get("ext"),
                         }
                         new_holders.append(repaired_holder)
                         repaired_count += 1
@@ -469,16 +480,31 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     continue
                 
                 # Snapshot existiert - prüfe ob relpath korrekt ist
-                if snapshot_name in manifest_lookup:
-                    manifest_items = manifest_lookup[snapshot_name]
-                    
-                    if sha in manifest_items:
-                        valid_relpaths = manifest_items[sha]  # Liste von korrekten relpaths
+                if snapsfile_infos = manifest_items[sha]  # Liste von {relpath, size, ...}
                         
-                        if holder_relpath in valid_relpaths:
-                            # relpath ist korrekt → Holder behalten
-                            new_holders.append(h)
+                        # Finde korrekten file_info für diesen relpath
+                        matching_info = next((info for info in file_infos if info["relpath"] == holder_relpath), None)
+                        
+                        if matching_info:
+                            # relpath ist korrekt → Holder mit vollständigen Metadaten behalten/erweitern
+                            corrected_holder = {
+                                "snapshot": snapshot_name,
+                                "relpath": matching_info["relpath"],
+                                "size": matching_info.get("size"),
+                                "mtime": matching_info.get("mtime"),
+                                "inode": matching_info.get("inode"),
+                                "ext": matching_info.get("ext"),
+                            }
+                            new_holders.append(corrected_holder)
                         else:
+                            # relpath ist falsch → korrigieren mit erstem gültigen Pfad + Metadaten
+                            corrected_holder = {
+                                "snapshot": snapshot_name,
+                                "relpath": file_infos[0]["relpath"],
+                                "size": file_infos[0].get("size"),
+                                "mtime": file_infos[0].get("mtime"),
+                                "inode": file_infos[0].get("inode"),
+                                "ext": file_infos[0].get("ext"),
                             # relpath ist falsch → korrigieren mit erstem gültigen Pfad
                             corrected_holder = {
                                 "snapshot": snapshot_name,
@@ -552,9 +578,14 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
                     
                     file_count += 1
                     
+                    # Holder mit ALLEN Metadaten aus Manifest
                     holder = {
                         "snapshot": snap_name,
-                        "relpath": relpath
+                        "relpath": relpath,
+                        "size": item.get("size"),
+                        "mtime": item.get("mtime"),
+                        "inode": item.get("inode"),  # {dev, ino, nlink}
+                        "ext": item.get("ext"),
                     }
                     
                     # Node existiert schon? (Deduplizierung über Snapshots)
@@ -565,9 +596,10 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
                         # Neuer Node
                         anchor_path = f"{snapshots_root}/{snap_name}/{relpath}"
                         new_index["items"][sha] = {
+                            "sha256": sha,  # Explizit hinzufügen
                             "anchor_path": anchor_path,
-                            "holders": [holder]
-                            # fileid und pcloud_hash fehlen → werden beim Upload ergänzt
+                            "holders": [holder],
+                            # fileid und pcloud_hash werden später per API ergänzt
                         }
                 
                 print(f"  [{snap_name}] {file_count} Dateien")
@@ -583,6 +615,94 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
     print(f"[rebuild] ✓ Index erstellt: {total_files} Dateien")
     
     return new_index
+
+
+def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool = False, 
+                                     sample_size: int = 100) -> Dict[str, Any]:
+    """
+    Ergänzt Index mit FileID und pcloud_hash per API-Abfrage.
+    
+    Args:
+        sample_only: Nur erste N items enrichen (für Testing)
+        sample_size: Wie viele items bei sample_only
+    
+    Returns: Stats dict mit enrichment_stats
+    """
+    items = index.get("items", {})
+    
+    print()
+    print("[enrich] Ergänze FileID + pcloud_hash per API...")
+    
+    if sample_only:
+        print(f"[enrich] ⚠ SAMPLE-MODUS: Nur erste {sample_size} items")
+    
+    enriched_fileid = 0
+    enriched_pcloud_hash = 0
+    skipped_fileid = 0
+    failed = 0
+    
+    items_to_process = list(items.items())
+    if sample_only:
+        items_to_process = items_to_process[:sample_size]
+    
+    total = len(items_to_process)
+    
+    for i, (sha, node) in enumerate(items_to_process, 1):
+        if not isinstance(node, dict):
+            continue
+        
+        anchor_path = node.get("anchor_path")
+        if not anchor_path:
+            continue
+        
+        # Progress
+        if i % 100 == 0 or i == total:
+            print(f"  [{i}/{total}] ({i*100//total}%) | "
+                  f"FileID: {enriched_fileid}, Hash: {enriched_pcloud_hash}, "
+                  f"Failed: {failed}")
+        
+        # FileID bereits vorhanden?
+        if node.get("fileid"):
+            skipped_fileid += 1
+            continue
+        
+        # stat_file per API
+        try:
+            md = pc.stat_file(cfg, path=anchor_path, with_checksum=False, enrich_path=False)
+            
+            if not md or md.get("isfolder"):
+                print(f"    ⚠ Anchor ist Ordner oder nicht gefunden: {anchor_path[:60]}...")
+                failed += 1
+                continue
+            
+            # FileID extrahieren
+            fileid = int(md.get("fileid") or md.get("id") or 0)
+            if fileid:
+                node["fileid"] = fileid
+                enriched_fileid += 1
+            
+            # pcloud_hash extrahieren (falls vorhanden)
+            pcloud_hash = md.get("hash")
+            if pcloud_hash:
+                node["pcloud_hash"] = pcloud_hash
+                enriched_pcloud_hash += 1
+        
+        except Exception as e:
+            print(f"    ✗ stat_file fehlgeschlagen: {anchor_path[:60]}... : {e}")
+            failed += 1
+    
+    print()
+    print(f"[enrich] ✓ FileID ergänzt: {enriched_fileid}")
+    print(f"[enrich] ✓ pcloud_hash ergänzt: {enriched_pcloud_hash}")
+    print(f"[enrich] ⊘ FileID bereits vorhanden: {skipped_fileid}")
+    print(f"[enrich] ✗ Fehlgeschlagen: {failed}")
+    
+    return {
+        "enriched_fileid": enriched_fileid,
+        "enriched_pcloud_hash": enriched_pcloud_hash,
+        "skipped_fileid": skipped_fileid,
+        "failed": failed,
+    }
 
 
 def generate_timetravel_archive(cfg: dict, master_index: dict, snapshots_root: str, 
@@ -774,7 +894,26 @@ def rebuild_complete_index(args):
             manifest_dir=manifest_dir
         )
         print(f"[phase 3] ✓ Index erstellt: {len(master_index.get('items', {}))} Dateien")
-        print(f"[phase 3]   ⚠ Hinweis: fileid/pcloud_hash fehlen (werden beim Upload ergänzt)")
+        
+        # === PHASE 3b: API-Metadaten ergänzen (FileID + pcloud_hash) ===
+        enrich_enabled = not args.skip_enrich if hasattr(args, 'skip_enrich') else True
+        
+        if enrich_enabled:
+            print()
+            print("[phase 3b] Ergänze FileID + pcloud_hash per API...")
+            enrich_stats = enrich_index_with_api_metadata(
+                cfg=cfg,
+                index=master_index,
+                sample_only=False
+            )
+            if enrich_stats.get('enriched_fileid', 0) > 0:
+                print(f"[phase 3b] ✓ {enrich_stats['enriched_fileid']} FileIDs ergänzt")
+            if enrich_stats.get('enriched_pcloud_hash', 0) > 0:
+                print(f"[phase 3b] ✓ {enrich_stats['enriched_pcloud_hash']} pcloud_hash ergänzt")
+        else:
+            print()
+            print("[phase 3b] ⊘ API-Enrichment übersprungen (--skip-enrich)")
+            print("[phase 3b]   ⚠ Hinweis: fileid/pcloud_hash fehlen (werden beim Upload ergänzt)")
     
     else:  # repair mode
         print("[phase 3] Repariere String-Holder und entferne verwaiste Holder...")
@@ -881,6 +1020,8 @@ Beispiel:
                     help="Pfad zur .env-Datei (optional)")
     ap.add_argument("--profile",
                     help="pCloud-Profil (optional)")
+    ap.add_argument("--skip-enrich", action="store_true",
+                    help="Überspringe FileID/pcloud_hash API-Enrichment (schneller, aber incomplete)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Nur Report, keine Änderungen")
     
