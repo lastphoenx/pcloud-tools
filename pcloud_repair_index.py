@@ -378,8 +378,8 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     items = index.get("items", {})
     valid_snapshots = set(snapshot_manifests)  # O(1) lookup
     
-    # Lade alle Manifeste (für Lookup sha256 → relpath per snapshot)
-    manifest_lookup = {}  # {snapshot_name: {sha256: relpath}}
+    # Lade alle Manifeste (für Lookup sha256 → [relpaths] per snapshot)
+    manifest_lookup = {}  # {snapshot_name: {sha256: [relpath1, relpath2, ...]}}
     
     print("[repair] Lade Manifeste für Holder-Reparatur...")
     for snap_name in snapshot_manifests:
@@ -390,7 +390,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                 items_list = manifest.get("items", [])
                 
                 # Manifeste v2/v3: items ist eine Liste von Objekten
-                # Baue Lookup-Dict: {sha256: relpath}
+                # Baue Lookup-Dict: {sha256: [relpaths]} (Liste für Hardlinks/Duplikate)
                 items_dict = {}
                 for item in items_list:
                     if not isinstance(item, dict):
@@ -400,7 +400,9 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     sha = item.get("sha256")
                     relpath = item.get("relpath")
                     if sha and relpath:
-                        items_dict[sha] = relpath
+                        if sha not in items_dict:
+                            items_dict[sha] = []
+                        items_dict[sha].append(relpath)
                 
                 manifest_lookup[snap_name] = items_dict
                 print(f"  ✓ {snap_name}: {len(items_dict)} Dateien")
@@ -414,6 +416,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     repaired_count = 0
     unrepaired_count = 0
     removed_count = 0
+    corrected_relpath_count = 0  # Für falsche relpaths in Dict-Holdern
     orphaned_snapshots = set()  # Track gelöschte Snapshots für Report
     
     # Iterate über alle Nodes
@@ -435,7 +438,8 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     
                     # Suche nach SHA256 in diesem Manifest
                     if sha in manifest_items:
-                        relpath = manifest_items[sha]
+                        relpaths = manifest_items[sha]  # Liste von relpaths
+                        relpath = relpaths[0]  # Nehme ersten Pfad (bei Hardlinks/Duplikaten)
                         
                         # Repariere: String → Dict
                         repaired_holder = {
@@ -454,15 +458,41 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     removed_count += 1
             
             elif isinstance(h, dict):
-                # Korrekt formatierter Holder - aber prüfe ob Snapshot noch existiert
+                # Korrekt formatierter Holder - prüfe Snapshot UND relpath
                 snapshot_name = h.get("snapshot")
-                if snapshot_name in valid_snapshots:
-                    # Snapshot existiert noch → Holder behalten
-                    new_holders.append(h)
-                else:
+                holder_relpath = h.get("relpath")
+                
+                if snapshot_name not in valid_snapshots:
                     # Verwaister Holder aus gelöschtem Snapshot → entfernen
                     orphaned_snapshots.add(snapshot_name)
                     removed_count += 1
+                    continue
+                
+                # Snapshot existiert - prüfe ob relpath korrekt ist
+                if snapshot_name in manifest_lookup:
+                    manifest_items = manifest_lookup[snapshot_name]
+                    
+                    if sha in manifest_items:
+                        valid_relpaths = manifest_items[sha]  # Liste von korrekten relpaths
+                        
+                        if holder_relpath in valid_relpaths:
+                            # relpath ist korrekt → Holder behalten
+                            new_holders.append(h)
+                        else:
+                            # relpath ist falsch → korrigieren mit erstem gültigen Pfad
+                            corrected_holder = {
+                                "snapshot": snapshot_name,
+                                "relpath": valid_relpaths[0]
+                            }
+                            new_holders.append(corrected_holder)
+                            corrected_relpath_count += 1
+                    else:
+                        # SHA nicht im Manifest → Holder entfernen
+                        print(f"  ⚠ SHA {sha[:16]}... nicht in Manifest {snapshot_name} → Holder entfernt")
+                        removed_count += 1
+                else:
+                    # Manifest nicht geladen (sollte nicht passieren) → Holder behalten
+                    new_holders.append(h)
             else:
                 # Unbekanntes Format
                 print(f"  ✗ Unbekanntes Holder-Format: {type(h)} → entfernt")
@@ -479,6 +509,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
         "repaired": repaired_count,
         "removed": removed_count,
         "unrepaired": unrepaired_count,
+        "corrected_relpath": corrected_relpath_count,
         "orphaned_snapshots": sorted(orphaned_snapshots)
     }
 
@@ -749,7 +780,8 @@ def rebuild_complete_index(args):
         print("[phase 3] Repariere String-Holder und entferne verwaiste Holder...")
         repair_stats = repair_string_holders_to_dict(master_index, manifest_files)
         print(f"[phase 3] ✓ Reparatur abgeschlossen")
-        print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder")
+        print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder (String→Dict)")
+        print(f"[phase 3]   Korrigiert: {repair_stats['corrected_relpath']} Holder (falscher relpath)")
         print(f"[phase 3]   Entfernt:  {repair_stats['removed']} Holder")
         if repair_stats.get('orphaned_snapshots'):
             print(f"[phase 3]   Gelöschte Snapshots entfernt:")
