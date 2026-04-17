@@ -406,6 +406,73 @@ def _batch_ensure_paths(cfg: dict, paths: list[str], *, dry: bool = False) -> No
             # nicht hart abbrechen – idempotent, nächste versuchen
             continue
 
+def _build_folder_cache_from_tree(cfg: dict, root_path: str) -> dict[str, int]:
+    """
+    Lädt Ordner-Struktur via listfolder (recursive=True, nofiles=True)
+    und baut eine Map: {normalized_path: folderid}
+    
+    Performance:
+      - 1× listfolder (recursive) API-Call
+      - Statt N× ensure_path/stat für Parent-FolderID-Lookups
+      - Typisch: 1 Call statt 1,000+ Calls (999x Reduktion)
+    
+    Returns:
+        dict mapping normalized paths to folderids
+        
+    Example:
+        cache = _build_folder_cache_from_tree(cfg, "/My Cloud/_snapshots/2026-04-17-120000")
+        # cache = {"/My Cloud/_snapshots/2026-04-17-120000": 12345,
+        #          "/My Cloud/_snapshots/2026-04-17-120000/dir1": 12346, ...}
+    """
+    try:
+        result = pc.listfolder(cfg, path=root_path, recursive=True, nofiles=True)
+    except Exception as e:
+        # Root existiert noch nicht (erstes Upload) oder Fehler → leere Map
+        if "2005" in str(e) or "not found" in str(e).lower():
+            return {}
+        # Bei anderen Fehlern auch leere Map (defensiv, kein Abbruch)
+        if os.environ.get("PCLOUD_VERBOSE") == "1":
+            _log(f"[warn] listfolder für Folder-Cache fehlgeschlagen: {e}")
+        return {}
+    
+    cache = {}
+    
+    def _traverse(node, parent_path=""):
+        """Rekursiv alle Ordner aus dem Tree extrahieren"""
+        if not isinstance(node, dict):
+            return
+        
+        # Nur Ordner interessieren uns
+        if not node.get("isfolder"):
+            return
+        
+        folder_name = node.get("name", "")
+        folderid = node.get("folderid")
+        
+        # Pfad konstruieren
+        if parent_path:
+            full_path = f"{parent_path}/{folder_name}"
+        else:
+            # Root-Node: verwende den übergebenen Pfad
+            full_path = root_path
+        
+        # Normalisieren (wichtig für Map-Lookup!)
+        normalized = pc._norm_remote_path(full_path)
+        
+        if folderid:
+            cache[normalized] = int(folderid)
+        
+        # Rekursiv in Kinder eintauchen
+        for child in node.get("contents") or []:
+            _traverse(child, full_path)
+    
+    # Start mit metadata (Root-Ordner)
+    metadata = result.get("metadata")
+    if metadata:
+        _traverse(metadata, parent_path="")
+    
+    return cache
+
 def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = False) -> None:
     """
     Schreibt gesammelte Stubs (.meta.json) in ihre Zielordner (parent folderid + filename).
@@ -435,45 +502,86 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         name = os.path.basename(stub_path)
         by_parent.setdefault(parent, []).append((name, payload))
 
-    # 2) parent-fids auflösen (mit 2004-Fallback)
+    # 2) parent-fids auflösen (optimiert: listfolder + selective ensure)
     parent_fids: dict[str, int] = {}
     _total_parents = len(by_parent)
-    _resolved_parents = 0
-    _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf...")
+    _cache_hits = 0
+    _cache_misses = 0
+    _api_calls = 0
+    
+    # 2a) Batch-Lookup: Lade existierende Ordner-Struktur (1 API-Call)
+    #     Extrahiere Snapshot-Root aus erstem Parent-Pfad
+    if not dry and by_parent:
+        # Snapshot-Root ermitteln (z.B. /My Cloud/_snapshots/2026-04-17-120000)
+        first_parent = next(iter(by_parent.keys()))
+        # Format: /.../snapshots_root/snapshot_name/... → extrahiere bis snapshot_name
+        parts = first_parent.split("/")
+        # Finde _snapshots Index
+        try:
+            snapshots_idx = parts.index("_snapshots")
+            # snapshot_root = alles bis einschließlich snapshot_name (snapshots_idx + 2)
+            snapshot_root = "/".join(parts[:snapshots_idx + 2])
+        except (ValueError, IndexError):
+            # Fallback: nehme Parent vom ersten Parent
+            snapshot_root = "/".join(parts[:-1]) if len(parts) > 1 else "/"
+        
+        _log(f"[stubs] Lade Ordner-Struktur via listfolder: {snapshot_root}")
+        t_cache_start = time.time()
+        folder_cache = _build_folder_cache_from_tree(cfg, snapshot_root)
+        t_cache_ms = (time.time() - t_cache_start) * 1000.0
+        _api_calls += 1  # Ein listfolder-Call
+        _log(f"[stubs] ✓ Folder-Cache geladen: {len(folder_cache)} Ordner in {t_cache_ms:.0f}ms")
+    else:
+        folder_cache = {}
+    
+    # 2b) Parent-FIDs: erst Cache-Lookup, bei Miss ensure_path
+    _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (via Cache + Selective Create)...")
     
     for parent in by_parent.keys():
         if dry:
             # im Dry-Run keine REST-Lookups; fiktive fid
             parent_fids[parent] = 0
-            _resolved_parents += 1
             continue
-        try:
-            fid = pc.ensure_path(cfg, path=parent)  # returns folderid (idempotent)
-            parent_fids[parent] = int(fid)
-            _resolved_parents += 1
-            
-            # Progress alle 50 Parents oder bei 10/20/30...%
-            if _resolved_parents % 50 == 0 or _resolved_parents == _total_parents:
-                _pct = int((_resolved_parents / _total_parents) * 100)
-                _eta_s = (_total_parents - _resolved_parents) * 0.5  # ~0.5s pro Parent
-                _eta_str = f"~{int(_eta_s/60)}min" if _eta_s > 60 else f"~{int(_eta_s)}s"
-                _log(f"[stubs] Parent-FIDs: {_resolved_parents}/{_total_parents} ({_pct}%) | {_eta_str} verbleibend")
-        except Exception as e:
-            # Bei 2004 (Already exists): FolderID via stat nachziehen
-            if "2004" in str(e):
-                try:
-                    fid = pc.stat_folderid_fast(cfg, parent)
-                    if fid:
-                        parent_fids[parent] = int(fid)
-                        _resolved_parents += 1
-                        if os.environ.get("PCLOUD_VERBOSE") == "1":
-                            _log(f"[info] Folder {parent} existiert bereits (2004) - FolderID via stat geholt: {fid}")
-                    else:
-                        _log(f"[warn] Folder {parent} existiert (2004), aber FolderID nicht auflösbar - Stubs werden übersprungen")
-                except Exception as e2:
-                    _log(f"[warn] cannot resolve folderid for {parent}: {e} (fallback failed: {e2})")
-            else:
-                _log(f"[warn] cannot resolve/ensure folderid for {parent}: {e}")
+        
+        # Normalisieren für Cache-Lookup
+        normalized_parent = pc._norm_remote_path(parent)
+        
+        # Cache-Lookup (O(1))
+        if normalized_parent in folder_cache:
+            parent_fids[parent] = folder_cache[normalized_parent]
+            _cache_hits += 1
+        else:
+            # Cache-Miss: Ordner existiert noch nicht → anlegen
+            try:
+                fid = pc.ensure_path(cfg, path=parent)
+                parent_fids[parent] = int(fid)
+                folder_cache[normalized_parent] = int(fid)  # Cache updaten
+                _cache_misses += 1
+                _api_calls += 1  # Zähle ensure_path als API-Call
+            except Exception as e:
+                # Bei 2004 (Already exists): FolderID via stat nachziehen
+                if "2004" in str(e):
+                    try:
+                        fid = pc.stat_folderid_fast(cfg, parent)
+                        if fid:
+                            parent_fids[parent] = int(fid)
+                            folder_cache[normalized_parent] = int(fid)
+                            _cache_misses += 1
+                            _api_calls += 1
+                            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                                _log(f"[info] Folder {parent} existiert bereits (2004) - FolderID via stat geholt: {fid}")
+                        else:
+                            _log(f"[warn] Folder {parent} existiert (2004), aber FolderID nicht auflösbar - Stubs werden übersprungen")
+                    except Exception as e2:
+                        _log(f"[warn] cannot resolve folderid for {parent}: {e} (fallback failed: {e2})")
+                else:
+                    _log(f"[warn] cannot resolve/ensure folderid for {parent}: {e}")
+    
+    # Performance-Report
+    if not dry:
+        _speedup = (_total_parents / _api_calls) if _api_calls > 0 else 0
+        _log(f"[stubs] ✓ Parent-FIDs aufgelöst: {_cache_hits} Cache-Hits, {_cache_misses} neu angelegt")
+        _log(f"[stubs] ✓ API-Calls: {_api_calls} (statt {_total_parents}) → {_speedup:.0f}x Reduktion")
 
     # 3) Schreibjobs bauen (nur Parents mit bekannter fid) + Payload anreichern
     tasks: list[tuple[str, str, dict]] = []
