@@ -361,16 +361,22 @@ Schema-Validierung:
 
 def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) -> Dict[str, Any]:
     """
-    Repariert korrupte String-Holder im Master-Index.
+    Repariert korrupte String-Holder im Master-Index UND entfernt verwaiste Holder.
     
     String-Holder entstehen durch Bug in pcloud_push_json_manifest_to_pcloud.py:
       holders.append(snapshot_name)  # ← String statt {"snapshot": ..., "relpath": ...}
     
-    Strategie: Nutze die lokalen Manifeste um den korrekten relpath zu rekonstruieren.
+    Verwaiste Holder entstehen nach Snapshot-Löschung:
+      Holder zeigen auf Snapshots die nicht mehr existieren
+    
+    Strategie: 
+      1. Nutze die lokalen Manifeste um den korrekten relpath zu rekonstruieren
+      2. Entferne alle Holder deren Snapshot nicht mehr in snapshot_manifests ist
     
     Returns: Stats dict mit repair_stats
     """
     items = index.get("items", {})
+    valid_snapshots = set(snapshot_manifests)  # O(1) lookup
     
     # Lade alle Manifeste (für Lookup sha256 → relpath per snapshot)
     manifest_lookup = {}  # {snapshot_name: {sha256: relpath}}
@@ -408,6 +414,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     repaired_count = 0
     unrepaired_count = 0
     removed_count = 0
+    orphaned_snapshots = set()  # Track gelöschte Snapshots für Report
     
     # Iterate über alle Nodes
     for sha, node in list(items.items()):
@@ -423,7 +430,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                 snapshot_name = h
                 
                 # Versuche relpath aus Manifest zu rekonstruieren
-                if snapshot_name in manifest_lookup:
+                if snapshot_name in valid_snapshots and snapshot_name in manifest_lookup:
                     manifest_items = manifest_lookup[snapshot_name]
                     
                     # Suche nach SHA256 in diesem Manifest
@@ -447,8 +454,15 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     removed_count += 1
             
             elif isinstance(h, dict):
-                # Korrekt formatierter Holder
-                new_holders.append(h)
+                # Korrekt formatierter Holder - aber prüfe ob Snapshot noch existiert
+                snapshot_name = h.get("snapshot")
+                if snapshot_name in valid_snapshots:
+                    # Snapshot existiert noch → Holder behalten
+                    new_holders.append(h)
+                else:
+                    # Verwaister Holder aus gelöschtem Snapshot → entfernen
+                    orphaned_snapshots.add(snapshot_name)
+                    removed_count += 1
             else:
                 # Unbekanntes Format
                 print(f"  ✗ Unbekanntes Holder-Format: {type(h)} → entfernt")
@@ -464,7 +478,8 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     return {
         "repaired": repaired_count,
         "removed": removed_count,
-        "unrepaired": unrepaired_count
+        "unrepaired": unrepaired_count,
+        "orphaned_snapshots": sorted(orphaned_snapshots)
     }
 
 
@@ -731,11 +746,15 @@ def rebuild_complete_index(args):
         print(f"[phase 3]   ⚠ Hinweis: fileid/pcloud_hash fehlen (werden beim Upload ergänzt)")
     
     else:  # repair mode
-        print("[phase 3] Repariere String-Holder...")
+        print("[phase 3] Repariere String-Holder und entferne verwaiste Holder...")
         repair_stats = repair_string_holders_to_dict(master_index, manifest_files)
         print(f"[phase 3] ✓ Reparatur abgeschlossen")
         print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder")
         print(f"[phase 3]   Entfernt:  {repair_stats['removed']} Holder")
+        if repair_stats.get('orphaned_snapshots'):
+            print(f"[phase 3]   Gelöschte Snapshots entfernt:")
+            for snap in repair_stats['orphaned_snapshots']:
+                print(f"[phase 3]     - {snap}")
     
     # === PHASE 4: Time-Travel Archive generieren ===
     print()
