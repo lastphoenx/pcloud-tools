@@ -480,7 +480,11 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                     continue
                 
                 # Snapshot existiert - prüfe ob relpath korrekt ist
-                if snapsfile_infos = manifest_items[sha]  # Liste von {relpath, size, ...}
+                if snapshot_name in manifest_lookup:
+                    manifest_items = manifest_lookup[snapshot_name]
+                    
+                    if sha in manifest_items:
+                        file_infos = manifest_items[sha]  # Liste von {relpath, size, ...}
                         
                         # Finde korrekten file_info für diesen relpath
                         matching_info = next((info for info in file_infos if info["relpath"] == holder_relpath), None)
@@ -505,10 +509,6 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                                 "mtime": file_infos[0].get("mtime"),
                                 "inode": file_infos[0].get("inode"),
                                 "ext": file_infos[0].get("ext"),
-                            # relpath ist falsch → korrigieren mit erstem gültigen Pfad
-                            corrected_holder = {
-                                "snapshot": snapshot_name,
-                                "relpath": valid_relpaths[0]
                             }
                             new_holders.append(corrected_holder)
                             corrected_relpath_count += 1
@@ -518,6 +518,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                         removed_count += 1
                 else:
                     # Manifest nicht geladen (sollte nicht passieren) → Holder behalten
+                    new_holders.append(h)
                     new_holders.append(h)
             else:
                 # Unbekanntes Format
