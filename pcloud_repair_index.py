@@ -642,14 +642,17 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
     return new_index
 
 
-def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool = False, 
+def enrich_index_with_api_metadata(cfg: dict, index: dict, dest_root: str, *, sample_only: bool = False, 
                                      sample_size: int = 100, force_enrich: bool = False, debug: bool = False) -> Dict[str, Any]:
     """
     Ergänzt Index mit FileID und pcloud_hash per API-Abfrage.
+    Falls anchor_path ein Stub ist, wird durch alle Holders iteriert um echtes File zu finden.
     
     Args:
+        dest_root: Basis-Pfad für Snapshots (/Backup/rtb_1to1)
         sample_only: Nur erste N items enrichen (für Testing)
         sample_size: Wie viele items bei sample_only
+        force_enrich: Auch bereits enriched Nodes nochmal enrichen
     
     Returns: Stats dict mit enrichment_stats
     """
@@ -698,35 +701,71 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
             skipped_fileid += 1
             continue
         
-        # stat_file per API
+        # stat_file per API (anchor_path könnte Stub sein!)
+        md = None
+        tried_paths = []
+        
         try:
             md = pc.stat_file(cfg, path=anchor_path, with_checksum=False, enrich_path=False)
+            tried_paths.append(("anchor", anchor_path))
             
-            if not md or md.get("isfolder"):
-                print(f"    ⚠ Anchor ist Ordner oder nicht gefunden: {anchor_path[:60]}...")
-                failed += 1
-                continue
-            
-            # DEBUG: Zeige was stat_file zurückgibt (nur wenn debug=True)
-            if debug:
-                print(f"    [DEBUG] API Response - md keys: {list(md.keys())[:10]}")
-                print(f"    [DEBUG] API Response - fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
-            
-            # FileID extrahieren
-            fileid = int(md.get("fileid") or md.get("id") or 0)
-            if fileid:
-                node["fileid"] = fileid
-                enriched_fileid += 1
-            
-            # pcloud_hash extrahieren (falls vorhanden)
-            pcloud_hash = md.get("hash")
-            if pcloud_hash:
-                node["pcloud_hash"] = pcloud_hash
-                enriched_pcloud_hash += 1
-        
+            if md and md.get("isfolder"):
+                md = None  # Ordner ignorieren
         except Exception as e:
-            print(f"    ✗ stat_file fehlgeschlagen: {anchor_path[:60]}... : {e}")
+            if debug and i <= 10:
+                print(f"    [DEBUG] anchor={anchor_path[:40]}... fehlgeschlagen (Stub?): {e}")
+            md = None
+        
+        # Falls anchor_path fehlgeschlagen (= Stub), suche in ALLEN Holders
+        if not md:
+            holders = node.get("holders", [])
+            for holder in holders:
+                if not isinstance(holder, dict):
+                    continue
+                snapshot = holder.get("snapshot")
+                relpath = holder.get("relpath")
+                if not snapshot or not relpath:
+                    continue
+                
+                # Baue Pfad für diesen Holder
+                holder_path = f"{dest_root}/_snapshots/{snapshot}/{relpath}"
+                tried_paths.append(("holder", holder_path))
+                
+                try:
+                    md = pc.stat_file(cfg, path=holder_path, with_checksum=False, enrich_path=False)
+                    
+                    if md and not md.get("isfolder"):
+                        # Gefunden! Echtes File (kein Stub)
+                        if debug and i <= 10:
+                            print(f"    [DEBUG] Echtes File gefunden: {holder_path[:60]}...")
+                        break
+                    else:
+                        md = None
+                except Exception:
+                    md = None
+                    continue
+        
+        if not md:
+            if debug and i <= 10:
+                print(f"    [DEBUG] Alle Pfade fehlgeschlagen: {len(tried_paths)} versucht")
             failed += 1
+            continue
+        
+        # DEBUG: Zeige was stat_file zurückgibt
+        if debug and i <= 3:
+            print(f"    [DEBUG] API Response - fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
+        
+        # FileID extrahieren
+        fileid = int(md.get("fileid") or md.get("id") or 0)
+        if fileid:
+            node["fileid"] = fileid
+            enriched_fileid += 1
+        
+        # pcloud_hash extrahieren (falls vorhanden)
+        pcloud_hash = md.get("hash")
+        if pcloud_hash:
+            node["pcloud_hash"] = pcloud_hash
+            enriched_pcloud_hash += 1
     
     print()
     print(f"[enrich] ✓ FileID ergänzt: {enriched_fileid}")
@@ -870,13 +909,35 @@ def enrich_index_with_listfolder(cfg: dict, index: dict, snapshots_root: str,
             skipped_fileid += 1
             continue
         
-        # Lookup in Mapping
+        # Lookup in Mapping (anchor_path könnte Stub sein!)
         file_meta = fileid_mapping.get(anchor_path)
+        
+        # Falls anchor_path nicht gefunden (= Stub), suche in ALLEN Holders
+        if not file_meta:
+            holders = node.get("holders", [])
+            for holder in holders:
+                if not isinstance(holder, dict):
+                    continue
+                snapshot = holder.get("snapshot")
+                relpath = holder.get("relpath")
+                if not snapshot or not relpath:
+                    continue
+                
+                # Baue Pfad für diesen Holder  
+                holder_path = f"{snapshots_root}/{snapshot}/{relpath}"
+                file_meta = fileid_mapping.get(holder_path)
+                
+                if file_meta:
+                    # Gefunden! Echtes File (kein Stub)
+                    if debug and i <= 10:
+                        print(f"    [DEBUG] anchor={anchor_path[:40]}... ist Stub")
+                        print(f"    [DEBUG] Echtes File gefunden: {holder_path[:60]}...")
+                    break
         
         if not file_meta:
             not_found += 1
             if debug and i <= 10:
-                print(f"    [DEBUG] Nicht im Mapping gefunden: {anchor_path[:60]}...")
+                print(f"    [DEBUG] Weder anchor noch Holders im Mapping: {anchor_path[:60]}...")
             continue
         
         # DEBUG: Zeige Mapping-Treffer
@@ -1199,6 +1260,7 @@ def rebuild_complete_index(args):
             enrich_stats = enrich_index_with_api_metadata(
                 cfg=cfg,
                 index=master_index,
+                dest_root=dest_root,
                 sample_only=False,
                 force_enrich=force_enrich,
                 debug=debug_mode
