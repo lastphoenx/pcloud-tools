@@ -643,7 +643,7 @@ def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: 
 
 
 def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool = False, 
-                                     sample_size: int = 100, force_enrich: bool = False) -> Dict[str, Any]:
+                                     sample_size: int = 100, force_enrich: bool = False, debug: bool = False) -> Dict[str, Any]:
     """
     Ergänzt Index mit FileID und pcloud_hash per API-Abfrage.
     
@@ -689,7 +689,7 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
                   f"Failed: {failed}")
         
         # DEBUG: Erste 3 Nodes - was hat der geladene Index?
-        if i <= 3:
+        if debug and i <= 3:
             print(f"  [DEBUG #{i}] node.get('fileid')={node.get('fileid')}, node.get('pcloud_hash')={node.get('pcloud_hash')}")
             print(f"  [DEBUG #{i}] anchor_path={anchor_path[:80]}...")
         
@@ -707,9 +707,10 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
                 failed += 1
                 continue
             
-            # DEBUG: Zeige was stat_file zurückgibt
-            print(f"    [DEBUG] API Response - md keys: {list(md.keys())[:10]}")
-            print(f"    [DEBUG] API Response - fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
+            # DEBUG: Zeige was stat_file zurückgibt (nur wenn debug=True)
+            if debug:
+                print(f"    [DEBUG] API Response - md keys: {list(md.keys())[:10]}")
+                print(f"    [DEBUG] API Response - fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
             
             # FileID extrahieren
             fileid = int(md.get("fileid") or md.get("id") or 0)
@@ -974,11 +975,16 @@ def rebuild_complete_index(args):
             print(f"[phase 3]   anchor_path gesetzt: {anchor_set_count} Nodes")
         
         # KRITISCH: Nach Holder-Repair sind alte FileIDs inkonsistent!
-        # Lösche FileIDs um Enrichment zu erzwingen
+        # Lösche FileIDs um Enrichment zu erzwingen (SMART: nur wenn Repair stattfand)
         force_enrich = getattr(args, 'force_enrich', False)
         skip_enrich = getattr(args, 'skip_enrich', False)
-        if force_enrich or (not skip_enrich):
-            print(f"[phase 3]   Lösche alte FileIDs für Re-Enrichment...")
+        
+        # Lösche FileIDs wenn: (1) force_enrich ODER (2) Repair hat Metadaten geändert
+        should_delete_fileids = force_enrich or (repair_stats.get('enriched_metadata', 0) > 0)
+        
+        if should_delete_fileids and not skip_enrich:
+            reason = "--force-enrich" if force_enrich else f"Holder-Repair ({repair_stats['enriched_metadata']} Holders geändert)"
+            print(f"[phase 3]   Lösche alte FileIDs für Re-Enrichment (Grund: {reason})...")
             deleted_fileid = 0
             deleted_hash = 0
             for sha, node in master_index.get("items", {}).items():
@@ -990,7 +996,9 @@ def rebuild_complete_index(args):
                 if "pcloud_hash" in node:
                     del node["pcloud_hash"]
                     deleted_hash += 1
-            print(f"[phase 3]   Gelöscht: {deleted_fileid} FileIDs, {deleted_hash} Hashes (für Re-Enrichment)")
+            print(f"[phase 3]   Gelöscht: {deleted_fileid} FileIDs, {deleted_hash} Hashes")
+        elif not skip_enrich:
+            print(f"[phase 3]   FileIDs behalten (kein Repair → keine Inkonsistenzen)")
     
     # === PHASE 3b: API-Metadaten ergänzen (FileID + pcloud_hash) ===
     # Läuft in BEIDEN Modi (rebuild + repair)
@@ -999,14 +1007,18 @@ def rebuild_complete_index(args):
     if enrich_enabled:
         print()
         print("[phase 3b] Ergänze FileID + pcloud_hash per API...")
-        force_enrich = args.force_enrich if hasattr(args, 'force_enrich') else False
+        force_enrich = getattr(args, 'force_enrich', False)
+        debug_mode = getattr(args, 'debug', False)
         if force_enrich:
             print("[phase 3b] ⚠ FORCE-ENRICH: Überschreibe existierende FileIDs")
+        if debug_mode:
+            print("[phase 3b] ⚠ DEBUG-MODUS aktiviert")
         enrich_stats = enrich_index_with_api_metadata(
             cfg=cfg,
             index=master_index,
             sample_only=False,
-            force_enrich=force_enrich
+            force_enrich=force_enrich,
+            debug=debug_mode
         )
         if enrich_stats.get('enriched_fileid', 0) > 0:
             print(f"[phase 3b] ✓ {enrich_stats['enriched_fileid']} FileIDs ergänzt")
@@ -1120,6 +1132,8 @@ Beispiel:
                     help="Überspringe FileID/pcloud_hash API-Enrichment (schneller, aber incomplete)")
     ap.add_argument("--force-enrich", action="store_true",
                     help="Erzwinge API-Enrichment auch wenn FileID bereits vorhanden (überschreibt alte FileIDs)")
+    ap.add_argument("--debug", action="store_true",
+                    help="Aktiviere Debug-Ausgaben (API Responses, etc.)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Nur Report, keine Änderungen")
     
