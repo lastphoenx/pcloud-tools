@@ -776,18 +776,23 @@ def enrich_index_with_listfolder(cfg: dict, index: dict, snapshots_root: str,
         
         try:
             # listfolder mit recursive=True → alle Dateien
-            tree = pc.list_folder(cfg, path=snap_path, recursive=True)
+            tree = pc.listfolder(cfg, path=snap_path, recursive=True)
             
             # Flatten tree zu file list
-            def _flatten(node, parent_path=""):
+            def _flatten(node, parent_path="", is_root=True):
                 files = []
                 if isinstance(node, dict):
                     node_name = node.get("name", "")
-                    node_path = f"{parent_path}/{node_name}".lstrip("/")
+                    
+                    # Pfad-Bau (root-Ordner hat leeren Namen)
+                    if is_root:
+                        current_path = ""
+                    else:
+                        current_path = f"{parent_path}/{node_name}".lstrip("/")
                     
                     if not node.get("isfolder"):
                         # Datei gefunden
-                        full_path = f"{snap_path}/{node_path}"
+                        full_path = f"{snap_path}/{current_path}".replace("//", "/")
                         files.append({
                             "path": full_path,
                             "fileid": node.get("fileid") or node.get("id"),
@@ -796,19 +801,31 @@ def enrich_index_with_listfolder(cfg: dict, index: dict, snapshots_root: str,
                     else:
                         # Ordner → recurse in contents
                         for child in node.get("contents", []):
-                            files.extend(_flatten(child, node_path))
+                            files.extend(_flatten(child, current_path, is_root=False))
                 
                 return files
             
-            files = _flatten(tree)
+            # Extrahiere metadata und flatten
+            metadata = tree.get("metadata", {})
+            files = _flatten(metadata, is_root=True)
             
             # Mapping aktualisieren
             for f in files:
                 if f["fileid"] and f["path"]:
-                    fileid_mapping[f["path"]] = {
-                        "fileid": int(f["fileid"]) if isinstance(f["fileid"], (str, int)) else 0,
-                        "hash": f["hash"],
-                    }
+                    # FileID kann String oder int sein, normalisiere zu int
+                    fileid_raw = f["fileid"]
+                    if isinstance(fileid_raw, str):
+                        # Entferne 'f' prefix falls vorhanden
+                        fileid_raw = fileid_raw.lstrip('f')
+                        fileid = int(fileid_raw) if fileid_raw.isdigit() else 0
+                    else:
+                        fileid = int(fileid_raw) if fileid_raw else 0
+                    
+                    if fileid > 0:
+                        fileid_mapping[f["path"]] = {
+                            "fileid": fileid,
+                            "hash": f["hash"],
+                        }
             
             print(f"✓ {len(files)} Dateien")
             
