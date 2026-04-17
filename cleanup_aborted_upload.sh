@@ -18,34 +18,58 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
 
 # === Argument-Handling ===
-if [ -z "$1" ]; then
+SNAPSHOT_NAME=""
+DO_REMOTE_DELETE=false
+DRY_RUN=false
+
+# Unterstützt beide Formen:
+#   $0 SNAPSHOT_NAME [--remote] [--dry-run]          (positional)
+#   $0 --snapshot SNAPSHOT_NAME [--remote] [--dry-run] (named flag)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --snapshot)
+            SNAPSHOT_NAME="$2"
+            shift 2
+            ;;
+        --remote)
+            DO_REMOTE_DELETE=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -*)
+            echo "❌ FEHLER: Unbekanntes Flag: $1" >&2
+            exit 1
+            ;;
+        *)
+            # Erstes Positional-Argument = Snapshot-Name
+            if [ -z "$SNAPSHOT_NAME" ]; then
+                SNAPSHOT_NAME="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$SNAPSHOT_NAME" ]; then
     echo "❌ FEHLER: Bitte Snapshot-Namen angeben!"
     echo ""
     echo "Usage:"
     echo "  $0 SNAPSHOT_NAME [--remote] [--dry-run]"
+    echo "  $0 --snapshot SNAPSHOT_NAME [--remote] [--dry-run]"
     echo ""
     echo "Beispiele:"
-    echo "  $0 2026-04-12-141849                      # Nur lokaler Cleanup"
-    echo "  $0 2026-04-12-141849 --remote             # Auch pCloud-Snapshot löschen"
-    echo "  $0 2026-04-12-141849 --dry-run            # Zeige was passieren würde (sicher)"
-    echo "  $0 2026-04-12-141849 --remote --dry-run   # Vollständiger Dry-Run"
+    echo "  $0 2026-04-12-141849                        # Nur lokaler Cleanup"
+    echo "  $0 2026-04-12-141849 --remote               # Auch pCloud-Snapshot löschen"
+    echo "  $0 --snapshot 2026-04-12-141849 --remote    # Named-Flag-Syntax"
+    echo "  $0 2026-04-12-141849 --dry-run              # Zeige was passieren würde (sicher)"
+    echo "  $0 2026-04-12-141849 --remote --dry-run     # Vollständiger Dry-Run"
     echo ""
     echo "Standard: Nur lokaler Cleanup (pCloud manuell via UI prüfen)"
     exit 1
 fi
-
-SNAPSHOT_NAME="$1"
-DO_REMOTE_DELETE=false
-DRY_RUN=false
-
-# Optional: --remote und --dry-run Flags (Reihenfolge egal)
-for arg in "$@"; do
-    if [ "$arg" = "--remote" ]; then
-        DO_REMOTE_DELETE=true
-    elif [ "$arg" = "--dry-run" ]; then
-        DRY_RUN=true
-    fi
-done
 
 RTB_BASE="/mnt/backup/rtb_nas"
 ARCHIVE_BASE="/srv/pcloud-archive"
