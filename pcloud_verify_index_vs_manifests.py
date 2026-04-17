@@ -32,14 +32,15 @@ except Exception:
     sys.exit(2)
 
 
-def load_manifests(manifest_dir: str) -> Dict[str, Dict[str, str]]:
+def load_manifests(manifest_dir: str) -> Dict[str, Dict[str, List[str]]]:
     """
     Lädt alle Manifeste aus dem Verzeichnis.
     
     Returns:
-        Dict[snapshot_name, Dict[sha256, relpath]]
+        Dict[snapshot_name, Dict[sha256, [relpaths]]]
+        Note: Liste für Hardlinks/Duplikate (gleicher SHA256, mehrere Pfade)
     """
-    manifests: Dict[str, Dict[str, str]] = {}
+    manifests: Dict[str, Dict[str, List[str]]] = {}
     
     if not os.path.isdir(manifest_dir):
         print(f"[ERROR] Manifest-Verzeichnis nicht gefunden: {manifest_dir}", file=sys.stderr)
@@ -63,7 +64,7 @@ def load_manifests(manifest_dir: str) -> Dict[str, Dict[str, str]]:
                 items_list = manifest.get("items", [])
                 
                 # Manifeste v2/v3: items ist eine Liste von Objekten
-                # Baue Lookup-Dict: {sha256: relpath}
+                # Baue Lookup-Dict: {sha256: [relpaths]} (Liste für Hardlinks/Duplikate)
                 items_dict = {}
                 for item in items_list:
                     if not isinstance(item, dict):
@@ -75,7 +76,9 @@ def load_manifests(manifest_dir: str) -> Dict[str, Dict[str, str]]:
                     relpath = item.get("relpath")
                     
                     if sha and relpath:
-                        items_dict[sha] = relpath
+                        if sha not in items_dict:
+                            items_dict[sha] = []
+                        items_dict[sha].append(relpath)
                 
                 manifests[snapshot_name] = items_dict
                 print(f"  ✓ {snapshot_name}: {len(items_dict)} Dateien")
@@ -109,10 +112,12 @@ def load_remote_index(cfg: dict, snaps_root: str, index_file: str = "content_ind
         sys.exit(2)
 
 
-def verify_index(index: dict, manifests: Dict[str, Dict[str, str]], 
+def verify_index(index: dict, manifests: Dict[str, Dict[str, List[str]]], 
                  snaps_root: str) -> Dict[str, Any]:
     """
     Vergleicht Index gegen Manifeste.
+    
+    Note: manifests enthält Listen von relpaths für Hardlinks/Duplikate
     
     Returns:
         Report-Dict mit allen Findings
@@ -131,10 +136,9 @@ def verify_index(index: dict, manifests: Dict[str, Dict[str, str]],
     
     # Build reverse lookup: Was sollte im Index sein?
     expected_files: Dict[str, Set[str]] = {}  # {sha256: {snapshot_names}}
-    manifest_lookup: Dict[str, Dict[str, str]] = {}  # {snapshot: {sha256: relpath}}
+    manifest_lookup = manifests  # Direkt verwenden: {snapshot: {sha256: [relpaths]}}
     
     for snapshot_name, files in manifests.items():
-        manifest_lookup[snapshot_name] = files
         for sha256 in files.keys():
             if sha256 not in expected_files:
                 expected_files[sha256] = set()
@@ -146,12 +150,14 @@ def verify_index(index: dict, manifests: Dict[str, Dict[str, str]],
         if sha256 not in items:
             # Datei fehlt komplett im Index
             for snap in snapshots_expected:
-                missing_in_index.append({
-                    "sha256": sha256,
-                    "snapshot": snap,
-                    "relpath": manifest_lookup[snap][sha256],
-                    "reason": "SHA256 nicht im Index"
-                })
+                relpaths = manifest_lookup[snap][sha256]  # Liste von Pfaden
+                for relpath in relpaths:
+                    missing_in_index.append({
+                        "sha256": sha256,
+                        "snapshot": snap,
+                        "relpath": relpath,
+                        "reason": "SHA256 nicht im Index"
+                    })
     
     print(f"[check 1] Fehlende Dateien: {len(missing_in_index)}")
     
@@ -207,14 +213,14 @@ def verify_index(index: dict, manifests: Dict[str, Dict[str, str]],
                 })
                 continue
             
-            # Prüfe relpath
-            expected_relpath = manifest_files[sha256]
-            if relpath != expected_relpath:
+            # Prüfe relpath (relpath muss in der Liste der gültigen Pfade sein)
+            expected_relpaths = manifest_files[sha256]  # Liste bei Hardlinks/Duplikaten
+            if relpath not in expected_relpaths:
                 relpath_mismatch.append({
                     "sha256": sha256,
                     "snapshot": snap,
                     "index_relpath": relpath,
-                    "manifest_relpath": expected_relpath
+                    "manifest_relpaths": expected_relpaths  # Alle gültigen Pfade
                 })
     
     print(f"[check 2] Extra Holder (nicht in Manifesten): {len(extra_in_index)}")
@@ -269,7 +275,13 @@ def print_report(report: Dict[str, Any]):
         for r in relpath_mm[:10]:
             print(f"    [RELPATH] {r['snapshot']}")
             print(f"              Index:    {r['index_relpath']}")
-            print(f"              Manifest: {r['manifest_relpath']}")
+            manifest_paths = r.get('manifest_relpaths', r.get('manifest_relpath'))
+            if isinstance(manifest_paths, list):
+                print(f"              Manifest: {manifest_paths[0]}")  # Zeige ersten gültigen Pfad
+                if len(manifest_paths) > 1:
+                    print(f"              (+ {len(manifest_paths)-1} weitere gültige Pfade)")
+            else:
+                print(f"              Manifest: {manifest_paths}")
         if len(relpath_mm) > 10:
             print(f"    ... und {len(relpath_mm)-10} weitere")
     
