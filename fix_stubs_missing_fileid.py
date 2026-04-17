@@ -4,14 +4,16 @@
 fix_stubs_missing_fileid.py
 
 Repariert Stubs (.meta.json), die keine FileID haben:
-1. Lädt Master-Index (content_index.json)
+1. Lädt Master-Index von pCloud (_snapshots/_index/content_index.json)
 2. Findet alle items ohne "fileid"
 3. Ermittelt FileID via stat_file() am anchor_path
 4. Aktualisiert Index + schreibt alle betroffenen Stubs neu
+5. Speichert Index zurück nach pCloud (mit remote Backup)
 
 Voraussetzungen:
-- Master-Index vorhanden: <dest-root>/_snapshots/_index/content_index.json
+- Master-Index remote vorhanden: <dest-root>/_snapshots/_index/content_index.json
 - pcloud_bin_lib.py im selben Verzeichnis
+- pCloud credentials (.env oder ENV)
 
 Beispiel:
     python fix_stubs_missing_fileid.py \\
@@ -53,32 +55,36 @@ stats = {
 }
 
 
-def load_index(index_path: str) -> dict:
-    """Lädt content_index.json"""
-    _log(f"[index] Lade: {index_path}")
-    with open(index_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_index(cfg: dict, index_path: str) -> dict:
+    """Lädt content_index.json von pCloud"""
+    _log(f"[index] Lade von pCloud: {index_path}")
+    try:
+        text = pc.get_textfile(cfg, path=index_path)
+        return json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"Index konnte nicht geladen werden: {e}")
 
 
-def save_index(index: dict, index_path: str, *, dry: bool = False) -> None:
-    """Speichert content_index.json (mit Backup)"""
+def save_index(cfg: dict, index: dict, index_path: str, *, dry: bool = False) -> None:
+    """Speichert content_index.json nach pCloud (mit Backup)"""
     if dry:
         _log(f"[dry] Index würde gespeichert: {index_path}")
         return
     
-    # Backup
+    # Backup remote erstellen (aktuellen Index als Backup speichern)
     backup_path = f"{index_path}.backup-{int(time.time())}"
-    if os.path.exists(index_path):
-        _log(f"[index] Backup: {backup_path}")
-        with open(index_path, "r", encoding="utf-8") as f:
-            backup = f.read()
-        with open(backup_path, "w", encoding="utf-8") as f:
-            f.write(backup)
+    try:
+        _log(f"[index] Erstelle Backup: {backup_path}")
+        # Aktuellen Stand von pCloud holen und als Backup speichern
+        current_text = pc.get_textfile(cfg, path=index_path)
+        current_index = json.loads(current_text)
+        pc.write_json_at_path(cfg, path=backup_path, obj=current_index)
+    except Exception as e:
+        _log(f"[warn] Backup fehlgeschlagen (fahre fort): {e}")
     
-    # Speichern
-    _log(f"[index] Speichere: {index_path}")
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2)
+    # Speichern nach pCloud
+    _log(f"[index] Speichere nach pCloud: {index_path}")
+    pc.write_json_at_path(cfg, path=index_path, obj=index)
     
     stats["index_updated"] = True
 
@@ -232,12 +238,12 @@ def main() -> int:
     # Config laden
     cfg = pc.effective_config()
     
-    # Index laden
-    if not os.path.exists(index_path):
-        _log(f"[error] Index nicht gefunden: {index_path}")
+    # Index laden (von pCloud)
+    try:
+        index = load_index(cfg, index_path)
+    except Exception as e:
+        _log(f"[error] {e}")
         return 1
-    
-    index = load_index(index_path)
     items = index.get("items", {})
     
     _log(f"[index] Items im Index: {len(items)}")
@@ -341,7 +347,7 @@ def main() -> int:
     
     # Phase 4: Index speichern
     _log("[phase4] Speichere Index...")
-    save_index(index, index_path, dry=args.dry_run)
+    save_index(cfg, index, index_path, dry=args.dry_run)
     
     # Final Report
     print("\n" + "="*60)
