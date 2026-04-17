@@ -437,14 +437,27 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
 
     # 2) parent-fids auflösen (mit 2004-Fallback)
     parent_fids: dict[str, int] = {}
+    _total_parents = len(by_parent)
+    _resolved_parents = 0
+    _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf...")
+    
     for parent in by_parent.keys():
         if dry:
             # im Dry-Run keine REST-Lookups; fiktive fid
             parent_fids[parent] = 0
+            _resolved_parents += 1
             continue
         try:
             fid = pc.ensure_path(cfg, path=parent)  # returns folderid (idempotent)
             parent_fids[parent] = int(fid)
+            _resolved_parents += 1
+            
+            # Progress alle 50 Parents oder bei 10/20/30...%
+            if _resolved_parents % 50 == 0 or _resolved_parents == _total_parents:
+                _pct = int((_resolved_parents / _total_parents) * 100)
+                _eta_s = (_total_parents - _resolved_parents) * 0.5  # ~0.5s pro Parent
+                _eta_str = f"~{int(_eta_s/60)}min" if _eta_s > 60 else f"~{int(_eta_s)}s"
+                _log(f"[stubs] Parent-FIDs: {_resolved_parents}/{_total_parents} ({_pct}%) | {_eta_str} verbleibend")
         except Exception as e:
             # Bei 2004 (Already exists): FolderID via stat nachziehen
             if "2004" in str(e):
@@ -452,6 +465,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                     fid = pc.stat_folderid_fast(cfg, parent)
                     if fid:
                         parent_fids[parent] = int(fid)
+                        _resolved_parents += 1
                         if os.environ.get("PCLOUD_VERBOSE") == "1":
                             _log(f"[info] Folder {parent} existiert bereits (2004) - FolderID via stat geholt: {fid}")
                     else:
@@ -1074,6 +1088,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
 
     # --- Batch: Stubs & Index schreiben (einmaliges Ensure + Writes) ---
     if not dry and stubs_to_write:
+        _log(f"[push] ✓ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
         t0 = time.time()
         _batch_write_stubs(cfg, stubs_to_write, dry=False)  # sorgt intern für 1x Parent-Ensure
         write_ms += (time.time() - t0) * 1000.0
