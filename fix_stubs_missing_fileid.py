@@ -159,10 +159,11 @@ def fetch_fileid_for_anchor(cfg: dict, anchor_path: str, fid_cache: dict, *, ver
 
 
 def rewrite_stub(cfg: dict, snapshots_root: str, snapshot: str, relpath: str, 
-                 sha256: str, anchor_path: str, fileid: int, 
+                 sha256: str, anchor_path: str, fileid: int, pcloud_hash: Optional[int],
+                 holder_metadata: Dict[str, Any],
                  *, dry: bool = False, verbose: bool = False) -> bool:
     """
-    Schreibt Stub (.meta.json) neu mit FileID
+    Schreibt Stub (.meta.json) neu mit ALLEN Metadaten
     
     Args:
         cfg: pCloud config
@@ -172,6 +173,8 @@ def rewrite_stub(cfg: dict, snapshots_root: str, snapshot: str, relpath: str,
         sha256: SHA256-Hash
         anchor_path: Anchor-Pfad
         fileid: FileID
+        pcloud_hash: pCloud-spezifischer Hash (optional)
+        holder_metadata: Metadaten aus holder (size, mtime, inode, ext)
         dry: Dry-run Modus
         verbose: Verbose logging
     
@@ -221,7 +224,35 @@ def rewrite_stub(cfg: dict, snapshots_root: str, snapshot: str, relpath: str,
         payload["anchor_path"] = anchor_path
         payload["fileid"] = fileid
         
-        # 4) Schreiben
+        # 4) Metadaten aus holder übernehmen
+        if holder_metadata.get("size") is not None:
+            payload["size"] = holder_metadata["size"]
+        if holder_metadata.get("mtime") is not None:
+            payload["mtime"] = holder_metadata["mtime"]
+        if holder_metadata.get("inode"):
+            payload["inode"] = holder_metadata["inode"]
+        if holder_metadata.get("ext"):
+            payload["ext"] = holder_metadata["ext"]
+        
+        # 5) pcloud_hash (optional)
+        if pcloud_hash:
+            payload["pcloud_hash"] = pcloud_hash
+        
+        # 6) Zusätzliche Stub-Metadaten
+        payload.setdefault("format_version", 1)
+        payload.setdefault("kind", "stub")
+        payload.setdefault("holder_type", "hardlink")
+        
+        # ISO-Timestamp für Debugging
+        if holder_metadata.get("mtime"):
+            try:
+                import datetime
+                dt = datetime.datetime.fromtimestamp(holder_metadata["mtime"], tz=datetime.timezone.utc)
+                payload["mtime_iso"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+        
+        # 7) Schreiben
         if verbose:
             _log(f"[stub] Write: {meta_path}")
         
@@ -366,6 +397,7 @@ def main() -> int:
             continue
         
         anchor_path = node.get("anchor_path")
+        pcloud_hash = node.get("pcloud_hash")
         holders = node.get("holders", [])
         
         # Nur Stubs neu schreiben (nicht den Anchor)
@@ -387,17 +419,21 @@ def main() -> int:
             stub_count += 1
             
             # Progress
-            if stub_count % 10 (nur falls FileIDs gefetched wurden)
-    if need_fetch_count > 0 and stats['fileids_fetched'] > 0:
-        _log("[phase4] Speichere Index (neue FileIDs wurden hinzugefügt)...")
-        save_index(cfg, index, index_path, dry=args.dry_run)
-    else:
-        _log("[phase4] Index-Speicherung übersprungen (keine Änderungen)")
-        if args.dry_run:
-            stats["index_updated"] = False
-            # Stub neu schreiben
+            if stub_count % 10 == 0 or args.verbose:
+                _log(f"[phase3] {stub_count} Stubs bearbeitet...")
+            
+            # Holder-Metadaten extrahieren
+            holder_metadata = {
+                "size": holder.get("size"),
+                "mtime": holder.get("mtime"),
+                "inode": holder.get("inode"),
+                "ext": holder.get("ext"),
+            }
+            
+            # Stub neu schreiben mit ALLEN Metadaten
             rewrite_stub(
-                cfg, snapshots_root, snapshot, relpath, sha256, anchor_path, fileid,
+                cfg, snapshots_root, snapshot, relpath, sha256, anchor_path, fileid, pcloud_hash,
+                holder_metadata,
                 dry=args.dry_run, verbose=args.verbose
             )
     
@@ -405,9 +441,14 @@ def main() -> int:
     _log(f"[phase3] ✓ {stats['stubs_rewritten']} Stubs neu geschrieben in {elapsed:.1f}s "
          f"({stats['stubs_failed']} failed)")
     
-    # Phase 4: Index speichern
-    _log("[phase4] Speichere Index...")
-    save_index(cfg, index, index_path, dry=args.dry_run)
+    # Phase 4: Index speichern (nur falls FileIDs gefetched wurden)
+    if need_fetch_count > 0 and stats['fileids_fetched'] > 0:
+        _log("[phase4] Speichere Index (neue FileIDs wurden hinzugefügt)...")
+        save_index(cfg, index, index_path, dry=args.dry_run)
+    else:
+        _log("[phase4] Index-Speicherung übersprungen (keine Änderungen)")
+        if args.dry_run:
+            stats["index_updated"] = False
     
     # Final Report
     print("\n" + "="*60)
