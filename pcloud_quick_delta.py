@@ -201,6 +201,7 @@ def compare_index_vs_remote(
     index: dict,
     by_fileid: Dict[int, dict],
     by_path: Dict[str, dict],
+    snaps_root: str,
 ) -> dict:
     """
     Vergleicht content_index.json gegen den Live-Baum.
@@ -229,6 +230,9 @@ def compare_index_vs_remote(
 
     # Set aller remote fileids für spätere "unbekannte Dateien"-Erkennung
     index_fileids: Set[int] = set()
+    
+    # Set aller bekannten Pfade (Anchors + Holders) für Delta-Copy-Modus
+    index_known_paths: Set[str] = set()
 
     checked = 0
     for sha, node in items.items():
@@ -239,6 +243,21 @@ def compare_index_vs_remote(
         index_fid = node.get("fileid")
         index_hash = node.get("pcloud_hash")
         index_size = None  # size nicht direkt im Node, aber in holders/stubs
+        
+        # Sammle alle bekannten Pfade (Anchor + Holders)
+        if anchor_path:
+            index_known_paths.add(anchor_path)
+        
+        # Auch Holder-Pfade sammeln (für Delta-Copy mit Server-Side Clone)
+        holders = node.get("holders", [])
+        if isinstance(holders, list):
+            for h in holders:
+                if isinstance(h, dict):
+                    snap = h.get("snapshot", "")
+                    relpath = h.get("relpath", "")
+                    if snap and relpath:
+                        holder_path = f"{snaps_root}/{snap}/{relpath}"
+                        index_known_paths.add(holder_path)
 
         if not anchor_path:
             continue
@@ -318,6 +337,7 @@ def compare_index_vs_remote(
         "size_mismatch": size_mismatch,
         "hash_missing_in_index": hash_missing_in_index,
         "index_fileids": index_fileids,
+        "index_known_paths": index_known_paths,
     }
 
 
@@ -330,10 +350,11 @@ def find_unknown_files(
     by_path: Dict[str, dict],
     index_fileids: Set[int],
     snaps_root: str,
+    index_known_paths: Set[str] = None,
 ) -> List[dict]:
     """
     Findet echte Dateien (keine .meta.json Stubs und kein content_index.json)
-    auf pCloud, die in keinem Index-Node als Anchor referenziert werden.
+    auf pCloud, die in keinem Index-Node als Anchor ODER Holder referenziert werden.
     
     Ignoriert:
     - Stubs (.meta.json)
@@ -346,6 +367,10 @@ def find_unknown_files(
     
     # Upload-Marker-Dateien (diese gehören zum Upload-Tracking, nicht zu Backups)
     MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
+    
+    # Fallback: leeres Set wenn nicht angegeben
+    if index_known_paths is None:
+        index_known_paths = set()
 
     for fid, md in by_fileid.items():
         fp = md.get("_full_path", "")
@@ -363,7 +388,8 @@ def find_unknown_files(
         if fname in MARKER_FILES:
             continue
 
-        if fid not in index_fileids:
+        # Prüfe FileID UND Pfad (für Delta-Copy-Modus mit Holders)
+        if fid not in index_fileids and fp not in index_known_paths:
             unknown.append({
                 "fileid": fid,
                 "path": fp,
@@ -616,13 +642,19 @@ Beispiele:
     print()
     print("[phase 3] Vergleiche Index vs. Remote...")
     t0 = time.time()
-    report = compare_index_vs_remote(index, by_fileid, by_path)
+    report = compare_index_vs_remote(index, by_fileid, by_path, snaps_root)
     print(f"[phase 3] Vergleich abgeschlossen ({time.time()-t0:.1f}s)")
 
     # 4) Unbekannte Dateien
     print()
     print("[phase 4] Suche unbekannte Dateien...")
-    unknown = find_unknown_files(by_fileid, by_path, report["index_fileids"], snaps_root)
+    unknown = find_unknown_files(
+        by_fileid, 
+        by_path, 
+        report["index_fileids"], 
+        snaps_root,
+        report.get("index_known_paths", set())
+    )
     print(f"[phase 4] {len(unknown)} unbekannte Dateien gefunden")
 
     # 5) Optional: SHA256-Backfill-Check
