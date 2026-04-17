@@ -664,6 +664,7 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
     enriched_fileid = 0
     enriched_pcloud_hash = 0
     skipped_fileid = 0
+    skipped_no_anchor = 0  # NEU: Nodes ohne anchor_path
     failed = 0
     
     items_to_process = list(items.items())
@@ -678,6 +679,7 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
         
         anchor_path = node.get("anchor_path")
         if not anchor_path:
+            skipped_no_anchor += 1
             continue
         
         # Progress
@@ -720,12 +722,15 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
     print(f"[enrich] ✓ FileID ergänzt: {enriched_fileid}")
     print(f"[enrich] ✓ pcloud_hash ergänzt: {enriched_pcloud_hash}")
     print(f"[enrich] ⊘ FileID bereits vorhanden: {skipped_fileid}")
+    if skipped_no_anchor > 0:
+        print(f"[enrich] ⚠ KEINE anchor_path: {skipped_no_anchor} nodes übersprungen!")
     print(f"[enrich] ✗ Fehlgeschlagen: {failed}")
     
     return {
         "enriched_fileid": enriched_fileid,
         "enriched_pcloud_hash": enriched_pcloud_hash,
         "skipped_fileid": skipped_fileid,
+        "skipped_no_anchor": skipped_no_anchor,
         "failed": failed,
     }
 
@@ -932,6 +937,32 @@ def rebuild_complete_index(args):
             print(f"[phase 3]   Gelöschte Snapshots entfernt:")
             for snap in repair_stats['orphaned_snapshots']:
                 print(f"[phase 3]     - {snap}")
+        
+        # Nach Repair: anchor_path für alle Nodes setzen (falls fehlend)
+        print(f"[phase 3] Setze anchor_path für Nodes ohne anchor_path...")
+        anchor_set_count = 0
+        for sha, node in master_index.get("items", {}).items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("anchor_path"):
+                continue  # Bereits vorhanden
+            
+            holders = node.get("holders", [])
+            if not holders:
+                continue
+            
+            # Sortiere Holder chronologisch, nehme ältesten
+            valid_holders = [h for h in holders if isinstance(h, dict) and h.get("snapshot") and h.get("relpath")]
+            if not valid_holders:
+                continue
+            
+            valid_holders.sort(key=lambda x: x["snapshot"])
+            oldest = valid_holders[0]
+            node["anchor_path"] = f"{snaps_root}/{oldest['snapshot']}/{oldest['relpath']}"
+            anchor_set_count += 1
+        
+        if anchor_set_count > 0:
+            print(f"[phase 3]   anchor_path gesetzt: {anchor_set_count} Nodes")
     
     # === PHASE 3b: API-Metadaten ergänzen (FileID + pcloud_hash) ===
     # Läuft in BEIDEN Modi (rebuild + repair)
@@ -951,6 +982,10 @@ def rebuild_complete_index(args):
             print(f"[phase 3b] ✓ {enrich_stats['enriched_pcloud_hash']} pcloud_hash ergänzt")
         if enrich_stats.get('skipped_fileid', 0) > 0:
             print(f"[phase 3b] ⊘ {enrich_stats['skipped_fileid']} items hatten bereits FileID")
+        if enrich_stats.get('skipped_no_anchor', 0) > 0:
+            print(f"[phase 3b] ⚠ KRITISCH: {enrich_stats['skipped_no_anchor']} items ohne anchor_path!")
+            print(f"[phase 3b]   → Repair-Modus fügt keine anchor_path hinzu")
+            print(f"[phase 3b]   → Lösung: Remote-Index löschen und Rebuild verwenden")
     else:
         print()
         print("[phase 3b] ⊘ API-Enrichment übersprungen (--skip-enrich)")
