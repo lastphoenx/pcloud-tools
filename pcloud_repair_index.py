@@ -424,6 +424,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
     unrepaired_count = 0
     removed_count = 0
     corrected_relpath_count = 0  # Für falsche relpaths in Dict-Holdern
+    enriched_metadata_count = 0  # Holder mit ergänzten Metadaten (size/mtime/inode/ext)
     orphaned_snapshots = set()  # Track gelöschte Snapshots für Report
     
     # Iterate über alle Nodes
@@ -499,6 +500,17 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                                 "inode": matching_info.get("inode"),
                                 "ext": matching_info.get("ext"),
                             }
+                            
+                            # Prüfe ob Metadaten ergänzt wurden
+                            had_incomplete_metadata = (
+                                h.get("size") is None or 
+                                h.get("mtime") is None or 
+                                h.get("inode") is None or 
+                                h.get("ext") is None
+                            )
+                            if had_incomplete_metadata:
+                                enriched_metadata_count += 1
+                            
                             new_holders.append(corrected_holder)
                         else:
                             # relpath ist falsch → korrigieren mit erstem gültigen Pfad + Metadaten
@@ -510,6 +522,17 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
                                 "inode": file_infos[0].get("inode"),
                                 "ext": file_infos[0].get("ext"),
                             }
+                            
+                            # Prüfe ob auch Metadaten ergänzt wurden
+                            had_incomplete_metadata = (
+                                h.get("size") is None or 
+                                h.get("mtime") is None or 
+                                h.get("inode") is None or 
+                                h.get("ext") is None
+                            )
+                            if had_incomplete_metadata:
+                                enriched_metadata_count += 1
+                            
                             new_holders.append(corrected_holder)
                             corrected_relpath_count += 1
                     else:
@@ -537,6 +560,7 @@ def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) ->
         "removed": removed_count,
         "unrepaired": unrepaired_count,
         "corrected_relpath": corrected_relpath_count,
+        "enriched_metadata": enriched_metadata_count,
         "orphaned_snapshots": sorted(orphaned_snapshots)
     }
 
@@ -903,6 +927,7 @@ def rebuild_complete_index(args):
         print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder (String→Dict)")
         print(f"[phase 3]   Korrigiert: {repair_stats['corrected_relpath']} Holder (falscher relpath)")
         print(f"[phase 3]   Entfernt:  {repair_stats['removed']} Holder")
+        print(f"[phase 3]   Metadaten ergänzt: {repair_stats['enriched_metadata']} Holder (size/mtime/inode/ext)")
         if repair_stats.get('orphaned_snapshots'):
             print(f"[phase 3]   Gelöschte Snapshots entfernt:")
             for snap in repair_stats['orphaned_snapshots']:
