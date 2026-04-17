@@ -1856,7 +1856,16 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         
         holders = node.setdefault("holders", [])
         relpath = file_item.get("relpath") or ""
-        holder_entry = {"snapshot": snapshot_name, "relpath": relpath}
+        
+        # Holder mit vollständigen Metadaten (wie in Manifesten)
+        holder_entry = {
+            "snapshot": snapshot_name,
+            "relpath": relpath,
+            "size": file_item.get("size"),
+            "mtime": file_item.get("mtime"),
+            "inode": file_item.get("inode"),  # {"dev": ..., "ino": ..., "nlink": ...}
+            "ext": file_item.get("ext"),
+        }
         
         # Check if this exact holder already exists (robust gegen String-Leichen)
         holder_exists = any(
