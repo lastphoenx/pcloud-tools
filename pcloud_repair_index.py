@@ -745,6 +745,155 @@ def enrich_index_with_api_metadata(cfg: dict, index: dict, *, sample_only: bool 
     }
 
 
+def enrich_index_with_listfolder(cfg: dict, index: dict, snapshots_root: str, 
+                                   snapshot_order: List[str], *, debug: bool = False) -> Dict[str, Any]:
+    """
+    Ergänzt Index mit FileID und pcloud_hash via listfolder (SCHNELL).
+    
+    Strategie:
+      1. Für jeden Snapshot: listfolder(recursive) → alle Files mit FileID + Hash
+      2. Baue Mapping: {full_path: {fileid, hash}}
+      3. Match anchor_path gegen Mapping
+      4. Setze FileID + Hash aus Mapping
+    
+    Performance: 3 API-Calls (3 Snapshots) statt 17929 (stat per File)
+    """
+    print()
+    print("[enrich] Ergänze FileID + pcloud_hash per listfolder (BATCH-Modus)...")
+    
+    if debug:
+        print("[enrich] ⚠ DEBUG-MODUS aktiviert")
+    
+    # === PHASE A: Baue FileID-Mapping für alle Snapshots ===
+    print("[enrich] Phase A: Lade FileID-Mappings per listfolder...")
+    
+    fileid_mapping = {}  # {full_path: {fileid, hash}}
+    
+    for snap_name in snapshot_order:
+        snap_path = f"{snapshots_root}/{snap_name}"
+        
+        print(f"  [listfolder] {snap_name}...", end=" ", flush=True)
+        
+        try:
+            # listfolder mit recursive=True → alle Dateien
+            tree = pc.list_folder(cfg, path=snap_path, recursive=True)
+            
+            # Flatten tree zu file list
+            def _flatten(node, parent_path=""):
+                files = []
+                if isinstance(node, dict):
+                    node_name = node.get("name", "")
+                    node_path = f"{parent_path}/{node_name}".lstrip("/")
+                    
+                    if not node.get("isfolder"):
+                        # Datei gefunden
+                        full_path = f"{snap_path}/{node_path}"
+                        files.append({
+                            "path": full_path,
+                            "fileid": node.get("fileid") or node.get("id"),
+                            "hash": node.get("hash"),
+                        })
+                    else:
+                        # Ordner → recurse in contents
+                        for child in node.get("contents", []):
+                            files.extend(_flatten(child, node_path))
+                
+                return files
+            
+            files = _flatten(tree)
+            
+            # Mapping aktualisieren
+            for f in files:
+                if f["fileid"] and f["path"]:
+                    fileid_mapping[f["path"]] = {
+                        "fileid": int(f["fileid"]) if isinstance(f["fileid"], (str, int)) else 0,
+                        "hash": f["hash"],
+                    }
+            
+            print(f"✓ {len(files)} Dateien")
+            
+        except Exception as e:
+            print(f"✗ Fehler: {e}")
+            continue
+    
+    print(f"[enrich] ✓ Mapping erstellt: {len(fileid_mapping)} Pfade")
+    
+    # === PHASE B: Match Index-Nodes gegen Mapping ===
+    print("[enrich] Phase B: Enriche Index-Nodes aus Mapping...")
+    
+    items = index.get("items", {})
+    
+    enriched_fileid = 0
+    enriched_pcloud_hash = 0
+    skipped_fileid = 0
+    skipped_no_anchor = 0
+    not_found = 0
+    
+    for i, (sha, node) in enumerate(items.items(), 1):
+        if not isinstance(node, dict):
+            continue
+        
+        anchor_path = node.get("anchor_path")
+        if not anchor_path:
+            skipped_no_anchor += 1
+            continue
+        
+        # Progress
+        if i % 1000 == 0 or i == len(items):
+            print(f"  [{i}/{len(items)}] ({i*100//len(items)}%) | "
+                  f"FileID: {enriched_fileid}, Hash: {enriched_pcloud_hash}, "
+                  f"NotFound: {not_found}")
+        
+        # DEBUG: Erste 3 Nodes
+        if debug and i <= 3:
+            print(f"  [DEBUG #{i}] anchor_path={anchor_path[:80]}...")
+        
+        # FileID bereits vorhanden? → Skip
+        if node.get("fileid"):
+            skipped_fileid += 1
+            continue
+        
+        # Lookup in Mapping
+        file_meta = fileid_mapping.get(anchor_path)
+        
+        if not file_meta:
+            not_found += 1
+            if debug and i <= 10:
+                print(f"    [DEBUG] Nicht im Mapping gefunden: {anchor_path[:60]}...")
+            continue
+        
+        # DEBUG: Zeige Mapping-Treffer
+        if debug and i <= 3:
+            print(f"    [DEBUG] Mapping-Treffer: fileid={file_meta['fileid']}, hash={file_meta['hash']}")
+        
+        # FileID setzen
+        if file_meta["fileid"]:
+            node["fileid"] = file_meta["fileid"]
+            enriched_fileid += 1
+        
+        # Hash setzen
+        if file_meta["hash"]:
+            node["pcloud_hash"] = file_meta["hash"]
+            enriched_pcloud_hash += 1
+    
+    print()
+    print(f"[enrich] ✓ FileID ergänzt: {enriched_fileid}")
+    print(f"[enrich] ✓ pcloud_hash ergänzt: {enriched_pcloud_hash}")
+    print(f"[enrich] ⊘ FileID bereits vorhanden: {skipped_fileid}")
+    if skipped_no_anchor > 0:
+        print(f"[enrich] ⚠ KEINE anchor_path: {skipped_no_anchor} nodes übersprungen!")
+    if not_found > 0:
+        print(f"[enrich] ⚠ Nicht im Mapping: {not_found} (evtl. gelöscht oder umbenannt)")
+    
+    return {
+        "enriched_fileid": enriched_fileid,
+        "enriched_pcloud_hash": enriched_pcloud_hash,
+        "skipped_fileid": skipped_fileid,
+        "skipped_no_anchor": skipped_no_anchor,
+        "not_found": not_found,
+    }
+
+
 def generate_timetravel_archive(cfg: dict, master_index: dict, snapshots_root: str, 
                                   snapshot_order: List[str], archive_dir: str,
                                   *, dry_run: bool = False) -> None:
@@ -1009,17 +1158,35 @@ def rebuild_complete_index(args):
         print("[phase 3b] Ergänze FileID + pcloud_hash per API...")
         force_enrich = getattr(args, 'force_enrich', False)
         debug_mode = getattr(args, 'debug', False)
+        enrich_method = getattr(args, 'enrich_method', 'stat')
+        
         if force_enrich:
             print("[phase 3b] ⚠ FORCE-ENRICH: Überschreibe existierende FileIDs")
         if debug_mode:
             print("[phase 3b] ⚠ DEBUG-MODUS aktiviert")
-        enrich_stats = enrich_index_with_api_metadata(
-            cfg=cfg,
-            index=master_index,
-            sample_only=False,
-            force_enrich=force_enrich,
-            debug=debug_mode
-        )
+        
+        print(f"[phase 3b] Methode: {enrich_method.upper()}")
+        
+        # Wähle Enrichment-Methode
+        if enrich_method == 'listfolder':
+            # BATCH-Modus: listfolder für alle Snapshots
+            enrich_stats = enrich_index_with_listfolder(
+                cfg=cfg,
+                index=master_index,
+                snapshots_root=snaps_root,
+                snapshot_order=manifest_files,
+                debug=debug_mode
+            )
+        else:
+            # STAT-Modus: Einzelne stat_file Calls (default)
+            enrich_stats = enrich_index_with_api_metadata(
+                cfg=cfg,
+                index=master_index,
+                sample_only=False,
+                force_enrich=force_enrich,
+                debug=debug_mode
+            )
+        
         if enrich_stats.get('enriched_fileid', 0) > 0:
             print(f"[phase 3b] ✓ {enrich_stats['enriched_fileid']} FileIDs ergänzt")
         if enrich_stats.get('enriched_pcloud_hash', 0) > 0:
@@ -1132,6 +1299,8 @@ Beispiel:
                     help="Überspringe FileID/pcloud_hash API-Enrichment (schneller, aber incomplete)")
     ap.add_argument("--force-enrich", action="store_true",
                     help="Erzwinge API-Enrichment auch wenn FileID bereits vorhanden (überschreibt alte FileIDs)")
+    ap.add_argument("--enrich-method", choices=['stat', 'listfolder'], default='stat',
+                    help="Enrichment-Methode: 'stat' (default, einzeln) oder 'listfolder' (batch, schnell)")
     ap.add_argument("--debug", action="store_true",
                     help="Aktiviere Debug-Ausgaben (API Responses, etc.)")
     ap.add_argument("--dry-run", action="store_true",
