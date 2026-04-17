@@ -192,6 +192,53 @@ def key_from_inode(item: dict) -> Optional[str]:
         return None
     return f"{dev}:{n}"
 
+def _compute_snapshot_stub_ratio(index: dict, snapshot_name: str) -> tuple:
+    """
+    Analysiert den lokalen Master-Index und berechnet die Stub-Ratio
+    für einen gegebenen Snapshot – OHNE API-Calls, rein lokal, O(n).
+
+    Ein Node "gehört" zu snapshot_name wenn:
+      a) anchor_path den Snapshot-Namen enthält (→ echte Datei / Anchor)
+      b) Ein Holder-Eintrag mit snapshot == snapshot_name existiert (→ Stub)
+
+    Returns: (total, stubs, stub_ratio)
+      total      = Anzahl Dateien, die in diesem Snapshot existieren
+      stubs      = Davon Stubs (d.h. Holder, aber NICHT Anchor)
+      stub_ratio = stubs / total (0.0 bis 1.0)
+    """
+    items = (index.get("items") or {})
+    total = 0
+    stub_count = 0
+
+    for sha, node in items.items():
+        anchor_path = node.get("anchor_path") or ""
+
+        # Snapshot-Name aus anchor_path extrahieren:
+        # Format: /.../_snapshots/YYYY-MM-DD-HHMMSS/relpath
+        # → Segment nach "_snapshots/" ist der Snapshot-Name
+        anchor_snap = ""
+        if "/_snapshots/" in anchor_path:
+            try:
+                anchor_snap = anchor_path.split("/_snapshots/")[1].split("/")[0]
+            except (IndexError, AttributeError):
+                anchor_snap = ""
+
+        # Prüfe ob Node in diesem Snapshot vorkommt (als Anchor ODER Holder)
+        is_anchor = (anchor_snap == snapshot_name)
+        is_holder = any(
+            isinstance(h, dict) and h.get("snapshot") == snapshot_name
+            for h in (node.get("holders") or [])
+        )
+
+        if is_anchor or is_holder:
+            total += 1
+            if not is_anchor:  # Holder aber kein Anchor → Stub
+                stub_count += 1
+
+    ratio = stub_count / total if total > 0 else 0.0
+    return total, stub_count, ratio
+
+
 def save_content_index_local(local_path: str, index: dict) -> None:
     """Speichert den Index lokal als JSON."""
     import tempfile
@@ -1520,7 +1567,34 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     
     t_find_ms = (time.time() - t_find_start) * 1000.0
     _log(f"[delta-copy][1/6] ✓ Basis: {basis_snapshot} ({t_find_ms:.0f}ms)")
-    
+
+    # === Schritt 1.5: Stub-Ratio-Check ===
+    # copyfolder lohnt sich nur, wenn der Basis-Snapshot bereits überwiegend
+    # aus Stubs besteht. Andernfalls würde copyfolder echte Dateien duplizieren
+    # (doppelte Quota), statt nur leichte Stubs zu klonen.
+    #
+    # Threshold via ENV konfigurierbar:
+    #   PCLOUD_COPYFOLDER_MIN_STUB_RATIO  (default 0.5 = 50% Stubs nötig)
+    #   PCLOUD_COPYFOLDER_MIN_FILES       (default 100, vermeidet False-Positives bei kleinen Snapshots)
+    _min_stub_ratio = float(os.environ.get("PCLOUD_COPYFOLDER_MIN_STUB_RATIO", "0.5"))
+    _min_files      = int(os.environ.get("PCLOUD_COPYFOLDER_MIN_FILES", "100"))
+
+    _basis_total, _basis_stubs, _basis_ratio = _compute_snapshot_stub_ratio(index, basis_snapshot)
+    _log(f"[delta-copy][1.5/6] Basis-Analyse '{basis_snapshot}': "
+         f"{_basis_total} Dateien, {_basis_stubs} Stubs ({_basis_ratio:.1%}) "
+         f"[threshold: >={_min_stub_ratio:.0%} bei >={_min_files} Dateien]")
+
+    if _basis_total < _min_files or _basis_ratio < _min_stub_ratio:
+        _log(f"[delta-copy][SAFE-MODE] Basis hat zu wenig Stubs "
+             f"({_basis_ratio:.1%} < {_min_stub_ratio:.0%} oder "
+             f"{_basis_total} < {_min_files} Dateien)")
+        _log(f"[delta-copy][SAFE-MODE] Baue Snapshot mit frischer Stub-Struktur auf "
+             f"(einmalige Transformation, danach TURBO-MODE aktiv)")
+        return push_1to1_mode(cfg, manifest, dest_root,
+                              dry=dry, verbose=verbose, manifest_path=manifest_path)
+
+    _log(f"[delta-copy][TURBO-MODE] Stub-Ratio OK ({_basis_ratio:.1%}) – nutze copyfolder + Delta")
+
     # === Schritt 2: copyfolder() - Server-seitiges Klonen ===
     _log(f"[delta-copy][2/6] Starte Server-Side Copy: {basis_snapshot} → {snapshot_name}")
     t_copy_start = time.time()
