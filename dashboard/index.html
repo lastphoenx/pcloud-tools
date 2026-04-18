@@ -160,9 +160,11 @@
       flex-shrink: 0;
     }
     .svc-dot.active   { background: var(--green); }
+    .svc-dot.success  { background: var(--green); }
     .svc-dot.inactive { background: var(--gray); }
     .svc-dot.failed   { background: var(--red); }
     .svc-dot.blocked  { background: var(--yellow); }
+    .svc-dot.skipped  { background: var(--yellow); }
     .svc-dot.running  { background: var(--blue); animation: pulse 1.5s infinite; }
     .svc-dot.unknown  { background: var(--gray); }
     .svc-name { flex: 1; color: var(--text); }
@@ -555,7 +557,7 @@
         + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
         + '<div class="card-grid">'
         + detailCardRTB(rtb)
-        + detailCardPCloud(cloud)
+        + detailCardPCloud(cloud, reports)
         + (recent.length > 0 ? detailCardRecentBackups(recent) : '')
         + '</div></div>';
 
@@ -637,30 +639,86 @@
 
     // ---- Detail card: pCloud -----------------------------------
 
-    function detailCardPCloud(cloud) {
+    function detailCardPCloud(cloud, reports) {
       const sc  = cloud.status_code !== undefined ? cloud.status_code : 3;
       const cls = sc === 0 ? 'green' : sc === 1 ? 'yellow' : 'red';
       let rows = ''
         + drow('Status',   cloud.status_text || 'UNKNOWN', cls)
         + drow('Hostname', cloud.hostname || 'N/A');
+
       const ba = (cloud.checks||{}).backup_age || {};
-      if (ba.message) rows += drow('Backup Age', ba.message, '', 100);
+
+      // ---- Sync-Analyse ----
+      const syncRow = buildSyncAnalysis(ba, reports);
+      rows += drow('Sync-Status', syncRow.text, syncRow.cls);
+
       if (ba.snapshot_count !== undefined) rows += drow('RTB Snapshots',    String(ba.snapshot_count));
       if (ba.manifest_count !== undefined) rows += drow('pCloud Manifests', String(ba.manifest_count));
+      if (ba.snapshot_count !== undefined && ba.manifest_count !== undefined) {
+        const diff = ba.snapshot_count - ba.manifest_count;
+        if (diff > 0)
+          rows += drow('Fehlend auf pCloud', diff + ' Snapshot(s)', 'red');
+        else if (diff < 0)
+          rows += drow('pCloud \xfcberschu\xdf', Math.abs(diff) + ' Manifest(s) mehr als RTB lokal (OK)', 'green');
+      }
+
+      if (ba.message) rows += drow('Health-Check Msg', ba.message, '', 120);
       if (ba.pcloud_snapshot && ba.pcloud_snapshot !== 'none' && ba.pcloud_snapshot !== 'unknown') {
         const h = ba.pcloud_age_hours || 0;
         const age = h < 24 ? h + 'h' : Math.floor(h/24) + 'd ' + (h%24) + 'h';
-        rows += drow('Last Success', ba.pcloud_snapshot + ' (' + age + ' ago)');
+        rows += drow('Neuester pCloud Snap', ba.pcloud_snapshot + ' (' + age + ' ago)');
       }
+
       const pq = (cloud.checks||{}).pcloud_quota || {};
       if (pq.message) rows += drow('Quota', pq.message);
       else if ((pq.details||{}).free_gb !== undefined)
         rows += drow('Quota', pq.details.free_gb + ' GB frei (' + pq.details.usage_percent + '%)');
+
       return '<div class="dcard">'
         + '<div class="dcard-header"><span>\u2601\uFE0F pCloud Backup</span>'
         + '<span class="svc-dot ' + cls + '" style="width:10px;height:10px"></span></div>'
         + '<div class="dcard-body">' + rows + '</div>'
         + '</div>';
+    }
+
+    // ---- Sync-Analyse: RTB ↔ pCloud ----------------------------
+    // Combines health-check data (status.json) with DB data (reports.json)
+
+    function buildSyncAnalysis(ba, reports) {
+      // 1. DB-basiert: l\xe4uft gerade ein Upload? Letzter fehlgeschlagen?
+      const recent = ((reports||{}).recent_backups || []);
+      const latest = recent[0] || null;
+
+      if (latest && latest.status === 'RUNNING') {
+        return { text: '\u21BB Upload l\xe4uft (' + (latest.snapshot||'') + ') \u2014 .upload_complete noch nicht gesetzt', cls: 'blue' };
+      }
+      if (latest && latest.status === 'FAILED') {
+        const err = latest.error ? ' \u2014 ' + trunc(latest.error, 60) : '';
+        return { text: '\u274C Letzter Upload FEHLGESCHLAGEN: ' + (latest.snapshot||'') + err, cls: 'red' };
+      }
+
+      // 2. Health-Check status_code
+      const sc = ba ? (typeof ba === 'object' ? undefined : 0) : undefined; // ba is checks.backup_age
+      // pCloud health-check already computed sync via snapshot name comparison
+      const msg = (ba||{}).message || '';
+      const isInSync = msg.toLowerCase().includes('in sync') || msg.toLowerCase().includes('synchron');
+      if (isInSync) {
+        // Check if there's a known gap: snapshot_count > manifest_count means pCloud is missing some
+        const diff = ((ba||{}).snapshot_count||0) - ((ba||{}).manifest_count||0);
+        if (diff > 0) {
+          return { text: '\u26A0\uFE0F Neuester Snapshot OK, aber ' + diff + ' Snapshot(s) fehlen auf pCloud (GAP)', cls: 'yellow' };
+        }
+        return { text: '\u2713 Synchron \u2014 pCloud und RTB auf gleichem Stand', cls: 'green' };
+      }
+
+      // Not in sync
+      const pcloudSnap = (ba||{}).pcloud_snapshot || 'unbekannt';
+      const h = (ba||{}).pcloud_age_hours || 0;
+      const age = h < 48 ? h + 'h' : Math.floor(h/24) + 'd';
+      return {
+        text: '\u26A0\uFE0F NICHT synchron \u2014 neuester pCloud-Snap: ' + pcloudSnap + ' (' + age + ' alt)',
+        cls: 'yellow'
+      };
     }
 
     // ---- Detail card: Recent Backups table ---------------------
@@ -729,15 +787,36 @@
     }
 
     function buildOverallExplain(data) {
-      const s = data.overall_status || '';
-      if (s === 'OK')       return 'Alle Systeme normal.';
-      if (s === 'RUNNING')  return 'Backup l\xe4uft gerade.';
-      if (s === 'CRITICAL') return 'Kritischer Fehler \u2014 sofortige Aktion erforderlich!';
+      const s        = data.overall_status || '';
+      const services = data.services || {};
+      const rtb      = ((data.scripts||{}).rtb_wrapper  || {});
+      const pcloud   = ((data.scripts||{}).pcloud_backup || {});
+
+      if (s === 'OK')       return '\u2713 Alle Systeme funktionieren normal.';
+      if (s === 'RUNNING')  return 'Backup l\xe4uft gerade \u2014 bitte nicht manuell unterbrechen.';
+      if (s === 'CRITICAL') return '\uD83D\uDEA8 Kritischer Fehler \u2014 sofortige Aktion erforderlich!';
+
       if (s === 'WARNING') {
-        const rtb = (((data.scripts||{}).rtb_wrapper)||{});
-        if (rtb.live_safety_gate === 'GREEN')
-          return 'Safety-Gate aktuell GR\xdcN. Letzter Lauf blockiert \u2014 wartet auf n\xe4chsten Durchlauf.';
-        return 'Warnung: Mindestens eine Komponente ben\xf6tigt Aufmerksamkeit.';
+        const parts = [];
+        // Blocked services
+        const blocked = Object.entries(services)
+          .filter(([,v]) => (v.exit_code||'').includes('(blocked)'))
+          .map(([k]) => k);
+        if (blocked.length > 0)
+          parts.push('Blockiert: ' + blocked.join(', ') + ' \u2014 Safety-Gate hat letzten Lauf gestoppt (Ransomware-Schutz).');
+        // Explain why not GREEN
+        if (blocked.includes('backup-pipeline') && rtb.live_safety_gate === 'GREEN')
+          parts.push('Live Safety-Gate ist GR\xdcN \u2014 System aktuell sicher. Status wird GREEN nach n\xe4chstem Backup-Lauf.');
+        // pCloud OK
+        if ((pcloud.status_code||3) === 0)
+          parts.push('pCloud Backup: \u2713 synchronisiert.');
+        // Failed services (non-blocked)
+        const failed = Object.entries(services)
+          .filter(([,v]) => v.status === 'failed' && !(v.exit_code||'').includes('(blocked)'))
+          .map(([k]) => k);
+        if (failed.length > 0)
+          parts.push('Fehler: ' + failed.join(', ') + ' \u2014 ben\xf6tigt Aufmerksamkeit.');
+        return parts.join(' \u2002|\u2002 ');
       }
       return '';
     }
@@ -788,12 +867,12 @@
       const dotCls  = blocked ? 'blocked' : (item.status || 'unknown');
       const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
       const detail  = (item.next_run && item.next_run !== 'N/A')
-        ? 'n\xe4chster Run: ' + item.next_run
+        ? 'n\xe4chster: ' + item.next_run
         : (item.last_start && item.last_start !== 'unknown' ? fmtTs(item.last_start) : '');
       return '<div class="service-item">'
         + '<span class="svc-dot ' + dotCls + '"></span>'
         + '<span class="svc-name">' + label + '</span>'
-        + '<span class="svc-detail">' + trunc(detail, 28) + '</span>'
+        + '<span class="svc-detail" title="' + esc(detail) + '">' + trunc(detail, 40) + '</span>'
         + '</div>';
     }
 
