@@ -25,6 +25,13 @@ PCLOUD_HEALTH_CHECK="${SCRIPT_DIR}/../pcloud_health_check.sh"
 
 # Output configuration
 MONITORING_OUTPUT="${MONITORING_OUTPUT:-/opt/apps/monitoring/status.json}"
+
+# Path configuration (override via environment if needed)
+RTB_LOG="${RTB_LOG:-/var/log/backup/rtb_wrapper.log}"
+RTB_SNAPSHOT_DIR="${RTB_SNAPSHOT_DIR:-/mnt/backup/rtb_nas}"
+ENTROPYWATCHER_BASE="${ENTROPYWATCHER_BASE:-/opt/apps/entropywatcher/main}"
+SAFETY_GATE_SCRIPT="${SAFETY_GATE_SCRIPT:-${ENTROPYWATCHER_BASE}/safety_gate.sh}"
+
 VERBOSE=0
 [[ "${1:-}" == "--verbose" ]] && VERBOSE=1
 
@@ -134,7 +141,7 @@ check_systemd_service() {
 # =====================================================
 # Parses /var/log/backup/rtb_wrapper.log for last run status
 check_rtb_wrapper() {
-  local rtb_log="/var/log/backup/rtb_wrapper.log"
+  local rtb_log="$RTB_LOG"
   local status="unknown"
   local last_run="never"
   local message="N/A"
@@ -227,8 +234,8 @@ check_rtb_wrapper() {
   fi
   
   # Count snapshots in RTB destination (if accessible)
-  if [[ -d "/mnt/backup/rtb_nas" ]]; then
-    snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
+  if [[ -d "$RTB_SNAPSHOT_DIR" ]]; then
+    snapshot_count=$(find "$RTB_SNAPSHOT_DIR" -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
   fi
   
   # Escape message and details
@@ -237,9 +244,9 @@ check_rtb_wrapper() {
   
   # Optional: Live Safety-Gate check (current status, not historical)
   local live_safety_gate="N/A"
-  if [[ -x "/opt/apps/entropywatcher/main/safety_gate.sh" ]] && [[ "$status" != "running" ]]; then
+  if [[ -x "$SAFETY_GATE_SCRIPT" ]] && [[ "$status" != "running" ]]; then
     # Only check if not currently running to avoid conflicts
-    if /opt/apps/entropywatcher/main/safety_gate.sh &>/dev/null; then
+    if "$SAFETY_GATE_SCRIPT" &>/dev/null; then
       live_safety_gate="GREEN"
     else
       local sg_exit=$?

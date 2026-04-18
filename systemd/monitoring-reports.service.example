@@ -1,0 +1,38 @@
+[Unit]
+Description=pCloud Monitoring - Generate reports.json from DB
+Documentation=https://github.com/example/pcloud-tools
+After=network.target mariadb.service
+Wants=mariadb.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+# Path to the reports generator script
+ExecStart=/opt/apps/pcloud-tools/main/scripts/generate_reports.sh
+
+# DB credentials (prefer a .my.cnf defaults-file — fewer plaintext secrets)
+# Option A: defaults-file (recommended)
+#Environment=DB_DEFAULTS_FILE=/etc/pcloud-tools/db.conf
+# Option B: explicit credentials (use only if Option A is not feasible)
+#Environment=DB_USER=pcloud_backup
+#Environment=DB_PASS=secret
+#Environment=DB_HOST=localhost
+#Environment=DB_NAME=pcloud_backup
+
+# Override output path if needed:
+#Environment=REPORTS_OUTPUT=/opt/apps/monitoring/reports.json
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/apps/monitoring
+PrivateTmp=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monitoring-reports
+
+[Install]
+WantedBy=multi-user.target
