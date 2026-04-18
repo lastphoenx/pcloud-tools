@@ -253,7 +253,8 @@ PY
 
 # --- Remote Snapshot Listing (Python/REST) ---
 load_remote_snapshots() {
-  "${PY}" - <<'PY'
+  # Timeout: max. 120s für den gesamten Scan (PCLOUD_SNAPSHOT_SCAN_LIMIT * ~1s/stat_file)
+  timeout 120 "${PY}" - <<'PY'
 import os, sys, json
 sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
@@ -277,13 +278,25 @@ if int(js.get("result", -1)) != 0:
 # Nur Snapshots mit .upload_complete Marker zurückgeben.
 # Ordner ohne Marker = Abbruch-Artefakt → nicht als "vorhanden" zählen,
 # damit Gap-Detection und Backfill korrekt anschlagen.
-names = []
+# Limit: max. PCLOUD_SNAPSHOT_SCAN_LIMIT Snapshots prüfen (Default: 60).
+# Bei sehr vielen Snapshots (>100) die ältesten überspringen — für
+# Gap-Detection und Backfill sind nur die letzten N relevant.
+MAX_SNAPS = int(os.environ.get("PCLOUD_SNAPSHOT_SCAN_LIMIT", "60"))
+candidates = []
 for c in (js.get("metadata") or {}).get("contents", []) or []:
     if not c.get("isfolder"):
         continue
     name = c.get("name", "")
     if name == "_index":
         continue
+    candidates.append(name)
+
+# Neueste zuerst prüfen (ISO-Datum → lexikographisch sortierbar)
+candidates.sort(reverse=True)
+candidates = candidates[:MAX_SNAPS]
+
+names = []
+for name in candidates:
     marker_path = f"{snap_root}/{name}/.upload_complete"
     try:
         pc.stat_file(cfg, path=marker_path, with_checksum=False)
