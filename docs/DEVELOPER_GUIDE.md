@@ -848,11 +848,38 @@ Upload läuft → Periodisch lokal speichern → Am Ende: Remote hochladen → L
 
 ---
 
-### 4. Index-Driven Skip (Resume)
+### 4. Index-Driven Skip (Resume) — nur `push_1to1_mode`
 
 **Problem:** Unterbrochene Uploads starten von vorne
 
-**Lösung:**
+**Entscheidungsbaum beim Neustart:**
+
+```
+.upload_started vorhanden?
+├── NEIN → Frischer Upload (normaler Pfad)
+└── JA
+    ├── .upload_complete vorhanden? → JA → Snapshot vollständig, sofort return
+    └── NEIN → Resume: Index laden + Already-in-Snapshot-Skip
+```
+
+**Lokaler Index-Cache (der eigentliche Resume-Trick):**
+
+```python
+# Beim Resume: lokale Kopie bevorzugen (schnell, kein Remote-API-Call)
+_local_index_path = f"/tmp/pcloud_index_{snapshot_name}.json"
+
+if os.path.exists(_local_index_path):
+    index = load_content_index_local(_local_index_path)
+    _log("[resume] Lokaler Index-Cache gefunden → kein Remote-Load nötig")
+else:
+    index = load_content_index(cfg, snapshots_root)  # Remote fallback
+```
+
+Der lokale Index wird durch periodisches Index-Saving (siehe §3) laufend
+aktualisiert. Bei einem Absturz enthält er den Stand der letzten 100 Dateien
+oder 5 Minuten — alle bereits hochgeladenen Dateien sind darin vermerkt.
+
+**Index-Driven Skip:**
 
 ```python
 # Prüfe ob bereits im Index für diesen Snapshot
@@ -885,6 +912,14 @@ if exists(".upload_started") and not exists(".upload_complete"):
 → Kein Re-Upload nötig!
 ```
 
+> **⚠️ Kein Resume in `push_1to1_delta_mode`:**
+> Der Delta-Copy-Modus hat keinen eigenen Resume-Mechanismus — kein
+> Marker-Check am Anfang, keinen lokalen Index-Cache, kein periodisches
+> Index-Saving. Bei einem Abbruch in Phase 5 (WRITE-Loop) wird beim nächsten
+> Lauf der abgebrochene Ziel-Snapshot gelöscht (Phase 2, Fix `dfb2ad3`) und
+> der gesamte `copyfolder` + Delta-Write neu gestartet. Da Turbo-Mode
+> typischerweise 1–3 Minuten dauert, ist das vertretbar.
+
 ---
 
 ## 🔧 Konfiguration & Env-Vars
@@ -904,6 +939,7 @@ if exists(".upload_started") and not exists(".upload_complete"):
 | `PCLOUD_COPYFOLDER_MIN_STUB_RATIO` | `0.5` | Min. Stub-Ratio für copyfolder |
 | `PCLOUD_COPYFOLDER_MIN_FILES` | `100` | Min. Anzahl Files für copyfolder |
 | `PCLOUD_TIMEOUT` | `60` | API-Timeout (s) |
+| `PCLOUD_SNAPSHOT_SCAN_LIMIT` | `60` | Max. Snapshots bei load_remote_snapshots (neueste zuerst) |
 
 ### Performance
 
