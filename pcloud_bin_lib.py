@@ -1727,8 +1727,7 @@ def download_binaryfile_to(cfg: dict, *,
     link = f"https://{hosts[0]}{link_path}"
     hash_obj = hashlib.sha256()
 
-    import os as _os
-    _os.makedirs(_os.path.dirname(local_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
 
     with session.get(link, stream=True, timeout=int(cfg.get("timeout", 30)),
                      allow_redirects=True) as r:
@@ -1742,7 +1741,7 @@ def download_binaryfile_to(cfg: dict, *,
     actual_sha = hash_obj.hexdigest()
     if sha256_verify and actual_sha.lower() != sha256_verify.lower():
         try:
-            _os.remove(local_path)
+            os.remove(local_path)
         except Exception:
             pass
         raise ValueError(f"SHA256 MISMATCH: expected {sha256_verify}, got {actual_sha}")
