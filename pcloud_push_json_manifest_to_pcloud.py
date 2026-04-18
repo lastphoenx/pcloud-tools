@@ -1925,7 +1925,19 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     basis_path = f"{snapshots_root}/{basis_snapshot}"
     
     # KRITISCH: Zielordner VORHER anlegen (copycontentonly erwartet existierenden Container)
+    # Sicherheitscheck: Falls Zielordner bereits existiert (abgebrochener vorheriger Lauf),
+    # muss er gelöscht werden. Der Index wird bei Abbruch NIE gespeichert (save_content_index
+    # läuft erst in Phase 6) → Partial-Snapshot ist nie im Index referenziert → sicher löschen.
     if not dry:
+        try:
+            pc.stat_file(cfg, path=dest_snapshot_dir, with_checksum=False)
+            # Ordner existiert → abgebrochener Lauf erkannt
+            _log(f"[delta-copy][2/6][warn] Zielordner existiert bereits (Abbruch-Artefakt) – wird gelöscht: {dest_snapshot_dir}")
+            pc.delete_folder(cfg, path=dest_snapshot_dir, recursive=True)
+            _log(f"[delta-copy][2/6] ✓ Artefakt-Ordner gelöscht")
+        except Exception:
+            pass  # Ordner existiert nicht → Normalfall
+
         try:
             pc.ensure_path(cfg, snapshots_root)  # Parent sicherstellen
             pc.ensure_path(cfg, dest_snapshot_dir)  # Zielordner anlegen!
