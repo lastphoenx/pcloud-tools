@@ -2229,7 +2229,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             node = {
                 "anchor_path": dst_path,
                 "anchor_snapshot": snapshot_name,
-                "holders": [snapshot_name],
+                "holders": [{"snapshot": snapshot_name, "relpath": relpath}],
                 "ext": ext,
             }
             if fileid:
