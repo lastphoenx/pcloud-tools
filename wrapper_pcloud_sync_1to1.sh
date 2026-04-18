@@ -274,10 +274,22 @@ if int(js.get("result", -1)) != 0:
     print("")
     raise SystemExit(0)
 
+# Nur Snapshots mit .upload_complete Marker zurückgeben.
+# Ordner ohne Marker = Abbruch-Artefakt → nicht als "vorhanden" zählen,
+# damit Gap-Detection und Backfill korrekt anschlagen.
 names = []
 for c in (js.get("metadata") or {}).get("contents", []) or []:
-    if c.get("isfolder") and c.get("name") != "_index":
-        names.append(c["name"])
+    if not c.get("isfolder"):
+        continue
+    name = c.get("name", "")
+    if name == "_index":
+        continue
+    marker_path = f"{snap_root}/{name}/.upload_complete"
+    try:
+        pc.stat_file(cfg, path=marker_path, with_checksum=False)
+        names.append(name)
+    except Exception:
+        pass  # Kein Marker → Abbruch-Artefakt, nicht ausgeben
 for n in sorted(names):
     print(n)
 PY
@@ -288,10 +300,24 @@ remote_has_snapshots() {
   [[ -n "$out" ]] && echo YES || echo NO
 }
 
+# Cache für remote_snapshot_exists: einmal laden, danach grep auf Cache.
+# Verhindert N×API-Calls pro Snapshot im Gap-Detection-Loop.
+_REMOTE_SNAPSHOTS_CACHE=""
+_remote_snapshots_loaded=0
+
+_ensure_remote_snapshots_cache() {
+  if [[ "$_remote_snapshots_loaded" -eq 0 ]]; then
+    _REMOTE_SNAPSHOTS_CACHE="$(load_remote_snapshots || true)"
+    _remote_snapshots_loaded=1
+  fi
+}
+
 remote_snapshot_exists() {
   local snapname="$1"
-  local out; out="$(load_remote_snapshots || true)"
-  grep -qx "$snapname" <<<"$out" && echo YES || echo NO
+  # Nur Snapshots mit .upload_complete gelten als vorhanden.
+  # load_remote_snapshots filtert Abbruch-Artefakte bereits heraus.
+  _ensure_remote_snapshots_cache
+  grep -qx "$snapname" <<<"$_REMOTE_SNAPSHOTS_CACHE" && echo YES || echo NO
 }
 
 local_snapshot_names() {
