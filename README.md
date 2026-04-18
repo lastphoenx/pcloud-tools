@@ -152,5 +152,3 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 - **Automation:** Bash, systemd-Timer
 - **Monitoring:** Vanilla HTML/JS Dashboard, Apprise (Alerts)
 - **DB:** MariaDB (Backup-Historie, Status-Tracking)
-
-**Warum Raspberry Pi statt NAS-Appliance?** Der Wechsel von QNAP (TS-453 Pro, TS-473A, TS-251+) und LaCie 5big NAS Pro auf einen Raspberry Pi 5 war nicht nur eine Entscheidung für mehr Kontrolle, sondern auch für deutlich weniger Stromverbrauch. Ein QNAP mit 4 Festplatten zieht im Dauerbetrieb ~30–50 W; das LaCie läuft ähnlich. Der Raspberry Pi 5 mit 5x 2.5" SSDs kommt auf ca. 10–15 W — bei identischer Funktionalität. Bei Dauerbetrieb sind das je nach Setup **50–80% weniger Stromkosten**, ohne Abstriche bei Verfügbarkeit oder Leistung.
