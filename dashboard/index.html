@@ -597,20 +597,23 @@
 
     function detailCardService(item) {
       const blocked = (item.exit_code||'').includes('(blocked)');
-      const dotCls  = blocked ? 'blocked' : (item.status || 'unknown');
+      // inactive+enabled=yes = healthy sleep state for timer oneshots
+      const effectiveDot = blocked ? 'blocked'
+        : (item.status === 'inactive' && item.enabled === 'yes') ? 'active'
+        : (item.status || 'unknown');
       const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
       let rows = ''
-        + drow('Status',       item.status || 'unknown', statusValCls(item.status, blocked))
+        + drow('Status',       item.status || 'unknown', statusValCls(item.status, blocked, item.enabled))
         + drow('Enabled',      item.enabled || 'unknown')
         + drow('Letzter Lauf', fmtTs(item.last_start))
-        + drow('Exit Code',    item.exit_code || 'N/A', blocked ? 'yellow' : '');
+        + drow('Exit Code',    item.exit_code || 'N/A', blocked ? 'yellow' : item.exit_code === '0' ? 'green' : '');
       if (item.next_run && item.next_run !== 'N/A')
         rows += drow('N\xe4chster Run', item.next_run);
       if (item.message && item.message !== 'N/A')
         rows += drow('Message', item.message, '', 100);
       return '<div class="dcard">'
         + '<div class="dcard-header"><span>' + esc(label) + '</span>'
-        + '<span class="svc-dot ' + dotCls + '" style="width:10px;height:10px"></span></div>'
+        + '<span class="svc-dot ' + effectiveDot + '" style="width:10px;height:10px;display:inline-block"></span></div>'
         + '<div class="dcard-body">' + rows + '</div>'
         + '</div>';
     }
@@ -756,9 +759,10 @@
         + '</div>';
     }
 
-    function statusValCls(status, blocked) {
+    function statusValCls(status, blocked, enabled) {
       if (blocked)             return 'yellow';
       if (status === 'active') return 'green';
+      if (status === 'inactive' && enabled === 'yes') return 'green';
       if (status === 'failed') return 'red';
       return '';
     }
@@ -864,7 +868,11 @@
 
     function svcRow(item) {
       const blocked = (item.exit_code||'').includes('(blocked)');
-      const dotCls  = blocked ? 'blocked' : (item.status || 'unknown');
+      // inactive+enabled=yes is the healthy dormant state for timer-triggered oneshot services
+      const effectiveStatus = blocked ? 'blocked'
+        : (item.status === 'inactive' && item.enabled === 'yes') ? 'active'
+        : (item.status || 'unknown');
+      const dotCls  = effectiveStatus;
       const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
       const detail  = (item.next_run && item.next_run !== 'N/A')
         ? 'n\xe4chster: ' + item.next_run

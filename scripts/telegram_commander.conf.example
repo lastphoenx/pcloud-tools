@@ -1,0 +1,27 @@
+# Telegram Commander Configuration
+# Copy to /etc/pcloud-tools/telegram_commander.conf (chmod 600, chown root)
+# All values can also be set via environment variables (env overrides file)
+
+# ─── Required ──────────────────────────────────────────────────────────────────
+
+# Bot token from @BotFather
+BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ012345678"
+
+# Comma-separated list of Telegram chat IDs allowed to send commands.
+# Get your chat_id: send /start to your bot, then:
+#   curl https://api.telegram.org/bot<TOKEN>/getUpdates
+ALLOWED_CHAT_IDS="987654321"
+
+# ─── Optional ──────────────────────────────────────────────────────────────────
+
+# Path to status.json used by /status command
+# STATUS_JSON=/opt/apps/monitoring/status.json
+
+# Backup wrapper script (currently not used directly; systemctl start is used)
+# BACKUP_WRAPPER=/opt/apps/pcloud-tools/main/rtb/rtb_wrapper.sh
+
+# Logging level: DEBUG, INFO, WARNING, ERROR
+# LOG_LEVEL=INFO
+
+# Long-poll timeout in seconds (keep ≤30 for responsive /status)
+# POLL_TIMEOUT=30

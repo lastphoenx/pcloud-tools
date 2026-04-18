@@ -25,13 +25,6 @@ PCLOUD_HEALTH_CHECK="${SCRIPT_DIR}/../pcloud_health_check.sh"
 
 # Output configuration
 MONITORING_OUTPUT="${MONITORING_OUTPUT:-/opt/apps/monitoring/status.json}"
-
-# Path configuration (override via environment if needed)
-RTB_LOG="${RTB_LOG:-/var/log/backup/rtb_wrapper.log}"
-RTB_SNAPSHOT_DIR="${RTB_SNAPSHOT_DIR:-/mnt/backup/rtb_nas}"
-ENTROPYWATCHER_BASE="${ENTROPYWATCHER_BASE:-/opt/apps/entropywatcher/main}"
-SAFETY_GATE_SCRIPT="${SAFETY_GATE_SCRIPT:-${ENTROPYWATCHER_BASE}/safety_gate.sh}"
-
 VERBOSE=0
 [[ "${1:-}" == "--verbose" ]] && VERBOSE=1
 
@@ -100,16 +93,27 @@ check_systemd_service() {
       # Extract timestamp from last line
       last_start=$(echo "$journal_output" | tail -1 | awk '{print $1}' || echo "unknown")
       
-      # Get exit code from journal
-      exit_code=$(journalctl -u "${service_name}.service" -n 50 --no-pager 2>/dev/null | grep -oP 'code=exited, status=\K[0-9]+' | tail -1)
-      [[ -z "$exit_code" ]] && exit_code="unknown"
-      
-      # Interpret exit code based on service and code
-      if [[ "$exit_code" == "0" || "$exit_code" == "unknown" ]]; then
-        exit_code="${exit_code}"
-      elif [[ "$exit_code" == "2" ]] && [[ "$service_name" == "backup-pipeline" ]]; then
+      # Get exit code from journal (100 lines to cover verbose oneshot output)
+      local journal_full
+      journal_full=$(journalctl -u "${service_name}.service" -n 100 --no-pager 2>/dev/null || echo "")
+      exit_code=$(echo "$journal_full" | grep -oP 'code=exited, status=\K[0-9]+' | tail -1)
+
+      # Fallback: systemd logs "Succeeded" / "Deactivated successfully" for clean exit 0
+      # without printing a numeric status line
+      if [[ -z "$exit_code" ]]; then
+        if echo "$journal_full" | grep -qE 'Succeeded\.|Deactivated successfully'; then
+          exit_code="0"
+        elif echo "$journal_full" | grep -qE 'Failed with result'; then
+          exit_code="1"
+        else
+          exit_code="unknown"
+        fi
+      fi
+
+      # Interpret exit code
+      if [[ "$exit_code" == "2" ]] && [[ "$service_name" == "backup-pipeline" ]]; then
         exit_code="${exit_code} (blocked)"
-      else
+      elif [[ "$exit_code" != "0" && "$exit_code" != "unknown" ]]; then
         exit_code="${exit_code} (error)"
       fi
       
@@ -141,7 +145,7 @@ check_systemd_service() {
 # =====================================================
 # Parses /var/log/backup/rtb_wrapper.log for last run status
 check_rtb_wrapper() {
-  local rtb_log="$RTB_LOG"
+  local rtb_log="/var/log/backup/rtb_wrapper.log"
   local status="unknown"
   local last_run="never"
   local message="N/A"
@@ -234,8 +238,8 @@ check_rtb_wrapper() {
   fi
   
   # Count snapshots in RTB destination (if accessible)
-  if [[ -d "$RTB_SNAPSHOT_DIR" ]]; then
-    snapshot_count=$(find "$RTB_SNAPSHOT_DIR" -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
+  if [[ -d "/mnt/backup/rtb_nas" ]]; then
+    snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
   fi
   
   # Escape message and details
@@ -244,9 +248,9 @@ check_rtb_wrapper() {
   
   # Optional: Live Safety-Gate check (current status, not historical)
   local live_safety_gate="N/A"
-  if [[ -x "$SAFETY_GATE_SCRIPT" ]] && [[ "$status" != "running" ]]; then
+  if [[ -x "/opt/apps/entropywatcher/main/safety_gate.sh" ]] && [[ "$status" != "running" ]]; then
     # Only check if not currently running to avoid conflicts
-    if "$SAFETY_GATE_SCRIPT" &>/dev/null; then
+    if /opt/apps/entropywatcher/main/safety_gate.sh &>/dev/null; then
       live_safety_gate="GREEN"
     else
       local sg_exit=$?

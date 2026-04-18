@@ -1,0 +1,45 @@
+[Unit]
+Description=Telegram Commander - Backup trigger via Telegram bot
+Documentation=file:///opt/apps/pcloud-tools/main/scripts/telegram_commander.py
+After=network-online.target
+Wants=network-online.target
+
+# Require config and status files to be present before start
+ConditionPathExists=/etc/pcloud-tools/telegram_commander.conf
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/scripts/telegram_commander.py
+
+# Restart on failure (Telegram API hiccups, network drops)
+Restart=on-failure
+RestartSec=10s
+# Avoid restart storm
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Allow systemctl start backup-pipeline.service
+AmbientCapabilities=
+# Allow reading /opt/apps
+ReadOnlyPaths=/opt/apps
+# Status/report files need to be readable
+ReadOnlyPaths=/opt/apps/monitoring
+
+# Environment (alternatively put these in telegram_commander.conf)
+# Environment=LOG_LEVEL=INFO
+# Environment=POLL_TIMEOUT=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-commander
+
+[Install]
+WantedBy=multi-user.target
