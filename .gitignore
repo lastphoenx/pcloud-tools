@@ -48,3 +48,6 @@ dist/
 .DS_Store
 Thumbs.db
 2_chatgpt_pcloud_integrity_check.py
+
+# Laufzeit-Symlink: dashboard/monitoring → /opt/apps/monitoring (Server-lokal)
+dashboard/monitoring
