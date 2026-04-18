@@ -1307,6 +1307,7 @@ def rebuild_complete_index(args):
         
         # 2. Remote
         try:
+            pc.ensure_parent_dirs(cfg, idx_path)  # _snapshots/_index/ ggf. anlegen
             pc.write_json_at_path(cfg, idx_path, master_index)
             print(f"[phase 5]   Remote: {idx_path}")
             print(f"[phase 5] ✓ Master-Index aktualisiert")
@@ -1378,8 +1379,8 @@ Beispiel:
                     help="Überspringe FileID/pcloud_hash API-Enrichment (schneller, aber incomplete)")
     ap.add_argument("--force-enrich", action="store_true",
                     help="Erzwinge API-Enrichment auch wenn FileID bereits vorhanden (überschreibt alte FileIDs)")
-    ap.add_argument("--enrich-method", choices=['stat', 'listfolder'], default='stat',
-                    help="Enrichment-Methode: 'stat' (default, einzeln) oder 'listfolder' (batch, schnell)")
+    ap.add_argument("--enrich-method", choices=['stat', 'listfolder'], default='listfolder',
+                    help="Enrichment-Methode: 'listfolder' (default, batch, sicher) oder 'stat' (einzeln)")
     ap.add_argument("--debug", action="store_true",
                     help="Aktiviere Debug-Ausgaben (API Responses, etc.)")
     ap.add_argument("--dry-run", action="store_true",
