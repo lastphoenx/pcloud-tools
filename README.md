@@ -141,6 +141,7 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 | [docs/GAP_HANDLING_FAQ.md](docs/GAP_HANDLING_FAQ.md) | Gap-Handling: FAQs |
 | [docs/GAP_HANDLING_WORKFLOWS.md](docs/GAP_HANDLING_WORKFLOWS.md) | Gap-Handling: Visuelle Workflow-Diagramme (Mermaid) |
 | [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md) | Technische Analyse der Delta-Copy-Implementierung |
+| [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Technical Deep Dive:** Gap-Handling, Delta-Copy, Index-System, Performance, Security |
 
 ---
 
