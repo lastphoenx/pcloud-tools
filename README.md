@@ -39,7 +39,8 @@ EntropyWatcher + ClamAV  →  RTB Wrapper  →  rsync-time-backup  →  pCloud-T
 ```
 
 Der Einstiegspunkt ist `rtb_wrapper.sh` (rtb-Repo), der nach erfolgreichem lokalem Backup automatisch `wrapper_pcloud_sync_1to1.sh` aufruft.  
-→ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+→ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
+→ Entstehungsgeschichte & Gesamt-Pipeline: [rtb/README.md](https://github.com/lastphoenx/rtb#die-entstehungsgeschichte)
 
 ---
 
