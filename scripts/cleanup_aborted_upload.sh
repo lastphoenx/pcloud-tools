@@ -44,6 +44,7 @@ while [ $# -gt 0 ]; do
             exit 1
             ;;
         *)
+            # Erstes Positional-Argument = Snapshot-Name
             if [ -z "$SNAPSHOT_NAME" ]; then
                 SNAPSHOT_NAME="$1"
             fi

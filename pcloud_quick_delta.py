@@ -39,9 +39,16 @@ def _flatten_tree(metadata: dict, parent_path: str = "", is_root: bool = True) -
     """
     Flattens a recursive listfolder response into a list of file dicts.
     Each dict gets an extra '_full_path' key with the reconstructed remote path.
+    
+    Marker-Dateien (.upload_started, .upload_complete, etc.) werden NICHT zurückgegeben.
     """
     results: List[dict] = []
     name = metadata.get("name", "")
+    
+    # Marker-Dateien ignorieren
+    MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
+    if name in MARKER_FILES:
+        return []  # Überspringe Marker-Dateien
 
     if is_root:
         current_path = parent_path
@@ -59,10 +66,23 @@ def _flatten_tree(metadata: dict, parent_path: str = "", is_root: bool = True) -
     return results
 
 
-def _load_index(cfg: dict, snaps_root: str) -> dict:
-    idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+def _load_index(cfg: dict, snaps_root: str, index_file: str = "content_index.json") -> dict:
+    """
+    Lädt Index-Datei (Master oder Archive).
+    
+    Args:
+        index_file: Dateiname (z.B. 'content_index.json' oder '2026-04-10-075334_index.json')
+    """
+    idx_path = f"{snaps_root.rstrip('/')}/_index/{index_file}"
+    
+    # Prüfe ob Archive-Index
+    is_archive = index_file != "content_index.json"
+    if is_archive:
+        # Archive-Indexes liegen unter _index/archive/
+        idx_path = f"{snaps_root.rstrip('/')}/_index/archive/{index_file}"
+    
     try:
-        txt = pc.get_textfile(cfg, path=idx_path)
+        txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)  # None für große Indexes
         j = json.loads(txt or '{"version":1,"items":{}}')
         if not isinstance(j, dict):
             j = {"version": 1, "items": {}}
@@ -74,14 +94,41 @@ def _load_index(cfg: dict, snaps_root: str) -> dict:
     return j
 
 
+def extract_snapshots_from_index(index: dict) -> Set[str]:
+    """
+    Extrahiert alle Snapshot-Namen aus dem Index (aus holders).
+    
+    Returns: Set von Snapshot-Namen (z.B. {'2026-04-10-075334', '2026-04-12-121042'})
+    """
+    snapshots: Set[str] = set()
+    items = index.get("items", {})
+    
+    for sha, node in items.items():
+        if not isinstance(node, dict):
+            continue
+        
+        holders = node.get("holders", [])
+        for h in holders:
+            if isinstance(h, dict):
+                snap = h.get("snapshot")
+                if snap:
+                    snapshots.add(snap)
+    
+    return snapshots
+
+
 # ============================================================================
 # Phase 1: Recursive listfolder → flat file map
 # ============================================================================
 
-def fetch_remote_tree(cfg: dict, snaps_root: str) -> Tuple[Dict[int, dict], Dict[str, dict]]:
+def fetch_remote_tree(cfg: dict, snaps_root: str, snapshot_filter: Optional[Set[str]] = None) -> Tuple[Dict[int, dict], Dict[str, dict]]:
     """
     Holt den kompletten Dateibaum unter snaps_root via einem einzigen
     rekursiven listfolder-Call.
+    
+    Args:
+        snapshot_filter: Optional Set von Snapshot-Namen. Wenn angegeben,
+                        werden nur Dateien aus diesen Snapshots zurückgegeben.
 
     Returns:
       by_fileid: {fileid: file_metadata_dict}    (für fileid-basierte Lookups)
@@ -89,7 +136,10 @@ def fetch_remote_tree(cfg: dict, snaps_root: str) -> Tuple[Dict[int, dict], Dict
 
     Stubs (.meta.json) werden separat getaggt aber mitgeführt.
     """
-    print(f"[fetch] Lade Remote-Baum: {snaps_root} (recursive)...")
+    if snapshot_filter:
+        print(f"[fetch] Lade Remote-Baum: {snaps_root} (filtered: {len(snapshot_filter)} snapshots)...")
+    else:
+        print(f"[fetch] Lade Remote-Baum: {snaps_root} (recursive)...")
     t0 = time.time()
 
     top = pc.call_with_backoff(
@@ -102,10 +152,29 @@ def fetch_remote_tree(cfg: dict, snaps_root: str) -> Tuple[Dict[int, dict], Dict
 
     by_fileid: Dict[int, dict] = {}
     by_path: Dict[str, dict] = {}
+    
+    filtered_out = 0
 
     for f in flat:
         fid = f.get("fileid")
         fp = f.get("_full_path", "")
+        
+        # Snapshot-Filter anwenden wenn gesetzt
+        if snapshot_filter:
+            # Extrahiere Snapshot-Namen aus Pfad: /backup-nas/_snapshots/2026-04-10-075334/...
+            path_parts = fp.split("/")
+            try:
+                snap_idx = path_parts.index("_snapshots") + 1
+                snapshot_name = path_parts[snap_idx]
+                
+                # Prüfe ob dieser Snapshot im Filter ist
+                if snapshot_name not in snapshot_filter:
+                    filtered_out += 1
+                    continue
+            except (ValueError, IndexError):
+                # Pfad passt nicht ins Schema (z.B. _index Ordner) → behalten
+                pass
+        
         if fid is not None:
             by_fileid[int(fid)] = f
         if fp:
@@ -115,7 +184,11 @@ def fetch_remote_tree(cfg: dict, snaps_root: str) -> Tuple[Dict[int, dict], Dict
     n_files = len(by_fileid)
     n_stubs = sum(1 for p in by_path if p.endswith(".meta.json"))
     n_real = n_files - n_stubs
-    print(f"[fetch] {n_files} Dateien geladen ({n_real} real, {n_stubs} stubs) in {dt:.1f}s")
+    
+    if snapshot_filter:
+        print(f"[fetch] {n_files} Dateien geladen ({n_real} real, {n_stubs} stubs, {filtered_out} filtered) in {dt:.1f}s")
+    else:
+        print(f"[fetch] {n_files} Dateien geladen ({n_real} real, {n_stubs} stubs) in {dt:.1f}s")
 
     return by_fileid, by_path
 
@@ -128,6 +201,7 @@ def compare_index_vs_remote(
     index: dict,
     by_fileid: Dict[int, dict],
     by_path: Dict[str, dict],
+    snaps_root: str,
 ) -> dict:
     """
     Vergleicht content_index.json gegen den Live-Baum.
@@ -142,6 +216,9 @@ def compare_index_vs_remote(
     Returns: Report-Dict mit allen Kategorien.
     """
     items = index.get("items", {})
+    
+    # Marker-Dateien ignorieren (Upload-Status-Tracking)
+    MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
 
     # Ergebnis-Listen
     ok: List[str] = []
@@ -153,6 +230,9 @@ def compare_index_vs_remote(
 
     # Set aller remote fileids für spätere "unbekannte Dateien"-Erkennung
     index_fileids: Set[int] = set()
+    
+    # Set aller bekannten Pfade (Anchors + Holders) für Delta-Copy-Modus
+    index_known_paths: Set[str] = set()
 
     checked = 0
     for sha, node in items.items():
@@ -163,6 +243,21 @@ def compare_index_vs_remote(
         index_fid = node.get("fileid")
         index_hash = node.get("pcloud_hash")
         index_size = None  # size nicht direkt im Node, aber in holders/stubs
+        
+        # Sammle alle bekannten Pfade (Anchor + Holders)
+        if anchor_path:
+            index_known_paths.add(anchor_path)
+        
+        # Auch Holder-Pfade sammeln (für Delta-Copy mit Server-Side Clone)
+        holders = node.get("holders", [])
+        if isinstance(holders, list):
+            for h in holders:
+                if isinstance(h, dict):
+                    snap = h.get("snapshot", "")
+                    relpath = h.get("relpath", "")
+                    if snap and relpath:
+                        holder_path = f"{snaps_root}/{snap}/{relpath}"
+                        index_known_paths.add(holder_path)
 
         if not anchor_path:
             continue
@@ -242,6 +337,7 @@ def compare_index_vs_remote(
         "size_mismatch": size_mismatch,
         "hash_missing_in_index": hash_missing_in_index,
         "index_fileids": index_fileids,
+        "index_known_paths": index_known_paths,
     }
 
 
@@ -254,16 +350,31 @@ def find_unknown_files(
     by_path: Dict[str, dict],
     index_fileids: Set[int],
     snaps_root: str,
+    index_known_paths: Set[str] = None,
 ) -> List[dict]:
     """
     Findet echte Dateien (keine .meta.json Stubs und kein content_index.json)
-    auf pCloud, die in keinem Index-Node als Anchor referenziert werden.
+    auf pCloud, die in keinem Index-Node als Anchor ODER Holder referenziert werden.
+    
+    Ignoriert:
+    - Stubs (.meta.json)
+    - content_index.json
+    - _index/ Ordner komplett
+    - Marker-Dateien (.upload_started, .upload_complete, etc.)
     """
     unknown: List[dict] = []
     idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+    
+    # Upload-Marker-Dateien (diese gehören zum Upload-Tracking, nicht zu Backups)
+    MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
+    
+    # Fallback: leeres Set wenn nicht angegeben
+    if index_known_paths is None:
+        index_known_paths = set()
 
     for fid, md in by_fileid.items():
         fp = md.get("_full_path", "")
+        fname = fp.split("/")[-1] if "/" in fp else fp
 
         # Stubs und Index selbst überspringen
         if fp.endswith(".meta.json"):
@@ -273,8 +384,12 @@ def find_unknown_files(
         # _index-Ordner generell überspringen (Marker files etc.)
         if "/_index/" in fp:
             continue
+        # Upload-Marker ignorieren
+        if fname in MARKER_FILES:
+            continue
 
-        if fid not in index_fileids:
+        # Prüfe FileID UND Pfad (für Delta-Copy-Modus mit Holders)
+        if fid not in index_fileids and fp not in index_known_paths:
             unknown.append({
                 "fileid": fid,
                 "path": fp,
@@ -458,9 +573,17 @@ Beispiele:
 
   # Report als JSON speichern:
   python pcloud_quick_delta.py --dest-root /backup-nas --json-out /srv/pcloud-temp/delta-report.json
+  
+  # Archive-Index prüfen (nur bestimmte Snapshots):
+  python pcloud_quick_delta.py --dest-root /backup-nas --index-file 2026-04-10-075334_index.json
+  
+  # Master-Index im Archiv prüfen:
+  python pcloud_quick_delta.py --dest-root /backup-nas --index-file content_index_master.json
 """)
     ap.add_argument("--dest-root", required=True,
-                    help="pCloud-Basispfad (z.B. /backup-nas)")
+                    help="pCloud-Basispfad (z.B. /Backup/rtb_1to1)")
+    ap.add_argument("--index-file", default="content_index.json",
+                    help="Index-Datei (default: content_index.json, oder Archive z.B. 2026-04-10-075334_index.json)")
     ap.add_argument("--env-file",
                     help="Pfad zur .env-Datei (optional)")
     ap.add_argument("--profile",
@@ -477,36 +600,61 @@ Beispiele:
     cfg = pc.effective_config(env_file=args.env_file, profile=args.profile)
     dest_root = pc._norm_remote_path(args.dest_root)
     snaps_root = f"{dest_root.rstrip('/')}/_snapshots"
+    
+    index_file = args.index_file
+    is_archive = index_file != "content_index.json"
 
     print(f"=== pcloud_quick_delta — tamper-detect ===")
     print(f"Destination: {snaps_root}")
+    if is_archive:
+        print(f"Index-Datei: {index_file} (Archive-Modus)")
+    else:
+        print(f"Index-Datei: {index_file} (Master)")
     print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
     t_total = time.time()
 
     # 1) Index laden
-    print("[phase 1] Lade content_index.json...")
+    print(f"[phase 1] Lade {index_file}...")
     t0 = time.time()
-    index = _load_index(cfg, snaps_root)
+    index = _load_index(cfg, snaps_root, index_file)
     n_items = len(index.get("items", {}))
     print(f"[phase 1] Index geladen: {n_items} Nodes ({time.time()-t0:.1f}s)")
+    
+    # 1b) Extrahiere Snapshots aus Index (für Archive-Modus)
+    snapshot_filter: Optional[Set[str]] = None
+    if is_archive:
+        snapshot_filter = extract_snapshots_from_index(index)
+        if snapshot_filter:
+            sorted_snaps = sorted(snapshot_filter)
+            print(f"[phase 1] Archive enthält {len(snapshot_filter)} Snapshots:")
+            for snap in sorted_snaps:
+                print(f"            - {snap}")
+        else:
+            print(f"[phase 1] ⚠ Keine Snapshots im Archive-Index gefunden")
 
-    # 2) Remote-Baum einlesen (ein API-Call)
+    # 2) Remote-Baum einlesen (ein API-Call, optional gefiltert)
     print()
-    by_fileid, by_path = fetch_remote_tree(cfg, snaps_root)
+    by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter=snapshot_filter)
 
     # 3) Vergleich Index vs. Remote
     print()
     print("[phase 3] Vergleiche Index vs. Remote...")
     t0 = time.time()
-    report = compare_index_vs_remote(index, by_fileid, by_path)
+    report = compare_index_vs_remote(index, by_fileid, by_path, snaps_root)
     print(f"[phase 3] Vergleich abgeschlossen ({time.time()-t0:.1f}s)")
 
     # 4) Unbekannte Dateien
     print()
     print("[phase 4] Suche unbekannte Dateien...")
-    unknown = find_unknown_files(by_fileid, by_path, report["index_fileids"], snaps_root)
+    unknown = find_unknown_files(
+        by_fileid, 
+        by_path, 
+        report["index_fileids"], 
+        snaps_root,
+        report.get("index_known_paths", set())
+    )
     print(f"[phase 4] {len(unknown)} unbekannte Dateien gefunden")
 
     # 5) Optional: SHA256-Backfill-Check

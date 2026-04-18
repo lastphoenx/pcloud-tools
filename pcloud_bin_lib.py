@@ -1549,8 +1549,12 @@ def _rest_get(cfg: dict, endpoint: str, params: dict | None = None):
     if tok and "access_token" not in p:
         p["access_token"] = tok
 
+    # WICHTIG: cfg["timeout"] hat VORRANG über session._default_timeout!
+    # (Meta-Operationen wie copyfolder können >60s dauern)
+    effective_timeout = timeout  # cfg["timeout"] bevorzugen
+
     try:
-        r = s.get(f"{base}/{endpoint}", params=p, timeout=getattr(s, "_default_timeout", timeout))
+        r = s.get(f"{base}/{endpoint}", params=p, timeout=effective_timeout)
         r.raise_for_status()  # Raise HTTPError für 4xx/5xx
     except requests.exceptions.HTTPError as e:
         # SECURITY: Entferne access_token aus Error-Message!
@@ -1650,6 +1654,100 @@ def get_textfile(cfg: dict, *, path: str | None = None, fileid: int | None = Non
     r.raise_for_status()
     return r.content.decode(encoding, errors="replace")
 
+def get_binaryfile(cfg: dict, *, path: str | None = None, fileid: int | None = None) -> bytes:
+    """
+    Lädt eine Datei als rohe Bytes herunter (für Binärdaten: Fotos, Archive, etc.).
+    Gleiche Mechanik wie get_textfile, aber ohne Dekodierung.
+    """
+    if (path is None) == (fileid is None):
+        raise ValueError("get_binaryfile: genau eines von path oder fileid angeben.")
+
+    gl_params = {"access_token": cfg["token"]}
+    if path is not None:
+        gl_params["path"] = _norm_remote_path(path)
+    else:
+        gl_params["fileid"] = int(fileid)
+
+    gl_url = f"{_rest_base(cfg)}/getfilelink"
+    session = _get_session()
+    gl = session.get(gl_url, params=gl_params, timeout=int(cfg.get("timeout", 30)))
+    gl.raise_for_status()
+
+    jd = gl.json()
+    if int(jd.get("result", -1)) != 0:
+        raise RuntimeError(f"getfilelink fehlgeschlagen: {jd}")
+
+    hosts = jd.get("hosts") or []
+    link_path = jd.get("path")
+    if not hosts or not link_path:
+        raise RuntimeError(f"getfilelink Antwort unvollständig: {jd}")
+
+    link = f"https://{hosts[0]}{link_path}"
+    r = session.get(link, timeout=int(cfg.get("timeout", 30)), allow_redirects=True)
+    r.raise_for_status()
+    return r.content
+
+def download_binaryfile_to(cfg: dict, *,
+                            path: str | None = None,
+                            fileid: int | None = None,
+                            local_path: str,
+                            sha256_verify: str | None = None,
+                            chunk_size: int = 8 * 1024 * 1024) -> str:
+    """
+    Streamt eine Datei chunksweise von pCloud direkt auf Festplatte.
+    RAM-schonend: kein vollständiges In-Memory-Puffern (kein r.content).
+    Berechnet SHA256 während des Streamens.
+
+    Returns: tatsächliche SHA256-Checksumme der geschriebenen Daten.
+    Raises:  RuntimeError bei pCloud-Fehler, ValueError bei SHA256-Mismatch.
+    """
+    if (path is None) == (fileid is None):
+        raise ValueError("download_binaryfile_to: genau eines von path oder fileid angeben.")
+
+    gl_params = {"access_token": cfg["token"]}
+    if path is not None:
+        gl_params["path"] = _norm_remote_path(path)
+    else:
+        gl_params["fileid"] = int(fileid)
+
+    gl_url = f"{_rest_base(cfg)}/getfilelink"
+    session = _get_session()
+    gl = session.get(gl_url, params=gl_params, timeout=int(cfg.get("timeout", 30)))
+    gl.raise_for_status()
+
+    jd = gl.json()
+    if int(jd.get("result", -1)) != 0:
+        raise RuntimeError(f"getfilelink fehlgeschlagen: {jd}")
+
+    hosts = jd.get("hosts") or []
+    link_path = jd.get("path")
+    if not hosts or not link_path:
+        raise RuntimeError(f"getfilelink Antwort unvollständig: {jd}")
+
+    link = f"https://{hosts[0]}{link_path}"
+    hash_obj = hashlib.sha256()
+
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+
+    with session.get(link, stream=True, timeout=int(cfg.get("timeout", 30)),
+                     allow_redirects=True) as r:
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    hash_obj.update(chunk)
+
+    actual_sha = hash_obj.hexdigest()
+    if sha256_verify and actual_sha.lower() != sha256_verify.lower():
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+        raise ValueError(f"SHA256 MISMATCH: expected {sha256_verify}, got {actual_sha}")
+
+    return actual_sha
+
 def copyfile(cfg: Dict[str, Any],
              *,
              from_path: str | None = None,
@@ -1685,6 +1783,72 @@ def copyfile(cfg: Dict[str, Any],
         params["force"] = 1
 
     return _rest_get(cfg, "copyfile", params)
+
+def copyfolder(cfg: Dict[str, Any],
+               *,
+               from_folderid: int | None = None,
+               from_path: str | None = None,
+               to_folderid: int | None = None,
+               to_path: str | None = None,
+               noover: bool = False,
+               copycontentonly: bool = False,
+               skipexisting: bool = False) -> Dict[str, Any]:
+    """
+    Server-side Folder Copy (Meta-Operation, sehr schnell).
+    
+    Kopiert einen kompletten Ordner inkl. aller Unterordner/Dateien
+    innerhalb von pCloud (kein Download/Upload).
+    
+    Args:
+        from_folderid: Quell-Ordner ID
+        from_path: Quell-Ordner Pfad (alternativ zu folderid)
+        to_folderid: Ziel-Ordner ID (bei copycontentonly=True: Ziel-Container)
+        to_path: Ziel-Ordner Pfad (bei copycontentonly=True: Ziel-Container)
+        noover: True = keine Überschreibung existierender Dateien
+        copycontentonly: True = nur Inhalt kopieren (nicht Ordner selbst)
+                        WICHTIG: to_path muss existieren und ist der Ziel-Container!
+        skipexisting: True = existierende Dateien überspringen
+    
+    Returns:
+        API response mit metadata des kopierten Ordners
+    
+    Performance: O(1) — Meta-Operation (nur Filesystem-Pointer)
+    
+    Example:
+        # Snapshot-Inhalt kopieren (copycontentonly=True)
+        pc.ensure_path(cfg, "/Backups/_snapshots/2026-04-16")  # Ziel vorher anlegen!
+        copyfolder(cfg, 
+                   from_path="/Backups/_snapshots/2026-04-15",
+                   to_path="/Backups/_snapshots/2026-04-16",
+                   copycontentonly=True)
+    """
+    params: Dict[str, Any] = {}
+    
+    # Quelle: folderid ODER path
+    if from_folderid is not None:
+        params["folderid"] = int(from_folderid)
+    elif from_path is not None:
+        params["path"] = _norm_remote_path(from_path)
+    else:
+        raise ValueError("copyfolder: Quelle fehlt (from_folderid oder from_path).")
+    
+    # Ziel: tofolderid ODER topath
+    if to_folderid is not None:
+        params["tofolderid"] = int(to_folderid)
+    elif to_path is not None:
+        params["topath"] = _norm_remote_path(to_path)
+    else:
+        raise ValueError("copyfolder: Ziel fehlt (to_folderid oder to_path).")
+    
+    # Optionale Flags
+    if noover:
+        params["noover"] = 1
+    if copycontentonly:
+        params["copycontentonly"] = 1
+    if skipexisting:
+        params["skipexisting"] = 1
+    
+    return _rest_get(cfg, "copyfolder", params)
 
 def renamefile(cfg: Dict[str, Any], *, fileid: int | None = None,
                path: str | None = None, toname: str = "") -> Dict[str, Any]:
@@ -1764,7 +1928,14 @@ movefile = move
 # ---- JSON Komfort: remote lesen/schreiben ----
 
 def read_json_at_path(cfg: Dict[str, Any], path: str, maxbytes: int | None = None) -> dict:
-    txt = get_textfile(cfg, path=path, maxbytes=maxbytes or 1024*1024)
+    """
+    Liest JSON von pCloud.
+    
+    Args:
+        maxbytes: Limit in Bytes. Default None = unbegrenzt (sicher für große Index-Files)
+                  Früher: 1MB Default → führte zu truncated JSON bei großen Indexes
+    """
+    txt = get_textfile(cfg, path=path, maxbytes=maxbytes)
     try:
         return _json.loads(txt)
     except Exception as e:

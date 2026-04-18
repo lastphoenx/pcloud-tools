@@ -1,0 +1,1398 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pcloud_repair_index.py — Index-Reparatur nach Delta-Check.
+
+Nimmt einen Delta-Report (JSON) von pcloud_quick_delta.py und bereinigt
+den content_index.json von Phantom-Einträgen (Holder ohne reale Datei).
+
+Workflow:
+  1. Delta-Report einlesen (missing_anchors)
+  2. Remote content_index.json laden
+  3. Für jeden missing_anchor: Holder-Eintrag entfernen
+  4. Bereinigten Index lokal speichern unter /srv/pcloud-temp/pcloud_index_{snapshot}.json
+  5. Beim nächsten Upload: Resume überspringt echte Dateien, lädt fehlende nach
+
+Benötigt: pcloud_bin_lib.py
+"""
+
+from __future__ import annotations
+import os, sys, json, argparse, tempfile
+from typing import Dict, List, Any
+
+try:
+    import pcloud_bin_lib as pc
+except Exception:
+    print("Fehler: pcloud_bin_lib nicht gefunden", file=sys.stderr)
+    sys.exit(2)
+
+
+def load_delta_report(path: str) -> dict:
+    """Lädt den JSON-Report von pcloud_quick_delta.py."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Delta-Report nicht lesbar: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def load_remote_index(cfg: dict, snaps_root: str) -> dict:
+    """Lädt content_index.json von pCloud."""
+    idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+    try:
+        txt = pc.get_textfile(cfg, path=idx_path)
+        j = json.loads(txt or '{"version":1,"items":{}}')
+        if not isinstance(j, dict):
+            j = {"version": 1, "items": {}}
+    except Exception as e:
+        print(f"[ERROR] Remote-Index nicht ladbar: {e}", file=sys.stderr)
+        sys.exit(2)
+    
+    if "items" not in j or not isinstance(j["items"], dict):
+        j["items"] = {}
+    if "version" not in j:
+        j["version"] = 1
+    
+    return j
+
+
+def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, cleanup_all: bool = False) -> Dict[str, Any]:
+    """
+    Entfernt Holder-Einträge für missing_anchors.
+    
+    Args:
+        cleanup_all: Wenn True, entfernt auch korrupte String-Holder bei existierenden Anchors
+    
+    Returns: Stats dict mit removed_holders, cleaned_nodes, removed_nodes, invalid_holders_*
+    """
+    items = index.get("items", {})
+    
+    # Build lookup: anchor_path -> (sha256, holder_info)
+    missing_lookup: Dict[str, dict] = {}
+    for m in missing_anchors:
+        anchor = m.get("anchor_path")
+        if anchor:
+            missing_lookup[anchor] = m
+    
+    removed_holders = 0
+    cleaned_nodes = 0
+    removed_nodes = 0
+    invalid_holders_missing = 0  # String-Holder bei Missing-Anchors (immer entfernt)
+    invalid_holders_other = 0     # String-Holder bei existierenden Anchors (nur mit --cleanup-all)
+    
+    verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
+    debug_samples = []  # Erste 3 Samples für Debugging
+    
+    # Iterate over all index nodes
+    for sha, node in list(items.items()):
+        if not isinstance(node, dict):
+            continue
+        
+        anchor_path = node.get("anchor_path")
+        holders = node.get("holders", [])
+        
+        # Check if this node's anchor is missing
+        is_missing_anchor = anchor_path and anchor_path in missing_lookup
+        
+        # Skip Nodes ohne Holders (Optimierung)
+        if not holders:
+            continue
+        
+        # === Schema-Check für ALLE Nodes (nicht nur Missing-Anchors) ===
+        new_holders = []
+        for h in holders:
+            # Schema-Validierung: String-Holder erkennen und behandeln
+            if not isinstance(h, dict):
+                if is_missing_anchor:
+                    # Bei Missing-Anchor: IMMER entfernen
+                    invalid_holders_missing += 1
+                    if verbose:
+                        print(f"[warn] Korrupter Holder entfernt (Missing-Anchor): {repr(h)[:60]}")
+                        print(f"       SHA256: {sha[:16]}... Anchor: {anchor_path}")
+                    continue
+                else:
+                    # Bei existierendem Anchor: nur mit --cleanup-all entfernen
+                    invalid_holders_other += 1
+                    
+                    # Debug: Erste 3 Samples sammeln
+                    if len(debug_samples) < 3:
+                        debug_samples.append({
+                            "sha": sha[:16],
+                            "anchor": anchor_path or "(none)",
+                            "holder_type": type(h).__name__,
+                            "holder_content": repr(h)[:100]
+                        })
+                    
+                    if cleanup_all:
+                        if verbose:
+                            print(f"[info] Korrupter Holder entfernt (--cleanup-all): {repr(h)[:60]}")
+                            print(f"       SHA256: {sha[:16]}...")
+                        continue
+                    else:
+                        # Behalten, nur zählen (für Reporting)
+                        new_holders.append(h)
+                        continue
+            
+            # Ab hier: h ist garantiert ein Dict
+            
+            # Bei Missing-Anchor: prüfe ob dieser Holder auf den Missing-Anchor zeigt
+            if is_missing_anchor:
+                h_snap = h.get("snapshot")
+                h_rel = h.get("relpath")
+                
+                # Reconstruct the holder's path (identical to upload logic)
+                # Upload does: anchor_path = f"{snapshots_root}/{snapshot}/{relpath}"
+                if h_snap and h_rel:
+                    holder_path = f"{snaps_root}/{h_snap}/{h_rel}"
+                    
+                    # If this holder path matches the missing anchor, remove it
+                    if holder_path == anchor_path:
+                        removed_holders += 1
+                        continue
+            
+            # Holder behalten
+            new_holders.append(h)
+        
+        # Update holders wenn sich was geändert hat
+        if len(new_holders) < len(holders):
+            node["holders"] = new_holders
+            cleaned_nodes += 1
+        
+        # CRITICAL: If the anchor_path itself is missing, remove it immediately
+        # (independent of how many holders remain)
+        if is_missing_anchor:
+            if "anchor_path" in node:
+                del node["anchor_path"]
+            if "fileid" in node:
+                del node["fileid"]
+            if "pcloud_hash" in node:
+                del node["pcloud_hash"]
+        
+        # If no holders left AND no anchor, remove node completely
+        if not new_holders and not node.get("anchor_path"):
+            del items[sha]
+            removed_nodes += 1
+    
+    return {
+        "removed_holders": removed_holders,
+        "cleaned_nodes": cleaned_nodes,
+        "removed_nodes": removed_nodes,
+        "invalid_holders_missing": invalid_holders_missing,
+        "invalid_holders_other": invalid_holders_other,
+        "debug_samples": debug_samples,
+    }
+
+
+def save_local_index(index: dict, snapshot_name: str, output_path: str | None = None) -> str:
+    """
+    Speichert den bereinigten Index lokal.
+    
+    Falls output_path nicht angegeben: /srv/pcloud-temp/pcloud_index_{snapshot}.json
+    """
+    if output_path:
+        out = output_path
+    else:
+        tmp_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        out = os.path.join(tmp_dir, f"pcloud_index_{snapshot_name}.json")
+    
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    
+    with open(out, 'w', encoding='utf-8') as f:
+        json.dump(index, f, indent=2, ensure_ascii=False)
+    
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="pcloud_repair_index — Bereinigt Index von Phantom-Einträgen",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Workflow:
+  1. Erzeuge Delta-Report:
+     python pcloud_quick_delta.py --dest-root /backup-nas --json-out /srv/pcloud-temp/delta.json
+  
+  2. Index reparieren:
+     python pcloud_repair_index.py --delta-report /srv/pcloud-temp/delta.json --dest-root /backup-nas
+  
+  3. Upload starten (nutzt automatisch den reparierten lokalen Index):
+     python pcloud_push_json_manifest_to_pcloud.py ...
+
+Schema-Validierung:
+  Das Tool prüft automatisch alle Holder-Einträge auf Schema-Korrektheit (Dict vs. String).
+  
+  - Bei Missing-Anchors: Korrupte String-Holder werden IMMER entfernt
+  - Bei existierenden Anchors: String-Holder werden nur gemeldet
+    → Verwende --cleanup-all zum Entfernen aller korrupten Holder
+""")
+    
+    ap.add_argument("--delta-report", required=True,
+                    help="JSON-Report von pcloud_quick_delta.py")
+    ap.add_argument("--dest-root", required=True,
+                    help="pCloud-Basispfad (z.B. /backup-nas)")
+    ap.add_argument("--snapshot",
+                    help="Snapshot-Name (wird aus Delta-Report extrahiert, falls nicht angegeben)")
+    ap.add_argument("--env-file",
+                    help="Pfad zur .env-Datei (optional)")
+    ap.add_argument("--profile",
+                    help="pCloud-Profil (optional)")
+    ap.add_argument("--output",
+                    help="Ausgabepfad für reparierten Index (default: /srv/pcloud-temp/pcloud_index_{snapshot}.json)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Nur Report, keine Änderungen")
+    ap.add_argument("--cleanup-all", action="store_true",
+                    help="Entferne auch korrupte Holder außerhalb von Missing-Anchors (String statt Dict)")
+    
+    args = ap.parse_args()
+    
+    cfg = pc.effective_config(env_file=args.env_file, profile=args.profile)
+    dest_root = pc._norm_remote_path(args.dest_root)
+    snaps_root = f"{dest_root.rstrip('/')}/_snapshots"
+    
+    print(f"=== pcloud_repair_index ===")
+    print(f"Delta-Report: {args.delta_report}")
+    print(f"Destination: {snaps_root}")
+    print()
+    
+    # 1. Delta-Report laden
+    print("[phase 1] Lade Delta-Report...")
+    report = load_delta_report(args.delta_report)
+    missing_anchors = report.get("missing_anchors", [])
+    
+    if not missing_anchors:
+        print("[info] Keine missing_anchors im Report → nichts zu tun")
+        return
+    
+    print(f"[phase 1] {len(missing_anchors)} fehlende Anchors gefunden")
+    
+    # Snapshot-Name aus Report extrahieren (falls nicht als Arg gegeben)
+    snapshot_name = args.snapshot
+    if not snapshot_name:
+        # Versuche aus dem ersten missing_anchor den Snapshot zu extrahieren
+        first_anchor = missing_anchors[0].get("anchor_path", "")
+        parts = first_anchor.split("/")
+        try:
+            snap_idx = parts.index("_snapshots") + 1
+            snapshot_name = parts[snap_idx]
+            print(f"[info] Snapshot-Name aus Report extrahiert: {snapshot_name}")
+        except (ValueError, IndexError):
+            print("[ERROR] Snapshot-Name konnte nicht ermittelt werden. Bitte --snapshot angeben.", file=sys.stderr)
+            sys.exit(2)
+    
+    # 2. Remote-Index laden
+    print()
+    print("[phase 2] Lade Remote content_index.json...")
+    index = load_remote_index(cfg, snaps_root)
+    n_nodes = len(index.get("items", {}))
+    print(f"[phase 2] Index geladen: {n_nodes} Nodes")
+    
+    # 3. Reparatur
+    print()
+    print("[phase 3] Repariere Index...")
+    if args.dry_run:
+        print("[dry-run] Simulation — keine Änderungen")
+        # Kopie für Dry-Run
+        import copy
+        index_copy = copy.deepcopy(index)
+        stats = repair_index(index_copy, missing_anchors, snaps_root, cleanup_all=args.cleanup_all)
+    else:
+        stats = repair_index(index, missing_anchors, snaps_root, cleanup_all=args.cleanup_all)
+    
+    print(f"[phase 3] Holders entfernt:     {stats['removed_holders']}")
+    print(f"[phase 3] Nodes bereinigt:      {stats['cleaned_nodes']}")
+    print(f"[phase 3] Nodes komplett gelöscht: {stats['removed_nodes']}")
+    
+    # Schema-Validierung Report
+    invalid_missing = stats.get('invalid_holders_missing', 0)
+    invalid_other = stats.get('invalid_holders_other', 0)
+    if invalid_missing > 0:
+        print(f"[phase 3] Korrupte Holder entfernt (Missing-Anchors): {invalid_missing}")
+    if invalid_other > 0:
+        if args.cleanup_all:
+            print(f"[phase 3] Korrupte Holder entfernt (--cleanup-all): {invalid_other}")
+        else:
+            print(f"[phase 3] ⚠ Korrupte Holder gefunden: {invalid_other} (String statt Dict)")
+            print(f"[phase 3]   → Verwende --cleanup-all zum Entfernen")
+            
+            # Debug-Samples anzeigen
+            debug_samples = stats.get('debug_samples', [])
+            if debug_samples:
+                print(f"\n[debug] Beispiele für korrupte Holder:")
+                for i, sample in enumerate(debug_samples, 1):
+                    print(f"  Sample {i}:")
+                    print(f"    SHA: {sample['sha']}...")
+                    print(f"    Anchor: {sample['anchor']}")
+                    print(f"    Holder-Type: {sample['holder_type']}")
+                    print(f"    Holder-Content: {sample['holder_content']}")
+    
+    # 4. Lokal speichern
+    if not args.dry_run:
+        print()
+        print("[phase 4] Speichere reparierten Index lokal...")
+        out_path = save_local_index(index, snapshot_name, args.output)
+        print(f"[phase 4] Index gespeichert: {out_path}")
+        
+        n_nodes_after = len(index.get("items", {}))
+        print()
+        print(f"[summary] Nodes vorher: {n_nodes}")
+        print(f"[summary] Nodes nachher: {n_nodes_after}")
+        print(f"[summary] Delta: {n_nodes - n_nodes_after} Nodes entfernt")
+        print()
+        print(f"✓ Reparatur abgeschlossen.")
+        print(f"  Beim nächsten Upload wird dieser Index verwendet:")
+        print(f"    {out_path}")
+        print()
+        print(f"  Upload-Befehl:")
+        print(f"    /opt/apps/pcloud-tools/venv-.../bin/python \\")
+        print(f"      /opt/apps/pcloud-tools/main/pcloud_push_json_manifest_to_pcloud.py \\")
+        print(f"      --manifest /srv/pcloud-temp/manifest.json \\")
+        print(f"      --dest-root {dest_root} \\")
+        print(f"      --snapshot-mode 1to1 \\")
+        print(f"      --env-file /opt/apps/pcloud-tools/main/.env")
+    else:
+        print()
+        print("[dry-run] Keine Änderungen vorgenommen")
+
+
+# ============================================================================
+# TIME-TRAVEL ARCHIVE: Index-Rekonstruktion für alle Snapshots
+# ============================================================================
+
+def repair_string_holders_to_dict(index: dict, snapshot_manifests: List[str]) -> Dict[str, Any]:
+    """
+    Repariert korrupte String-Holder im Master-Index UND entfernt verwaiste Holder.
+    
+    String-Holder entstehen durch Bug in pcloud_push_json_manifest_to_pcloud.py:
+      holders.append(snapshot_name)  # ← String statt {"snapshot": ..., "relpath": ...}
+    
+    Verwaiste Holder entstehen nach Snapshot-Löschung:
+      Holder zeigen auf Snapshots die nicht mehr existieren
+    
+    Strategie: 
+      1. Nutze die lokalen Manifeste um den korrekten relpath zu rekonstruieren
+      2. Entferne alle Holder deren Snapshot nicht mehr in snapshot_manifests ist
+    
+    Returns: Stats dict mit repair_stats
+    """
+    items = index.get("items", {})
+    valid_snapshots = set(snapshot_manifests)  # O(1) lookup
+    
+    # Lade alle Manifeste (für Lookup sha256 → [relpaths] + metadata per snapshot)
+    manifest_lookup = {}  # {snapshot_name: {sha256: [{"relpath": ..., "size": ..., "mtime": ..., "inode": ...}]}}
+    
+    print("[repair] Lade Manifeste für Holder-Reparatur...")
+    for snap_name in snapshot_manifests:
+        manifest_path = f"/srv/pcloud-archive/manifests/{snap_name}.json"
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+                items_list = manifest.get("items", [])
+                
+                # Manifeste v2/v3: items ist eine Liste von Objekten
+                # Baue Lookup-Dict: {sha256: [{"relpath": ..., "size": ..., ...}]} (Liste für Hardlinks/Duplikate)
+                items_dict = {}
+                for item in items_list:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "file":
+                        continue
+                    sha = item.get("sha256")
+                    relpath = item.get("relpath")
+                    if sha and relpath:
+                        if sha not in items_dict:
+                            items_dict[sha] = []
+                        # Speichere alle Metadaten
+                        items_dict[sha].append({
+                            "relpath": relpath,
+                            "size": item.get("size"),
+                            "mtime": item.get("mtime"),
+                            "inode": item.get("inode"),
+                            "ext": item.get("ext"),
+                        })
+                
+                manifest_lookup[snap_name] = items_dict
+                print(f"  ✓ {snap_name}: {len(items_dict)} Dateien")
+        except FileNotFoundError:
+            print(f"  ⚠ Manifest nicht gefunden: {snap_name}")
+            continue
+        except Exception as e:
+            print(f"  ✗ Fehler beim Laden von {snap_name}: {e}")
+            continue
+    
+    repaired_count = 0
+    unrepaired_count = 0
+    removed_count = 0
+    corrected_relpath_count = 0  # Für falsche relpaths in Dict-Holdern
+    enriched_metadata_count = 0  # Holder mit ergänzten Metadaten (size/mtime/inode/ext)
+    orphaned_snapshots = set()  # Track gelöschte Snapshots für Report
+    
+    # Iterate über alle Nodes
+    for sha, node in list(items.items()):
+        if not isinstance(node, dict):
+            continue
+        
+        holders = node.get("holders", [])
+        new_holders = []
+        
+        for h in holders:
+            # String-Holder erkannt?
+            if isinstance(h, str):
+                snapshot_name = h
+                
+                # Versuche relpath aus Manifest zu rekonstruieren
+                if snapshot_name in valid_snapshots and snapshot_name in manifest_lookup:
+                    manifest_items = manifest_lookup[snapshot_name]
+                    
+                    # Suche nach SHA256 in diesem Manifest
+                    if sha in manifest_items:
+                        file_infos = manifest_items[sha]  # Liste von {relpath, size, mtime, ...}
+                        file_info = file_infos[0]  # Nehme ersten (bei Hardlinks/Duplikaten)
+                        
+                        # Repariere: String → Dict mit allen Metadaten
+                        repaired_holder = {
+                            "snapshot": snapshot_name,
+                            "relpath": file_info["relpath"],
+                            "size": file_info.get("size"),
+                            "mtime": file_info.get("mtime"),
+                            "inode": file_info.get("inode"),
+                            "ext": file_info.get("ext"),
+                        }
+                        new_holders.append(repaired_holder)
+                        repaired_count += 1
+                    else:
+                        # SHA256 nicht in Manifest gefunden → entfernen
+                        print(f"  ⚠ SHA {sha[:16]}... nicht in Manifest {snapshot_name} → Holder entfernt")
+                        removed_count += 1
+                else:
+                    # Manifest nicht verfügbar → Holder entfernen
+                    print(f"  ⚠ Manifest {snapshot_name} nicht verfügbar → Holder entfernt")
+                    removed_count += 1
+            
+            elif isinstance(h, dict):
+                # Korrekt formatierter Holder - prüfe Snapshot UND relpath
+                snapshot_name = h.get("snapshot")
+                holder_relpath = h.get("relpath")
+                
+                if snapshot_name not in valid_snapshots:
+                    # Verwaister Holder aus gelöschtem Snapshot → entfernen
+                    orphaned_snapshots.add(snapshot_name)
+                    removed_count += 1
+                    continue
+                
+                # Snapshot existiert - prüfe ob relpath korrekt ist
+                if snapshot_name in manifest_lookup:
+                    manifest_items = manifest_lookup[snapshot_name]
+                    
+                    if sha in manifest_items:
+                        file_infos = manifest_items[sha]  # Liste von {relpath, size, ...}
+                        
+                        # Finde korrekten file_info für diesen relpath
+                        matching_info = next((info for info in file_infos if info["relpath"] == holder_relpath), None)
+                        
+                        if matching_info:
+                            # relpath ist korrekt → Holder mit vollständigen Metadaten behalten/erweitern
+                            corrected_holder = {
+                                "snapshot": snapshot_name,
+                                "relpath": matching_info["relpath"],
+                                "size": matching_info.get("size"),
+                                "mtime": matching_info.get("mtime"),
+                                "inode": matching_info.get("inode"),
+                                "ext": matching_info.get("ext"),
+                            }
+                            
+                            # Prüfe ob Metadaten ergänzt wurden
+                            had_incomplete_metadata = (
+                                h.get("size") is None or 
+                                h.get("mtime") is None or 
+                                h.get("inode") is None or 
+                                h.get("ext") is None
+                            )
+                            if had_incomplete_metadata:
+                                enriched_metadata_count += 1
+                            
+                            new_holders.append(corrected_holder)
+                        else:
+                            # relpath ist falsch → korrigieren mit erstem gültigen Pfad + Metadaten
+                            corrected_holder = {
+                                "snapshot": snapshot_name,
+                                "relpath": file_infos[0]["relpath"],
+                                "size": file_infos[0].get("size"),
+                                "mtime": file_infos[0].get("mtime"),
+                                "inode": file_infos[0].get("inode"),
+                                "ext": file_infos[0].get("ext"),
+                            }
+                            
+                            # Prüfe ob auch Metadaten ergänzt wurden
+                            had_incomplete_metadata = (
+                                h.get("size") is None or 
+                                h.get("mtime") is None or 
+                                h.get("inode") is None or 
+                                h.get("ext") is None
+                            )
+                            if had_incomplete_metadata:
+                                enriched_metadata_count += 1
+                            
+                            new_holders.append(corrected_holder)
+                            corrected_relpath_count += 1
+                    else:
+                        # SHA nicht im Manifest → Holder entfernen
+                        print(f"  ⚠ SHA {sha[:16]}... nicht in Manifest {snapshot_name} → Holder entfernt")
+                        removed_count += 1
+                else:
+                    # Manifest nicht geladen (sollte nicht passieren) → Holder behalten
+                    new_holders.append(h)
+                    new_holders.append(h)
+            else:
+                # Unbekanntes Format
+                print(f"  ✗ Unbekanntes Holder-Format: {type(h)} → entfernt")
+                removed_count += 1
+        
+        # Update holders
+        node["holders"] = new_holders
+        
+        # Wenn keine Holder mehr → Node löschen
+        if not new_holders:
+            del items[sha]
+    
+    return {
+        "repaired": repaired_count,
+        "removed": removed_count,
+        "unrepaired": unrepaired_count,
+        "corrected_relpath": corrected_relpath_count,
+        "enriched_metadata": enriched_metadata_count,
+        "orphaned_snapshots": sorted(orphaned_snapshots)
+    }
+
+
+def rebuild_index_from_manifests(snapshot_manifests: List[str], snapshots_root: str, 
+                                   manifest_dir: str) -> dict:
+    """
+    Baut Index komplett neu aus Manifesten auf (wenn kein Remote-Index existiert).
+    
+    Achtung: fileid und pcloud_hash fehlen (werden beim Upload ergänzt).
+    
+    Returns: Neuer Index mit {"version": 1, "items": {sha256: node}}
+    """
+    new_index = {"version": 1, "items": {}}
+    
+    print("[rebuild] Baue Index von Grund auf aus Manifesten...")
+    
+    # Lade alle Manifeste
+    for snap_name in snapshot_manifests:
+        manifest_path = os.path.join(manifest_dir, f"{snap_name}.json")
+        
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+                items_list = manifest.get("items", [])
+                
+                # Manifeste v2/v3: items ist eine Liste von Objekten
+                file_count = 0
+                for item in items_list:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "file":
+                        continue
+                    
+                    sha = item.get("sha256")
+                    relpath = item.get("relpath")
+                    
+                    if not sha or not relpath:
+                        continue
+                    
+                    file_count += 1
+                    
+                    # Holder mit ALLEN Metadaten aus Manifest
+                    holder = {
+                        "snapshot": snap_name,
+                        "relpath": relpath,
+                        "size": item.get("size"),
+                        "mtime": item.get("mtime"),
+                        "inode": item.get("inode"),  # {dev, ino, nlink}
+                        "ext": item.get("ext"),
+                    }
+                    
+                    # Node existiert schon? (Deduplizierung über Snapshots)
+                    if sha in new_index["items"]:
+                        # Holder hinzufügen
+                        new_index["items"][sha]["holders"].append(holder)
+                    else:
+                        # Neuer Node
+                        anchor_path = f"{snapshots_root}/{snap_name}/{relpath}"
+                        new_index["items"][sha] = {
+                            "sha256": sha,  # Explizit hinzufügen
+                            "anchor_path": anchor_path,
+                            "holders": [holder],
+                            # fileid und pcloud_hash werden später per API ergänzt
+                        }
+                
+                print(f"  [{snap_name}] {file_count} Dateien")
+        
+        except FileNotFoundError:
+            print(f"  ⚠ Manifest nicht gefunden: {snap_name}")
+            continue
+        except Exception as e:
+            print(f"  ✗ Fehler beim Laden von {snap_name}: {e}")
+            continue
+    
+    total_files = len(new_index["items"])
+    print(f"[rebuild] ✓ Index erstellt: {total_files} Dateien")
+    
+    return new_index
+
+
+def enrich_index_with_api_metadata(cfg: dict, index: dict, dest_root: str, *, sample_only: bool = False, 
+                                     sample_size: int = 100, force_enrich: bool = False, debug: bool = False) -> Dict[str, Any]:
+    """
+    Ergänzt Index mit FileID und pcloud_hash per API-Abfrage.
+    Falls anchor_path ein Stub ist, wird durch alle Holders iteriert um echtes File zu finden.
+    
+    Args:
+        dest_root: Basis-Pfad für Snapshots (/Backup/rtb_1to1)
+        sample_only: Nur erste N items enrichen (für Testing)
+        sample_size: Wie viele items bei sample_only
+        force_enrich: Auch bereits enriched Nodes nochmal enrichen
+    
+    Returns: Stats dict mit enrichment_stats
+    """
+    items = index.get("items", {})
+    
+    print()
+    print("[enrich] Ergänze FileID + pcloud_hash per API...")
+    
+    if sample_only:
+        print(f"[enrich] ⚠ SAMPLE-MODUS: Nur erste {sample_size} items")
+    
+    enriched_fileid = 0
+    enriched_pcloud_hash = 0
+    skipped_fileid = 0
+    skipped_no_anchor = 0  # NEU: Nodes ohne anchor_path
+    failed = 0
+    
+    items_to_process = list(items.items())
+    if sample_only:
+        items_to_process = items_to_process[:sample_size]
+    
+    total = len(items_to_process)
+    
+    for i, (sha, node) in enumerate(items_to_process, 1):
+        if not isinstance(node, dict):
+            continue
+        
+        anchor_path = node.get("anchor_path")
+        if not anchor_path:
+            skipped_no_anchor += 1
+            continue
+        
+        # Progress
+        if i % 100 == 0 or i == total:
+            print(f"  [{i}/{total}] ({i*100//total}%) | "
+                  f"FileID: {enriched_fileid}, Hash: {enriched_pcloud_hash}, "
+                  f"Failed: {failed}")
+        
+        # DEBUG: Erste 3 Nodes - was hat der geladene Index?
+        if debug and i <= 3:
+            print(f"  [DEBUG #{i}] node.get('fileid')={node.get('fileid')}, node.get('pcloud_hash')={node.get('pcloud_hash')}")
+            print(f"  [DEBUG #{i}] anchor_path={anchor_path[:80]}...")
+        
+        # FileID bereits vorhanden? (Skip nur wenn nicht force_enrich)
+        if node.get("fileid") and not force_enrich:
+            skipped_fileid += 1
+            continue
+        
+        # stat_file per API (anchor_path könnte Stub sein!)
+        md = None
+        tried_paths = []
+        
+        try:
+            md = pc.stat_file(cfg, path=anchor_path, with_checksum=False, enrich_path=False)
+            tried_paths.append(("anchor", anchor_path))
+            
+            if md and md.get("isfolder"):
+                md = None  # Ordner ignorieren
+        except Exception as e:
+            if debug and i <= 10:
+                print(f"    [DEBUG] anchor={anchor_path[:40]}... fehlgeschlagen (Stub?): {e}")
+            md = None
+        
+        # Falls anchor_path fehlgeschlagen (= Stub), suche in ALLEN Holders
+        if not md:
+            holders = node.get("holders", [])
+            for holder in holders:
+                if not isinstance(holder, dict):
+                    continue
+                snapshot = holder.get("snapshot")
+                relpath = holder.get("relpath")
+                if not snapshot or not relpath:
+                    continue
+                
+                # Baue Pfad für diesen Holder
+                holder_path = f"{dest_root}/_snapshots/{snapshot}/{relpath}"
+                tried_paths.append(("holder", holder_path))
+                
+                try:
+                    md = pc.stat_file(cfg, path=holder_path, with_checksum=False, enrich_path=False)
+                    
+                    if md and not md.get("isfolder"):
+                        # Gefunden! Echtes File (kein Stub)
+                        if debug and i <= 10:
+                            print(f"    [DEBUG] Echtes File gefunden: {holder_path[:60]}...")
+                        break
+                    else:
+                        md = None
+                except Exception:
+                    md = None
+                    continue
+        
+        if not md:
+            if debug and i <= 10:
+                print(f"    [DEBUG] Alle Pfade fehlgeschlagen: {len(tried_paths)} versucht")
+            failed += 1
+            continue
+        
+        # DEBUG: Zeige was stat_file zurückgibt
+        if debug and i <= 3:
+            print(f"    [DEBUG] API Response - fileid={md.get('fileid')}, id={md.get('id')}, hash={md.get('hash')}")
+        
+        # FileID extrahieren
+        fileid = int(md.get("fileid") or md.get("id") or 0)
+        if fileid:
+            node["fileid"] = fileid
+            enriched_fileid += 1
+        
+        # pcloud_hash extrahieren (falls vorhanden)
+        pcloud_hash = md.get("hash")
+        if pcloud_hash:
+            node["pcloud_hash"] = pcloud_hash
+            enriched_pcloud_hash += 1
+    
+    print()
+    print(f"[enrich] ✓ FileID ergänzt: {enriched_fileid}")
+    print(f"[enrich] ✓ pcloud_hash ergänzt: {enriched_pcloud_hash}")
+    print(f"[enrich] ⊘ FileID bereits vorhanden: {skipped_fileid}")
+    if skipped_no_anchor > 0:
+        print(f"[enrich] ⚠ KEINE anchor_path: {skipped_no_anchor} nodes übersprungen!")
+    print(f"[enrich] ✗ Fehlgeschlagen: {failed}")
+    
+    return {
+        "enriched_fileid": enriched_fileid,
+        "enriched_pcloud_hash": enriched_pcloud_hash,
+        "skipped_fileid": skipped_fileid,
+        "skipped_no_anchor": skipped_no_anchor,
+        "failed": failed,
+    }
+
+
+def enrich_index_with_listfolder(cfg: dict, index: dict, snapshots_root: str, 
+                                   snapshot_order: List[str], *, debug: bool = False) -> Dict[str, Any]:
+    """
+    Ergänzt Index mit FileID und pcloud_hash via listfolder (SCHNELL).
+    
+    Strategie:
+      1. Für jeden Snapshot: listfolder(recursive) → alle Files mit FileID + Hash
+      2. Baue Mapping: {full_path: {fileid, hash}}
+      3. Match anchor_path gegen Mapping
+      4. Setze FileID + Hash aus Mapping
+    
+    Performance: 3 API-Calls (3 Snapshots) statt 17929 (stat per File)
+    """
+    print()
+    print("[enrich] Ergänze FileID + pcloud_hash per listfolder (BATCH-Modus)...")
+    
+    if debug:
+        print("[enrich] ⚠ DEBUG-MODUS aktiviert")
+    
+    # === PHASE A: Baue FileID-Mapping für alle Snapshots ===
+    print("[enrich] Phase A: Lade FileID-Mappings per listfolder...")
+    
+    fileid_mapping = {}  # {full_path: {fileid, hash}}
+    
+    for snap_name in snapshot_order:
+        snap_path = f"{snapshots_root}/{snap_name}"
+        
+        print(f"  [listfolder] {snap_name}...", end=" ", flush=True)
+        
+        try:
+            # listfolder mit recursive=True → alle Dateien
+            tree = pc.listfolder(cfg, path=snap_path, recursive=True)
+            
+            # Flatten tree zu file list
+            def _flatten(node, parent_path="", is_root=True):
+                files = []
+                if isinstance(node, dict):
+                    node_name = node.get("name", "")
+                    
+                    # Pfad-Bau (root-Ordner hat leeren Namen)
+                    if is_root:
+                        current_path = ""
+                    else:
+                        current_path = f"{parent_path}/{node_name}".lstrip("/")
+                    
+                    if not node.get("isfolder"):
+                        # Datei gefunden
+                        full_path = f"{snap_path}/{current_path}".replace("//", "/")
+                        files.append({
+                            "path": full_path,
+                            "fileid": node.get("fileid") or node.get("id"),
+                            "hash": node.get("hash"),
+                        })
+                    else:
+                        # Ordner → recurse in contents
+                        for child in node.get("contents", []):
+                            files.extend(_flatten(child, current_path, is_root=False))
+                
+                return files
+            
+            # Extrahiere metadata und flatten
+            metadata = tree.get("metadata", {})
+            files = _flatten(metadata, is_root=True)
+            
+            # Mapping aktualisieren
+            for f in files:
+                if f["fileid"] and f["path"]:
+                    # FileID kann String oder int sein, normalisiere zu int
+                    fileid_raw = f["fileid"]
+                    if isinstance(fileid_raw, str):
+                        # Entferne 'f' prefix falls vorhanden
+                        fileid_raw = fileid_raw.lstrip('f')
+                        fileid = int(fileid_raw) if fileid_raw.isdigit() else 0
+                    else:
+                        fileid = int(fileid_raw) if fileid_raw else 0
+                    
+                    if fileid > 0:
+                        fileid_mapping[f["path"]] = {
+                            "fileid": fileid,
+                            "hash": f["hash"],
+                        }
+            
+            print(f"✓ {len(files)} Dateien")
+            
+        except Exception as e:
+            print(f"✗ Fehler: {e}")
+            continue
+    
+    print(f"[enrich] ✓ Mapping erstellt: {len(fileid_mapping)} Pfade")
+    
+    # === PHASE B: Match Index-Nodes gegen Mapping ===
+    print("[enrich] Phase B: Enriche Index-Nodes aus Mapping...")
+    
+    items = index.get("items", {})
+    
+    enriched_fileid = 0
+    enriched_pcloud_hash = 0
+    skipped_fileid = 0
+    skipped_no_anchor = 0
+    not_found = 0
+    
+    for i, (sha, node) in enumerate(items.items(), 1):
+        if not isinstance(node, dict):
+            continue
+        
+        anchor_path = node.get("anchor_path")
+        if not anchor_path:
+            skipped_no_anchor += 1
+            continue
+        
+        # Progress
+        if i % 1000 == 0 or i == len(items):
+            print(f"  [{i}/{len(items)}] ({i*100//len(items)}%) | "
+                  f"FileID: {enriched_fileid}, Hash: {enriched_pcloud_hash}, "
+                  f"NotFound: {not_found}")
+        
+        # DEBUG: Erste 3 Nodes
+        if debug and i <= 3:
+            print(f"  [DEBUG #{i}] anchor_path={anchor_path[:80]}...")
+        
+        # FileID bereits vorhanden? → Skip
+        if node.get("fileid"):
+            skipped_fileid += 1
+            continue
+        
+        # Lookup in Mapping (anchor_path könnte Stub sein!)
+        file_meta = fileid_mapping.get(anchor_path)
+        
+        # Falls anchor_path nicht gefunden (= Stub), suche in ALLEN Holders
+        if not file_meta:
+            holders = node.get("holders", [])
+            for holder in holders:
+                if not isinstance(holder, dict):
+                    continue
+                snapshot = holder.get("snapshot")
+                relpath = holder.get("relpath")
+                if not snapshot or not relpath:
+                    continue
+                
+                # Baue Pfad für diesen Holder  
+                holder_path = f"{snapshots_root}/{snapshot}/{relpath}"
+                file_meta = fileid_mapping.get(holder_path)
+                
+                if file_meta:
+                    # Gefunden! Echtes File (kein Stub)
+                    if debug and i <= 10:
+                        print(f"    [DEBUG] anchor={anchor_path[:40]}... ist Stub")
+                        print(f"    [DEBUG] Echtes File gefunden: {holder_path[:60]}...")
+                    break
+        
+        if not file_meta:
+            not_found += 1
+            if debug and i <= 10:
+                print(f"    [DEBUG] Weder anchor noch Holders im Mapping: {anchor_path[:60]}...")
+            continue
+        
+        # DEBUG: Zeige Mapping-Treffer
+        if debug and i <= 3:
+            print(f"    [DEBUG] Mapping-Treffer: fileid={file_meta['fileid']}, hash={file_meta['hash']}")
+        
+        # FileID setzen
+        if file_meta["fileid"]:
+            node["fileid"] = file_meta["fileid"]
+            enriched_fileid += 1
+        
+        # Hash setzen
+        if file_meta["hash"]:
+            node["pcloud_hash"] = file_meta["hash"]
+            enriched_pcloud_hash += 1
+    
+    print()
+    print(f"[enrich] ✓ FileID ergänzt: {enriched_fileid}")
+    print(f"[enrich] ✓ pcloud_hash ergänzt: {enriched_pcloud_hash}")
+    print(f"[enrich] ⊘ FileID bereits vorhanden: {skipped_fileid}")
+    if skipped_no_anchor > 0:
+        print(f"[enrich] ⚠ KEINE anchor_path: {skipped_no_anchor} nodes übersprungen!")
+    if not_found > 0:
+        print(f"[enrich] ⚠ Nicht im Mapping: {not_found} (evtl. gelöscht oder umbenannt)")
+    
+    return {
+        "enriched_fileid": enriched_fileid,
+        "enriched_pcloud_hash": enriched_pcloud_hash,
+        "skipped_fileid": skipped_fileid,
+        "skipped_no_anchor": skipped_no_anchor,
+        "not_found": not_found,
+    }
+
+
+def generate_timetravel_archive(cfg: dict, master_index: dict, snapshots_root: str, 
+                                  snapshot_order: List[str], archive_dir: str,
+                                  *, dry_run: bool = False) -> None:
+    """
+    Erzeugt Time-Travel Archive: Für jeden Snapshot den Index-Stand zu diesem Zeitpunkt.
+    
+    Workflow:
+      1. Snapshot 1: Nur Dateien aus Snapshot 1
+      2. Snapshot 2: Kumuliert Snapshot 1 + 2
+      3. Snapshot N: Kumuliert Snapshot 1..N
+    
+    Jeder Archive-Index enthält:
+      - Nur Nodes deren ältester Holder <= current_snapshot
+      - Nur Holders die <= current_snapshot sind
+      - anchor_path zeigt auf den ältesten Holder
+    
+    Speichert:
+      - Lokal: {archive_dir}/{snapshot}_index.json
+      - Remote: {snapshots_root}/_index/archive/{snapshot}_index.json
+    """
+    items = master_index.get("items", {})
+    
+    print()
+    print(f"[timetravel] Generiere Archive für {len(snapshot_order)} Snapshots...")
+    print(f"[timetravel] Archive-Verzeichnis: {archive_dir}")
+    print()
+    
+    for i, current_snap in enumerate(snapshot_order, 1):
+        print(f"[{i}/{len(snapshot_order)}] {current_snap}...", end=" ", flush=True)
+        
+        # Erstelle Index für diesen Zeitpunkt
+        snap_index = {"version": 1, "items": {}}
+        
+        for sha, node in items.items():
+            if not isinstance(node, dict):
+                continue
+            
+            holders = node.get("holders", [])
+            
+            # Filter: Nur Holder <= current_snap
+            valid_holders = []
+            for h in holders:
+                if not isinstance(h, dict):
+                    continue
+                    
+                h_snap = h.get("snapshot")
+                if h_snap and h_snap <= current_snap:
+                    valid_holders.append(h)
+            
+            # Wenn keine gültigen Holder → skip node
+            if not valid_holders:
+                continue
+            
+            # Sortiere Holder chronologisch (ältester zuerst)
+            valid_holders.sort(key=lambda x: x["snapshot"])
+            
+            # Anchor ist der älteste Holder
+            oldest = valid_holders[0]
+            anchor_path = f"{snapshots_root}/{oldest['snapshot']}/{oldest['relpath']}"
+            
+            # Erstelle Node für diesen Stand
+            snap_node = {
+                "anchor_path": anchor_path,
+                "holders": valid_holders
+            }
+            
+            # fileid und pcloud_hash optional (fehlen bei Rebuild)
+            if node.get("fileid"):
+                snap_node["fileid"] = node["fileid"]
+            if node.get("pcloud_hash"):
+                snap_node["pcloud_hash"] = node["pcloud_hash"]
+            
+            snap_index["items"][sha] = snap_node
+        
+        n_files = len(snap_index["items"])
+        print(f"{n_files} Dateien", end="")
+        
+        # Speichern (lokal + remote)
+        if not dry_run:
+            # 1. Lokal
+            local_path = os.path.join(archive_dir, f"{current_snap}_index.json")
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            
+            with open(local_path, 'w', encoding='utf-8') as f:
+                json.dump(snap_index, f, indent=2, ensure_ascii=False)
+            
+            # 2. Remote
+            remote_path = f"{snapshots_root}/_index/archive/{current_snap}_index.json"
+            try:
+                pc.write_json_at_path(cfg, remote_path, snap_index)
+                print(f" → ✓")
+            except Exception as e:
+                print(f" → ✗ Remote-Upload fehlgeschlagen: {e}")
+        else:
+            print(f" → [dry-run]")
+    
+    print()
+    print(f"[timetravel] ✓ Archive generiert")
+
+
+def rebuild_complete_index(args):
+    """
+    Hauptfunktion: Rekonstruiere kompletten Index aus Manifesten und erzeuge Archive.
+    
+    Workflow:
+      1. Remote Master-Index laden (mit maxbytes=None für große Files)
+      2. String-Holder reparieren (mit Manifesten)
+      3. Time-Travel Archive generieren (für jeden Snapshot)
+      4. Master-Index remote+lokal speichern
+      5. Archive remote+lokal speichern
+    
+    Nutzen:
+      - Beim Löschen von Snapshots: Passenden Archive-Index als Master kopieren
+      - Historie: Alle Index-Stände bleiben erhalten
+      - Debugging: Lokale Kopien aller Index-Versionen
+    """
+    cfg = pc.effective_config(env_file=args.env_file, profile=args.profile)
+    dest_root = pc._norm_remote_path(args.dest_root)
+    snaps_root = f"{dest_root.rstrip('/')}/_snapshots"
+    
+    # Archive-Verzeichnis (lokal)
+    archive_dir = args.archive_dir or "/srv/pcloud-archive/indexes"
+    os.makedirs(archive_dir, exist_ok=True)
+    
+    # Manifest-Verzeichnis
+    manifest_dir = args.manifest_dir or "/srv/pcloud-archive/manifests"
+    
+    print("=" * 70)
+    print("INDEX-REKONSTRUKTION: Time-Travel Archive")
+    print("=" * 70)
+    print(f"Destination: {snaps_root}")
+    print(f"Archive-Dir: {archive_dir}")
+    print(f"Manifest-Dir: {manifest_dir}")
+    print()
+    
+    # === PHASE 1: Remote Master-Index laden (oder neu erstellen) ===
+    print("[phase 1] Lade Remote Master-Index...")
+    idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+    
+    try:
+        # WICHTIG: maxbytes=None für große Index-Files (> 1 MB)
+        master_index = pc.read_json_at_path(cfg, idx_path, maxbytes=None)
+        print(f"[phase 1] ✓ Existierender Index geladen: {len(master_index.get('items', {}))} Nodes")
+        index_mode = "repair"
+    except Exception as e:
+        error_str = str(e)
+        # Prüfe ob File nicht existiert (result 2002 oder 2009)
+        if "2002" in error_str or "2009" in error_str or "does not exist" in error_str.lower():
+            print(f"[phase 1] ℹ Index existiert noch nicht → wird neu erstellt")
+            master_index = {"version": 1, "items": {}}
+            index_mode = "rebuild"
+        else:
+            # Anderer Fehler (z.B. Netzwerk)
+            print(f"[phase 1] ✗ Fehler beim Laden: {e}")
+            sys.exit(2)
+    
+    # === PHASE 2: Snapshot-Reihenfolge ermitteln ===
+    print()
+    print("[phase 2] Ermittle Snapshot-Chronologie...")
+    
+    if not os.path.isdir(manifest_dir):
+        print(f"[phase 2] ✗ Manifest-Verzeichnis nicht gefunden: {manifest_dir}")
+        sys.exit(2)
+    
+    # Alle Manifeste auflisten (chronologisch sortiert)
+    manifest_files = sorted([
+        f.replace(".json", "") 
+        for f in os.listdir(manifest_dir) 
+        if f.endswith(".json")
+    ])
+    
+    if not manifest_files:
+        print(f"[phase 2] ✗ Keine Manifeste gefunden in {manifest_dir}")
+        sys.exit(2)
+    
+    print(f"[phase 2] ✓ {len(manifest_files)} Snapshots gefunden")
+    print(f"[phase 2]   Ältester: {manifest_files[0]}")
+    print(f"[phase 2]   Neuester: {manifest_files[-1]}")
+    
+    # === PHASE 3: Index aufbauen/reparieren ===
+    print()
+    if index_mode == "rebuild":
+        print("[phase 3] Baue Index von Grund auf aus Manifesten...")
+        master_index = rebuild_index_from_manifests(
+            snapshot_manifests=manifest_files,
+            snapshots_root=snaps_root,
+            manifest_dir=manifest_dir
+        )
+        print(f"[phase 3] ✓ Index erstellt: {len(master_index.get('items', {}))} Dateien")
+    
+    else:  # repair mode
+        print("[phase 3] Repariere String-Holder und entferne verwaiste Holder...")
+        repair_stats = repair_string_holders_to_dict(master_index, manifest_files)
+        print(f"[phase 3] ✓ Reparatur abgeschlossen")
+        print(f"[phase 3]   Repariert: {repair_stats['repaired']} Holder (String→Dict)")
+        print(f"[phase 3]   Korrigiert: {repair_stats['corrected_relpath']} Holder (falscher relpath)")
+        print(f"[phase 3]   Entfernt:  {repair_stats['removed']} Holder")
+        print(f"[phase 3]   Metadaten ergänzt: {repair_stats['enriched_metadata']} Holder (size/mtime/inode/ext)")
+        if repair_stats.get('orphaned_snapshots'):
+            print(f"[phase 3]   Gelöschte Snapshots entfernt:")
+            for snap in repair_stats['orphaned_snapshots']:
+                print(f"[phase 3]     - {snap}")
+        
+        # Nach Repair: anchor_path für alle Nodes setzen (falls fehlend)
+        print(f"[phase 3] Setze anchor_path für Nodes ohne anchor_path...")
+        anchor_set_count = 0
+        for sha, node in master_index.get("items", {}).items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("anchor_path"):
+                continue  # Bereits vorhanden
+            
+            holders = node.get("holders", [])
+            if not holders:
+                continue
+            
+            # Sortiere Holder chronologisch, nehme ältesten
+            valid_holders = [h for h in holders if isinstance(h, dict) and h.get("snapshot") and h.get("relpath")]
+            if not valid_holders:
+                continue
+            
+            valid_holders.sort(key=lambda x: x["snapshot"])
+            oldest = valid_holders[0]
+            node["anchor_path"] = f"{snaps_root}/{oldest['snapshot']}/{oldest['relpath']}"
+            anchor_set_count += 1
+        
+        if anchor_set_count > 0:
+            print(f"[phase 3]   anchor_path gesetzt: {anchor_set_count} Nodes")
+        
+        # KRITISCH: Nach Holder-Repair sind alte FileIDs inkonsistent!
+        # Lösche FileIDs um Enrichment zu erzwingen (SMART: nur wenn Repair stattfand)
+        force_enrich = getattr(args, 'force_enrich', False)
+        skip_enrich = getattr(args, 'skip_enrich', False)
+        
+        # Lösche FileIDs wenn: (1) force_enrich ODER (2) Repair hat Metadaten geändert
+        should_delete_fileids = force_enrich or (repair_stats.get('enriched_metadata', 0) > 0)
+        
+        if should_delete_fileids and not skip_enrich:
+            reason = "--force-enrich" if force_enrich else f"Holder-Repair ({repair_stats['enriched_metadata']} Holders geändert)"
+            print(f"[phase 3]   Lösche alte FileIDs für Re-Enrichment (Grund: {reason})...")
+            deleted_fileid = 0
+            deleted_hash = 0
+            for sha, node in master_index.get("items", {}).items():
+                if not isinstance(node, dict):
+                    continue
+                if "fileid" in node:
+                    del node["fileid"]
+                    deleted_fileid += 1
+                if "pcloud_hash" in node:
+                    del node["pcloud_hash"]
+                    deleted_hash += 1
+            print(f"[phase 3]   Gelöscht: {deleted_fileid} FileIDs, {deleted_hash} Hashes")
+        elif not skip_enrich:
+            print(f"[phase 3]   FileIDs behalten (kein Repair → keine Inkonsistenzen)")
+    
+    # === PHASE 3b: API-Metadaten ergänzen (FileID + pcloud_hash) ===
+    # Läuft in BEIDEN Modi (rebuild + repair)
+    enrich_enabled = not args.skip_enrich if hasattr(args, 'skip_enrich') else True
+    
+    if enrich_enabled:
+        print()
+        print("[phase 3b] Ergänze FileID + pcloud_hash per API...")
+        force_enrich = getattr(args, 'force_enrich', False)
+        debug_mode = getattr(args, 'debug', False)
+        enrich_method = getattr(args, 'enrich_method', 'stat')
+        
+        if force_enrich:
+            print("[phase 3b] ⚠ FORCE-ENRICH: Überschreibe existierende FileIDs")
+        if debug_mode:
+            print("[phase 3b] ⚠ DEBUG-MODUS aktiviert")
+        
+        print(f"[phase 3b] Methode: {enrich_method.upper()}")
+        
+        # Wähle Enrichment-Methode
+        if enrich_method == 'listfolder':
+            # BATCH-Modus: listfolder für alle Snapshots
+            enrich_stats = enrich_index_with_listfolder(
+                cfg=cfg,
+                index=master_index,
+                snapshots_root=snaps_root,
+                snapshot_order=manifest_files,
+                debug=debug_mode
+            )
+        else:
+            # STAT-Modus: Einzelne stat_file Calls (default)
+            enrich_stats = enrich_index_with_api_metadata(
+                cfg=cfg,
+                index=master_index,
+                dest_root=dest_root,
+                sample_only=False,
+                force_enrich=force_enrich,
+                debug=debug_mode
+            )
+        
+        if enrich_stats.get('enriched_fileid', 0) > 0:
+            print(f"[phase 3b] ✓ {enrich_stats['enriched_fileid']} FileIDs ergänzt")
+        if enrich_stats.get('enriched_pcloud_hash', 0) > 0:
+            print(f"[phase 3b] ✓ {enrich_stats['enriched_pcloud_hash']} pcloud_hash ergänzt")
+        if enrich_stats.get('skipped_fileid', 0) > 0:
+            print(f"[phase 3b] ⊘ {enrich_stats['skipped_fileid']} items hatten bereits FileID")
+        if enrich_stats.get('skipped_no_anchor', 0) > 0:
+            print(f"[phase 3b] ⚠ KRITISCH: {enrich_stats['skipped_no_anchor']} items ohne anchor_path!")
+            print(f"[phase 3b]   → Repair-Modus fügt keine anchor_path hinzu")
+            print(f"[phase 3b]   → Lösung: Remote-Index löschen und Rebuild verwenden")
+    else:
+        print()
+        print("[phase 3b] ⊘ API-Enrichment übersprungen (--skip-enrich)")
+        print("[phase 3b]   ⚠ Hinweis: fileid/pcloud_hash fehlen möglicherweise")
+    
+    # === PHASE 4: Time-Travel Archive generieren ===
+    print()
+    print("[phase 4] Generiere Time-Travel Archive...")
+    
+    generate_timetravel_archive(
+        cfg=cfg,
+        master_index=master_index,
+        snapshots_root=snaps_root,
+        snapshot_order=manifest_files,
+        archive_dir=archive_dir,
+        dry_run=args.dry_run
+    )
+    
+    # === PHASE 5: Master-Index speichern ===
+    if not args.dry_run:
+        print()
+        print("[phase 5] Speichere reparierten Master-Index...")
+        
+        # 1. Lokal
+        local_master = os.path.join(archive_dir, "content_index_master.json")
+        with open(local_master, 'w', encoding='utf-8') as f:
+            json.dump(master_index, f, indent=2, ensure_ascii=False)
+        print(f"[phase 5]   Lokal: {local_master}")
+        
+        # 2. Remote
+        try:
+            pc.ensure_parent_dirs(cfg, idx_path)  # _snapshots/_index/ ggf. anlegen
+            pc.write_json_at_path(cfg, idx_path, master_index)
+            print(f"[phase 5]   Remote: {idx_path}")
+            print(f"[phase 5] ✓ Master-Index aktualisiert")
+        except Exception as e:
+            print(f"[phase 5] ✗ Remote-Upload fehlgeschlagen: {e}")
+            sys.exit(2)
+    else:
+        print()
+        print("[phase 5] [dry-run] Master-Index nicht gespeichert")
+    
+    # === SUMMARY ===
+    print()
+    print("=" * 70)
+    print("✓ INDEX-REKONSTRUKTION ABGESCHLOSSEN")
+    print("=" * 70)
+    print(f"Master-Index: {len(master_index.get('items', {}))} Dateien")
+    print(f"Archive: {len(manifest_files)} Snapshots")
+    print()
+    print("Nutzung beim Löschen von Snapshots:")
+    print("  1. Letzten gültigen Snapshot ermitteln (z.B. 'snapshot_5')")
+    print("  2. Archive-Index kopieren:")
+    print(f"     cp {archive_dir}/snapshot_5_index.json \\")
+    print(f"        {archive_dir}/content_index_master.json")
+    print("  3. Remote hochladen:")
+    print("     python pcloud_repair_index.py --upload-master ...")
+    print()
+
+
+def main_rebuild():
+    """Entry point für --rebuild-from-manifests."""
+    ap = argparse.ArgumentParser(
+        description="Index-Rekonstruktion: Time-Travel Archive aus Manifesten",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Dieser Modus rekonstruiert den kompletten Index aus lokalen Manifesten und
+erzeugt Time-Travel Archive für jeden Snapshot.
+
+Workflow:
+  1. Remote Master-Index laden und String-Holder reparieren
+  2. Für jeden Snapshot: Index-Stand zu diesem Zeitpunkt generieren
+  3. Archive lokal und remote speichern
+  4. Master-Index aktualisieren
+
+Nutzen:
+  - Beim Löschen von Snapshots: Passenden Archive-Index kopieren
+  - Historie: Alle Index-Stände bleiben verfügbar
+  - Debugging: Lokale Kopien aller Versionen
+
+Beispiel:
+  python pcloud_repair_index.py --rebuild-from-manifests \\
+    --dest-root /backup-nas \\
+    --manifest-dir /srv/pcloud-archive/manifests \\
+    --archive-dir /srv/pcloud-archive/indexes
+""")
+    
+    ap.add_argument("--rebuild-from-manifests", action="store_true",
+                    help="Aktiviert Time-Travel Archive-Modus (wird automatisch erkannt)")
+    ap.add_argument("--dest-root", required=True,
+                    help="pCloud-Basispfad (z.B. /backup-nas)")
+    ap.add_argument("--manifest-dir",
+                    help="Verzeichnis mit Manifest-JSONs (default: /srv/pcloud-archive/manifests)")
+    ap.add_argument("--archive-dir",
+                    help="Lokales Archiv-Verzeichnis (default: /srv/pcloud-archive/indexes)")
+    ap.add_argument("--env-file",
+                    help="Pfad zur .env-Datei (optional)")
+    ap.add_argument("--profile",
+                    help="pCloud-Profil (optional)")
+    ap.add_argument("--skip-enrich", action="store_true",
+                    help="Überspringe FileID/pcloud_hash API-Enrichment (schneller, aber incomplete)")
+    ap.add_argument("--force-enrich", action="store_true",
+                    help="Erzwinge API-Enrichment auch wenn FileID bereits vorhanden (überschreibt alte FileIDs)")
+    ap.add_argument("--enrich-method", choices=['stat', 'listfolder'], default='listfolder',
+                    help="Enrichment-Methode: 'listfolder' (default, batch, sicher) oder 'stat' (einzeln)")
+    ap.add_argument("--debug", action="store_true",
+                    help="Aktiviere Debug-Ausgaben (API Responses, etc.)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Nur Report, keine Änderungen")
+    
+    args = ap.parse_args()
+    rebuild_complete_index(args)
+
+
+if __name__ == "__main__":
+    # Check welcher Modus (vor ArgumentParser um Konflikte zu vermeiden)
+    if "--rebuild-from-manifests" in sys.argv:
+        main_rebuild()
+    else:
+        main()

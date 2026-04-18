@@ -34,67 +34,27 @@ class IndexLoadError(Exception):
 
 def download_file_with_verify(cfg: Dict, remote_path: str, local_path: str, sha256_expected: Optional[str] = None) -> bool:
     """
-    Datei von pCloud downloaden mit SHA256-Verifikation und Chunk-Verarbeitung
-    
-    Args:
-        cfg: pCloud Config
-        remote_path: Pfad auf pCloud
-        local_path: Lokaler Ziel-Dateipfad
-        sha256_expected: SHA256 zur Verifikation
-    
-    Returns:
-        True wenn erfolgreich
+    Datei von pCloud streamen + SHA256-Verifikation.
+    RAM-schonend: kein vollständiges In-Memory-Puffern.
     """
     try:
-        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-        
-        # Download via get_textfile (für kleine Dateien) oder streaming
-        # Zuerst Dateigröße prüfen
         stat = pc.stat_file(cfg, path=remote_path, with_checksum=False) or {}
         file_size = stat.get("size", 0)
-        
-        log(f"Download: {remote_path} ({file_size} bytes)")
-        
-        hash_obj = hashlib.sha256() if sha256_expected else None
-        bytes_downloaded = 0
-        
-        # Für kleine Dateien: get_textfile
-        if file_size < CHUNK_SIZE:  # < 8 MiB
-            try:
-                content = pc.get_textfile(cfg, path=remote_path)
-                content_bytes = content.encode() if isinstance(content, str) else content
-                bytes_downloaded = len(content_bytes)
+        log(f"Download: {remote_path} ({file_size:,} bytes)")
 
-                with open(local_path, "wb") as f:
-                    f.write(content_bytes)
-
-                if hash_obj:
-                    hash_obj.update(content_bytes)
-            except Exception as e:
-                log(f"get_textfile fehlgeschlagen: {e}, versuche alternative...", "warn")
-                # Fallback: über fileid wenn vorhanden
-                if "fileid" in stat:
-                    return download_via_fileid(cfg, stat["fileid"], local_path, sha256_expected)
-                return False
-        else:
-            # Große Dateien: streaming via get_textfile mit Chunks
-            log(f"Große Datei ({file_size} bytes), verwende Chunk-Download...")
-            # Fallback: versuche über fileid
-            if "fileid" in stat:
-                return download_via_fileid(cfg, stat["fileid"], local_path, sha256_expected)
-            return False
-        
-        # SHA256-Verifikation
-        if sha256_expected and hash_obj:
-            actual_sha = hash_obj.hexdigest()
-            if actual_sha.lower() != sha256_expected.lower():
-                log(f"SHA256 MISMATCH: expected {sha256_expected}, got {actual_sha}", "error")
-                os.remove(local_path)
-                return False
-            log(f"✓ SHA256 OK")
-        
+        pc.download_binaryfile_to(
+            cfg, path=remote_path,
+            local_path=local_path,
+            sha256_verify=sha256_expected,
+        )
+        if sha256_expected:
+            log("\u2713 SHA256 OK")
         return True
-    
+
+    except ValueError as e:
+        # SHA256-Mismatch (Datei wurde von download_binaryfile_to gelöscht)
+        log(str(e), "error")
+        return False
     except Exception as e:
         log(f"Download fehlgeschlagen: {e}", "error")
         if os.path.exists(local_path):
@@ -106,36 +66,31 @@ def download_file_with_verify(cfg: Dict, remote_path: str, local_path: str, sha2
 
 def download_via_fileid(cfg: Dict, fileid: int, local_path: str, sha256_expected: Optional[str] = None) -> bool:
     """
-    Download via FileID (Binary API)
+    Download via FileID — streaming, RAM-schonend.
     """
     try:
-        # Stat per FileID
         stat = pc.stat_file(cfg, fileid=fileid, with_checksum=False) or {}
-        file_size = stat.get("size", 0)
-        
-        log(f"Download (FileID {fileid}): {file_size} bytes")
-        
-        # Versuche get_textfile mit FileID
-        content = pc.get_textfile(cfg, fileid=fileid)
-        content_bytes = content.encode() if isinstance(content, str) else content
-        
-        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-        with open(local_path, "wb") as f:
-            f.write(content_bytes)
-        
+        log(f"Download (FileID {fileid}): {stat.get('size', 0):,} bytes")
+
+        pc.download_binaryfile_to(
+            cfg, fileid=fileid,
+            local_path=local_path,
+            sha256_verify=sha256_expected,
+        )
         if sha256_expected:
-            hash_obj = hashlib.sha256()
-            hash_obj.update(content_bytes)
-            actual_sha = hash_obj.hexdigest()
-            if actual_sha.lower() != sha256_expected.lower():
-                log(f"SHA256 MISMATCH", "error")
-                os.remove(local_path)
-                return False
-        
+            log("\u2713 SHA256 OK")
         return True
-    
+
+    except ValueError as e:
+        log(str(e), "error")
+        return False
     except Exception as e:
         log(f"Download (FileID) fehlgeschlagen: {e}", "error")
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
         return False
 
 def verify_files(out_dir: str, items: List[Dict]) -> Dict[str, int]:
@@ -198,12 +153,10 @@ def load_index_from_pcloud(cfg: Dict, dest_root: str, snapshot: str) -> List[Dic
     """
     index_path = f"{dest_root}/_snapshots/_index/content_index.json"
     log(f"Lade Content-Index: {index_path}")
-    
+
     try:
-        # Download Index via Binary API
-        content = pc.get_textfile(cfg, path=index_path)
-        index = json.loads(content)
-        
+        index = pc.read_json_at_path(cfg, index_path, maxbytes=None)
+
         if "items" not in index:
             log("Index ungültig (keine 'items')", "error")
             raise IndexLoadError("Index ungültig (keine 'items')")
@@ -221,6 +174,7 @@ def load_index_from_pcloud(cfg: Dict, dest_root: str, snapshot: str) -> List[Dic
                         "sha256": sha256,
                         "fileid": obj.get("fileid"),
                         "anchor_path": anchor_path,
+                        "size": obj.get("size"),
                     })
         
         if not items:
@@ -265,6 +219,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
+  # Verfügbare Snapshots anzeigen
+  %(prog)s --manifest pcloud --list-snapshots
+
   # Plan anzeigen
   %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /tmp/restore
 
@@ -274,7 +231,8 @@ Beispiele:
     )
     
     ap.add_argument("--manifest", required=True, help="'pcloud' oder lokaler Manifest-Pfad")
-    ap.add_argument("--snapshot", required=True, help="Snapshot-Name")
+    ap.add_argument("--snapshot", help="Snapshot-Name")
+    ap.add_argument("--list-snapshots", action="store_true", help="Verfügbare Snapshots aus dem pCloud-Index anzeigen und beenden")
     ap.add_argument("--out-dir", help="Lokales Restore-Ziel (Basis, Snapshot wird als Unterordner angelegt – nur flat-Modus verpflichtend)")
 
     ap.add_argument("--mode", choices=["flat", "object-store"], default="flat",
@@ -300,6 +258,37 @@ Beispiele:
     ap.add_argument("--token")
     
     args = ap.parse_args()
+
+    # --list-snapshots: früh ausführen, kein --snapshot nötig
+    if args.list_snapshots:
+        cfg = pc.effective_config(
+            env_file=args.env_file,
+            env_dir=getattr(args, 'env_dir', None),
+            profile=args.profile,
+            overrides={
+                "host": args.host, "port": args.port,
+                "timeout": args.timeout, "device": args.device, "token": args.token,
+            }
+        )
+        index_path = f"{args.dest_root}/_snapshots/_index/content_index.json"
+        try:
+            index = pc.read_json_at_path(cfg, index_path, maxbytes=None)
+        except Exception as e:
+            log(f"Index laden fehlgeschlagen: {e}", "error")
+            return 2
+        snapshots: set[str] = set()
+        for obj in index.get("items", {}).values():
+            for h in obj.get("holders", []):
+                if h.get("snapshot"):
+                    snapshots.add(h["snapshot"])
+        print(f"Verfügbare Snapshots in {args.dest_root}:")
+        for s in sorted(snapshots, reverse=True):
+            print(f"  {s}")
+        return 0
+
+    if not args.snapshot:
+        log("--snapshot ist erforderlich (oder --list-snapshots für Übersicht)", "error")
+        return 2
 
     # Modus-Konflikte prüfen
     if args.download and args.verify_only:
@@ -375,9 +364,17 @@ Beispiele:
     if not args.download:
         log("Plan-Modus (keine Downloads, nur Vorschau):")
         for it in sel[:10]:
-            print(f"  {it.get('relpath')} [{it.get('sha256', '?')[:8]}]")
+            size_str = f", {it['size']:,} B" if it.get("size") is not None else ""
+            print(f"  {it.get('relpath')} [{it.get('sha256', '?')[:8]}]{size_str}")
         if len(sel) > 10:
             print(f"  ... ({len(sel) - 10} weitere)")
+        known_sizes = [it["size"] for it in sel if it.get("size") is not None]
+        if known_sizes:
+            total_bytes = sum(known_sizes)
+            total_mb = total_bytes / (1024 * 1024)
+            log(f"Gesamt: {len(sel)} Dateien, ~{total_mb:.1f} MB ({total_bytes:,} Bytes)")
+        else:
+            log(f"Gesamt: {len(sel)} Dateien (Größe nicht im Index verfügbar)")
         return 0
     
     # Echtes Restore
@@ -408,9 +405,21 @@ Beispiele:
                 continue
 
             # Deduplizierung innerhalb eines Laufs (SHA-Caching)
+            # Beide Dateien müssen lokal existieren, auch wenn sie denselben Inhalt haben!
             if sha256 and sha256 in sha_cache:
-                log("  → Cache Hit (SHA256, bereits in diesem Lauf geladen)")
-                stats["skipped"] += 1
+                cached_src = sha_cache[sha256]
+                if cached_src != local_dest and not os.path.exists(local_dest):
+                    log("  \u2192 Cache Hit (SHA256): erstelle Hardlink/Kopie")
+                    os.makedirs(os.path.dirname(local_dest) or ".", exist_ok=True)
+                    try:
+                        os.link(cached_src, local_dest)
+                    except OSError:
+                        import shutil
+                        shutil.copy2(cached_src, local_dest)
+                    stats["success"] += 1
+                else:
+                    log("  \u2192 Cache Hit (SHA256, Ziel bereits vorhanden)")
+                    stats["skipped"] += 1
                 continue
 
             # Bereits vorhandene lokale Datei prüfen und ggf. überspringen
@@ -435,17 +444,32 @@ Beispiele:
             # Verzeichnis erstellen
             os.makedirs(os.path.dirname(local_dest) or ".", exist_ok=True)
 
-            # Download von anchor_path (echte Datei, nicht Stub!)
+            # Download von anchor_path (echte Datei, nicht Stub!), fileid als Fallback
+            verify_hash = sha256 if args.verify else None
+
+            def _try_fileid_fallback() -> bool:
+                if fileid:
+                    log("  \u2192 Fallback: lade via fileid...", "warn")
+                    return download_via_fileid(cfg, fileid, local_dest, verify_hash)
+                log("  \u2717 Kein anchor_path und keine fileid vorhanden", "error")
+                return False
+
             if anchor_path:
-                verify_hash = sha256 if args.verify else None
                 if download_file_with_verify(cfg, anchor_path, local_dest, verify_hash):
+                    if sha256:
+                        sha_cache[sha256] = local_dest
+                    stats["success"] += 1
+                elif _try_fileid_fallback():
                     if sha256:
                         sha_cache[sha256] = local_dest
                     stats["success"] += 1
                 else:
                     stats["failed"] += 1
+            elif _try_fileid_fallback():
+                if sha256:
+                    sha_cache[sha256] = local_dest
+                stats["success"] += 1
             else:
-                log(f"  ✗ Kein anchor_path vorhanden", "error")
                 stats["failed"] += 1
 
         log("=" * 60)
@@ -470,6 +494,7 @@ Beispiele:
         relpath = item.get("relpath", f"?_{idx}")
         sha256 = item.get("sha256")
         anchor_path = item.get("anchor_path")
+        fileid = item.get("fileid")
         snapshot_name = args.snapshot
 
         if not sha256:
@@ -486,18 +511,23 @@ Beispiele:
         # Falls Objektdatei noch nicht existiert: aus pCloud holen
         if not os.path.exists(obj_path):
             os.makedirs(obj_dir, exist_ok=True)
-            if not anchor_path:
-                log("  ✗ Kein anchor_path vorhanden (Object-Store)", "error")
-                stats["failed"] += 1
-                continue
-
-            log(f"  → Objekt fehlt lokal, lade nach {obj_path}...")
             verify_hash = sha256 if args.verify else None
-            if download_file_with_verify(cfg, anchor_path, obj_path, verify_hash):
+
+            def _download_object() -> bool:
+                if anchor_path:
+                    log(f"  → Objekt fehlt lokal, lade nach {obj_path}...")
+                    if download_file_with_verify(cfg, anchor_path, obj_path, verify_hash):
+                        return True
+                    log("  → anchor_path fehlgeschlagen, versuche fileid...", "warn")
+                if fileid:
+                    return download_via_fileid(cfg, fileid, obj_path, verify_hash)
+                log("  ✗ Kein anchor_path und keine fileid vorhanden (Object-Store)", "error")
+                return False
+
+            if _download_object():
                 stats["objects"] += 1
             else:
                 log("  ✗ Download ins Object-Store fehlgeschlagen", "error")
-                # Sicherheitsmaßnahme: defekte Datei entfernen
                 try:
                     if os.path.exists(obj_path):
                         os.remove(obj_path)

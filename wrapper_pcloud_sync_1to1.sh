@@ -253,7 +253,8 @@ PY
 
 # --- Remote Snapshot Listing (Python/REST) ---
 load_remote_snapshots() {
-  "${PY}" - <<'PY'
+  # Timeout: max. 120s für den gesamten Scan (PCLOUD_SNAPSHOT_SCAN_LIMIT * ~1s/stat_file)
+  timeout 120 "${PY}" - <<'PY'
 import os, sys, json
 sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
@@ -274,10 +275,34 @@ if int(js.get("result", -1)) != 0:
     print("")
     raise SystemExit(0)
 
-names = []
+# Nur Snapshots mit .upload_complete Marker zurückgeben.
+# Ordner ohne Marker = Abbruch-Artefakt → nicht als "vorhanden" zählen,
+# damit Gap-Detection und Backfill korrekt anschlagen.
+# Limit: max. PCLOUD_SNAPSHOT_SCAN_LIMIT Snapshots prüfen (Default: 60).
+# Bei sehr vielen Snapshots (>100) die ältesten überspringen — für
+# Gap-Detection und Backfill sind nur die letzten N relevant.
+MAX_SNAPS = int(os.environ.get("PCLOUD_SNAPSHOT_SCAN_LIMIT", "60"))
+candidates = []
 for c in (js.get("metadata") or {}).get("contents", []) or []:
-    if c.get("isfolder") and c.get("name") != "_index":
-        names.append(c["name"])
+    if not c.get("isfolder"):
+        continue
+    name = c.get("name", "")
+    if name == "_index":
+        continue
+    candidates.append(name)
+
+# Neueste zuerst prüfen (ISO-Datum → lexikographisch sortierbar)
+candidates.sort(reverse=True)
+candidates = candidates[:MAX_SNAPS]
+
+names = []
+for name in candidates:
+    marker_path = f"{snap_root}/{name}/.upload_complete"
+    try:
+        pc.stat_file(cfg, path=marker_path, with_checksum=False)
+        names.append(name)
+    except Exception:
+        pass  # Kein Marker → Abbruch-Artefakt, nicht ausgeben
 for n in sorted(names):
     print(n)
 PY
@@ -288,10 +313,24 @@ remote_has_snapshots() {
   [[ -n "$out" ]] && echo YES || echo NO
 }
 
+# Cache für remote_snapshot_exists: einmal laden, danach grep auf Cache.
+# Verhindert N×API-Calls pro Snapshot im Gap-Detection-Loop.
+_REMOTE_SNAPSHOTS_CACHE=""
+_remote_snapshots_loaded=0
+
+_ensure_remote_snapshots_cache() {
+  if [[ "$_remote_snapshots_loaded" -eq 0 ]]; then
+    _REMOTE_SNAPSHOTS_CACHE="$(load_remote_snapshots || true)"
+    _remote_snapshots_loaded=1
+  fi
+}
+
 remote_snapshot_exists() {
   local snapname="$1"
-  local out; out="$(load_remote_snapshots || true)"
-  grep -qx "$snapname" <<<"$out" && echo YES || echo NO
+  # Nur Snapshots mit .upload_complete gelten als vorhanden.
+  # load_remote_snapshots filtert Abbruch-Artefakte bereits heraus.
+  _ensure_remote_snapshots_cache
+  grep -qx "$snapname" <<<"$_REMOTE_SNAPSHOTS_CACHE" && echo YES || echo NO
 }
 
 local_snapshot_names() {
@@ -301,6 +340,59 @@ local_snapshot_names() {
 }
 
 remote_snapshot_names() { load_remote_snapshots; }
+
+# --- Gap Handling: Snapshot Integrity Validation ---
+validate_snapshot_integrity() {
+  local snapshot="$1"
+  
+  # 1. Check: Manifest lokal vorhanden?
+  local manifest="${PCLOUD_ARCHIVE_DIR}/manifests/${snapshot}.json"
+  if [[ ! -f "$manifest" ]]; then
+    echo "MISSING_MANIFEST"
+    return
+  fi
+  
+  # 2. Check: Manifest enthält korrekte ref_snapshot?
+  local ref_snapshot; ref_snapshot=$(jq -r '.ref_snapshot // "null"' "$manifest" 2>/dev/null || echo "null")
+  if [[ "$ref_snapshot" == "null" ]]; then
+    # Erstes Manifest (kein Referenz-Snapshot) → immer OK
+    echo "OK"
+    return
+  fi
+  
+  # 3. Prüfe ob Referenz-Snapshot vorhanden ist (remote)
+  if [[ "$(remote_snapshot_exists "$ref_snapshot")" == "NO" ]]; then
+    echo "BROKEN_CHAIN"  # Referenz fehlt → Chain unterbrochen
+    return
+  fi
+  
+  # 4. Optional: Delta-Check (quick_delta für gesamte Root - aufwändig!)
+  # Für PoC: Manifest + Ref-Check genügt
+  echo "OK"
+}
+
+# --- Gap Handling: Remote Snapshot löschen ---
+delete_remote_snapshot() {
+  local snapshot="$1"
+  _log INFO "Deleting remote snapshot: $snapshot"
+  
+  "${PY}" - <<PY
+import os, sys
+sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
+import pcloud_bin_lib as pc
+
+cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
+dest_root = os.environ.get("PCLOUD_DEST","/Backup/rtb_1to1")
+snap_path = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots/${snapshot}"
+
+try:
+    pc.delete_folder(cfg, path=snap_path, recursive=True)
+    print("OK")
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
 
 need_retention_sync() {
   local locals remotes s remote_only=""
@@ -364,10 +456,26 @@ build_and_push() {
   local RET=""
   [[ "$(need_retention_sync)" == "YES" ]] && RET="--retention-sync"
 
+  # Delta-Copy: standardmäßig aktiv (Auto-Mode).
+  # Der Stub-Ratio-Check im Push-Tool entscheidet intern:
+  #   - SAFE-MODE:  Basis hat zu wenig Stubs → push_1to1_mode() (Stubs schreiben)
+  #   - TURBO-MODE: Basis stub-ifiziert        → copyfolder + Delta
+  # PCLOUD_USE_DELTA_COPY=0 deaktiviert Delta-Copy explizit (z.B. für Debugging).
+  local DELTA_FLAG="--use-delta-copy"
+  [[ "${PCLOUD_USE_DELTA_COPY:-1}" == "0" ]] && DELTA_FLAG=""
+
   # Upload phase
   T0=$(date +%s)
   _db_phase_log "upload" "start"
-  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE" || {
+
+  # Log-Hinweis
+  if [[ -n "$DELTA_FLAG" ]]; then
+    _log INFO "Upload-Modus: Delta-Copy Auto (SAFE/TURBO wird intern via Stub-Ratio entschieden)"
+  else
+    _log INFO "Upload-Modus: Full-Mode (PCLOUD_USE_DELTA_COPY=0)"
+  fi
+  
+  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET $DELTA_FLAG --env-file "$ENV_FILE" || {
     _db_phase_log "upload" "end" "FAILED"
     rm -f "$mani" 2>/dev/null || true
     return 1
@@ -456,9 +564,9 @@ if [[ -L "${RTB}/latest" || -d "${RTB}/latest" ]]; then
   fi
 fi
 
-# Bootstrap (remote leer)
+# Bootstrap (remote leer - Initial Sync)
 if [[ "$(remote_has_snapshots)" == "NO" ]]; then
-  _log INFO "Bootstrap: Remote empty – backfilling all local snapshots (old → new)"
+  _log INFO "Bootstrap: Remote empty – uploading all local snapshots (initial sync)"
   mapfile -t SNAPS < <(find "$RTB" -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' | sort)
   if [[ ${#SNAPS[@]} -eq 0 ]]; then
     _log WARN "No local snapshots found"
@@ -481,30 +589,157 @@ fixed = finalize_index_fileids(cfg, snapshots_root)
 print(f"[finalize] index fileids fixed={fixed}")
 PY
   _db_run_end SUCCESS 0
-  _log INFO "Bootstrap/backfill completed successfully"
+  _log INFO "Bootstrap completed successfully"
   exit 0
 fi
 
-# Intelligentes Gap-Backfilling (statt nur latest)
+# Sync-Check: Fehlende Snapshots erkennen und hochladen
 _log INFO "Checking for missing snapshots..."
 uploaded_count=0
+gap_count=0
+new_count=0
+rebuild_count=0
 
-for s in $(local_snapshot_names); do
+# Listen für Gap-Erkennung
+mapfile -t local_snaps < <(local_snapshot_names)
+mapfile -t remote_snaps < <(remote_snapshot_names)
+
+# Gap-Strategie (env-var oder default)
+GAP_STRATEGY=${PCLOUD_GAP_STRATEGY:-optimistic}  # conservative|optimistic|aggressive
+
+for s in "${local_snaps[@]}"; do
   if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    _log WARN "Gap detected: Snapshot $s missing remote – backfilling..."
-    build_and_push "$RTB/$s" || {
-      _db_run_end FAILED 1 "Gap backfill failed for $s"
-      exit 1
-    }
-    uploaded_count=$((uploaded_count + 1))
+    # Gap-Erkennung: Gibt es einen SPÄTEREN Snapshot, der remote existiert?
+    is_gap=0
+    later_snaps=()
+    for later in "${local_snaps[@]}"; do
+      if [[ "$later" > "$s" ]]; then
+        if [[ "$(remote_snapshot_exists "$later")" == "YES" ]]; then
+          is_gap=1
+          later_snaps+=("$later")
+        fi
+      fi
+    done
+    
+    # === GAP-HANDLING ===
+    if [[ $is_gap -eq 1 ]]; then
+      _log WARN "Gap detected: Snapshot $s missing remote (${#later_snaps[@]} later snapshots exist)"
+      gap_count=$((gap_count + 1))
+      
+      case "$GAP_STRATEGY" in
+        conservative)
+          # Fall CONSERVATIVE: Abbruch, manuelle Intervention nötig
+          _log ERROR "Gap detected in conservative mode – manual intervention required!"
+          _log ERROR "Later snapshots may have broken hardlink chains: ${later_snaps[*]}"
+          _log ERROR "Run with PCLOUD_GAP_STRATEGY=optimistic to auto-repair"
+          _db_run_end FAILED 1 "Gap detected (conservative mode)"
+          exit 1
+          ;;
+          
+        optimistic)
+          # Fall OPTIMISTIC: Prüfe Integrität, entscheide A vs. B
+          _log INFO "Validating integrity of later snapshots..."
+          needs_rebuild=0
+          
+          for later in "${later_snaps[@]}"; do
+            status=$(validate_snapshot_integrity "$later")
+            _log INFO "  → $later: $status"
+            
+            if [[ "$status" != "OK" ]]; then
+              _log WARN "Snapshot $later integrity compromised (ref-chain broken)"
+              needs_rebuild=1
+              break
+            fi
+          done
+          
+          if [[ $needs_rebuild -eq 1 ]]; then
+            # Szenario A: Broken chain → Rebuild
+            _log WARN "Gap caused broken chain – rebuilding ${#later_snaps[@]} snapshot(s)"
+            
+            # Lösche kompromittierte Snapshots
+            for later in "${later_snaps[@]}"; do
+              delete_remote_snapshot "$later" || {
+                _log ERROR "Failed to delete $later"
+                _db_run_end FAILED 1 "Gap repair failed (delete)"
+                exit 1
+              }
+            done
+            
+            # Upload Gap + alle Folgenden in richtiger Reihenfolge
+            build_and_push "$RTB/$s" || {
+              _db_run_end FAILED 1 "Gap backfill failed: $s"
+              exit 1
+            }
+            
+            for later in "${later_snaps[@]}"; do
+              build_and_push "$RTB/$later" || {
+                _db_run_end FAILED 1 "Rebuild failed: $later"
+                exit 1
+              }
+              rebuild_count=$((rebuild_count + 1))
+            done
+            
+            uploaded_count=$((uploaded_count + 1 + ${#later_snaps[@]}))
+            _log INFO "Gap repair complete: rebuilt chain ($s + ${#later_snaps[@]} later)"
+          else
+            # Szenario B: Chain intact → nur Gap füllen
+            _log INFO "Later snapshots intact – backfilling gap only"
+            build_and_push "$RTB/$s" || {
+              _db_run_end FAILED 1 "Gap backfill failed: $s"
+              exit 1
+            }
+            uploaded_count=$((uploaded_count + 1))
+          fi
+          ;;
+          
+        aggressive)
+          # Fall AGGRESSIVE: Immer rebuilden (sicher, aber ineffizient)
+          _log WARN "Gap detected in aggressive mode – auto-rebuilding chain"
+          
+          for later in "${later_snaps[@]}"; do
+            delete_remote_snapshot "$later" || true  # Ignoriere Fehler
+          done
+          
+          build_and_push "$RTB/$s"
+          for later in "${later_snaps[@]}"; do
+            build_and_push "$RTB/$later"
+            rebuild_count=$((rebuild_count + 1))
+          done
+          
+          uploaded_count=$((uploaded_count + 1 + ${#later_snaps[@]}))
+          _log INFO "Gap repair complete (aggressive rebuild)"
+          ;;
+          
+        *)
+          _log ERROR "Unknown GAP_STRATEGY: $GAP_STRATEGY"
+          exit 1
+          ;;
+      esac
+      
+    else
+      # === NEUER SNAPSHOT (kein Gap) ===
+      _log INFO "New snapshot detected: $s (not yet on pCloud) – uploading..."
+      new_count=$((new_count + 1))
+      
+      build_and_push "$RTB/$s" || {
+        _db_run_end FAILED 1 "Upload failed for $s"
+        exit 1
+      }
+      uploaded_count=$((uploaded_count + 1))
+    fi
   fi
 done
 
 if [[ $uploaded_count -eq 0 ]]; then
   _log INFO "All snapshots already on pCloud"
 else
-  _log INFO "Successfully uploaded $uploaded_count snapshot(s)"
-  _db_update_metrics "gaps_backfilled = $uploaded_count"
+  if [[ $rebuild_count -gt 0 ]]; then
+    _log INFO "Successfully processed $uploaded_count snapshot(s) (gaps: $gap_count, new: $new_count, rebuilt: $rebuild_count)"
+    _db_update_metrics "gaps_synced = $gap_count, new_snapshots = $new_count, rebuilt_snapshots = $rebuild_count"
+  else
+    _log INFO "Successfully uploaded $uploaded_count snapshot(s) (gaps: $gap_count, new: $new_count)"
+    _db_update_metrics "gaps_synced = $gap_count, new_snapshots = $new_count"
+  fi
 fi
 
 # Cleanup: Alte Temp-Dateien löschen (>7 Tage)

@@ -1,132 +1,46 @@
 # pCloud-Tools
 
-Deduplizierte Cloud-Backups mit JSON-Manifest-Architektur für die pCloud-API. Ermöglicht platzsparende Snapshots ähnlich wie `rsync --hard-links`, aber in der Cloud.
+Automatisierte, deduplizierte Cloud-Backups für die pCloud-API. Lokale Rsync-Snapshots werden effizient in die Cloud synchronisiert: jede Datei wird genau einmal physisch gespeichert, alle weiteren Snapshots referenzieren sie als Metadaten-Stubs. Ein typischer Nacht-Lauf mit 50 MB Änderungen an einem 90-GB-Bestand dauert wenige Minuten.
 
-Funktioniert auf Linux/Debian. Hauptvorteil: **Content-based Deduplication** (SHA256) - gleiche Dateien werden nur einmal hochgeladen, Snapshots bestehen aus JSON-Metadaten + Verweisen auf File-Pool. Vollständige Restore-Funktion rekonstruiert Backups aus Manifests.
+Läuft vollautomatisch als systemd-Timer auf Linux/Debian (Raspberry Pi). Nach dem initialen Setup ist kein manueller Eingriff nötig.
+
+→ **Architektur & Ablaufkette:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
+→ **Setup-Anleitung:** [docs/SETUP.md](docs/SETUP.md)
 
 ---
 
 ## 📚 Table of Contents
 
-- [🏗️ Projekt-Übersicht](#️-projekt-übersicht-secure-nas--backup-ecosystem)
-  - [📦 Repositories](#-repositories)
-  - [🎯 Die Entstehungsgeschichte](#-die-entstehungsgeschichte)
-  - [🔗 Zusammenspiel der Komponenten](#-zusammenspiel-der-komponenten)
-- [🛠️ Technologie-Stack](#️-technologie-stack)
+- [Repositories & Zusammenspiel](#repositories--zusammenspiel)
 - [Installation](#installation)
-- [Usage](#usage)
-- [Features](#features)
-- [📊 Monitoring & Alerting](#-monitoring--alerting)
-  - [Web Dashboard (Phase 3)](#web-dashboard-phase-3)
-  - [Push Notifications (Phase 4)](#push-notifications-phase-4)
-  - [Status Aggregator (Phase 2)](#status-aggregator-phase-2)
-- [Examples](#examples)
-- [How It Works](#how-it-works)
-- [Integration with Backup Pipeline](#integration-with-backup-pipeline)
-- [Best Practices](#best-practices)
-- [Contributing](#contributing)
-- [License](#license)
+- [Kern-Tools](#kern-tools)
+- [Wartung & Diagnose](#wartung--diagnose-manuell)
+- [Monitoring & Alerting](#monitoring--alerting)
+- [Dokumentation](#dokumentation)
+- [Technologie-Stack](#technologie-stack)
 
 ---
 
-# 🏗️ Projekt-Übersicht: Secure NAS & Backup Ecosystem
+## Repositories & Zusammenspiel
 
-## 📦 Repositories
+pCloud-Tools ist Teil einer mehrstufigen Backup-Pipeline. Jedes Repo steht für sich, sie können aber kombiniert werden:
 
-Dieses Projekt besteht aus mehreren zusammenhängenden Komponenten:
+| Repo | Funktion |
+|---|---|
+| **[entropy-watcher-und-clamav-scanner](https://github.com/lastphoenx/entropy-watcher-und-clamav-scanner)** | Security Gate vor dem Backup (Entropy + ClamAV) |
+| **[rtb](https://github.com/lastphoenx/rtb)** | Wrapper für Rsync Time Backup: startet Backup nur bei erkannten Änderungen |
+| **[rsync-time-backup](https://github.com/laurent22/rsync-time-backup)** (extern) | Hardlink-basierte lokale Snapshots |
+| **pCloud-Tools** (dieser Repo) | Deduplizierter Upload lokaler Snapshots in die pCloud |
 
-- **[EntropyWatcher & ClamAV Scanner](https://github.com/lastphoenx/entropy-watcher-und-clamav-scanner)** - Pre-Backup Security Gate mit Intrusion Detection
-- **[pCloud-Tools](https://github.com/lastphoenx/pcloud-tools)** - Deduplizierte Cloud-Backups mit JSON-Manifest
-- **[RTB Wrapper](https://github.com/lastphoenx/rtb)** - Delta-Detection für Rsync Time Backup
-- **[Rsync Time Backup](https://github.com/laurent22/rsync-time-backup)** (Original) - Hardlink-basierte lokale Backups
-
----
-
-## 🎯 Die Entstehungsgeschichte
-
-### Von proprietären NAS-Systemen zu Debian
-
-Die Reise begann mit Frustration: **QNAP** (TS-453 Pro, TS-473A, TS-251+) und **LaCie 5big NAS Pro** waren zwar funktional, aber sobald man mehr als die Standard-Features wollte, wurde es zum Gefrickel. Autostart-Scripts, limitierte Shell-Umgebungen, fehlende Packages - man kam einfach nicht ans Ziel.
-
-**Die Lösung:** Wechsel auf ein vollwertiges **Debian-System**. Hardware: **Raspberry Pi 5** mit **Radxa Penta SATA HAT** (5x 2.5" SATA-SSDs), Samba-Share mit Recycling-Bin. Volle Kontrolle, Standard-Tools, keine Vendor-Lock-ins.
-
-### Der Weg zur vollautomatisierten Backup-Pipeline
-
-#### 1️⃣ **RTB Wrapper** - Delta-gesteuerte Backups
-
-Ziel: Automatisierte lokale Backups mit Deduplizierung über Standard-Debian-Tools.
-
-Ich entschied mich für [Rsync Time Backup](https://github.com/laurent22/rsync-time-backup) - ein cleveres Script, das `rsync --hard-links` nutzt, um platzsparende Snapshots zu erstellen. **Problem:** Das Script lief immer, auch wenn keine Änderungen vorlagen.
-
-**Lösung:** Der [RTB Wrapper](https://github.com/lastphoenx/rtb) prüft vorher ob überhaupt ein Delta existiert (via `rsync --dry-run`). Nur bei echten Änderungen wird das Backup ausgeführt.
-
-#### 2️⃣ **EntropyWatcher + ClamAV** - Pre-Backup Security Gate
-
-Eine Erkenntnis: **Backups von infizierten Dateien sind wertlos.** Schlimmer noch - sie verbreiten Malware in die Backup-Historie und Cloud.
-
-**Lösung:** [EntropyWatcher & ClamAV Scanner](https://github.com/lastphoenx/entropy-watcher-und-clamav-scanner) analysiert `/srv/nas` (und optional das OS) auf:
-- **Entropy-Anomalien** (verschlüsselte/komprimierte verdächtige Dateien)
-- **Malware-Signaturen** (ClamAV)
-- **Safety-Gate-Mechanismus:** Backups werden nur bei grünem Status ausgeführt
-
-Später erweitert auf das gesamte Betriebssystem (`/`, `/boot`, `/home`).
-
-#### 3️⃣ **Honeyfiles** - Intrusion Detection mit Ködern
-
-Der **Shai-Hulud 2.0 npm Worm** zeigte: Moderne Malware sucht aktiv nach Credentials (`~/.aws/credentials`, `.git-credentials`, `.env`-Dateien).
-
-**Gegenmaßnahme:** **Honeyfiles** - 7 randomisiert benannte Köder-Dateien, überwacht durch **auditd** auf Kernel-Ebene:
-- **Tier 1:** Zugriff auf Honeyfile = sofortiger Alarm + Backup-Blockade
-- **Tier 2:** Zugriff auf Honeyfile-Config = verdächtig
-- **Tier 3:** Manipulation an auditd = kritischer Alarm
-
-#### 4️⃣ **pCloud-Tools** - Deduplizierte Cloud-Backups
-
-Mit funktionierender lokaler Backup- und Security-Pipeline kam die Frage: **Wie bekomme ich das sicher in die Cloud?**
-
-**Anforderung:** Deduplizierung wie bei `rsync --hard-links` (Inode-Prinzip), aber `rclone` konnte das nicht.
-
-**Lösung:** [pCloud-Tools](https://github.com/lastphoenx/pcloud-tools) mit **JSON-Manifest-Architektur**:
-- **JSON-Stub-System:** Jedes Backup speichert nur Metadaten + Verweise auf echte Files
-- **Inhalts-basierte Deduplizierung:** Gleicher SHA256-Hash = gleiche Datei = kein Upload
-- **Restore-Funktion:** Rekonstruiert komplette Backups aus Manifests + File-Pool
-
----
-
-## 🔗 Zusammenspiel der Komponenten
-
+**Ablaufkette (vollständige Pipeline):**
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  1. EntropyWatcher + ClamAV (Safety Gate)                   │
-│     ↓ GREEN = Sicher | YELLOW = Warnung | RED = STOP        │
-└─────────────────────────────────────────────────────────────┘
-                            ↓ (nur bei GREEN)
-┌─────────────────────────────────────────────────────────────┐
-│  2. RTB Wrapper prüft: Hat sich was geändert?               │
-│     ↓ JA = Delta erkannt | NEIN = Skip Backup               │
-└─────────────────────────────────────────────────────────────┘
-                            ↓ (nur bei Delta)
-┌─────────────────────────────────────────────────────────────┐
-│  3. Rsync Time Backup (lokale Snapshots mit Hard-Links)     │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│  4. pCloud-Tools (deduplizierter Upload in Cloud)           │
-└─────────────────────────────────────────────────────────────┘
-
-       [Honeyfiles überwachen parallel das gesamte System]
+EntropyWatcher + ClamAV  →  RTB Wrapper  →  rsync-time-backup  →  pCloud-Tools
+      (Safety Gate)          (Dry-Run)        (Hardlink-Snap)      (Cloud-Sync)
 ```
 
----
-
-## 🛠️ Technologie-Stack
-
-- **OS:** Debian Bookworm (Raspberry Pi 5)
-- **Storage:** 5x 2.5" SATA SSD (Radxa Penta SATA HAT)
-- **File Sharing:** Samba mit Recycling-Bin
-- **Security:** auditd, ClamAV, Python-basierte Entropy-Analyse
-- **Backup:** rsync, JSON-Manifests, pCloud API
-- **Automation:** Bash, systemd-timer, Git-Workflow
+Der Einstiegspunkt ist `rtb_wrapper.sh` (rtb-Repo), der nach erfolgreichem lokalem Backup automatisch `wrapper_pcloud_sync_1to1.sh` aufruft.  
+→ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
+→ Entstehungsgeschichte & Gesamt-Pipeline: [rtb/README.md](https://github.com/lastphoenx/rtb#die-entstehungsgeschichte)
 
 ---
 
@@ -136,459 +50,106 @@ Mit funktionierender lokaler Backup- und Security-Pipeline kam die Frage: **Wie 
 git clone https://github.com/lastphoenx/pcloud-tools
 cd pcloud-tools
 
-# Python Virtual Environment erstellen
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Konfiguration
 cp .env.example .env
-# Edit .env with your pCloud credentials
+# .env mit pCloud-Credentials befüllen
 ```
 
-**Abhängigkeiten:**  
-Alle Skripte nutzen Python-Standardbibliothek. Optional: [`python-dotenv`](https://pypi.org/project/python-dotenv/) für `.env`-Support.
-
-## Usage
-
-```
-Primary Tools:
-  pcloud_json_manifest.py                    Create JSON manifests from local backups
-  pcloud_push_json_manifest_to_pcloud.py     Upload manifests + deduplicated files
-  pcloud_restore.py                          Restore backups from manifests
-  pcloud_integrity_check.py                  Verify cloud backup integrity
-
-Helper Tools:
-  pcloud_bin_lib.py                          Binary client library for pCloud API
-  wrapper_pcloud_sync_1to1.sh                Shell wrapper for backup automation
-
-Umgebungsvariablen (.env):
-  PCLOUD_USER                                pCloud username
-  PCLOUD_PASS                                pCloud password
-  PCLOUD_REGION                              Region (eu|us)
-  LOCAL_BACKUP_ROOT                          Local source directory
-  PCLOUD_BACKUP_ROOT                         Cloud destination directory
-```
-
-## Features
-
-* **JSON-Manifest-Architektur** - Snapshots bestehen aus Metadaten + Verweise auf File-Pool
-
-* **Content-based Deduplication** - SHA256-basiert: gleiche Datei wird nur einmal gespeichert
-
-* **Space Efficiency** - Wie `rsync --hard-links`, aber in der Cloud
-
-* **Full Restore** - Rekonstruiert komplette Backups aus Manifests + File-Pool
-
-* **Integrity Check** - Verifiziert Cloud-Backups gegen SHA256-Hashes
-
-* **Incremental Uploads** - Nur neue/geänderte Dateien werden hochgeladen
-
-* **Python Standard Library** - Keine externen API-Wrapper nötig
-
-* **Automation-Ready** - Shell-Wrapper für systemd-Timer Integration
-
-## Technical Improvements (April 2026)
-
-Recent optimizations have significantly improved reliability, performance, and robustness:
-
-### Network & Upload Stability
-* **DNS Caching** - Reduces DNS resolution overhead for repeated API calls
-* **HTTP Keep-Alive Sessions** - Persistent connections reduce TCP handshake latency
-* **Chunked Upload for Large Files** - Files >100MB use multi-part upload (5MB chunks by default)
-  - Automatic retry per chunk (8 attempts with exponential backoff)
-  - Session refresh on connection errors (prevents stale socket issues)
-  - Proper `Content-Type: application/octet-stream` headers
-* **Correct pCloud API Usage**:
-  - `upload_create`: Only `access_token` parameter
-  - `upload_write`: Binary data with proper headers
-  - `upload_save`: Uses `folderid` + `name` (not `path`)
-
-### Resume & Recovery
-* **Index-Driven Skip Logic** - Maintains local index (`/tmp/pcloud_index_<snapshot>.json`) with successfully uploaded files
-  - On restart: Automatically skips already-uploaded files
-  - Safe for multi-TB uploads over days/weeks
-  - Configurable index save interval (default: every 100 files via `--index-save-interval`)
-* **Incremental Index Updates** - Index saved during upload (not just at end)
-* **Upload to pCloud on Success** - Index uploaded to snapshot folder after successful completion
-
-### Security & Privacy
-* **Token Scrubbing** - Access tokens automatically removed from exception messages (regex-based)
-  - Prevents accidental token leaks in logs/error reports
-  - Applied to HTTP errors and connection exceptions
-
-### Performance Tuning
-* **Configurable Timeouts** - Adjustable via `PCLOUD_TIMEOUT` or `PCLOUD_TIMEOUT_SECS` env vars
-* **Chunk Parameters**:
-  - `PCLOUD_CHUNK_SIZE` - Chunk size in bytes (default: 5MB)
-  - `PCLOUD_CHUNK_RETRIES` - Retry attempts per chunk (default: 8)
-  - `PCLOUD_CHUNK_DELAY` - Delay between chunks in seconds (default: 0.15s)
-  - `PCLOUD_CHUNK_THRESHOLD` - File size threshold for chunked upload (default: 100MB)
-* **Batch Folder Creation** - Minimizes API calls when creating directory structures:
-  - Single recursive `listfolder()` call fetches all existing remote folders
-  - Diff against manifest folders to identify only missing directories
-  - Creates only missing folders (sorted by depth for parent-first creation)
-  - `PCLOUD_FOLDER_CREATE_SLEEP` - Rate limiting between folder creation (default: 0.05s)
-* **Directory Caching** - In-memory cache (`_KNOWN_DIRS`) prevents redundant folder existence checks
-
-### Resume Capability
-* **Automatic Resume on Restart** - Local index file `/tmp/pcloud_index_<snapshot>.json` tracks uploaded files
-  - On restart: Automatically detects and resumes incomplete uploads
-  - Skips already uploaded files (no re-upload waste)
-  - Safe for multi-TB uploads over days/weeks
-* **Index Save Intervals**:
-  - `PCLOUD_INDEX_SAVE_INTERVAL=100` - Save index every N files (default: 100)
-  - `PCLOUD_INDEX_SAVE_INTERVAL_TIME=300` - OR save every N seconds (default: 300 = 5 min)
-  - Whichever trigger fires first wins (hybrid approach)
-* **Command Line Options**:
-  ```bash
-  # Resume: Just re-run the same command
-  python pcloud_push_json_manifest_to_pcloud.py \
-    --manifest /path/to/snapshot.json \
-    --dest-root /Backup/rtb_1to1 \
-    --snapshot-mode 1to1 \
-    --env-file .env
-  
-  # Optional: Clean up old snapshots before upload (1to1 mode only)
-  --retention-sync
-  
-  # Test run without actual upload
-  --dry-run
-  ```
-
-### Logging & Visibility
-* **Progress Indicators** - Real-time upload progress for large files
-* **Verbose Mode** - `PCLOUD_VERBOSE=1` shows per-chunk progress
-* **Better Error Messages** - Clearer diagnostics for network/API failures
-
-### Example Configuration
-```bash
-# .env or environment
-PCLOUD_CHUNK_SIZE=$((5 * 1024 * 1024))    # 5MB chunks
-PCLOUD_CHUNK_RETRIES=8                     # 8 retry attempts
-PCLOUD_CHUNK_DELAY=0.15                    # 150ms between chunks
-PCLOUD_TIMEOUT=300                         # 5min timeout
-PCLOUD_VERBOSE=1                           # Show detailed logs
-```
-
-**Real-world Impact:** Successfully uploaded 19,808 files / 89.66 GB including 910MB video files that previously failed with connection errors.
+→ Vollständige Setup-Anleitung inkl. MariaDB, systemd-Timer und erstem Backup-Run: [docs/SETUP.md](docs/SETUP.md)
 
 ---
 
-## 📊 Monitoring & Alerting
+## Kern-Tools
 
-### Web Dashboard (Phase 3)
+Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper angestossen und sollten **nicht verschoben** werden:
 
-**Real-time monitoring dashboard** for all backup and security services:
+| Datei | Funktion |
+|---|---|
+| `wrapper_pcloud_sync_1to1.sh` | Orchestrator: ruft alle Phasen in Reihenfolge auf |
+| `pcloud_json_manifest.py` | Manifest-Erstellung (Smart-Hashing via inode/mtime) |
+| `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication |
+| `pcloud_quick_delta.py` | Post-Upload-Verifikation (Delta-Check) |
+| `pcloud_bin_lib.py` | pCloud Binary-API-Bibliothek (Connection, Retry, Chunked Upload) |
+| `create_folder_template.py` | Einmaliges Setup des `_folder_template`-Cache (SAFE-MODE Beschleunigung) |
+| `pcloud_health_check.sh` | Backup-Status, Quota, Alter — Nagios/Zabbix-kompatibel |
+| `pcloud_status.sh` | Interaktives Status-Dashboard aus MariaDB |
 
-📍 **Location:** `dashboard/index.html`  
-🎨 **Tech Stack:** Vanilla HTML/CSS/JavaScript (no dependencies)  
-📡 **Data Source:** `/opt/apps/monitoring/status.json` (auto-refresh every 30s)
+---
 
-**Features:**
-- ✅ **Systemd Service Status** - entropy-watcher, clamav, honeyfile-monitor, cleanup-samba-recycle, backup-pipeline
-- 📦 **Backup Script Status** - RTB wrapper, pCloud sync
-- 🎯 **Color-coded Status Cards** - Green (OK), Yellow (WARNING), Red (CRITICAL)
-- 📱 **Responsive Design** - Works on desktop, tablet, mobile
-- 🔄 **Auto-refresh** - Updates every 30 seconds
-- 🔒 **nginx + Authentik Ready** - SSO integration support
+## Wartung & Diagnose (manuell)
+
+Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen:
+
+| Datei | Funktion |
+|---|---|
+| `scripts/cleanup_aborted_upload.sh` | Bereinigt abgebrochene Uploads (lokal + remote) |
+| `scripts/cleanup_orphaned_manifests.sh` | Entfernt Manifeste ohne zugehörigen Snapshot |
+| `scripts/fix_stubs_missing_fileid.py` | Repariert Stubs ohne FileID (nach API-Fehlern) |
+| `scripts/rewrite_stubs_from_index.py` | Regeneriert alle Stubs eines Snapshots aus dem Index |
+| `scripts/pcloud_manifest_diff.py` | Vergleicht zwei Manifeste (Diff-Ansicht) |
+| `scripts/pcloud_integrity_check.py` | Tiefenprüfung: Hashes, FileIDs, Holder-Konsistenz |
+| `scripts/pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
+| `scripts/pcloud_restore.py` | ⚠️ Stellt Snapshots von pCloud wieder her (Notfall-Tool) |
+| `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
+
+---
+
+## Monitoring & Alerting
+
+Dashboard und Alerting sind implementiert; die systemd/nginx-Integration auf dem Pi ist noch einzurichten.
+
+**Vorhandene Komponenten:**
+
+| Datei | Funktion |
+|---|---|
+| `dashboard/index.html` | Web-Dashboard (Vanilla HTML/JS, kein Framework) — zeigt Status aller Services |
+| `scripts/aggregate_status.sh` | Sammelt Status aller Services als `/opt/apps/monitoring/status.json` |
+| `scripts/send_alert.sh` | pCloud-spezifische Alerts via Apprise |
+| `scripts/send_aggregated_alert.sh` | Multi-Service-Alerts, erkennt Statuswechsel (kein Spam) |
 
 **Quick Setup:**
 ```bash
-# 1. Deploy dashboard
+# Dashboard deployen
 sudo mkdir -p /var/www/monitoring
 sudo cp dashboard/index.html /var/www/monitoring/
 
-# 2. Configure nginx
-sudo nano /etc/nginx/sites-available/monitoring
-# See dashboard/README.md for nginx config
-
-# 3. Setup aggregator (collects status)
-sudo crontab -e
-# Add: */5 * * * * /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
-```
-
-**Screenshot Example:**
-```
-┌─────────────────────────────────────────────────────┐
-│ 🖥️ Backup & Monitoring Dashboard                   │
-│ pi-nas • 2026-04-15 14:30:00                        │
-└─────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────┐
-│              ✅ OK                                  │
-│        Overall System Status                         │
-└─────────────────────────────────────────────────────┘
-
-📋 Systemd Services               🔧 Backup Scripts
-┌──────────────────────┐          ┌──────────────────────┐
-│ Entropywatcher Nas   │          │ RTB Wrapper          │
-│ ● Active             │          │ ● Success            │
-│ Last: 14:00          │          │ Snapshots: 12        │
-└──────────────────────┘          └──────────────────────┘
-```
-
-**See:** [dashboard/README.md](dashboard/README.md) for full setup instructions.
-
-### Push Notifications (Phase 4)
-
-**Intelligent alerting** with status change detection via [Apprise](https://github.com/caronc/apprise).
-
-**Scripts:**
-- **`send_alert.sh`** - pCloud-specific alerts
-- **`send_aggregated_alert.sh`** - Multi-service alerts (all backups + monitoring)
-
-**Features:**
-- 🔔 **100+ Services** - Telegram, Discord, ntfy.sh, Gotify, Pushover, Email...
-- 🎯 **Smart Detection** - Only alerts on status CHANGES (no spam!)
-- 🎨 **Severity Levels** - ✅ OK, ⚠️ WARNING, 🚨 CRITICAL
-- 🔄 **State Tracking** - Remembers last known status
-- 📝 **Detailed Issues** - Shows failed services, error messages
-
-**Example Alert (Telegram):**
-```
-🚨 CRITICAL - System Monitoring (pi-nas)
-
-Overall Status: CRITICAL
-Reason: Status changed: OK → CRITICAL
-
-Summary:
-  • Failed Services: 2
-  • Inactive Services: 1
-
-Timestamp: 2026-04-15 14:30:22
-
-View detailed status:
-  cat /opt/apps/monitoring/status.json
-```
-
-**Quick Setup:**
-```bash
-# 1. Install Apprise
-sudo apt install python3-apprise
-
-# 2. Configure Telegram (or other services)
-sudo cp apprise.yml.example /opt/apps/apprise.yml
-sudo nano /opt/apps/apprise.yml
-# Add Telegram bot token + chat ID (see docs/TELEGRAM.md)
-
-# 3. Secure config
-sudo chown root:root /opt/apps/apprise.yml
-sudo chmod 600 /opt/apps/apprise.yml
-
-# 4. Test notifications
-./scripts/send_aggregated_alert.sh --test
-
-# 5. Automate with systemd (recommended)
-sudo cp systemd/monitoring-alert.{service,timer}.example /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now monitoring-alert.timer
-
-# Alternative: Automate with cron
-*/5 * * * * /opt/apps/pcloud-tools/main/scripts/send_aggregated_alert.sh
-```
-
-**Systemd Integration (Recommended):**
-The monitoring-alert.timer automatically triggers after status updates:
-- Runs after `monitoring-status-update.service` completes
-- Fallback: Every 30 minutes
-- Only sends notifications when status changes
-
-**See:**
-- [docs/TELEGRAM.md](docs/TELEGRAM.md) - Complete Telegram bot setup guide
-- [systemd/README.md](systemd/README.md) - Systemd service installation
-- [apprise.yml.example](apprise.yml.example) - Multi-service configuration
-
-**Supported Services (via tags):**
-- **Telegram** (`tag: telegram`) - Bot via @BotFather
-- **Discord** (`tag: discord`) - Server webhook
-- **ntfy.sh** (`tag: ntfy`) - Self-hosted or cloud
-
-**See:** [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md) for detailed configuration.
-
-### Status Aggregator (Phase 2)
-
-**Central status collector** that monitors all backup and monitoring services.
-
-📍 **Script:** `scripts/aggregate_status.sh`  
-📊 **Output:** `/opt/apps/monitoring/status.json`
-
-**Monitored Components:**
-```bash
-# Systemd Services
-- entropywatcher-nas
-- entropywatcher-os
-- entropywatcher-nas-av
-- entropywatcher-os-av
-- honeyfile-monitor
-- cleanup-samba-recycle
-- backup-pipeline
-
-# Backup Scripts
-- RTB Wrapper (via /var/log/backup/rtb_wrapper.log)
-- pCloud Backup (via pcloud_health_check.sh --json)
-```
-
-**JSON Output Example:**
-```json
-{
-  "timestamp": "2026-04-15T14:30:00Z",
-  "hostname": "pi-nas",
-  "overall_status": "OK",
-  "exit_code": 0,
-  "services": {
-    "entropywatcher-nas": {
-      "status": "active",
-      "enabled": "yes",
-      "last_start": "2026-04-15T14:00:00Z",
-      "exit_code": "0",
-      "message": "Scan completed successfully"
-    }
-  },
-  "scripts": {
-    "rtb_wrapper": {
-      "status": "success",
-      "last_run": "2026-04-15 14:00:00",
-      "snapshot_count": 12
-    },
-    "pcloud_backup": {
-      "status_code": 0,
-      "status_text": "OK"
-    }
-  }
-}
-```
-
-**Usage:**
-```bash
-# Run manually (verbose)
-./scripts/aggregate_status.sh --verbose
-
-# Automation (cron - every 5 minutes)
+# Status-Aggregator (cron, alle 5 min)
 */5 * * * * /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
 
-# Custom output location
-MONITORING_OUTPUT=/tmp/status.json ./scripts/aggregate_status.sh
+# Alerts aktivieren
+sudo cp apprise.yml.example /opt/apps/apprise.yml
+# Telegram/Discord/ntfy-Credentials eintragen
 ```
 
-**Exit Codes:**
-- `0` = All OK
-- `1` = Warnings detected
-- `2` = Critical issues found
+→ Dashboard-Setup (nginx): [dashboard/README.md](dashboard/README.md)  
+→ Apprise-Konfiguration: [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md)
 
 ---
 
-## Examples
+## Dokumentation
 
-* **JSON-Manifest aus lokalem Backup erstellen:**
+| Dokument | Inhalt |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architektur, Ablaufkette, SAFE/TURBO-Logik, Tool-Inventar |
+| [docs/SETUP.md](docs/SETUP.md) | Vollständige Installations-Anleitung |
+| [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md) | Alerting-Konfiguration (Telegram, Discord, ntfy…) |
+| [docs/RCLONE_TOKEN_REFRESH.md](docs/RCLONE_TOKEN_REFRESH.md) | pCloud OAuth-Token erneuern (headless/SSH) |
+| [docs/GAP_HANDLING.md](docs/GAP_HANDLING.md) | Gap-Handling: Szenarien, Strategien, Troubleshooting + Quick Start |
+| [docs/GAP_HANDLING_FAQ.md](docs/GAP_HANDLING_FAQ.md) | Gap-Handling: FAQs |
+| [docs/GAP_HANDLING_WORKFLOWS.md](docs/GAP_HANDLING_WORKFLOWS.md) | Gap-Handling: Visuelle Workflow-Diagramme (Mermaid) |
+| [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md) | Technische Analyse der Delta-Copy-Implementierung |
+| [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Technical Deep Dive:** Gap-Handling, Delta-Copy, Index-System, Performance, Security |
 
-```bash
-python pcloud_json_manifest.py \
-  --source /mnt/backup/latest \
-  --output /tmp/manifest_$(date +%Y%m%d).json
-```
+---
 
-* **Deduplizierter Upload in pCloud:**
+## Technologie-Stack
 
-```bash
-python pcloud_push_json_manifest_to_pcloud.py \
-  --manifest /tmp/manifest_20251214.json \
-  --pool-dir /pCloudBackups/file_pool \
-  --manifest-dir /pCloudBackups/manifests
-```
-
-* **Backup wiederherstellen:**
-
-```bash
-python pcloud_restore.py \
-  --manifest /pCloudBackups/manifests/manifest_20251214.json \
-  --pool-dir /pCloudBackups/file_pool \
-  --output /mnt/restore/2024-12-14
-```
-
-* **Integritäts-Check:**
-
-```bash
-python pcloud_integrity_check.py \
-  --manifest /pCloudBackups/manifests/manifest_20251214.json \
-  --pool-dir /pCloudBackups/file_pool
-```
-
-* **Automatisierung via Wrapper:**
-
-```bash
-# wrapper_pcloud_sync_1to1.sh ruft die Tools in korrekter Reihenfolge auf
-bash wrapper_pcloud_sync_1to1.sh /mnt/backup/latest
-```
-
-## How It Works
-
-**Architektur:**
-
-```
-1. JSON-Manifest erstellen (lokal)
-   ├─ Scannt Backup-Verzeichnis
-   ├─ Berechnet SHA256 für jede Datei
-   └─ Speichert Metadaten (path, size, mtime, sha256) in JSON
-
-2. Deduplizierter Upload
-   ├─ Prüft für jede Datei: SHA256 bereits im Pool?
-   ├─ JA → Nur Manifest-Verweis, kein Upload
-   └─ NEIN → Upload in file_pool/<first_2_chars_of_sha256>/<sha256>
-
-3. Restore
-   ├─ Liest Manifest
-   ├─ Für jeden Eintrag: Download aus file_pool/<sha256>
-   └─ Rekonstruiert Original-Verzeichnisstruktur
-```
-
-**File-Pool-Struktur:**
-
-```
-/pCloudBackups/
-├─ file_pool/
-│  ├─ a7/
-│  │  └─ a7f3e9d8c2b1... (Datei mit SHA256 = a7f3e9...)
-│  ├─ b8/
-│  │  └─ b8g2h1k9f3c4...
-│  └─ ...
-└─ manifests/
-   ├─ manifest_20251201.json
-   ├─ manifest_20251208.json
-   └─ manifest_20251214.json
-```
-
-**Deduplizierung:**
-- Datei `photo.jpg` in 10 Snapshots → 1x im file_pool, 10x Verweis im Manifest
-- Platzersparnis: ~90% bei typischen Backup-Historien
-
-## Integration with Backup Pipeline
-
-Dieses Tool ist **Stufe 4** in der automatisierten Backup-Pipeline:
-
-1. **EntropyWatcher + ClamAV** (Safety Gate) → EXIT 0 = GREEN
-2. **RTB Wrapper** prüft Delta → JA = Änderungen erkannt
-3. **Rsync Time Backup** erstellt lokalen Snapshot
-4. **pCloud-Tools** (dieser Repo) → deduplizierter Cloud-Upload
-
-**Wrapper-Integration:**
-
-```bash
-# In rtb_wrapper.sh (nach erfolgreichem rsync):
-if [ $RSYNC_EXIT -eq 0 ]; then
-  bash wrapper_pcloud_sync_1to1.sh "$BACKUP_LATEST_DIR"
-fi
-```
-
-## Best Practices
-
-* **Manifest-Naming** - Zeitstempel verwenden: `manifest_$(date +%Y%m%d_%H%M%S).json`
-
-* **Pool-Cleanup** - Alte SHA256-Dateien nur löschen, wenn kein Manifest mehr darauf verweist
-
-* **Integrity Checks** - Regelmäßig nach Upload ausführen (wöchentlich empfohlen)
-
-* **Bandwidth** - Bei großen Uploads: `--rate-limit` in pCloud-API nutzen
-
-* **Restore-Tests** - Monatliche Test-Restores in Staging-Umgebung
-
-* **Region** - `PCLOUD_REGION=eu` für EU-Datacenter (DSGVO-Compliance)
+- **OS:** Debian Bookworm (Raspberry Pi 5)
+- **Storage:** 5x 2.5" SATA SSD (Radxa Penta SATA HAT)
+- **Backup:** rsync, JSON-Manifests, pCloud Binary API
+- **Automation:** Bash, systemd-Timer
+- **Monitoring:** Vanilla HTML/JS Dashboard, Apprise (Alerts)
+- **DB:** MariaDB (Backup-Historie, Status-Tracking)
