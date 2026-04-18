@@ -241,7 +241,27 @@ check_rtb_wrapper() {
   if [[ -d "/mnt/backup/rtb_nas" ]]; then
     snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
   fi
-  
+
+  # ---- Dry-Run pre-check result ----
+  # The wrapper runs rsync --dry-run before each backup to decide if a new
+  # snapshot is needed. Parse the most recent [check] block from the log.
+  local dry_run_result="unknown"
+  local dry_run_ts=""
+  if echo "$log_tail" | grep -q '\[check\] Prüfe auf Änderungen'; then
+    # Find where the LAST [check] line is and look at what follows it
+    local last_check_lineno
+    last_check_lineno=$(echo "$log_tail" | grep -n '\[check\] Prüfe auf Änderungen' | tail -1 | cut -d: -f1)
+    local tail_from_check
+    tail_from_check=$(echo "$log_tail" | tail -n +"$last_check_lineno")
+    if echo "$tail_from_check" | grep -q 'Änderungen erkannt'; then
+      dry_run_result="changes_detected"
+      dry_run_ts=$(echo "$tail_from_check" | grep 'Änderungen erkannt' | head -1 | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' || echo "")
+    elif echo "$tail_from_check" | grep -q 'Keine Änderungen'; then
+      dry_run_result="no_changes"
+      dry_run_ts=$(echo "$tail_from_check" | grep 'Keine Änderungen' | head -1 | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' || echo "")
+    fi
+  fi
+
   # Escape message and details
   message=$(escape_json "$message")
   details=$(escape_json "$details")
@@ -272,6 +292,12 @@ check_rtb_wrapper() {
   fi
   if [[ "$live_safety_gate" != "N/A" ]]; then
     json="$json,\"live_safety_gate\":\"$live_safety_gate\""
+  fi
+  if [[ "$dry_run_result" != "unknown" ]]; then
+    json="$json,\"dry_run_result\":\"$dry_run_result\""
+    if [[ -n "$dry_run_ts" ]]; then
+      json="$json,\"dry_run_ts\":\"$dry_run_ts\""
+    fi
   fi
   json="$json}"
   

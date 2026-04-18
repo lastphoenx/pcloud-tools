@@ -12,6 +12,10 @@ Type=simple
 User=root
 Group=root
 
+# If using a virtualenv (check with: ls /opt/apps/venv-*/bin/python3), replace
+# /usr/bin/python3 with the venv interpreter, e.g.:
+#   ExecStart=/opt/apps/venv-20260331-1756/bin/python3 /opt/apps/pcloud-tools/main/scripts/telegram_commander.py
+# Find the active venv python while the venv is activated: "which python3"
 ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/scripts/telegram_commander.py
 
 # Restart on failure (Telegram API hiccups, network drops)

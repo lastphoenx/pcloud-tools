@@ -430,6 +430,7 @@
         +   '<div class="info-group">'
         +     '<div class="info-row"><span class="lbl">RTB letzter Lauf</span><span class="val">' + fmtTs(rtb.last_run) + '</span></div>'
         +     '<div class="info-row"><span class="lbl">RTB Snapshots</span><span class="val">' + snapCount + '</span></div>'
+        +     rtbDryRunHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
         +     (perf.total_runs ? (
@@ -634,6 +635,8 @@
       rows += drow('Status letzter Lauf', rtb.status || 'unknown', rtbCls(rtb.status))
         + drow('Letzter Lauf', fmtTs(rtb.last_run))
         + drow('Snapshots', String(rtb.snapshot_count || 0));
+      const drObj = rtbDryRunObj(rtb);
+      if (drObj) rows += drow('N\xe4chstes Backup', drObj.text, drObj.cls);
       // ── Histor. Safety-Gate + Erklärung zum letzten Lauf ──────
       if (rtb.safety_gate)
         rows += drow('Safety-Gate (letzter Lauf)', rtb.safety_gate, sgValCls(rtb.safety_gate));
@@ -831,6 +834,24 @@
         return parts.join(' \u2002|\u2002 ');
       }
       return '';
+    }
+
+    // Returns {text, cls} for the dry-run pre-check result, or null
+    function rtbDryRunObj(rtb) {
+      const r  = rtb.dry_run_result;
+      const ts = rtb.dry_run_ts ? '  (' + fmtTs(rtb.dry_run_ts) + ')' : '';
+      if (r === 'changes_detected')
+        return { text: '\u26a1 \xc4nderungen erkannt \u2014 Backup steht bevor' + ts, cls: 'yellow' };
+      if (r === 'no_changes')
+        return { text: '\u2713 Keine \xc4nderungen \u2014 kein Backup n\xf6tig' + ts, cls: 'green' };
+      return null;
+    }
+    // Inline HTML for the tile info-row
+    function rtbDryRunHTML(rtb) {
+      const o = rtbDryRunObj(rtb);
+      if (!o) return '';
+      return '<div class="info-row"><span class="lbl">N\xe4chstes Backup</span>'
+           + '<span class="val ' + o.cls + '">' + o.text + '</span></div>';
     }
 
     function rtbCls(status) {
