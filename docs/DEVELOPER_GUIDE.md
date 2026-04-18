@@ -1,19 +1,26 @@
-# Developer Guide: pCloud Gap-Handling & Delta-Copy
+# Developer Guide: pCloud Backup-Pipeline
 
 > Lebende Systemdokumentation für Entwickler und Betrieb.
 > Bei strukturellen Änderungen bitte aktualisieren.
+>
+> **Konvention:** Alle Code-Referenzen nutzen Funktionsnamen statt Zeilennummern,
+> damit der Guide auch nach Refactoring aktuell bleibt.
 
 ---
 
 ## 📋 Übersicht
 
-Die pCloud-Backup-Pipeline wurde **komplett umgebaut** mit drei Hauptkomponenten:
+Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
 
-1. **Gap-Handling-System** (wrapper_pcloud_sync_1to1.sh) - Intelligente Lückenreparatur
-2. **Delta-Copy-Modus** (pcloud_push_json_manifest_to_pcloud.py) - Server-seitiges Klonen
-3. **Integrity-Verification** (pcloud_quick_delta.py) - Tamper-Detection
+| # | Säule | Hauptkomponente | Zweck |
+|---|-------|-----------------|-------|
+| 1 | **Fundament** | `pcloud_bin_lib.py` | Binary-API, Streaming, RAM-Schutz |
+| 2 | **Upload & Gap-Handling** | `wrapper_pcloud_sync_1to1.sh` | Orchestrierung, Lückenreparatur |
+| 3 | **Delta-Copy (TURBO)** | `pcloud_push_json_manifest_to_pcloud.py` | Server-seitiges Klonen |
+| 4 | **Resilient Restore** | `scripts/pcloud_restore.py` | Binary-safe Download, Dedup |
+| 5 | **Recovery & Time-Travel** | `scripts/pcloud_repair_index.py` | Index-Reparatur, Snapshot-Rekonstruktion |
 
-**Status:** Production-Ready, vollständig dokumentiert (5 Docs)
+**Status:** Production-Ready auf Raspberry Pi
 
 ---
 
@@ -43,15 +50,24 @@ Die pCloud-Backup-Pipeline wurde **komplett umgebaut** mit drei Hauptkomponenten
         │                                 │
         └────────────┬────────────────────┘
                      ▼
-        ┌─────────────────────────────┐
-        │  Python-Tools (Backend)     │
-        ├─────────────────────────────┤
-        │ • pcloud_json_manifest.py   │
-        │ • pcloud_push_...py         │
-        │ • pcloud_quick_delta.py     │
-        │ • pcloud_manifest_diff.py   │
-        │ • pcloud_bin_lib.py         │
-        └─────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Python-Tools (Backend)                                │
+├─────────────────────────────────────────────────────────┤
+│  Upload-Pipeline:                                      │
+│  • pcloud_json_manifest.py    (Manifest-Erzeugung)     │
+│  • pcloud_push_...py          (Upload + Delta-Copy)    │
+│  • pcloud_quick_delta.py      (Tamper-Detection)       │
+│  • scripts/pcloud_manifest_diff.py (Manifest-Diff)     │
+│                                                         │
+│  Recovery-Tools (scripts/):                            │
+│  • pcloud_restore.py          (Snapshot-Download)      │
+│  • pcloud_repair_index.py     (Index-Reparatur)        │
+│  • pcloud_integrity_check.py  (Konsistenz-Prüfung)    │
+│  • pcloud_verify_index_vs_manifests.py                 │
+│                                                         │
+│  Fundament:                                            │
+│  • pcloud_bin_lib.py          (Binary-API + Streaming) │
+└─────────────────────────────────────────────────────────┘
                      │
                      ▼
         ┌─────────────────────────────┐
@@ -62,15 +78,146 @@ Die pCloud-Backup-Pipeline wurde **komplett umgebaut** mit drei Hauptkomponenten
 
 ---
 
-## 🔍 Detailanalyse: Gap-Handling-System
+## 🧱 Säule 1: Das Fundament — pcloud_bin_lib.py (2065 Zeilen)
 
-### 1. Implementierung (wrapper_pcloud_sync_1to1.sh)
+Die gesamte Pipeline baut auf `pcloud_bin_lib.py` auf. Diese Bibliothek implementiert
+die **pCloud Binary-API** (kein REST-SDK, sondern ein eigener Binär-Protokoll-Client)
+und stellt alle Tools bereit, die die oberen Schichten nutzen.
+
+### Warum eine eigene Binary-API?
+
+pCloud bietet neben der REST-API eine **binäre TCP/TLS-Schnittstelle** auf Port 8399.
+Der Vorteil: kompakteres Request/Response-Format, weniger Overhead.
+Die Bibliothek implementiert einen minimalen Decoder (`_BinReader`), der die
+pCloud-spezifischen Typenbereiche (Strings 0-7/100-199, Numbers 8-15/200-219,
+Hashes Typ 16, Arrays Typ 17, Booleans 18/19, Data 20) parst.
+
+**Kern-Ablauf jedes API-Calls:**
+
+```
+1. Request bauen      → _build_request(method, params, data_len)
+2. TLS-Verbindung     → _connect(host, port, timeout) mit DNS-Cache
+3. Senden + Empfangen → _rpc() → (response_hash, optional_data_bytes)
+4. Ergebnis prüfen    → _expect_ok() → RuntimeError bei result != 0
+```
+
+### Kritische Funktion: `read_json_at_path()`
+
+```python
+def read_json_at_path(cfg, path, maxbytes=None):
+    """
+    Liest JSON von pCloud.
+    
+    KRITISCH: maxbytes=None (Default) = unbegrenzt.
+    
+    Hintergrund: Der frühere Default war 1MB (maxbytes=1048576).
+    Das führte bei großen content_index.json (>1MB bei 20k+ Dateien)
+    zu abgeschnittenem JSON → JSONDecodeError → Pipeline-Crash.
+    
+    Fix: maxbytes=None entfernt das Limit komplett.
+    Alle Aufrufer (restore, quick_delta, push) nutzen jetzt maxbytes=None.
+    """
+    txt = get_textfile(cfg, path=path, maxbytes=maxbytes)
+    return json.loads(txt)
+```
+
+**Warum das wichtig ist:** Jedes Tool, das den content_index.json liest,
+ruft letztlich diese Funktion auf. Ein falsches Limit = defekter Index = Chaos.
+
+### Drei Stufen des Datei-Downloads
+
+Die Library bietet drei Wege, Dateien von pCloud zu holen — jeder für einen
+anderen Use-Case optimiert:
+
+| Funktion | RAM-Verbrauch | Use-Case |
+|----------|---------------|----------|
+| `get_textfile()` | Gesamte Datei im RAM | Kleine Texte (<1MB): JSON, Manifeste |
+| `get_binaryfile()` | Gesamte Datei im RAM | Kleine Binärdateien |
+| `download_binaryfile_to()` | **Konstant ~8 MiB** | Große Dateien: Fotos, Videos, Archive |
+
+#### `download_binaryfile_to()` — RAM-schonender Streaming-Download
+
+Das ist **die** kritische Funktion für den Raspberry Pi (512 MB - 4 GB RAM).
+Ohne Streaming würde ein 500 MB Video den gesamten RAM belegen.
+
+**So funktioniert es (vereinfacht für Nicht-Python-Entwickler):**
+
+```python
+def download_binaryfile_to(cfg, *, path=None, fileid=None,
+                            local_path, sha256_verify=None, chunk_size=8*1024*1024):
+    # 1. Signierten Download-Link holen (getfilelink API)
+    link = get_signed_download_link(cfg, path or fileid)
+    
+    # 2. Streaming-Download: statt r.content (= alles in RAM)
+    #    nutzen wir r.iter_content() (= 8 MiB Häppchen)
+    hash_obj = hashlib.sha256()
+    
+    with session.get(link, stream=True) as r:      # stream=True = Kern des Tricks!
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size): # 8 MiB pro Iteration
+                f.write(chunk)                       # Sofort auf Disk
+                hash_obj.update(chunk)               # SHA256 mitberechnen
+    
+    # 3. SHA256-Verifikation (optional aber empfohlen)
+    actual_sha = hash_obj.hexdigest()
+    if sha256_verify and actual_sha != sha256_verify:
+        os.remove(local_path)  # Korrupte Datei sofort löschen
+        raise ValueError(f"SHA256 MISMATCH: expected {sha256_verify}, got {actual_sha}")
+    
+    return actual_sha
+```
+
+**Der Trick erklärt:**
+- `stream=True` sagt der HTTP-Library: "Lade den Body NICHT sofort komplett."
+- `iter_content(chunk_size=8MB)` gibt die Daten stückweise zurück.
+- Jedes Stück wird sofort auf die Festplatte geschrieben und für den SHA256-Hash verarbeitet.
+- **Maximaler RAM-Verbrauch: ~8 MiB** — egal ob die Datei 1 MB oder 10 GB groß ist.
+
+### Weitere wichtige Funktionen
+
+| Funktion | Zweck |
+|----------|-------|
+| `copyfolder()` | Server-seitiges Klonen (Delta-Copy Phase 2) |
+| `copyfile()` | Server-seitige Dateikopie (Index-Archivierung) |
+| `ensure_path()` / `ensure_path_cached()` | Ordnerstruktur rekursiv anlegen |
+| `upload_streaming()` | Datei-Upload via REST mit Keep-Alive Session |
+| `delete_folder(recursive=True)` | Snapshot-Löschung (Gap-Handling) |
+| `stat_file()` | Datei-Metadaten (fileid, size, hash) |
+| `call_with_backoff()` | Retry mit exponential Backoff bei API-Fehlern |
+| `effective_config()` | Config aus .env + Profilen + Overrides zusammenbauen |
+
+### Keep-Alive Session & DNS-Cache
+
+Zwei Performance-Optimierungen, die bei tausenden API-Calls den Unterschied machen:
+
+```python
+# 1. Globale Keep-Alive Session (Modul-Level, einmalig)
+_session = requests.Session()
+_session.headers.update({"Connection": "keep-alive"})
+adapter = HTTPAdapter(max_retries=2, pool_connections=10, pool_maxsize=10)
+# → Wiederverwendet TCP-Verbindungen statt jedes Mal neu aufzubauen
+
+# 2. DNS-Cache (verhindert tausende DNS-Lookups)
+_dns_cache = {}
+def _resolve_cached(host, port):
+    key = (host, port)
+    if key not in _dns_cache:
+        _dns_cache[key] = socket.getaddrinfo(host, port, AF_INET, SOCK_STREAM)[0][4][0]
+    return _dns_cache[key]
+```
+
+---
+
+## 🔍 Säule 2: Gap-Handling & Upload-Orchestrierung
+
+### 1. Implementierung (wrapper_pcloud_sync_1to1.sh, 645 Zeilen)
 
 **Hauptfunktionen:**
 
-#### `validate_snapshot_integrity()` (Zeile 306-334)
+#### `validate_snapshot_integrity()`
 
-**Zweck:** Prüft ob ein Snapshot konsistent ist (3-Stufen-Check)
+**Zweck:** Prüft ob ein Snapshot konsistent ist (3-Stufen-Check).
+Wird im Optimistic-Modus aufgerufen, um zwischen Scenario A und B zu unterscheiden.
 
 **Check-Sequence:**
 ```bash
@@ -102,7 +249,7 @@ Die pCloud-Backup-Pipeline wurde **komplett umgebaut** mit drei Hauptkomponenten
 
 ---
 
-#### `delete_remote_snapshot()` (Zeile 336-356)
+#### `delete_remote_snapshot()`
 
 **Zweck:** Löscht Remote-Snapshot rekursiv
 
@@ -124,24 +271,24 @@ _log INFO "Deleting remote snapshot: 2026-04-15"
 
 ---
 
-#### Gap-Detection-Loop (Zeile 565-698)
+#### Gap-Detection-Loop (Hauptschleife nach `# Sync-Check`)
 
 **Workflow:**
 
 ```bash
 1. Snapshot-Listen laden
-   local_snaps=()   # find $RTB -type d
-   remote_snaps=()  # load_remote_snapshots (Python)
+   local_snaps=()   # find $RTB -type d (lokal)
+   remote_snaps=()  # load_remote_snapshots (Python → REST listfolder)
 
 2. For each local_snap:
    IF remote existiert NICHT:
      → Prüfe: Existieren SPÄTERE Snapshots remote?
        JA → Gap detected (is_gap=1)
-       NEIN → Neuer Snapshot (regulärer Upload)
+       NEIN → Neuer Snapshot (regulärer Upload via build_and_push)
 
 3. Gap-Handling nach Strategie:
-   → Conservative: ABORT
-   → Optimistic: Validate → A/B
+   → Conservative: ABORT + Manual
+   → Optimistic: validate_snapshot_integrity() → Scenario A/B
    → Aggressive: DELETE + REBUILD
 ```
 
@@ -184,47 +331,88 @@ gap_count        # Gefüllte Gaps
 new_count        # Neue Snapshots (kein Gap)
 rebuild_count    # Rebuilder Snapshots (Scenario A)
 
-→ MariaDB: gaps_synced, new_snapshots, rebuilt_snapshots
+# → MariaDB (Tabelle: backup_runs):
+#   gaps_synced       = Anzahl gefüllter Lücken
+#   new_snapshots     = Neu hochgeladene Snapshots
+#   rebuilt_snapshots = Anzahl Snapshots die wegen Scenario A (Broken Chain)
+#                       gelöscht und komplett neu hochgeladen werden mussten.
+#                       Ein hoher Wert hier deutet auf häufige Upload-Unterbrechungen hin.
 ```
+
+#### `build_and_push()` — Der Upload-Kernel
+
+Diese Funktion ist der Kern jedes Snapshot-Uploads (ob neu, Gap-Fill oder Rebuild).
+Sie orchestriert drei Phasen:
+
+```
+Phase 1: MANIFEST erstellen
+  → pcloud_json_manifest.py --root $SNAP --snapshot $SNAPNAME --hash sha256
+  → Smart-Mode: Sucht automatisch letztes archiviertes Manifest als Referenz
+  → Dauer wird in MariaDB als manifest_duration_sec geloggt
+
+Phase 2: UPLOAD
+  → pcloud_push_json_manifest_to_pcloud.py --manifest $mani --dest-root $PCLOUD_DEST
+  → Bei PCLOUD_USE_DELTA_COPY=1: Delta-Mode (copyfolder + selective update)
+  → Sonst: Full-Mode (alle Dateien + Stubs neu schreiben)
+  → Dauer wird als upload_duration_sec geloggt
+
+Phase 3: VERIFY (Delta-Check)
+  → pcloud_quick_delta.py → Vergleicht LIVE vs. Index
+  → Delta-Report wird archiviert: ${PCLOUD_ARCHIVE_DIR}/deltas/
+  → Non-critical: Fehlschlag blockiert NICHT den Upload-Erfolg
+```
+
+**Wichtig:** Bei Phase-2-Fehler wird das temporäre Manifest gelöscht und `return 1`
+ausgelöst — die Gap-Handling-Schleife entscheidet dann über Abbruch oder Fortfahrt.
 
 ---
 
 ### 2. MariaDB-Integration
 
+**Tabellen:** `backup_runs` (Haupttabelle) und `backup_phases` (Phase-Timing)
+
 **Tracking-Funktionen:**
 
-#### `_db_run_start()` (Zeile 142-156)
+#### `_db_run_start()`
 ```bash
-# Generiert Run-ID, loggt Start-Timestamp
-RUN_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
-# INSERT INTO pcloud_run_history (run_id, run_start, snapshot, ...)
+# Generiert Run-ID (uuidgen oder /proc/sys/kernel/random/uuid)
+# INSERT INTO backup_runs (run_id, snapshot_name, status, started_at)
 ```
 
-#### `_db_run_end()` (Zeile 158-187)
+#### `_db_run_end()`
 ```bash
-# Parameter: Status (SUCCESS/FAILED), Exit-Code, Error-Message
-# UPDATE pcloud_run_history SET run_end, run_status, exit_code, error_msg
+# Parameter: status (SUCCESS/FAILED), error_msg
+# UPDATE backup_runs SET status, finished_at, duration_sec, error_message
 ```
 
-#### `_db_update_metrics()` (Zeile 189-204)
+#### `_db_phase_log()`
+```bash
+# Loggt Phasen-Start/Ende in backup_phases Tabelle
+# Parameter: phase_name (manifest/upload/verify), action (start/end), status
+```
+
+#### `_db_update_metrics()`
 ```bash
 # Parameter: SQL-Fragment (z.B. "gaps_synced = 1, rebuilt_snapshots = 2")
-# UPDATE pcloud_run_history SET <metrics> WHERE run_id = $RUN_ID
+# UPDATE backup_runs SET <metrics> WHERE run_id = $RUN_ID
 ```
 
-**Neue Spalten (Gap-Handling):**
+**Metriken-Spalten in backup_runs:**
 ```sql
-gaps_synced INT DEFAULT 0,
-new_snapshots INT DEFAULT 0,
-rebuilt_snapshots INT DEFAULT 0
+gaps_synced INT DEFAULT 0,         -- Gefüllte Lücken (Scenario A + B)
+new_snapshots INT DEFAULT 0,       -- Erstmalig hochgeladene Snapshots
+rebuilt_snapshots INT DEFAULT 0,   -- Wegen Broken Chain neu gebaute Snapshots
+manifest_duration_sec INT,
+upload_duration_sec INT,
+verify_duration_sec INT
 ```
 
 **Beispiel-Query:**
 ```sql
-SELECT run_id, gaps_synced, rebuilt_snapshots, run_status
-FROM pcloud_run_history
+SELECT run_id, gaps_synced, rebuilt_snapshots, status
+FROM backup_runs
 WHERE gaps_synced > 0
-ORDER BY run_start DESC
+ORDER BY started_at DESC
 LIMIT 10;
 ```
 
@@ -254,11 +442,11 @@ jq -r 'select(.level == "WARN" or .level == "ERROR")' /var/log/backup/pcloud_syn
 
 ---
 
-## ⚡ Delta-Copy-Modus (TURBO)
+## ⚡ Säule 3: Delta-Copy-Modus (TURBO)
 
-### Implementierung (pcloud_push_json_manifest_to_pcloud.py)
+### Implementierung (pcloud_push_json_manifest_to_pcloud.py, 2093 Zeilen)
 
-#### `push_1to1_delta_mode()` (Zeile 1490-2050)
+#### `push_1to1_delta_mode()`
 
 **6-Phasen-Workflow:**
 
@@ -305,7 +493,7 @@ Phase 6: Index + Marker schreiben
 
 ---
 
-#### `_compute_snapshot_stub_ratio()` (Zeile 195-240)
+#### `_compute_snapshot_stub_ratio()`
 
 **Zweck:** Berechnet Stub-Ratio für Snapshot (lokal, O(n))
 
@@ -355,7 +543,7 @@ else:
 
 **Verbesserungen in aktueller Version:**
 
-#### Marker-Files-Ignorierung (Zeile 36-60)
+#### Marker-Files-Ignorierung in `_flatten_tree()`
 
 **Problem:** `.upload_started`, `.upload_complete` wurden als "UNKNOWN" gemeldet
 
@@ -377,7 +565,7 @@ def _flatten_tree(metadata: dict, ...):
 
 ---
 
-#### Index-Archive-Support (Zeile 79-95)
+#### Index-Archive-Support in `_load_index()`
 
 **Feature:** Unterstützt Snapshot-isolierte Archive-Indexes
 
@@ -397,7 +585,7 @@ def _load_index(cfg, snaps_root, index_file="content_index.json"):
 
 ---
 
-#### Snapshot-Filtering (Zeile 96-115)
+#### Snapshot-Filtering via `extract_snapshots_from_index()`
 
 **Feature:** Nur bestimmte Snapshots prüfen
 
@@ -423,7 +611,7 @@ by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter)
 
 ## 📦 Manifest-Diff (Delta-Copy-Basis)
 
-### pcloud_manifest_diff.py
+### scripts/pcloud_manifest_diff.py
 
 **Kategorisierung:**
 
@@ -567,7 +755,7 @@ fi
 
 **Problem:** Sequential `ensure_path()` bei tausenden Stubs = langsam
 
-**Lösung (Zeile 700-800 in pcloud_push_):**
+**Lösung in `_batch_write_stubs()`:**
 
 ```python
 # 1. Einen rekursiven listfolder-Call (statt N ensure-Calls)
@@ -602,7 +790,7 @@ if not folder_cache and _total_parents > 10:
 
 **Problem:** Alle Manifest-Ordner immer anlegen = verschwendet API-Calls
 
-**Lösung (Zeile 901+ in pcloud_push_):**
+**Lösung in `push_1to1_mode()` (Diff-basierte Ordner-Anlage):**
 
 ```python
 # 1. Remote-Ordner via listfolder holen
@@ -749,26 +937,31 @@ if exists(".upload_started") and not exists(".upload_complete"):
 
 ## 📈 Metriken & Monitoring
 
-### MariaDB-Spalten (pcloud_run_history)
+### MariaDB-Spalten (backup_runs)
 
 **Basis:**
 ```sql
 run_id VARCHAR(36),
-run_start DATETIME,
-run_end DATETIME,
-run_status VARCHAR(20),  -- SUCCESS, FAILED
-exit_code INT,
-error_msg TEXT,
-snapshot VARCHAR(255),
-snapshot_path VARCHAR(512)
+snapshot_name VARCHAR(255),
+status VARCHAR(20),        -- RUNNING, SUCCESS, FAILED
+started_at DATETIME,
+finished_at DATETIME,
+duration_sec INT,
+error_message TEXT
 ```
 
 **Gap-Handling:**
 ```sql
 gaps_synced INT DEFAULT 0,
 new_snapshots INT DEFAULT 0,
-rebuilt_snapshots INT DEFAULT 0
+rebuilt_snapshots INT DEFAULT 0    -- ⬅ Scenario-A-Indikator (Broken Chain)
 ```
+
+> **`rebuilt_snapshots` erklärt:** Wenn das Gap-Handling im Optimistic-Modus
+> eine gebrochene Referenz-Kette erkennt (Scenario A), werden alle späteren
+> Snapshots gelöscht und **komplett neu hochgeladen**. Jeder dieser Rebuilds
+> zählt als +1 auf `rebuilt_snapshots`. Ein hoher Wert deutet auf häufige
+> Upload-Unterbrechungen oder äußere Störungen hin.
 
 **Performance:**
 ```sql
@@ -777,33 +970,43 @@ upload_duration_sec INT,
 verify_duration_sec INT
 ```
 
+**Phasen-Tabelle (backup_phases):**
+```sql
+run_id VARCHAR(36),
+phase_name VARCHAR(50),    -- manifest, upload, verify
+status VARCHAR(20),
+started_at DATETIME,
+finished_at DATETIME,
+duration_sec INT
+```
+
 **Beispiel-Queries:**
 
 ```sql
 -- Gap-Events finden
-SELECT run_id, snapshot, gaps_synced, rebuilt_snapshots, run_status
-FROM pcloud_run_history
+SELECT run_id, snapshot_name, gaps_synced, rebuilt_snapshots, status
+FROM backup_runs
 WHERE gaps_synced > 0
-ORDER BY run_start DESC;
+ORDER BY started_at DESC;
 
 -- Performance-Trend
 SELECT 
-  DATE(run_start) as date,
+  DATE(started_at) as date,
   AVG(upload_duration_sec) as avg_upload_sec,
   AVG(rebuilt_snapshots) as avg_rebuilds
-FROM pcloud_run_history
-WHERE run_status = 'SUCCESS'
-  AND run_start > NOW() - INTERVAL 30 DAY
-GROUP BY DATE(run_start);
+FROM backup_runs
+WHERE status = 'SUCCESS'
+  AND started_at > NOW() - INTERVAL 30 DAY
+GROUP BY DATE(started_at);
 
 -- Error-Rate
 SELECT 
-  run_status,
+  status,
   COUNT(*) as count,
   COUNT(*) * 100.0 / SUM(COUNT(*)) OVER() as percent
-FROM pcloud_run_history
-WHERE run_start > NOW() - INTERVAL 7 DAY
-GROUP BY run_status;
+FROM backup_runs
+WHERE started_at > NOW() - INTERVAL 7 DAY
+GROUP BY status;
 ```
 
 ---
@@ -832,7 +1035,8 @@ jq -r 'select(.level == "ERROR") | "\(.timestamp) \(.message)"' /var/log/backup/
 
 ```
 docs/
-├── GAP_HANDLING.md                 (vollständig inkl. Quick Start)
+├── DEVELOPER_GUIDE.md              (dieses Dokument)
+├── GAP_HANDLING.md                 (Gap-System Referenz)
 ├── GAP_HANDLING_FAQ.md             (Q&A)
 ├── GAP_HANDLING_WORKFLOWS.md       (Mermaid-Diagramme)
 ├── DELTA_COPY_ANALYSIS.md          (Delta-Copy-Technologie)
@@ -842,15 +1046,14 @@ docs/
 └── RCLONE_TOKEN_REFRESH.md         (OAuth-Token)
 ```
 
-**Qualität:** Production-Ready, vollständig, mit Diagrammen
-
 ---
 
 ## 🎯 Kritische Code-Stellen
 
 ### 1. Stub-Ratio-Check (Quota-Protection)
 
-**Location:** pcloud_push_json_manifest_to_pcloud.py:1572-1596
+**Location:** `_compute_snapshot_stub_ratio()` in `pcloud_push_json_manifest_to_pcloud.py`
+und Threshold-Check in `push_1to1_delta_mode()`
 
 **Warum kritisch?**
 - Falsch → copyfolder klont echte Files = **doppelte Quota**
@@ -873,7 +1076,7 @@ PCLOUD_COPYFOLDER_MIN_FILES=200
 ---
 
 ### 2. Gap-Validation-Loop (Scenario-Detection)
-
+Gap-Detection-Loop in `wrapper_pcloud_sync_1to1.sh` (Optimistic-Branch)
 **Location:** wrapper_pcloud_sync_1to1.sh:602-610
 
 **Warum kritisch?**
@@ -885,8 +1088,8 @@ PCLOUD_COPYFOLDER_MIN_FILES=200
 if [[ "$status" != "OK" ]]; then
     # Conservative-Bias: Lieber rebuilden als Risiko
     needs_rebuild=1
-    break
-fi
+
+**Location:** Phase 5 (WRITE-Loop) in `push_1to1_delta_mode()` und Index-Save in `push_1to1_mode()`
 ```
 
 **Erweiterung:** Deep-Validation (optional)
@@ -900,7 +1103,7 @@ fi
 ---
 
 ### 3. Index-Update in Delta-Copy (Phase 5)
-
+Phase 5 (WRITE-Loop) in `push_1to1_delta_mode()` und Index-Save in `push_1to1_mode()`
 **Location:** pcloud_push_json_manifest_to_pcloud.py:1800-1900 (geschätzt)
 
 **Warum kritisch?**
@@ -919,7 +1122,7 @@ for sha in diff["new"] + diff["changed"]:
 
 ### 4. Marker-Files-Handling
 
-**Location:** pcloud_quick_delta.py:36-60
+**Location:** `_flatten_tree()` in `pcloud_quick_delta.py`
 
 **Warum kritisch?**
 - Marker als "UNKNOWN" = False-Positives
@@ -1003,6 +1206,302 @@ if ratio < 0.5:
 SELECT snapshot, uploaded_count, stubs_count
 FROM pcloud_metrics
 WHERE run_start > NOW() - INTERVAL 7 DAY;
+```
+
+---
+
+## 🔄 Säule 4: Resilient Restore System (scripts/pcloud_restore.py)
+
+Das Restore-Tool ist das Gegenstück zum Upload: Es kann komplette Snapshots
+von pCloud herunterladen und lokal rekonstruieren — auf zwei sehr unterschiedliche Arten.
+
+### Zwei Restore-Modi
+
+| Modus | Zielstruktur | Use-Case |
+|-------|-------------|----------|
+| **flat** (Default) | `out-dir/snapshot/relpath` | Schnelle Wiederherstellung eines Snapshots |
+| **object-store** | `_objects/ab/sha256` + `_snapshots/snap/relpath` (Hardlinks) | Mehrere Snapshots platzsparend |
+
+### Binary-Safe by Default
+
+**Das Problem:** Die erste Version nutzte `r.content.decode("utf-8")` zum Download.
+Das funktioniert für Text — aber bei Binärdateien (Fotos, Videos, Archive)
+führt `decode()` zu **Datenkorruption** (Bytes, die kein gültiges UTF-8 sind,
+werden durch Ersatzzeichen ersetzt).
+
+**Die Lösung:** Der Restore nutzt ausschließlich `download_binaryfile_to()` aus der
+pcloud_bin_lib.py (siehe Säule 1). Diese Funktion:
+
+1. Streamt die Daten chunksweise (`stream=True` + `iter_content`)
+2. Schreibt rohe Bytes direkt auf Disk (kein `decode()`)
+3. Berechnet SHA256 **während** des Streamens
+4. Löscht die Datei automatisch bei SHA256-Mismatch
+
+→ **Kein RAM-Overflow, keine Korruption, keine kaputten Fotos.**
+
+### FileID-Fallback — Maximale Ausfallsicherheit
+
+Jeder Index-Eintrag hat zwei Wege zum Original:
+
+```
+anchor_path  = "/Backup/rtb_1to1/_snapshots/2026-04-15/photos/bild.jpg"
+fileid       = 12345678  (pCloud-interne numerische ID)
+```
+
+**Restore-Strategie (3 Stufen):**
+
+```python
+# In download_file_with_verify() und download_via_fileid():
+
+# Stufe 1: Versuche anchor_path (Pfad-basiert)
+if anchor_path:
+    if download_file_with_verify(cfg, anchor_path, local_dest, sha256):
+        return SUCCESS
+    
+# Stufe 2: Fallback auf fileid (ID-basiert)
+if fileid:
+    if download_via_fileid(cfg, fileid, local_dest, sha256):
+        return SUCCESS
+
+# Stufe 3: Fail (kein Weg zum Original)
+return FAILED
+```
+
+**Warum zwei Wege?**
+- `anchor_path` kann veraltet sein (Snapshot umbenannt/verschoben)
+- `fileid` ist permanent (solange die Datei existiert)
+- Umgekehrt: `fileid` fehlt manchmal bei alten Index-Einträgen
+- **Zusammen:** Maximale Chance auf erfolgreichen Download
+
+### SHA-Caching & Deduplizierung
+
+Bei Snapshots mit vielen identischen Dateien (z.B. OS-Backups wo sich
+nur wenige Dateien ändern) wäre es Verschwendung, die gleiche Datei
+mehrfach herunterzuladen.
+
+**So funktioniert die Dedup im Flat-Modus:**
+
+```python
+sha_cache = {}  # {sha256_hash → lokaler_pfad}
+
+for item in snapshot_items:
+    sha256 = item["sha256"]
+    
+    # Dedup-Check: Haben wir diese Datei schon heruntergeladen?
+    if sha256 in sha_cache:
+        cached_src = sha_cache[sha256]
+        
+        # Erstelle Hardlink (sehr schnell, kein Platzverbrauch)
+        try:
+            os.link(cached_src, local_dest)
+        except OSError:
+            # Cross-Filesystem? → Normale Kopie
+            shutil.copy2(cached_src, local_dest)
+        continue
+    
+    # Noch nicht im Cache → Download + Verify
+    download_file_with_verify(cfg, anchor_path, local_dest, sha256)
+    sha_cache[sha256] = local_dest  # Für spätere Dedup
+```
+
+**Im Object-Store-Modus** ist die Dedup noch stärker:
+- Jede SHA256-Datei existiert nur einmal in `_objects/ab/sha256`
+- Alle Snapshot-Einträge sind Hardlinks auf das gleiche Object
+- Bei mehreren Snapshots: gigantische Platzersparnis
+
+### Sicherheitsfeature: Path-Traversal-Guard
+
+Weil die `relpath`-Werte aus dem Index kommen (und theoretisch manipuliert
+sein könnten), prüft der Restore:
+
+```python
+# Sicherstellen, dass der Ziel-Pfad INNERHALB des Restore-Verzeichnisses liegt
+expected_prefix = os.path.join(base_out_dir) + os.sep
+normalized = os.path.normpath(local_dest)
+if not normalized.startswith(expected_prefix):
+    log(f"✗ Path-Traversal verhindert: {relpath}", "error")
+    stats["failed"] += 1
+    continue  # Datei wird übersprungen
+```
+
+→ Ein `relpath` wie `../../etc/passwd` kann keinen Schaden anrichten.
+
+### CLI-Beispiele
+
+```bash
+# Verfügbare Snapshots auflisten
+python pcloud_restore.py --manifest pcloud --list-snapshots
+
+# Plan anzeigen (kein Download)
+python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
+    --out-dir /tmp/restore
+
+# Echtes Restore mit SHA256-Verifikation (flat)
+python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
+    --out-dir /srv/restore --download --verify
+
+# Object-Store-Modus (mehrere Snapshots, platzsparend)
+python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
+    --mode object-store \
+    --local-objects-root /srv/restore/_objects \
+    --local-snapshots-root /srv/restore/_snapshots \
+    --download --verify
+
+# Bestehenden Restore nur verifizieren (kein erneuter Download)
+python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
+    --out-dir /srv/restore --verify-only
+```
+
+---
+
+## ⏳ Säule 5: Recovery & Time-Travel (scripts/pcloud_repair_index.py)
+
+Wenn `pcloud_quick_delta.py` "missing_anchors" meldet — also Dateien, die im Index
+stehen, aber auf pCloud nicht mehr existieren — dann greift dieses Tool.
+Es ist **mehr als ein Bugfix-Script**: Es ermöglicht Time-Travel-Rekonstruktion
+vergangener Snapshot-Zustände.
+
+### 4-Phasen-Workflow
+
+```
+Phase 1: Delta-Report laden
+  → Liest JSON-Output von pcloud_quick_delta.py
+  → Extrahiert missing_anchors (Dateien mit Index-Eintrag aber ohne reale Datei)
+
+Phase 2: Remote content_index.json laden
+  → Holt aktuellen Master-Index von pCloud
+  → Nutzt get_textfile() (kein maxbytes-Limit)
+
+Phase 3: Index reparieren (repair_index())
+  → Für jeden missing_anchor: Zugehörige Holder-Einträge entfernen
+  → Schema-Validierung: Erkennt korrupte Holder (String statt Dict)
+  → Verwaiste Nodes (keine Holder + kein Anchor) komplett löschen
+  → Anchor-Felder (anchor_path, fileid, pcloud_hash) bei fehlenden Anchors entfernen
+
+Phase 4: Reparierten Index lokal speichern
+  → /srv/pcloud-temp/pcloud_index_{snapshot}.json
+  → Beim nächsten Upload: push_1to1_mode() lädt diesen lokalen Index
+  → Resume-Mechanismus erkennt fehlende Dateien und lädt sie nach
+```
+
+### Die `repair_index()` Funktion im Detail
+
+Diese Funktion ist das Herzstück und verdient eine genaue Erklärung,
+weil sie drei verschiedene Arten von Problemen gleichzeitig behandelt:
+
+```python
+def repair_index(index, missing_anchors, snaps_root, *, cleanup_all=False):
+    """
+    Was passiert hier Schritt für Schritt:
+    
+    1. LOOKUP aufbauen: anchor_path → missing_anchor_info
+       (damit wir schnell prüfen können, ob ein Node betroffen ist)
+    
+    2. Für JEDEN Node im Index:
+       a) Ist sein anchor_path in der missing-Liste?
+       b) Sind seine Holder gültige Dicts? (Schema-Check)
+       
+    3. Schema-Check für ALLE Nodes (nicht nur fehlende):
+       - Dict-Holder bei fehlenden Anchors → entfernen wenn Pfad matcht
+       - String-Holder (korrupt!) bei fehlenden Anchors → IMMER entfernen
+       - String-Holder bei existierenden Anchors → nur mit --cleanup-all
+       
+    4. Bei fehlenden Anchors: anchor_path, fileid, pcloud_hash löschen
+       (der Node selbst bleibt, wenn noch andere Holder existieren)
+       
+    5. Verwaiste Nodes (keine Holder + kein Anchor) → komplett löschen
+    """
+```
+
+**Warum ist der Schema-Check wichtig?**
+
+Durch einen früheren Bug konnten Holder als Strings statt als Dicts im Index landen.
+Das Tool erkennt und bereinigt diese automatisch:
+
+```python
+# Korrupter Holder (String):
+"holders": ["2026-04-15/photos/bild.jpg"]  # ← FALSCH
+
+# Korrekter Holder (Dict):
+"holders": [{"snapshot": "2026-04-15", "relpath": "photos/bild.jpg"}]  # ← RICHTIG
+```
+
+### Time-Travel-Rekonstruktion
+
+Das Archive-System speichert für **jeden Snapshot** einen eigenen Index:
+
+```
+Remote: /Backup/rtb_1to1/_snapshots/_index/archive/
+  ├─ 2026-04-10-075334_index.json   ← Zustand nach Snapshot 1
+  ├─ 2026-04-12-121042_index.json   ← Zustand nach Snapshot 2
+  └─ 2026-04-15-093021_index.json   ← Zustand nach Snapshot 3
+```
+
+**Wenn der Master-Index korrupt ist**, kann man jeden einzelnen
+historischen Zustand rekonstruieren:
+
+```bash
+# 1. Quick-Delta mit Archive-Index laufen lassen
+python pcloud_quick_delta.py \
+    --dest-root /Backup/rtb_1to1 \
+    --index-file 2026-04-15-093021_index.json \
+    --json-out /tmp/delta_archive.json
+
+# 2. Mit diesem Report den Index reparieren
+python pcloud_repair_index.py \
+    --delta-report /tmp/delta_archive.json \
+    --dest-root /Backup/rtb_1to1
+
+# 3. Nächster Upload nutzt automatisch den lokal reparierten Index
+```
+
+### Error 2002 Robustness (Graceful Fallback)
+
+`load_remote_index()` fängt den Fall ab, dass der Remote-Pfad noch gar nicht
+existiert (pCloud API Error 2002 = "Directory does not exist"):
+
+```python
+def load_remote_index(cfg, snaps_root):
+    idx_path = f"{snaps_root}/_index/content_index.json"
+    try:
+        txt = pc.get_textfile(cfg, path=idx_path)
+        j = json.loads(txt or '{"version":1,"items":{}}')
+    except Exception:
+        # Pfad existiert noch nicht oder Index nicht lesbar
+        # → Leeren Index zurückgeben statt Crash
+        sys.exit(2)  # Expliziter Fehler, kein Stille
+```
+
+### CLI-Beispiele
+
+```bash
+# Schritt 1: Delta-Report erzeugen
+python pcloud_quick_delta.py \
+    --dest-root /Backup/rtb_1to1 \
+    --json-out /srv/pcloud-temp/delta.json
+
+# Schritt 2: Dry-Run (nur Report, keine Änderungen)
+python pcloud_repair_index.py \
+    --delta-report /srv/pcloud-temp/delta.json \
+    --dest-root /Backup/rtb_1to1 \
+    --dry-run
+
+# Schritt 3: Reparatur durchführen
+python pcloud_repair_index.py \
+    --delta-report /srv/pcloud-temp/delta.json \
+    --dest-root /Backup/rtb_1to1
+
+# Optional: Alle korrupten String-Holder aufräumen
+python pcloud_repair_index.py \
+    --delta-report /srv/pcloud-temp/delta.json \
+    --dest-root /Backup/rtb_1to1 \
+    --cleanup-all
+
+# Output:
+# [phase 3] Holders entfernt:     12
+# [phase 3] Nodes bereinigt:      8
+# [phase 3] Nodes komplett gelöscht: 3
+# [phase 4] Index gespeichert: /srv/pcloud-temp/pcloud_index_2026-04-15.json
 ```
 
 ---
