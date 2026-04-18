@@ -47,52 +47,27 @@ def download_file_with_verify(cfg: Dict, remote_path: str, local_path: str, sha2
     """
     try:
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-        
-        # Download via get_textfile (für kleine Dateien) oder streaming
-        # Zuerst Dateigröße prüfen
+
         stat = pc.stat_file(cfg, path=remote_path, with_checksum=False) or {}
         file_size = stat.get("size", 0)
-        
+
         log(f"Download: {remote_path} ({file_size} bytes)")
-        
-        hash_obj = hashlib.sha256() if sha256_expected else None
-        bytes_downloaded = 0
-        
-        # Für kleine Dateien: get_textfile
-        if file_size < CHUNK_SIZE:  # < 8 MiB
-            try:
-                content = pc.get_textfile(cfg, path=remote_path)
-                content_bytes = content.encode() if isinstance(content, str) else content
-                bytes_downloaded = len(content_bytes)
 
-                with open(local_path, "wb") as f:
-                    f.write(content_bytes)
+        # Binär-Download (korrekt für alle Dateitypen: Text, Fotos, Archive, ...)
+        content_bytes = pc.get_binaryfile(cfg, path=remote_path)
 
-                if hash_obj:
-                    hash_obj.update(content_bytes)
-            except Exception as e:
-                log(f"get_textfile fehlgeschlagen: {e}, versuche alternative...", "warn")
-                # Fallback: über fileid wenn vorhanden
-                if "fileid" in stat:
-                    return download_via_fileid(cfg, stat["fileid"], local_path, sha256_expected)
-                return False
-        else:
-            # Große Dateien: streaming via get_textfile mit Chunks
-            log(f"Große Datei ({file_size} bytes), verwende Chunk-Download...")
-            # Fallback: versuche über fileid
-            if "fileid" in stat:
-                return download_via_fileid(cfg, stat["fileid"], local_path, sha256_expected)
-            return False
-        
+        with open(local_path, "wb") as f:
+            f.write(content_bytes)
+
         # SHA256-Verifikation
-        if sha256_expected and hash_obj:
-            actual_sha = hash_obj.hexdigest()
+        if sha256_expected:
+            actual_sha = hashlib.sha256(content_bytes).hexdigest()
             if actual_sha.lower() != sha256_expected.lower():
                 log(f"SHA256 MISMATCH: expected {sha256_expected}, got {actual_sha}", "error")
                 os.remove(local_path)
                 return False
-            log(f"✓ SHA256 OK")
-        
+            log(f"\u2713 SHA256 OK")
+
         return True
     
     except Exception as e:
@@ -109,31 +84,25 @@ def download_via_fileid(cfg: Dict, fileid: int, local_path: str, sha256_expected
     Download via FileID (Binary API)
     """
     try:
-        # Stat per FileID
         stat = pc.stat_file(cfg, fileid=fileid, with_checksum=False) or {}
         file_size = stat.get("size", 0)
-        
         log(f"Download (FileID {fileid}): {file_size} bytes")
-        
-        # Versuche get_textfile mit FileID
-        content = pc.get_textfile(cfg, fileid=fileid)
-        content_bytes = content.encode() if isinstance(content, str) else content
-        
+
+        content_bytes = pc.get_binaryfile(cfg, fileid=fileid)
+
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         with open(local_path, "wb") as f:
             f.write(content_bytes)
-        
+
         if sha256_expected:
-            hash_obj = hashlib.sha256()
-            hash_obj.update(content_bytes)
-            actual_sha = hash_obj.hexdigest()
+            actual_sha = hashlib.sha256(content_bytes).hexdigest()
             if actual_sha.lower() != sha256_expected.lower():
                 log(f"SHA256 MISMATCH", "error")
                 os.remove(local_path)
                 return False
-        
+
         return True
-    
+
     except Exception as e:
         log(f"Download (FileID) fehlgeschlagen: {e}", "error")
         return False
@@ -198,12 +167,10 @@ def load_index_from_pcloud(cfg: Dict, dest_root: str, snapshot: str) -> List[Dic
     """
     index_path = f"{dest_root}/_snapshots/_index/content_index.json"
     log(f"Lade Content-Index: {index_path}")
-    
+
     try:
-        # Download Index via Binary API
-        content = pc.get_textfile(cfg, path=index_path)
-        index = json.loads(content)
-        
+        index = pc.read_json_at_path(cfg, index_path, maxbytes=None)
+
         if "items" not in index:
             log("Index ungültig (keine 'items')", "error")
             raise IndexLoadError("Index ungültig (keine 'items')")
@@ -265,6 +232,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
+  # Verfügbare Snapshots anzeigen
+  %(prog)s --manifest pcloud --list-snapshots
+
   # Plan anzeigen
   %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /tmp/restore
 
@@ -274,7 +244,8 @@ Beispiele:
     )
     
     ap.add_argument("--manifest", required=True, help="'pcloud' oder lokaler Manifest-Pfad")
-    ap.add_argument("--snapshot", required=True, help="Snapshot-Name")
+    ap.add_argument("--snapshot", help="Snapshot-Name")
+    ap.add_argument("--list-snapshots", action="store_true", help="Verfügbare Snapshots aus dem pCloud-Index anzeigen und beenden")
     ap.add_argument("--out-dir", help="Lokales Restore-Ziel (Basis, Snapshot wird als Unterordner angelegt – nur flat-Modus verpflichtend)")
 
     ap.add_argument("--mode", choices=["flat", "object-store"], default="flat",
@@ -300,6 +271,37 @@ Beispiele:
     ap.add_argument("--token")
     
     args = ap.parse_args()
+
+    # --list-snapshots: früh ausführen, kein --snapshot nötig
+    if args.list_snapshots:
+        cfg = pc.effective_config(
+            env_file=args.env_file,
+            env_dir=getattr(args, 'env_dir', None),
+            profile=args.profile,
+            overrides={
+                "host": args.host, "port": args.port,
+                "timeout": args.timeout, "device": args.device, "token": args.token,
+            }
+        )
+        index_path = f"{args.dest_root}/_snapshots/_index/content_index.json"
+        try:
+            index = pc.read_json_at_path(cfg, index_path, maxbytes=None)
+        except Exception as e:
+            log(f"Index laden fehlgeschlagen: {e}", "error")
+            return 2
+        snapshots: set[str] = set()
+        for obj in index.get("items", {}).values():
+            for h in obj.get("holders", []):
+                if h.get("snapshot"):
+                    snapshots.add(h["snapshot"])
+        print(f"Verfügbare Snapshots in {args.dest_root}:")
+        for s in sorted(snapshots, reverse=True):
+            print(f"  {s}")
+        return 0
+
+    if not args.snapshot:
+        log("--snapshot ist erforderlich (oder --list-snapshots für Übersicht)", "error")
+        return 2
 
     # Modus-Konflikte prüfen
     if args.download and args.verify_only:
@@ -408,9 +410,21 @@ Beispiele:
                 continue
 
             # Deduplizierung innerhalb eines Laufs (SHA-Caching)
+            # Beide Dateien müssen lokal existieren, auch wenn sie denselben Inhalt haben!
             if sha256 and sha256 in sha_cache:
-                log("  → Cache Hit (SHA256, bereits in diesem Lauf geladen)")
-                stats["skipped"] += 1
+                cached_src = sha_cache[sha256]
+                if cached_src != local_dest and not os.path.exists(local_dest):
+                    log("  \u2192 Cache Hit (SHA256): erstelle Hardlink/Kopie")
+                    os.makedirs(os.path.dirname(local_dest) or ".", exist_ok=True)
+                    try:
+                        os.link(cached_src, local_dest)
+                    except OSError:
+                        import shutil
+                        shutil.copy2(cached_src, local_dest)
+                    stats["success"] += 1
+                else:
+                    log("  \u2192 Cache Hit (SHA256, Ziel bereits vorhanden)")
+                    stats["skipped"] += 1
                 continue
 
             # Bereits vorhandene lokale Datei prüfen und ggf. überspringen

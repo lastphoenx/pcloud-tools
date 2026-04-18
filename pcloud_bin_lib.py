@@ -1654,6 +1654,39 @@ def get_textfile(cfg: dict, *, path: str | None = None, fileid: int | None = Non
     r.raise_for_status()
     return r.content.decode(encoding, errors="replace")
 
+def get_binaryfile(cfg: dict, *, path: str | None = None, fileid: int | None = None) -> bytes:
+    """
+    Lädt eine Datei als rohe Bytes herunter (für Binärdaten: Fotos, Archive, etc.).
+    Gleiche Mechanik wie get_textfile, aber ohne Dekodierung.
+    """
+    if (path is None) == (fileid is None):
+        raise ValueError("get_binaryfile: genau eines von path oder fileid angeben.")
+
+    gl_params = {"access_token": cfg["token"]}
+    if path is not None:
+        gl_params["path"] = _norm_remote_path(path)
+    else:
+        gl_params["fileid"] = int(fileid)
+
+    gl_url = f"{_rest_base(cfg)}/getfilelink"
+    session = _get_session()
+    gl = session.get(gl_url, params=gl_params, timeout=int(cfg.get("timeout", 30)))
+    gl.raise_for_status()
+
+    jd = gl.json()
+    if int(jd.get("result", -1)) != 0:
+        raise RuntimeError(f"getfilelink fehlgeschlagen: {jd}")
+
+    hosts = jd.get("hosts") or []
+    link_path = jd.get("path")
+    if not hosts or not link_path:
+        raise RuntimeError(f"getfilelink Antwort unvollständig: {jd}")
+
+    link = f"https://{hosts[0]}{link_path}"
+    r = session.get(link, timeout=int(cfg.get("timeout", 30)), allow_redirects=True)
+    r.raise_for_status()
+    return r.content
+
 def copyfile(cfg: Dict[str, Any],
              *,
              from_path: str | None = None,
