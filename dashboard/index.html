@@ -387,10 +387,12 @@
     // ---- Tile 1: Backup-Status ----------------------------------
 
     function tileBackup(rtb, cloud, reports) {
+      // Use explicit undefined check — status_code=0 is falsy but means "OK"
+      const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
       const rtbOk   = rtb.status === 'success';
-      const cloudOk = (cloud.status_code || 3) === 0;
+      const cloudOk = cloudCode === 0;
       const tileCls = (rtbOk && cloudOk) ? 'ok'
-                    : (rtb.status === 'failed' || (cloud.status_code||3) >= 2) ? 'bad'
+                    : (rtb.status === 'failed' || cloudCode >= 2) ? 'bad'
                     : 'warning';
 
       const snapCount = rtb.snapshot_count || 0;
@@ -498,8 +500,11 @@
       const names = ['cleanup-samba-recycle','backup-pipeline'];
       const items = names.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
 
-      const anyFailed = items.some(i => i.status === 'failed');
-      const tileCls   = anyFailed ? 'bad' : 'ok';
+      // Safety-Gate blocked runs exit non-zero → systemd marks service 'failed'.
+      // That is the protection system working, not a system health problem.
+      const anyFailed  = items.some(i => i.status === 'failed' && !(i.exit_code||'').includes('(blocked)'));
+      const anyBlocked = items.some(i => (i.exit_code||'').includes('(blocked)'));
+      const tileCls    = anyFailed ? 'bad' : anyBlocked ? 'warning' : 'ok';
 
       const phases       = ((reports || {}).phase_stats   || []);
       const failedBackups = ((reports || {}).failed_backups || []).slice(0, 3);
@@ -621,14 +626,17 @@
     // ---- Detail card: RTB Wrapper ------------------------------
 
     function detailCardRTB(rtb) {
-      let rows = ''
-        + drow('Status',    rtb.status || 'unknown', rtbCls(rtb.status))
-        + drow('Letzter Lauf', fmtTs(rtb.last_run))
-        + drow('Snapshots', String(rtb.snapshot_count || 0));
-      if (rtb.safety_gate)
-        rows += drow('Safety-Gate (hist.)', rtb.safety_gate, sgValCls(rtb.safety_gate));
+      // ── Aktueller Zustand (NOW) ────────────────────────────────
+      let rows = '';
       if (rtb.live_safety_gate)
         rows += drow('Live Safety-Gate', rtb.live_safety_gate, sgValCls(rtb.live_safety_gate));
+      // ── Letzter Lauf ──────────────────────────────────────────
+      rows += drow('Status letzter Lauf', rtb.status || 'unknown', rtbCls(rtb.status))
+        + drow('Letzter Lauf', fmtTs(rtb.last_run))
+        + drow('Snapshots', String(rtb.snapshot_count || 0));
+      // ── Histor. Safety-Gate + Erklärung zum letzten Lauf ──────
+      if (rtb.safety_gate)
+        rows += drow('Safety-Gate (letzter Lauf)', rtb.safety_gate, sgValCls(rtb.safety_gate));
       if (rtb.message)
         rows += drow('Message', rtb.message, '', 120);
       if (rtb.details)
