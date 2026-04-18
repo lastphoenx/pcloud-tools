@@ -1,0 +1,25 @@
+[Unit]
+Description=Monitoring Status Update Timer - Event-triggered + fallback
+Documentation=https://github.com/lastphoenx/pcloud-tools
+Requires=monitoring-status-update.service
+
+[Timer]
+# Event-triggered: Run after important services complete
+# This ensures dashboard shows fresh data immediately after key operations
+OnUnitActivation=entropywatcher-nas.service
+OnUnitActivation=entropywatcher-nas-av.service
+OnUnitActivation=backup-pipeline.service
+
+# Fallback: Run every 15 minutes to ensure regular updates
+# (in case services don't run or fail to trigger)
+OnCalendar=*:0/15
+# Startup: Run 2 minutes after boot to populate initial status
+OnBootSec=2min
+
+# Tolerance: Allow jitter to spread load across multiple timers
+AccuracySec=1m
+# Persistence: Still run if system was off at scheduled time
+Persistent=true
+
+[Install]
+WantedBy=timers.target

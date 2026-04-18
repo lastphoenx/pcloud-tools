@@ -1,0 +1,53 @@
+[Unit]
+Description=Monitoring Dashboard Web Server
+Documentation=https://github.com/lastphoenx/pcloud-tools
+After=network.target
+Wants=monitoring-status-update.timer
+
+[Service]
+Type=simple
+User=thomas
+Group=thomas
+Restart=on-failure
+RestartSec=10s
+
+# Environment
+WorkingDirectory=/opt/apps/pcloud-tools/main/dashboard
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Execution
+# Python HTTP server with custom handler for cache control
+ExecStart=/usr/bin/python3 -c "\
+import http.server\n\
+import socketserver\n\
+\n\
+class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):\n\
+    def end_headers(self):\n\
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')\n\
+        self.send_header('Pragma', 'no-cache')\n\
+        self.send_header('Expires', '0')\n\
+        super().end_headers()\n\
+\n\
+with socketserver.TCPServer(('', 8080), NoCacheHTTPRequestHandler) as httpd:\n\
+    print('Dashboard server started on port 8080')\n\
+    httpd.serve_forever()\n\
+"
+
+# Security
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/opt/apps/pcloud-tools/main/dashboard
+ReadOnlyPaths=/opt/apps/monitoring
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=1024
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monitoring-dashboard
+
+[Install]
+WantedBy=multi-user.target
