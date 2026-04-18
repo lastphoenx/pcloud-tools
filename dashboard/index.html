@@ -130,14 +130,15 @@
     .info-row {
       display: flex;
       justify-content: space-between;
-      align-items: center;
+      align-items: baseline;
       padding: 7px 10px;
       background: var(--surface2);
       border-radius: 8px;
       font-size: 13px;
+      gap: 8px;
     }
-    .info-row .lbl { color: var(--muted); }
-    .info-row .val { font-weight: 500; text-align: right; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .info-row .lbl { color: var(--muted); flex-shrink: 0; }
+    .info-row .val { font-weight: 500; text-align: right; word-break: break-word; max-width: 65%; }
     .info-row .val.green  { color: var(--green); }
     .info-row .val.yellow { color: var(--yellow); }
     .info-row .val.red    { color: var(--red); }
@@ -259,6 +260,44 @@
       font-size: 13px;
       margin: 8px 0;
     }
+
+    /* ── Detail Sections ── */
+    .detail-section { margin-top: 28px; }
+    .section-heading {
+      font-size: 12px; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.8px;
+      display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+    }
+    .section-heading::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .dcard {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .dcard-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+      font-size: 14px; font-weight: 600;
+    }
+    .dcard-body { padding: 4px 16px 10px; }
+    .dcard-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+      padding: 7px 0; border-bottom: 1px solid rgba(51,65,85,0.5);
+      font-size: 13px; gap: 12px;
+    }
+    .dcard-row:last-child { border-bottom: none; }
+    .dcard-lbl { color: var(--muted); flex-shrink: 0; }
+    .dcard-val { font-weight: 500; text-align: right; word-break: break-word; max-width: 65%; }
+    .dcard-val.green  { color: var(--green); }
+    .dcard-val.yellow { color: var(--yellow); }
+    .dcard-val.red    { color: var(--red); }
+    .dcard-val.blue   { color: var(--blue); }
   </style>
 </head>
 <body>
@@ -282,6 +321,8 @@
       <div class="spinner"></div> Lade Monitoring-Daten&#x2026;
     </div>
   </div>
+
+  <div id="detail-sections"></div>
 
   <div class="footer">
     <span>Auto-Refresh in <strong id="countdown">30</strong>s</span>
@@ -337,6 +378,8 @@
         tileBackup(rtb, cloud, reports) +
         tileMalware(svc) +
         tileSysHealth(svc, reports);
+
+      renderDetails(svc, rtb, cloud, reports);
     }
 
     // ---- Tile 1: Backup-Status ----------------------------------
@@ -497,6 +540,172 @@
 
       html += '</div></div>';
       return html;
+    }
+
+    // ---- Full detail sections ----------------------------------
+
+    function renderDetails(svc, rtb, cloud, reports) {
+      const el = document.getElementById('detail-sections');
+      if (!el) return;
+      let html = '';
+
+      // Backup detail
+      const recent = ((reports||{}).recent_backups||[]).slice(0, 10);
+      html += '<div class="detail-section">'
+        + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
+        + '<div class="card-grid">'
+        + detailCardRTB(rtb)
+        + detailCardPCloud(cloud)
+        + (recent.length > 0 ? detailCardRecentBackups(recent) : '')
+        + '</div></div>';
+
+      // Malware detail
+      const mNames = ['entropywatcher-nas','entropywatcher-os','entropywatcher-nas-av','entropywatcher-os-av','honeyfile-monitor'];
+      const mItems = mNames.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
+      if (mItems.length > 0) {
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\uD83D\uDEE1\uFE0F Malware &amp; Integrit\xe4t \u2013 Details</span></div>'
+          + '<div class="card-grid">'
+          + mItems.map(i => detailCardService(i)).join('')
+          + '</div></div>';
+      }
+
+      // System detail
+      const sNames = ['cleanup-samba-recycle','backup-pipeline'];
+      const sItems = sNames.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
+      const failedBk = ((reports||{}).failed_backups||[]).slice(0, 5);
+      if (sItems.length > 0 || failedBk.length > 0) {
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\uD83D\uDDA5\uFE0F System \u2013 Details</span></div>'
+          + '<div class="card-grid">'
+          + sItems.map(i => detailCardService(i)).join('');
+        if (failedBk.length > 0) {
+          html += '<div class="dcard"><div class="dcard-header"><span>Letzte Fehler (7d)</span></div>'
+            + '<div class="dcard-body">'
+            + failedBk.map(f => drow(f.snapshot||'\u2014', f.error||'\u2014', 'red', 80)).join('')
+            + '</div></div>';
+        }
+        html += '</div></div>';
+      }
+
+      el.innerHTML = html;
+    }
+
+    // ---- Detail card: systemd service --------------------------
+
+    function detailCardService(item) {
+      const blocked = (item.exit_code||'').includes('(blocked)');
+      const dotCls  = blocked ? 'blocked' : (item.status || 'unknown');
+      const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      let rows = ''
+        + drow('Status',       item.status || 'unknown', statusValCls(item.status, blocked))
+        + drow('Enabled',      item.enabled || 'unknown')
+        + drow('Letzter Lauf', fmtTs(item.last_start))
+        + drow('Exit Code',    item.exit_code || 'N/A', blocked ? 'yellow' : '');
+      if (item.next_run && item.next_run !== 'N/A')
+        rows += drow('N\xe4chster Run', item.next_run);
+      if (item.message && item.message !== 'N/A')
+        rows += drow('Message', item.message, '', 100);
+      return '<div class="dcard">'
+        + '<div class="dcard-header"><span>' + esc(label) + '</span>'
+        + '<span class="svc-dot ' + dotCls + '" style="width:10px;height:10px"></span></div>'
+        + '<div class="dcard-body">' + rows + '</div>'
+        + '</div>';
+    }
+
+    // ---- Detail card: RTB Wrapper ------------------------------
+
+    function detailCardRTB(rtb) {
+      let rows = ''
+        + drow('Status',    rtb.status || 'unknown', rtbCls(rtb.status))
+        + drow('Letzter Lauf', fmtTs(rtb.last_run))
+        + drow('Snapshots', String(rtb.snapshot_count || 0));
+      if (rtb.safety_gate)
+        rows += drow('Safety-Gate (hist.)', rtb.safety_gate, sgValCls(rtb.safety_gate));
+      if (rtb.live_safety_gate)
+        rows += drow('Live Safety-Gate', rtb.live_safety_gate, sgValCls(rtb.live_safety_gate));
+      if (rtb.message)
+        rows += drow('Message', rtb.message, '', 120);
+      if (rtb.details)
+        rows += drow('Details', rtb.details, '', 120);
+      return '<div class="dcard">'
+        + '<div class="dcard-header"><span>\uD83D\uDD04 RTB Wrapper</span>'
+        + '<span class="svc-dot ' + rtbCls(rtb.status) + '" style="width:10px;height:10px"></span></div>'
+        + '<div class="dcard-body">' + rows + '</div>'
+        + '</div>';
+    }
+
+    // ---- Detail card: pCloud -----------------------------------
+
+    function detailCardPCloud(cloud) {
+      const sc  = cloud.status_code !== undefined ? cloud.status_code : 3;
+      const cls = sc === 0 ? 'green' : sc === 1 ? 'yellow' : 'red';
+      let rows = ''
+        + drow('Status',   cloud.status_text || 'UNKNOWN', cls)
+        + drow('Hostname', cloud.hostname || 'N/A');
+      const ba = (cloud.checks||{}).backup_age || {};
+      if (ba.message) rows += drow('Backup Age', ba.message, '', 100);
+      if (ba.snapshot_count !== undefined) rows += drow('RTB Snapshots',    String(ba.snapshot_count));
+      if (ba.manifest_count !== undefined) rows += drow('pCloud Manifests', String(ba.manifest_count));
+      if (ba.pcloud_snapshot && ba.pcloud_snapshot !== 'none' && ba.pcloud_snapshot !== 'unknown') {
+        const h = ba.pcloud_age_hours || 0;
+        const age = h < 24 ? h + 'h' : Math.floor(h/24) + 'd ' + (h%24) + 'h';
+        rows += drow('Last Success', ba.pcloud_snapshot + ' (' + age + ' ago)');
+      }
+      const pq = (cloud.checks||{}).pcloud_quota || {};
+      if (pq.message) rows += drow('Quota', pq.message);
+      else if ((pq.details||{}).free_gb !== undefined)
+        rows += drow('Quota', pq.details.free_gb + ' GB frei (' + pq.details.usage_percent + '%)');
+      return '<div class="dcard">'
+        + '<div class="dcard-header"><span>\u2601\uFE0F pCloud Backup</span>'
+        + '<span class="svc-dot ' + cls + '" style="width:10px;height:10px"></span></div>'
+        + '<div class="dcard-body">' + rows + '</div>'
+        + '</div>';
+    }
+
+    // ---- Detail card: Recent Backups table ---------------------
+
+    function detailCardRecentBackups(recent) {
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header"><span>\uD83D\uDCCB Letzte Backup-L\xe4ufe</span></div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<table class="report-table">'
+        + '<thead><tr>'
+        + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th><th>GB</th><th>Fehler</th>'
+        + '</tr></thead><tbody>'
+        + recent.map(r => '<tr>'
+            + '<td>' + esc(r.snapshot||'\u2014') + '</td>'
+            + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + esc(r.status||'\u2014') + '</span></td>'
+            + '<td>' + fmtTs(r.started_at) + '</td>'
+            + '<td>' + fmtTs(r.finished_at) + '</td>'
+            + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
+            + '<td>' + (r.files_uploaded || '\u2014') + '</td>'
+            + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
+            + '<td title="' + esc(r.error||'') + '">' + esc(trunc(r.error||'', 35)) + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>'
+        + '</div></div>';
+    }
+
+    // ---- Helper: single detail row -----------------------------
+
+    function drow(label, value, cls, maxLen) {
+      const full = String(value);
+      const disp = maxLen ? trunc(full, maxLen) : full;
+      return '<div class="dcard-row">'
+        + '<span class="dcard-lbl">' + esc(label) + '</span>'
+        + '<span class="dcard-val' + (cls ? ' ' + cls : '') + '" title="' + esc(full) + '">' + esc(disp) + '</span>'
+        + '</div>';
+    }
+
+    function statusValCls(status, blocked) {
+      if (blocked)             return 'yellow';
+      if (status === 'active') return 'green';
+      if (status === 'failed') return 'red';
+      return '';
+    }
+    function sgValCls(sg) {
+      return sg === 'GREEN' ? 'green' : sg === 'YELLOW' ? 'yellow' : sg === 'RED' ? 'red' : '';
     }
 
     // ---- Detail toggle -----------------------------------------
