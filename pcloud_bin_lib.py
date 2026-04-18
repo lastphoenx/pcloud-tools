@@ -1687,6 +1687,68 @@ def get_binaryfile(cfg: dict, *, path: str | None = None, fileid: int | None = N
     r.raise_for_status()
     return r.content
 
+def download_binaryfile_to(cfg: dict, *,
+                            path: str | None = None,
+                            fileid: int | None = None,
+                            local_path: str,
+                            sha256_verify: str | None = None,
+                            chunk_size: int = 8 * 1024 * 1024) -> str:
+    """
+    Streamt eine Datei chunksweise von pCloud direkt auf Festplatte.
+    RAM-schonend: kein vollständiges In-Memory-Puffern (kein r.content).
+    Berechnet SHA256 während des Streamens.
+
+    Returns: tatsächliche SHA256-Checksumme der geschriebenen Daten.
+    Raises:  RuntimeError bei pCloud-Fehler, ValueError bei SHA256-Mismatch.
+    """
+    if (path is None) == (fileid is None):
+        raise ValueError("download_binaryfile_to: genau eines von path oder fileid angeben.")
+
+    gl_params = {"access_token": cfg["token"]}
+    if path is not None:
+        gl_params["path"] = _norm_remote_path(path)
+    else:
+        gl_params["fileid"] = int(fileid)
+
+    gl_url = f"{_rest_base(cfg)}/getfilelink"
+    session = _get_session()
+    gl = session.get(gl_url, params=gl_params, timeout=int(cfg.get("timeout", 30)))
+    gl.raise_for_status()
+
+    jd = gl.json()
+    if int(jd.get("result", -1)) != 0:
+        raise RuntimeError(f"getfilelink fehlgeschlagen: {jd}")
+
+    hosts = jd.get("hosts") or []
+    link_path = jd.get("path")
+    if not hosts or not link_path:
+        raise RuntimeError(f"getfilelink Antwort unvollständig: {jd}")
+
+    link = f"https://{hosts[0]}{link_path}"
+    hash_obj = hashlib.sha256()
+
+    import os as _os
+    _os.makedirs(_os.path.dirname(local_path) or ".", exist_ok=True)
+
+    with session.get(link, stream=True, timeout=int(cfg.get("timeout", 30)),
+                     allow_redirects=True) as r:
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    hash_obj.update(chunk)
+
+    actual_sha = hash_obj.hexdigest()
+    if sha256_verify and actual_sha.lower() != sha256_verify.lower():
+        try:
+            _os.remove(local_path)
+        except Exception:
+            pass
+        raise ValueError(f"SHA256 MISMATCH: expected {sha256_verify}, got {actual_sha}")
+
+    return actual_sha
+
 def copyfile(cfg: Dict[str, Any],
              *,
              from_path: str | None = None,
