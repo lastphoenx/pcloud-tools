@@ -89,10 +89,10 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/fix_stubs_missing_fileid.py` | Repariert Stubs ohne FileID (nach API-Fehlern) |
 | `scripts/rewrite_stubs_from_index.py` | Regeneriert alle Stubs eines Snapshots aus dem Index |
 | `scripts/pcloud_manifest_diff.py` | Vergleicht zwei Manifeste (Diff-Ansicht) |
-| `pcloud_integrity_check.py` | Tiefenprüfung: Hashes, FileIDs, Holder-Konsistenz |
-| `pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
-| `pcloud_restore.py` | Stellt Snapshots von pCloud wieder her |
-| `pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
+| `scripts/pcloud_integrity_check.py` | Tiefenprüfung: Hashes, FileIDs, Holder-Konsistenz |
+| `scripts/pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
+| `scripts/pcloud_restore.py` | ⚠️ Stellt Snapshots von pCloud wieder her (Notfall-Tool) |
+| `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
 
 ---
 
@@ -136,10 +136,9 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 | [docs/SETUP.md](docs/SETUP.md) | Vollständige Installations-Anleitung |
 | [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md) | Alerting-Konfiguration (Telegram, Discord, ntfy…) |
 | [docs/RCLONE_TOKEN_REFRESH.md](docs/RCLONE_TOKEN_REFRESH.md) | pCloud OAuth-Token erneuern (headless/SSH) |
-| [docs/GAP_HANDLING.md](docs/GAP_HANDLING.md) | Gap-Handling: fehlende Snapshots, Strategien, Troubleshooting |
-| [docs/GAP_HANDLING_QUICKSTART.md](docs/GAP_HANDLING_QUICKSTART.md) | Gap-Handling: Express-Setup in 5 Minuten |
+| [docs/GAP_HANDLING.md](docs/GAP_HANDLING.md) | Gap-Handling: Szenarien, Strategien, Troubleshooting + Quick Start |
 | [docs/GAP_HANDLING_FAQ.md](docs/GAP_HANDLING_FAQ.md) | Gap-Handling: FAQs |
-| [docs/GAP_HANDLING_WORKFLOWS.md](docs/GAP_HANDLING_WORKFLOWS.md) | Gap-Handling: Visuelle Workflow-Diagramme |
+| [docs/GAP_HANDLING_WORKFLOWS.md](docs/GAP_HANDLING_WORKFLOWS.md) | Gap-Handling: Visuelle Workflow-Diagramme (Mermaid) |
 | [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md) | Technische Analyse der Delta-Copy-Implementierung |
 
 ---

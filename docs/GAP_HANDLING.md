@@ -1252,3 +1252,87 @@ fi
 
 *Dokumentation generiert: 2026-04-16*  
 *Letzte Aktualisierung: 2026-04-16*
+
+---
+
+## ⚡ Quick Start — Produktiv in 5 Minuten
+
+### 1️⃣ Branch aktivieren
+
+```bash
+cd /opt/apps/pcloud-tools/main
+git fetch origin
+git checkout feature/delta-copy-poc
+git pull origin feature/delta-copy-poc
+```
+
+### 2️⃣ Konfiguration anpassen
+
+```bash
+sudo nano /opt/apps/pcloud-tools/main/.env
+
+# Diese Zeilen hinzufügen/ändern:
+PCLOUD_USE_DELTA_COPY=1
+PCLOUD_GAP_STRATEGY=optimistic
+PCLOUD_ENABLE_JSONL=1
+```
+
+### 3️⃣ Ersten Backup-Run starten
+
+```bash
+# Test-Run (Conservative = sicher)
+sudo PCLOUD_GAP_STRATEGY=conservative bash /opt/apps/rtb/rtb_wrapper.sh
+
+# Bei Erfolg: Wechsel zu Optimistic
+sudo PCLOUD_GAP_STRATEGY=optimistic bash /opt/apps/rtb/rtb_wrapper.sh
+```
+
+### Strategie-Wahl
+
+| Strategie | Wann nutzen |
+|---|---|
+| `optimistic` | Empfohlen für 99% der Use-Cases |
+| `conservative` | Erste Tests, maximale Sicherheit |
+| `aggressive` | Nach schweren Integritätsproblemen |
+
+### Status prüfen
+
+```bash
+# Letzte Logs
+tail -50 /var/log/backup/pcloud_sync.log
+
+# Gap-Events
+grep "Gap detected" /var/log/backup/pcloud_sync.log | tail -10
+
+# DB-Übersicht
+mysql -u backup_pipeline -p -e "
+  SELECT run_id, gaps_synced, new_snapshots, rebuilt_snapshots, run_status
+  FROM pcloud_run_history ORDER BY run_start DESC LIMIT 5"
+```
+
+### Troubleshooting Quick-Fixes
+
+```bash
+# "Gap detected in conservative mode" → Wechsel:
+sudo PCLOUD_GAP_STRATEGY=optimistic bash /opt/apps/rtb/rtb_wrapper.sh
+
+# "MISSING_MANIFEST" → Aggressive Rebuild:
+sudo PCLOUD_GAP_STRATEGY=aggressive bash /opt/apps/rtb/rtb_wrapper.sh
+```
+
+### Performance-Erwartung
+
+| Scenario | Snapshots | Upload-Zeit | Strategie |
+|---|---|---|---|
+| Neuer Snapshot | 1 | ~2–7h | Alle gleich |
+| Gap (Chain intakt) | 1 | ~2–7h | Optimistic ⚡ |
+| Gap (Chain intakt) | 3 | ~18–21h | Aggressive 🐌 |
+| Gap (Chain kaputt) | 3 | ~18–21h | Alle gleich |
+
+### Sicherheits-Check nach Gap-Event
+
+```bash
+LAST_DELTA=$(ls -t /srv/pcloud-archive/deltas/*.json | head -1)
+jq '.status' "$LAST_DELTA"          # Erwartet: "OK"
+jq '.missing_anchors | length' "$LAST_DELTA"  # Erwartet: 0
+```
