@@ -28,6 +28,13 @@ MONITORING_OUTPUT="${MONITORING_OUTPUT:-/opt/apps/monitoring/status.json}"
 VERBOSE=0
 [[ "${1:-}" == "--verbose" ]] && VERBOSE=1
 
+# Paths to companion scripts (override via env)
+ENTROPYWATCHER_SAFETY_GATE="${ENTROPYWATCHER_SAFETY_GATE:-/opt/apps/entropywatcher/main/safety_gate.sh}"
+RTB_WRAPPER_SCRIPT="${RTB_WRAPPER_SCRIPT:-/opt/apps/rtb/rtb_wrapper.sh}"
+
+# Exported: visible inside subshell command-substitution calls below
+export LIVE_SG_STATUS="N/A" LIVE_SG_DETAILS="" LIVE_SG_TS=""
+
 # Ensure output directory exists
 mkdir -p "$(dirname "$MONITORING_OUTPUT")"
 
@@ -83,48 +90,30 @@ check_systemd_service() {
     enabled="no"
   fi
   
-  # Get last start time and messages from journal
+  # Get timestamp + last message from journal (fast: only last 3 lines needed)
   if command -v journalctl &>/dev/null; then
-    # Get last 3 lines from service journal
     local journal_output
     journal_output=$(journalctl -u "${service_name}.service" -n 3 --no-pager --output=short-iso 2>/dev/null || echo "")
-    
     if [[ -n "$journal_output" ]]; then
-      # Extract timestamp from last line
       last_start=$(echo "$journal_output" | tail -1 | awk '{print $1}' || echo "unknown")
-      
-      # Get exit code from journal (100 lines to cover verbose oneshot output)
-      local journal_full
-      journal_full=$(journalctl -u "${service_name}.service" -n 100 --no-pager 2>/dev/null || echo "")
-      exit_code=$(echo "$journal_full" | grep -oP 'code=exited, status=\K[0-9]+' | tail -1)
-
-      # Fallback: systemd logs "Succeeded" / "Deactivated successfully" for clean exit 0
-      # without printing a numeric status line
-      if [[ -z "$exit_code" ]]; then
-        if echo "$journal_full" | grep -qE 'Succeeded\.|Deactivated successfully'; then
-          exit_code="0"
-        elif echo "$journal_full" | grep -qE 'Failed with result'; then
-          exit_code="1"
-        else
-          exit_code="unknown"
-        fi
-      fi
-
-      # Interpret exit code
-      if [[ "$exit_code" == "2" ]] && [[ "$service_name" == "backup-pipeline" ]]; then
-        exit_code="${exit_code} (blocked)"
-      elif [[ "$exit_code" != "0" && "$exit_code" != "unknown" ]]; then
-        exit_code="${exit_code} (error)"
-      fi
-      
-      # Get last meaningful message (skip systemd boilerplate)
       last_message=$(echo "$journal_output" | tail -1 | sed -E 's/^[^ ]+ [^ ]+ [^ ]+ //' | head -c 200 || echo "N/A")
-      
-      # Add explanation for backup-pipeline blocked status
-      if [[ "$service_name" == "backup-pipeline" ]] && echo "$exit_code" | grep -q "(blocked)"; then
-        last_message="Safety-Gate blockierte vorherigen Lauf (Ransomware-Schutz). Live Status prüfen via live_safety_gate. Original: ${last_message}"
-      fi
     fi
+  fi
+
+  # Exit code via systemctl show — authoritative, avoids unreliable journal text-parsing.
+  # ExecMainStatus holds the last main-process exit code even when service is inactive.
+  local show_line
+  show_line=$(systemctl show "${service_name}.service" -p ExecMainStatus 2>/dev/null | head -1 || echo "")
+  if [[ "$show_line" =~ ExecMainStatus=([0-9]+) ]]; then
+    exit_code="${BASH_REMATCH[1]}"
+  fi
+
+  # Annotate non-zero exit codes with context
+  if [[ "$service_name" == "backup-pipeline" ]] && [[ "$exit_code" =~ ^[12]$ ]]; then
+    exit_code="${exit_code} (blocked)"
+    last_message="Safety-Gate blockierte vorherigen Lauf. Live: ${LIVE_SG_STATUS:-N/A}. Nachricht: ${last_message}"
+  elif [[ "$exit_code" != "0" && "$exit_code" != "unknown" ]] && [[ "$exit_code" =~ ^[0-9]+$ ]]; then
+    exit_code="${exit_code} (error)"
   fi
   
   # Get next run time (for timer-based services)
@@ -137,7 +126,18 @@ check_systemd_service() {
   last_message=$(escape_json "$last_message")
   next_run=$(escape_json "$next_run")
   
-  echo "{\"status\":\"$status\",\"enabled\":\"$enabled\",\"last_start\":\"$last_start\",\"exit_code\":\"$exit_code\",\"next_run\":\"$next_run\",\"message\":\"$last_message\"}"
+  # For backup-pipeline: attach live safety-gate data (exported from main)
+  local extra_fields=""
+  if [[ "$service_name" == "backup-pipeline" ]] && [[ "${LIVE_SG_STATUS:-N/A}" != "N/A" ]]; then
+    extra_fields=",\"live_safety_gate\":\"${LIVE_SG_STATUS}\""
+    if [[ -n "${LIVE_SG_DETAILS:-}" ]]; then
+      local esc_sg
+      esc_sg=$(escape_json "${LIVE_SG_DETAILS}")
+      extra_fields="${extra_fields},\"live_sg_details\":\"${esc_sg}\""
+    fi
+  fi
+
+  echo "{\"status\":\"$status\",\"enabled\":\"$enabled\",\"last_start\":\"$last_start\",\"exit_code\":\"$exit_code\",\"next_run\":\"$next_run\",\"message\":\"$last_message\"${extra_fields}}"
 }
 
 # =====================================================
@@ -242,46 +242,34 @@ check_rtb_wrapper() {
     snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
   fi
 
-  # ---- Dry-Run pre-check result ----
-  # The wrapper runs rsync --dry-run before each backup to decide if a new
-  # snapshot is needed. Parse the most recent [check] block from the log.
+  # ---- Live Dry-Run pre-check ----
+  # Call rtb_wrapper.sh --check-only: pure rsync -ni, no lock / no log / no backup.
+  #   exit 1 + "changes_detected" → backup will fire next run
+  #   exit 0 + "no_changes"       → no backup needed
+  #   exit 0 + "no_baseline"      → no prior snapshot yet
   local dry_run_result="unknown"
   local dry_run_ts=""
-  if echo "$log_tail" | grep -q '\[check\] Prüfe auf Änderungen'; then
-    # Find where the LAST [check] line is and look at what follows it
-    local last_check_lineno
-    last_check_lineno=$(echo "$log_tail" | grep -n '\[check\] Prüfe auf Änderungen' | tail -1 | cut -d: -f1)
-    local tail_from_check
-    tail_from_check=$(echo "$log_tail" | tail -n +"$last_check_lineno")
-    if echo "$tail_from_check" | grep -q 'Änderungen erkannt'; then
-      dry_run_result="changes_detected"
-      dry_run_ts=$(echo "$tail_from_check" | grep 'Änderungen erkannt' | head -1 | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' || echo "")
-    elif echo "$tail_from_check" | grep -q 'Keine Änderungen'; then
-      dry_run_result="no_changes"
-      dry_run_ts=$(echo "$tail_from_check" | grep 'Keine Änderungen' | head -1 | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' || echo "")
-    fi
+  if [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
+    local check_out check_rc
+    set +e
+    check_out=$("${RTB_WRAPPER_SCRIPT}" --check-only 2>/dev/null)
+    check_rc=$?
+    set -e
+    dry_run_ts=$(date '+%Y-%m-%d %H:%M:%S')
+    case "$check_out" in
+      changes_detected)        dry_run_result="changes_detected" ;;
+      no_changes|no_baseline)  dry_run_result="no_changes" ;;
+    esac
   fi
 
   # Escape message and details
   message=$(escape_json "$message")
   details=$(escape_json "$details")
   
-  # Optional: Live Safety-Gate check (current status, not historical)
-  local live_safety_gate="N/A"
-  if [[ -x "/opt/apps/entropywatcher/main/safety_gate.sh" ]] && [[ "$status" != "running" ]]; then
-    # Only check if not currently running to avoid conflicts
-    if /opt/apps/entropywatcher/main/safety_gate.sh &>/dev/null; then
-      live_safety_gate="GREEN"
-    else
-      local sg_exit=$?
-      case $sg_exit in
-        1) live_safety_gate="YELLOW" ;;
-        2) live_safety_gate="RED" ;;
-        *) live_safety_gate="UNKNOWN" ;;
-      esac
-    fi
-  fi
-  
+  # Live Safety-Gate: pre-computed in main and exported — no duplicate invocations.
+  local live_safety_gate="${LIVE_SG_STATUS:-N/A}"
+  local live_sg_details="${LIVE_SG_DETAILS:-}"
+
   # Build JSON with optional details field
   local json="{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"message\":\"$message\""
   if [[ -n "$details" ]]; then
@@ -292,6 +280,11 @@ check_rtb_wrapper() {
   fi
   if [[ "$live_safety_gate" != "N/A" ]]; then
     json="$json,\"live_safety_gate\":\"$live_safety_gate\""
+    if [[ -n "$live_sg_details" ]]; then
+      local esc_live_sg
+      esc_live_sg=$(escape_json "$live_sg_details")
+      json="$json,\"live_sg_details\":\"$esc_live_sg\""
+    fi
   fi
   if [[ "$dry_run_result" != "unknown" ]]; then
     json="$json,\"dry_run_result\":\"$dry_run_result\""
@@ -329,10 +322,59 @@ check_pcloud() {
 }
 
 # =====================================================
+# Live Safety-Gate Check (run once in main, result shared)
+# =====================================================
+# Sets+exports: LIVE_SG_STATUS (GREEN|YELLOW|RED|UNKNOWN|N/A)
+#               LIVE_SG_DETAILS ("Honeyfiles: OK | nas: GREEN | nas-av: GREEN")
+check_live_safety_gate() {
+  if [[ ! -x "$ENTROPYWATCHER_SAFETY_GATE" ]]; then
+    log "Live Safety-Gate: script not found at $ENTROPYWATCHER_SAFETY_GATE"
+    return
+  fi
+
+  local sg_output sg_exit
+  set +e
+  sg_output=$("$ENTROPYWATCHER_SAFETY_GATE" 2>&1)
+  sg_exit=$?
+  set -e
+
+  case $sg_exit in
+    0) LIVE_SG_STATUS="GREEN" ;;
+    1) LIVE_SG_STATUS="YELLOW" ;;
+    2) LIVE_SG_STATUS="RED" ;;
+    *) LIVE_SG_STATUS="UNKNOWN" ;;
+  esac
+  LIVE_SG_TS=$(date '+%Y-%m-%dT%H:%M:%SZ')
+
+  # Parse individual component states from safety_gate.sh stdout
+  local honeyfile nas nas_av
+  if echo "$sg_output" | grep -q 'kein verdächtiger Zugriff'; then
+    honeyfile="OK"
+  elif echo "$sg_output" | grep -qE 'HONEYFILE-ALARM|Honeyfile-Alarm'; then
+    honeyfile="ALARM"
+  else
+    honeyfile="unknown"
+  fi
+  # " nas: GREEN" but NOT "nas-av: GREEN" — space-prefix distinguishes them
+  nas=$(echo "$sg_output"    | grep -oP '(?<= nas: )(GREEN|YELLOW|RED)'    | head -1 || echo "")
+  nas_av=$(echo "$sg_output" | grep -oP '(?<=nas-av: )(GREEN|YELLOW|RED)'  | head -1 || echo "")
+
+  if [[ -n "$nas" || -n "$nas_av" ]]; then
+    LIVE_SG_DETAILS="Honeyfiles: ${honeyfile} | nas: ${nas:-?} | nas-av: ${nas_av:-?}"
+  fi
+
+  export LIVE_SG_STATUS LIVE_SG_DETAILS LIVE_SG_TS
+  log "Live Safety-Gate: ${LIVE_SG_STATUS}${LIVE_SG_DETAILS:+ (${LIVE_SG_DETAILS})}"
+}
+
+# =====================================================
 # Main Aggregation Logic
 # =====================================================
 
 log "Starting status aggregation..."
+
+log "Checking Live Safety-Gate..."
+check_live_safety_gate
 
 # Define services to monitor
 SYSTEMD_SERVICES=(

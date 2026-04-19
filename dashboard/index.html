@@ -602,19 +602,25 @@
     // ---- Detail card: systemd service --------------------------
 
     function detailCardService(item) {
-      const blocked = (item.exit_code||'').includes('(blocked)');
-      // inactive+enabled=yes = healthy sleep state for timer oneshots
+      const blocked  = (item.exit_code||'').includes('(blocked)');
+      const hasTimer = item.next_run && item.next_run !== 'N/A' && item.next_run !== 'never';
+      // inactive+enabled=yes OR has a timer = healthy dormant state
       const effectiveDot = blocked ? 'blocked'
-        : (item.status === 'inactive' && item.enabled === 'yes') ? 'active'
+        : (item.status === 'inactive' && (item.enabled === 'yes' || hasTimer)) ? 'active'
         : (item.status || 'unknown');
       const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
       let rows = ''
-        + drow('Status',       item.status || 'unknown', statusValCls(item.status, blocked, item.enabled))
+        + drow('Status',       item.status || 'unknown', statusValCls(item.status, blocked, item.enabled, item.next_run))
         + drow('Enabled',      item.enabled || 'unknown')
         + drow('Letzter Lauf', fmtTs(item.last_start))
         + drow('Exit Code',    item.exit_code || 'N/A', blocked ? 'yellow' : item.exit_code === '0' ? 'green' : '');
       if (item.next_run && item.next_run !== 'N/A')
         rows += drow('N\xe4chster Run', item.next_run);
+      // backup-pipeline: live safety-gate status
+      if (item.live_safety_gate)
+        rows += drow('Live Safety-Gate', item.live_safety_gate, sgValCls(item.live_safety_gate));
+      if (item.live_sg_details)
+        rows += drow('\u2514 Komponenten', item.live_sg_details, sgValCls(item.live_safety_gate), 150);
       if (item.message && item.message !== 'N/A')
         rows += drow('Message', item.message, '', 100);
       return '<div class="dcard">'
@@ -631,6 +637,8 @@
       let rows = '';
       if (rtb.live_safety_gate)
         rows += drow('Live Safety-Gate', rtb.live_safety_gate, sgValCls(rtb.live_safety_gate));
+      if (rtb.live_sg_details)
+        rows += drow('\u2514 Komponenten', rtb.live_sg_details, sgValCls(rtb.live_safety_gate), 150);
       // ── Letzter Lauf ──────────────────────────────────────────
       rows += drow('Status letzter Lauf', rtb.status || 'unknown', rtbCls(rtb.status))
         + drow('Letzter Lauf', fmtTs(rtb.last_run))
@@ -770,10 +778,11 @@
         + '</div>';
     }
 
-    function statusValCls(status, blocked, enabled) {
+    function statusValCls(status, blocked, enabled, next_run) {
+      const hasTimer = next_run && next_run !== 'N/A' && next_run !== 'never';
       if (blocked)             return 'yellow';
       if (status === 'active') return 'green';
-      if (status === 'inactive' && enabled === 'yes') return 'green';
+      if (status === 'inactive' && (enabled === 'yes' || hasTimer)) return 'green';
       if (status === 'failed') return 'red';
       return '';
     }
@@ -896,10 +905,11 @@
     }
 
     function svcRow(item) {
-      const blocked = (item.exit_code||'').includes('(blocked)');
-      // inactive+enabled=yes is the healthy dormant state for timer-triggered oneshot services
+      const blocked  = (item.exit_code||'').includes('(blocked)');
+      const hasTimer = item.next_run && item.next_run !== 'N/A' && item.next_run !== 'never';
+      // inactive+enabled=yes OR has a timer = healthy dormant state
       const effectiveStatus = blocked ? 'blocked'
-        : (item.status === 'inactive' && item.enabled === 'yes') ? 'active'
+        : (item.status === 'inactive' && (item.enabled === 'yes' || hasTimer)) ? 'active'
         : (item.status || 'unknown');
       const dotCls  = effectiveStatus;
       const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
