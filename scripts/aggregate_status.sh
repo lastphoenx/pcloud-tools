@@ -262,9 +262,12 @@ check_rtb_wrapper() {
     message="No status markers found in recent log entries"
   fi
   
-  # Count snapshots in RTB destination (if accessible)
+  # Count snapshots + latest snapshot name from RTB filesystem (authoritative source of truth)
+  local latest_snapshot=""
   if [[ -d "/mnt/backup/rtb_nas" ]]; then
     snapshot_count=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null | wc -l || echo "0")
+    latest_snapshot=$(find /mnt/backup/rtb_nas -maxdepth 1 -type d -name "20*" 2>/dev/null \
+      | sort -r | head -1 | xargs -r basename 2>/dev/null || echo "")
   fi
 
   # ---- Live Dry-Run pre-check ----
@@ -296,7 +299,7 @@ check_rtb_wrapper() {
   local live_sg_details="${LIVE_SG_DETAILS:-}"
 
   # Build JSON with optional details field
-  local json="{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"message\":\"$message\""
+  local json="{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"latest_snapshot\":\"$latest_snapshot\",\"message\":\"$message\""
   if [[ -n "$details" ]]; then
     json="$json,\"details\":\"$details\""
   fi

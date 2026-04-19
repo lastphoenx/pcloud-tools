@@ -567,7 +567,7 @@
         + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
         + '<div class="card-grid">'
         + detailCardRTB(rtb)
-        + detailCardPCloud(cloud, reports)
+        + detailCardPCloud(cloud, reports, rtb)
         + (recent.length > 0 ? detailCardRecentBackups(recent) : '')
         + '</div></div>';
 
@@ -665,7 +665,21 @@
 
     // ---- Detail card: pCloud -----------------------------------
 
-    function detailCardPCloud(cloud, reports) {
+    function snapshotAge(snapName) {
+      // Parse snapshot name like '2026-04-18-004404' → {hours, label}
+      if (!snapName || snapName === 'unknown' || snapName === 'none') return null;
+      try {
+        // Format: YYYY-MM-DD-HHMMSS
+        const d = snapName.match(/^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})$/);
+        if (!d) return null;
+        const ts = new Date(+d[1], +d[2]-1, +d[3], +d[4], +d[5], +d[6]);
+        const h = Math.round((Date.now() - ts.getTime()) / 3600000);
+        const label = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
+        return { hours: h, label };
+      } catch(e) { return null; }
+    }
+
+    function detailCardPCloud(cloud, reports, rtb) {
       const sc  = cloud.status_code !== undefined ? cloud.status_code : 3;
       const cls = sc === 0 ? 'green' : sc === 1 ? 'yellow' : 'red';
       let rows = ''
@@ -690,17 +704,22 @@
 
       if (ba.message) rows += drow('Health-Check Msg', ba.message, '', 120);
 
-      // rtb_snapshot = latest snapshot on local filesystem (always current, source of truth)
-      if (ba.rtb_snapshot && ba.rtb_snapshot !== 'unknown') {
-        const h = ba.rtb_age_hours || 0;
-        const age = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
-        rows += drow('Neuester Snapshot (lokal)', ba.rtb_snapshot + ' (' + age + ')', h < 48 ? 'green' : h < 72 ? 'yellow' : 'red');
+      // Newest local snapshot: prefer rtb.latest_snapshot (aggregate_status.sh reads filesystem directly)
+      // Fall back to ba.rtb_snapshot (pcloud_health_check.sh, same filesystem but separate process)
+      const localSnap = (rtb && rtb.latest_snapshot && rtb.latest_snapshot !== '') ? rtb.latest_snapshot
+                      : (ba.rtb_snapshot && ba.rtb_snapshot !== 'unknown') ? ba.rtb_snapshot : null;
+      if (localSnap) {
+        // Compute age from snapshot name (always accurate, no stale JSON field)
+        const ag = snapshotAge(localSnap);
+        const h  = ag ? ag.hours : (ba.rtb_age_hours || 0);
+        const ageLbl = ag ? ag.label : (h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago');
+        rows += drow('Neuester Snapshot (lokal)', localSnap + ' (' + ageLbl + ')', h < 48 ? 'green' : h < 72 ? 'yellow' : 'red');
       }
       // pcloud_snapshot = last DB-recorded pCloud upload (requires PCLOUD_ENABLE_DB=1)
       if (ba.pcloud_snapshot && ba.pcloud_snapshot !== 'none' && ba.pcloud_snapshot !== 'unknown') {
         const h = ba.pcloud_age_hours || 0;
         const age = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
-        const isSame = ba.rtb_snapshot === ba.pcloud_snapshot;
+        const isSame = localSnap === ba.pcloud_snapshot;
         rows += drow('Letzter DB-Eintrag (pCloud)', ba.pcloud_snapshot + ' (' + age + ')' + (isSame ? '' : ' ⚠ abweichend!'), isSame ? '' : 'yellow');
       }
 
