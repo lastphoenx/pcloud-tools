@@ -142,9 +142,22 @@ check_systemd_service() {
   fi
   
   # Get next run time (for timer-based services)
+  # Parse timer info from systemctl list-timers and convert to ISO 8601
   local next_run="N/A"
   if systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | grep -q "${service_name}.timer"; then
-    next_run=$(systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | awk '{print $1, $2, $3, $4}' | head -1 || echo "N/A")
+    local timer_line
+    timer_line=$(systemctl list-timers "${service_name}.timer" --no-pager --no-legend 2>/dev/null | sed -n '1p')
+    if [[ -n "$timer_line" ]]; then
+      # Extract NEXT datetime: "Day YYYY-MM-DD HH:MM:SS TZ ..." → take columns 2+3
+      local next_date next_time
+      next_date=$(echo "$timer_line" | awk '{print $2}')
+      next_time=$(echo "$timer_line" | awk '{print $3}')
+      if [[ "$next_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "$next_time" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+        next_run="${next_date}T${next_time}"  # ISO 8601 format
+      else
+        next_run="N/A"
+      fi
+    fi
   fi
   
   # Escape message for JSON
