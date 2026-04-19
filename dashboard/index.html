@@ -396,8 +396,12 @@
                     : 'warning';
 
       const snapCount = rtb.snapshot_count || 0;
-      const sgLive    = rtb.live_safety_gate || rtb.safety_gate || '\u2014';
-      const sgClass   = sgLive === 'GREEN' ? 'green' : sgLive === 'YELLOW' ? 'yellow' : sgLive === 'RED' ? 'red' : 'gray';
+      // Show LIVE SG if available, fall back to historical — label makes source explicit
+      const sgLive     = rtb.live_safety_gate || '';
+      const sgHist     = rtb.safety_gate || '';
+      const sgDisplay  = sgLive || sgHist || '\u2014';
+      const sgLabel    = sgLive ? 'Safety-Gate (live)' : sgHist ? 'Safety-Gate (hist.)' : 'Safety-Gate';
+      const sgClass    = sgDisplay === 'GREEN' ? 'green' : sgDisplay === 'YELLOW' ? 'yellow' : sgDisplay === 'RED' ? 'red' : 'gray';
 
       const perf       = ((reports || {}).performance_stats || {});
       const successPct = perf.total_runs > 0
@@ -423,8 +427,8 @@
         +       '<div class="lbl">pCloud Sync</div>'
         +     '</div>'
         +     '<div class="summary-box ' + sgClass + '">'
-        +       '<div class="big" style="font-size:15px">' + sgLive + '</div>'
-        +       '<div class="lbl">Safety-Gate</div>'
+        +       '<div class="big" style="font-size:15px">' + sgDisplay + '</div>'
+        +       '<div class="lbl">' + sgLabel + '</div>'
         +     '</div>'
         +   '</div>'
         +   '<div class="info-group">'
@@ -685,10 +689,19 @@
       }
 
       if (ba.message) rows += drow('Health-Check Msg', ba.message, '', 120);
+
+      // rtb_snapshot = latest snapshot on local filesystem (always current, source of truth)
+      if (ba.rtb_snapshot && ba.rtb_snapshot !== 'unknown') {
+        const h = ba.rtb_age_hours || 0;
+        const age = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
+        rows += drow('Neuester Snapshot (lokal)', ba.rtb_snapshot + ' (' + age + ')', h < 48 ? 'green' : h < 72 ? 'yellow' : 'red');
+      }
+      // pcloud_snapshot = last DB-recorded pCloud upload (requires PCLOUD_ENABLE_DB=1)
       if (ba.pcloud_snapshot && ba.pcloud_snapshot !== 'none' && ba.pcloud_snapshot !== 'unknown') {
         const h = ba.pcloud_age_hours || 0;
-        const age = h < 24 ? h + 'h' : Math.floor(h/24) + 'd ' + (h%24) + 'h';
-        rows += drow('Neuester pCloud Snap', ba.pcloud_snapshot + ' (' + age + ' ago)');
+        const age = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
+        const isSame = ba.rtb_snapshot === ba.pcloud_snapshot;
+        rows += drow('Letzter DB-Eintrag (pCloud)', ba.pcloud_snapshot + ' (' + age + ')' + (isSame ? '' : ' ⚠ abweichend!'), isSame ? '' : 'yellow');
       }
 
       const pq = (cloud.checks||{}).pcloud_quota || {};

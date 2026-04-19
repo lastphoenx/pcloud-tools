@@ -90,22 +90,47 @@ check_systemd_service() {
     enabled="no"
   fi
   
-  # Get timestamp + last message from journal (fast: only last 3 lines needed)
-  if command -v journalctl &>/dev/null; then
-    local journal_output
-    journal_output=$(journalctl -u "${service_name}.service" -n 3 --no-pager --output=short-iso 2>/dev/null || echo "")
-    if [[ -n "$journal_output" ]]; then
-      last_start=$(echo "$journal_output" | tail -1 | awk '{print $1}' || echo "unknown")
-      last_message=$(echo "$journal_output" | tail -1 | sed -E 's/^[^ ]+ [^ ]+ [^ ]+ //' | head -c 200 || echo "N/A")
-    fi
+  # ── Reliable timestamps + exit code via systemctl show ──────────────
+  # InactiveEnterTimestamp = when service last finished (for inactive oneshot).
+  # ActiveEnterTimestamp   = when service first became active (= current start).
+  # ExecMainStatus         = last exit code of the main process (persistent).
+  local show_props
+  show_props=$(systemctl show "${service_name}.service" \
+    -p InactiveEnterTimestamp,ActiveEnterTimestamp,ExecMainStatus \
+    2>/dev/null || echo "")
+
+  if [[ "$show_props" =~ ExecMainStatus=([0-9]+) ]]; then
+    exit_code="${BASH_REMATCH[1]}"
   fi
 
-  # Exit code via systemctl show — authoritative, avoids unreliable journal text-parsing.
-  # ExecMainStatus holds the last main-process exit code even when service is inactive.
-  local show_line
-  show_line=$(systemctl show "${service_name}.service" -p ExecMainStatus 2>/dev/null | head -1 || echo "")
-  if [[ "$show_line" =~ ExecMainStatus=([0-9]+) ]]; then
-    exit_code="${BASH_REMATCH[1]}"
+  # Pick the most useful timestamp
+  local ts_raw=""
+  if [[ "$status" == "active" ]]; then
+    ts_raw=$(echo "$show_props" | grep -oP 'ActiveEnterTimestamp=\K.+' | head -1 || echo "")
+  else
+    ts_raw=$(echo "$show_props" | grep -oP 'InactiveEnterTimestamp=\K.+' | head -1 || echo "")
+  fi
+  if [[ -n "$ts_raw" && "$ts_raw" != "n/a" ]]; then
+    # Convert to ISO 8601 (fmtTs in dashboard expects parseable date string)
+    local ts_iso
+    ts_iso=$(date -d "$ts_raw" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo "")
+    [[ -n "$ts_iso" ]] && last_start="$ts_iso"
+  fi
+
+  # ── Last meaningful message from journal ────────────────────────────
+  # Skip systemd boilerplate: "Consumed N CPU time", "Started/Starting/Stopped/..."
+  if command -v journalctl &>/dev/null; then
+    local journal_output
+    journal_output=$(journalctl -u "${service_name}.service" -n 15 \
+      --no-pager --output=cat 2>/dev/null || echo "")
+    if [[ -n "$journal_output" ]]; then
+      local filtered
+      filtered=$(echo "$journal_output" | grep -vE \
+        'Consumed [0-9]|^Starting |^Stopping |^Started |^Stopped |^Deactivated |^Finished ' \
+        | tail -1 | head -c 200 || echo "")
+      [[ -n "$filtered" ]] && last_message="$filtered" || \
+        last_message=$(echo "$journal_output" | tail -1 | head -c 200)
+    fi
   fi
 
   # Annotate non-zero exit codes with context
