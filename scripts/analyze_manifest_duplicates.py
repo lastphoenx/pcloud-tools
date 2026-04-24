@@ -85,10 +85,19 @@ def analyze_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     df['duplicate_id'] = df['sha256'].map(sha256_to_id)
     df['duplicate_id'] = df['duplicate_id'].fillna(0).astype(int)
     
-    # Platzverschwendung: (Anzahl - 1) × Dateigröße
-    # Nur für Duplikate berechnen
+    # Platzverschwendung berechnen (KORREKT pro Zeile, nicht mehrfach gezählt):
+    # Strategie: Sortiere pro SHA256-Gruppe, erste Instanz = 0 (würden wir behalten),
+    # alle weiteren = size (sind Verschwendung)
     df['wasted_space'] = 0
-    df.loc[df['is_duplicate'], 'wasted_space'] = df['size'] * (df['duplicate_count'] - 1)
+    
+    # Für jede SHA256-Gruppe: Alle außer der ersten sind Verschwendung
+    for sha256, group in df[df['is_duplicate']].groupby('sha256'):
+        # Erste Instanz behalten (wasted_space = 0)
+        # Weitere Instanzen: jeweils 'size' ist verschwendet
+        indices = group.index.tolist()
+        if len(indices) > 1:
+            # Indices ab Position 1 (2., 3., ... Kopie) sind Verschwendung
+            df.loc[indices[1:], 'wasted_space'] = df.loc[indices[1:], 'size']
     
     return df
 
@@ -114,13 +123,13 @@ def create_space_analysis(df: pd.DataFrame) -> pd.DataFrame:
     if df_dupes.empty:
         return pd.DataFrame()
     
-    # Pro Duplikat-Gruppe: erste Datei als Beispiel, Gesamtstatistik
+    # Pro Duplikat-Gruppe: Summe des wasted_space (= size × (count - 1))
     analysis = df_dupes.groupby('sha256').agg({
         'duplicate_id': 'first',
         'filename': 'first',  # Beispiel-Dateiname
         'size': 'first',  # Einzeldateigröße
         'duplicate_count': 'first',
-        'wasted_space': 'first'  # Bereits korrekt berechnet pro Gruppe
+        'wasted_space': 'sum'  # SUMME des wasted_space (korrekt, da pro Zeile nur eigener Anteil)
     }).reset_index()
     
     # Readable Formate hinzufügen
