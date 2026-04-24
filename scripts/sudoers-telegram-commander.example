@@ -1,0 +1,8 @@
+# /etc/sudoers.d/telegram-commander
+# Allow telegram-commander (running as root) to start backup-pipeline
+# NOTE: if telegram_commander.service runs as root (User=root), this is NOT needed.
+#       Only required if you run the service as a dedicated unprivileged user.
+#
+# Example: run as user 'tcmd' with only systemctl start permission:
+#   Cmnd_Alias BACKUP_START = /bin/systemctl start backup-pipeline.service
+#   tcmd ALL=(root) NOPASSWD: BACKUP_START

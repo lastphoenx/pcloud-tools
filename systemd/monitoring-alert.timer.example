@@ -1,0 +1,26 @@
+[Unit]
+Description=Monitoring Alert Notification Timer
+Documentation=file:///opt/apps/pcloud-tools/main/scripts/README.md
+# Must run after status update to check for changes
+After=monitoring-status-update.timer
+
+[Timer]
+# Primary trigger: Run after monitoring-status-update.service completes
+# This ensures we check for status changes immediately after updates
+OnUnitActivation=monitoring-status-update.service
+
+# Fallback: Also run periodically (every 30 minutes)
+# Catches any missed status changes
+OnCalendar=*:0/30
+
+# Initial run: 3 minutes after boot (after status-update has run)
+OnBootSec=3min
+
+# Randomize activation by up to 1 minute to spread load
+AccuracySec=1m
+
+# Catch up on missed runs (if system was offline)
+Persistent=true
+
+[Install]
+WantedBy=timers.target

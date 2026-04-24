@@ -1,0 +1,49 @@
+[Unit]
+Description=Telegram Commander - Backup trigger via Telegram bot
+Documentation=file:///opt/apps/pcloud-tools/main/scripts/telegram_commander.py
+After=network-online.target
+Wants=network-online.target
+
+# Config is read from telegram_commander.conf or apprise.yml (fallback)
+# No ConditionPathExists needed - script handles missing config gracefully
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# If using a virtualenv (check with: ls /opt/apps/venv-*/bin/python3), replace
+# /usr/bin/python3 with the venv interpreter, e.g.:
+#   ExecStart=/opt/apps/venv-20260331-1756/bin/python3 /opt/apps/pcloud-tools/main/scripts/telegram_commander.py
+# Find the active venv python while the venv is activated: "which python3"
+ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/scripts/telegram_commander.py
+
+# Restart on failure (Telegram API hiccups, network drops)
+Restart=on-failure
+RestartSec=10s
+# Avoid restart storm
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Allow systemctl start backup-pipeline.service
+AmbientCapabilities=
+# Allow reading /opt/apps
+ReadOnlyPaths=/opt/apps
+# Status/report files need to be readable
+ReadOnlyPaths=/opt/apps/monitoring
+
+# Environment (alternatively put these in telegram_commander.conf)
+# Environment=LOG_LEVEL=INFO
+# Environment=POLL_TIMEOUT=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-commander
+
+[Install]
+WantedBy=multi-user.target

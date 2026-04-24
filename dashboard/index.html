@@ -1,0 +1,1229 @@
+﻿<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Backup & Monitoring Dashboard</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --green:   #22c55e;
+      --yellow:  #f59e0b;
+      --red:     #ef4444;
+      --blue:    #3b82f6;
+      --gray:    #6b7280;
+      --bg:      #0f172a;
+      --surface: #1e293b;
+      --surface2:#273549;
+      --border:  #334155;
+      --text:    #e2e8f0;
+      --muted:   #94a3b8;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 16px;
+    }
+    .header h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+    .header .meta { font-size: 13px; color: var(--muted); text-align: right; }
+    .header .meta span { display: block; }
+
+    .overall-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 16px;
+    }
+    .overall-dot {
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--gray);
+    }
+    .overall-dot.ok       { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .overall-dot.warning  { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+    .overall-dot.critical { background: var(--red);   box-shadow: 0 0 8px var(--red); }
+    .overall-dot.running  { background: var(--blue);  box-shadow: 0 0 8px var(--blue); animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+    .overall-label { font-size: 16px; font-weight: 600; }
+    .overall-explain { font-size: 13px; color: var(--muted); }
+
+    .tiles {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+    @media (max-width: 1000px) { .tiles { grid-template-columns: 1fr; } }
+    @media (min-width: 1001px) and (max-width: 1280px) { .tiles { grid-template-columns: 1fr 1fr; } }
+
+    .tile {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .tile-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .tile-icon { font-size: 20px; }
+    .tile-title { font-size: 16px; font-weight: 600; flex: 1; }
+    .tile-status-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      background: var(--gray);
+    }
+    .tile-status-dot.ok      { background: var(--green); }
+    .tile-status-dot.warning { background: var(--yellow); }
+    .tile-status-dot.bad     { background: var(--red); }
+    .tile-status-dot.running { background: var(--blue); animation: pulse 1.5s infinite; }
+
+    .tile-body { padding: 16px 20px; flex: 1; display: flex; flex-direction: column; gap: 10px; }
+
+    .summary-row {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 4px;
+    }
+    .summary-box {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      text-align: center;
+    }
+    .summary-box .big { font-size: 26px; font-weight: 700; line-height: 1; }
+    .summary-box .lbl { font-size: 11px; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .summary-box.green .big  { color: var(--green); }
+    .summary-box.yellow .big { color: var(--yellow); }
+    .summary-box.red .big    { color: var(--red); }
+    .summary-box.blue .big   { color: var(--blue); }
+    .summary-box.gray .big   { color: var(--muted); }
+
+    .info-group { display: flex; flex-direction: column; gap: 6px; }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      padding: 7px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 13px;
+      gap: 8px;
+    }
+    .info-row .lbl { color: var(--muted); flex-shrink: 0; }
+    .info-row .val { font-weight: 500; text-align: right; word-break: break-word; max-width: 65%; }
+    .info-row .val.green  { color: var(--green); }
+    .info-row .val.yellow { color: var(--yellow); }
+    .info-row .val.red    { color: var(--red); }
+    .info-row .val.blue   { color: var(--blue); }
+
+    .service-list { display: flex; flex-direction: column; gap: 5px; }
+    .service-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 13px;
+    }
+    .svc-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .svc-dot.active   { background: var(--green); }
+    .svc-dot.success  { background: var(--green); }
+    .svc-dot.inactive { background: var(--gray); }
+    .svc-dot.failed   { background: var(--red); }
+    .svc-dot.stalled  { background: var(--red); animation: pulse 1.5s infinite; }
+    .svc-dot.blocked  { background: var(--yellow); }
+    .svc-dot.skipped  { background: var(--yellow); }
+    .svc-dot.running  { background: var(--blue); animation: pulse 1.5s infinite; }
+    .svc-dot.unknown  { background: var(--gray); }
+    /* Color-based classes for detail cards */
+    .svc-dot.green    { background: var(--green); }
+    .svc-dot.yellow   { background: var(--yellow); }
+    .svc-dot.red      { background: var(--red); }
+    .svc-dot.blue     { background: var(--blue); }
+    .svc-dot.gray     { background: var(--gray); }
+    .svc-name { flex: 1; color: var(--text); }
+    .svc-detail { font-size: 11px; color: var(--muted); }
+
+    .tile-detail {
+      border-top: 1px solid var(--border);
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s ease;
+    }
+    .tile-detail.open { max-height: 600px; }
+    .tile-detail-inner { 
+      padding: 16px 20px; 
+      max-height: 550px;
+      overflow-x: auto; 
+      overflow-y: auto;
+      /* Horizontal + vertical scrolling for large tables */ 
+    }
+    .detail-toggle {
+      background: none; border: none; cursor: pointer;
+      width: 100%;
+      padding: 10px 20px;
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: color 0.2s;
+    }
+    .detail-toggle:hover { color: var(--text); }
+    .detail-toggle .arrow { transition: transform 0.3s; }
+    .detail-toggle.open .arrow { transform: rotate(180deg); }
+
+    .report-table {
+      width: 100%;
+      min-width: 600px; /* Ensure scrolling activates for narrow viewports */
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .report-table th {
+      text-align: left;
+      color: var(--muted);
+      font-weight: 500;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      font-size: 11px;
+    }
+    .report-table td {
+      padding: 7px 8px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    .report-table tr:last-child td { border-bottom: none; }
+    .report-table tr:hover td { background: rgba(255,255,255,0.03); }
+    .badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge.success { background: rgba(34,197,94,0.15);  color: var(--green); }
+    .badge.failed  { background: rgba(239,68,68,0.15);  color: var(--red); }
+    .badge.running { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .badge.nas     { background: rgba(168,85,247,0.15); color: #a855f7; }
+    .badge.os      { background: rgba(59,130,246,0.15); color: var(--blue); }
+
+    .footer {
+      margin-top: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+      padding: 10px 4px;
+    }
+
+    .loading-overlay {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      padding: 40px;
+      gap: 10px;
+    }
+    .spinner {
+      width: 20px; height: 20px;
+      border: 2px solid var(--border);
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .err-box {
+      background: rgba(239,68,68,0.1);
+      border: 1px solid rgba(239,68,68,0.3);
+      border-radius: 10px;
+      padding: 16px;
+      color: #fca5a5;
+      font-size: 13px;
+      margin: 8px 0;
+    }
+
+    /* ── Detail Sections ── */
+    .detail-section { margin-top: 28px; }
+    .section-heading {
+      font-size: 12px; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.8px;
+      display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+    }
+    .section-heading::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .dcard {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .dcard-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+      font-size: 14px; font-weight: 600;
+    }
+    .dcard-body { 
+      padding: 4px 16px 10px; 
+      overflow-x: auto; 
+      /* Horizontal scrolling for wide tables */ 
+    }
+    .dcard-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+      padding: 7px 0; border-bottom: 1px solid rgba(51,65,85,0.5);
+      font-size: 13px; gap: 12px;
+    }
+    .dcard-row:last-child { border-bottom: none; }
+    .dcard-lbl { color: var(--muted); flex-shrink: 0; }
+    .dcard-val { font-weight: 500; text-align: right; word-break: break-word; max-width: 80%; }
+    .dcard-val.green  { color: var(--green); }
+    .dcard-val.yellow { color: var(--yellow); }
+    .dcard-val.red    { color: var(--red); }
+    .dcard-val.blue   { color: var(--blue); }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>&#x1F5A5;&#xFE0F; Backup &amp; Monitoring Dashboard</h1>
+    <div class="meta">
+      <span id="hostname">&#x2014;</span>
+      <span id="data-timestamp">&#x2014;</span>
+    </div>
+  </div>
+
+  <div class="overall-bar" id="overall-bar">
+    <div class="overall-dot" id="overall-dot"></div>
+    <span class="overall-label" id="overall-label">Lade&#x2026;</span>
+    <span class="overall-explain" id="overall-explain"></span>
+  </div>
+
+  <div class="tiles" id="tiles">
+    <div class="loading-overlay" style="grid-column:1/-1">
+      <div class="spinner"></div> Lade Monitoring-Daten&#x2026;
+    </div>
+  </div>
+
+  <div id="detail-sections"></div>
+
+  <div class="footer">
+    <span>Auto-Refresh in <strong id="countdown">30</strong>s</span>
+    <span id="last-update">&#x2014;</span>
+  </div>
+
+  <script>
+    const STATUS_URL  = '/monitoring/status.json';
+    const REPORTS_URL = '/monitoring/reports.json';
+    const REFRESH_SEC = 30;
+
+    let countdown = REFRESH_SEC;
+    let countdownInterval = null;
+
+    async function fetchAll() {
+      const [statusRes, reportsRes] = await Promise.allSettled([
+        fetch(STATUS_URL  + '?t=' + Date.now()).then(r => r.ok ? r.json() : Promise.reject(r.status)),
+        fetch(REPORTS_URL + '?t=' + Date.now()).then(r => r.ok ? r.json() : null).catch(() => null)
+      ]);
+
+      const status  = statusRes.status  === 'fulfilled' ? statusRes.value  : null;
+      const reports = reportsRes.status === 'fulfilled' ? reportsRes.value : null;
+
+      if (!status) {
+        renderError(statusRes.reason);
+      } else {
+        render(status, reports);
+      }
+      resetCountdown();
+    }
+
+    function renderError(reason) {
+      document.getElementById('tiles').innerHTML =
+        '<div class="err-box" style="grid-column:1/-1">\u274C Fehler beim Laden von status.json (' + reason + '). Retry in ' + REFRESH_SEC + 's.</div>';
+    }
+
+    function render(status, reports) {
+      document.getElementById('hostname').textContent = status.hostname || '\u2014';
+      document.getElementById('data-timestamp').textContent = fmtTs(status.timestamp);
+      document.getElementById('last-update').textContent = 'Letztes Update: ' + new Date().toLocaleTimeString('de-DE');
+
+      const overall = (status.overall_status || 'UNKNOWN').toUpperCase();
+      const dot = document.getElementById('overall-dot');
+      dot.className = 'overall-dot ' + overallClass(overall);
+      document.getElementById('overall-label').textContent = overall;
+      document.getElementById('overall-explain').textContent = buildOverallExplain(status);
+
+      const svc   = status.services || {};
+      const rtb   = ((status.scripts || {}).rtb_wrapper   || {});
+      const cloud = ((status.scripts || {}).pcloud_backup  || {});
+
+      document.getElementById('tiles').innerHTML =
+        tileBackup(rtb, cloud, reports) +
+        tileMalware(svc, reports) +
+        tileSysHealth(svc, reports);
+
+      renderDetails(svc, rtb, cloud, reports, status);
+    }
+
+    // ---- Tile 1: Backup-Status ----------------------------------
+
+    function tileBackup(rtb, cloud, reports) {
+      // Use explicit undefined check — status_code=0 is falsy but means "OK"
+      const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
+      const rtbOk   = rtb.status === 'success';
+      const cloudOk = cloudCode === 0;
+      const tileCls = (rtbOk && cloudOk) ? 'ok'
+                    : (rtb.status === 'failed' || cloudCode >= 2) ? 'bad'
+                    : 'warning';
+
+      const snapCount = rtb.snapshot_count || 0;
+      // Show LIVE SG if available, fall back to historical — label makes source explicit
+      const sgLive     = rtb.live_safety_gate || '';
+      const sgHist     = rtb.safety_gate || '';
+      const sgDisplay  = sgLive || sgHist || '\u2014';
+      const sgLabel    = sgLive ? 'Safety-Gate (live)' : sgHist ? 'Safety-Gate (hist.)' : 'Safety-Gate';
+      const sgClass    = sgDisplay === 'GREEN' ? 'green' : sgDisplay === 'YELLOW' ? 'yellow' : sgDisplay === 'RED' ? 'red' : 'gray';
+
+      const perf       = ((reports || {}).performance_stats || {});
+      const successPct = perf.total_runs > 0
+        ? Math.round((perf.successful_runs / perf.total_runs) * 100)
+        : null;
+
+      const recent = ((reports || {}).recent_backups || []).slice(0, 7);
+
+      let html = '<div class="tile">'
+        + '<div class="tile-header">'
+        +   '<span class="tile-icon">\uD83D\uDD04</span>'
+        +   '<span class="tile-title">Backup-Status</span>'
+        +   '<span class="tile-status-dot ' + tileCls + '"></span>'
+        + '</div>'
+        + '<div class="tile-body">'
+        +   '<div class="summary-row">'
+        +     '<div class="summary-box ' + rtbCls(rtb.status) + '">'
+        +       '<div class="big">' + rtbIcon(rtb.status) + '</div>'
+        +       '<div class="lbl">RTB Backup</div>'
+        +     '</div>'
+        +     '<div class="summary-box ' + cloudStatusCls(cloud) + '">'
+        +       '<div class="big">' + cloudIcon(cloud) + '</div>'
+        +       '<div class="lbl">pCloud Sync</div>'
+        +     '</div>'
+        +     '<div class="summary-box ' + sgClass + '">'
+        +       '<div class="big" style="font-size:15px">' + sgDisplay + '</div>'
+        +       '<div class="lbl">' + sgLabel + '</div>'
+        +     '</div>'
+        +   '</div>'
+        +   '<div class="info-group">'
+        +     '<div class="info-row"><span class="lbl">RTB letzter Lauf</span><span class="val">' + fmtTs(rtb.last_run) + '</span></div>'
+        +     '<div class="info-row"><span class="lbl">RTB Snapshots</span><span class="val">' + snapCount + '</span></div>'
+        +     rtbDryRunHTML(rtb)
+        +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
+        +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
+        +     (perf.total_runs ? (
+                '<div class="info-row"><span class="lbl">Erfolgsrate 30d</span><span class="val ' + (successPct >= 90 ? 'green' : successPct >= 70 ? 'yellow' : 'red') + '">' + successPct + '%</span></div>'
+              + '<div class="info-row"><span class="lbl">\xD8 Dauer</span><span class="val">' + perf.avg_duration_min + ' min</span></div>'
+              + '<div class="info-row"><span class="lbl">Gesamt hochgeladen (30d)</span><span class="val">' + perf.total_gb_uploaded + ' GB</span></div>'
+              ) : '')
+        +   '</div>'
+        + '</div>';
+
+      if (recent.length > 0) {
+        html += '<button class="detail-toggle" id="btn-backup" onclick="toggleDetail(\'backup\')">'
+          + '<span>Letzte Backup-L\xe4ufe</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
+          + '<table class="report-table"><thead><tr>'
+          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th><th>GB</th>'
+          + '</tr></thead><tbody>'
+          + recent.map(r =>
+              '<tr>'
+            + '<td>' + (r.snapshot || '\u2014') + '</td>'
+            + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + (r.status||'\u2014') + '</span></td>'
+            + '<td>' + fmtTs(r.started_at) + '</td>'
+            + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
+            + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
+            + '</tr>'
+            ).join('')
+          + '</tbody></table></div></div>';
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    // ---- Tile 2: Malware & Integritaet -------------------------
+
+    function tileMalware(svc, reports) {
+      const names = ['entropywatcher-nas','entropywatcher-os','entropywatcher-nas-av','entropywatcher-os-av','honeyfile-monitor'];
+      const items = names.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
+
+      const anyFailed  = items.some(i => i.status === 'failed');
+      
+      // DB-Daten: flagged files + missing files + AV events
+      const ew = (reports && reports.entropywatcher) || {};
+      const flaggedFiles = ew.flagged_files || {};
+      const totalFlagged = Object.values(flaggedFiles).reduce((sum, n) => sum + n, 0);
+      const flaggedFilesDetailed = ew.flagged_files_detailed || [];
+      const lastScans = ew.last_scans || [];
+      // Count ALL missing files from DB (not just last scan)
+      const missingFiles = ew.missing_files || [];
+      const totalMissing = missingFiles.length;
+      const avEvents = (ew.av_events || []).length;
+      
+      // Tile-Klasse: rot bei AV-Events oder failed services, gelb bei flagged/missing files
+      // inactive ist KEIN Problem (timer-basierte Services)
+      const tileCls = anyFailed || avEvents > 0 ? 'bad'
+                    : totalFlagged > 0 || totalMissing > 0 ? 'warning'
+                    : 'ok';
+
+      const activeCount  = items.filter(i => i.status === 'active').length;
+      const inactiveCount = items.filter(i => i.status !== 'active' && i.status !== 'failed').length;
+      const failedCount  = items.filter(i => i.status === 'failed').length;
+
+      let html = '<div class="tile">'
+        + '<div class="tile-header">'
+        +   '<span class="tile-icon">\uD83D\uDEE1\uFE0F</span>'
+        +   '<span class="tile-title">Malware &amp; Integrit\xe4t</span>'
+        +   '<span class="tile-status-dot ' + tileCls + '"></span>'
+        + '</div>'
+        + '<div class="tile-body">'
+        +   '<div class="summary-row">'
+        +     '<div class="summary-box green"><div class="big">' + activeCount + '</div><div class="lbl">Aktiv</div></div>'
+        +     '<div class="summary-box ' + (totalFlagged > 0 ? 'yellow' : 'gray') + '"><div class="big">' + totalFlagged + '</div><div class="lbl">Flagged</div></div>'
+        +     '<div class="summary-box ' + (totalMissing > 0 ? 'yellow' : 'gray') + '"><div class="big">' + totalMissing + '</div><div class="lbl">Missing</div></div>'
+        +     '<div class="summary-box ' + (avEvents > 0 || failedCount > 0 ? 'red' : 'gray') + '"><div class="big">' + (avEvents || failedCount) + '</div><div class="lbl">' + (avEvents > 0 ? 'AV-Events' : 'Fehler') + '</div></div>'
+        +   '</div>'
+        +   '<div class="service-list">' + items.map(i => svcRow(i)).join('') + '</div>';
+
+      // Add flagged files table (expandable)
+      if (flaggedFilesDetailed.length > 0) {
+        html += '<button class="detail-toggle" id="btn-flagged" onclick="toggleDetail(\'flagged\')">'
+          + '<span>Flagged Dateien (' + flaggedFilesDetailed.length + ')</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-flagged"><div class="tile-detail-inner">'
+          + '<table class="report-table"><thead><tr>'
+          + '<th>Quelle</th><th>Pfad</th><th>Entropie</th><th>Grund</th>'
+          + '</tr></thead><tbody>'
+          + flaggedFilesDetailed.map(f =>
+              '<tr>'
+            + '<td><span class="badge ' + (f.source === 'nas' ? 'nas' : 'os') + '">' + (f.source || '\u2014') + '</span></td>'
+            + '<td style="font-family:monospace;font-size:11px" title="' + esc(f.path || '') + '">' + esc(f.path || '\u2014') + '</td>'
+            + '<td>' + (f.entropy || '\u2014') + '</td>'
+            + '<td style="font-size:11px">' + esc(f.reason || '\u2014') + '</td>'
+            + '</tr>'
+            ).join('')
+          + '</tbody></table></div></div>';
+      }
+
+      // Add missing files table (expandable)
+      if (missingFiles.length > 0) {
+        html += '<button class="detail-toggle" id="btn-missing" onclick="toggleDetail(\'missing\')">'
+          + '<span>Fehlende Dateien (' + missingFiles.length + ')</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-missing"><div class="tile-detail-inner">'
+          + '<table class="report-table"><thead><tr>'
+          + '<th>Quelle</th><th>Pfad</th><th>Seit</th>'
+          + '</tr></thead><tbody>'
+          + missingFiles.map(f =>
+              '<tr>'
+            + '<td><span class="badge ' + (f.source === 'nas' ? 'nas' : 'os') + '">' + (f.source || '\u2014') + '</span></td>'
+            + '<td style="font-family:monospace;font-size:11px">' + esc(f.path || '\u2014') + '</td>'
+            + '<td>' + (f.missing_since || '\u2014') + '</td>'
+            + '</tr>'
+            ).join('')
+          + '</tbody></table></div></div>';
+      }
+
+      html += '</div></div>';
+      return html;
+    }
+
+    // ---- Tile 3: System-Gesundheit ------------------------------
+
+    function tileSysHealth(svc, reports) {
+      const names = ['cleanup-samba-recycle','backup-pipeline'];
+      const items = names.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
+
+      // Safety-Gate blocked runs exit non-zero → systemd marks service 'failed'.
+      // That is the protection system working, not a system health problem.
+      const anyFailed  = items.some(i => i.status === 'failed' && !(i.exit_code||'').includes('(blocked)'));
+      const anyBlocked = items.some(i => (i.exit_code||'').includes('(blocked)'));
+      const tileCls    = anyFailed ? 'bad' : anyBlocked ? 'warning' : 'ok';
+
+      const phases       = ((reports || {}).phase_stats   || []);
+      const failedBackups = ((reports || {}).failed_backups || []).slice(0, 3);
+
+      let html = '<div class="tile">'
+        + '<div class="tile-header">'
+        +   '<span class="tile-icon">\uD83D\uDDA5\uFE0F</span>'
+        +   '<span class="tile-title">System-Gesundheit</span>'
+        +   '<span class="tile-status-dot ' + tileCls + '"></span>'
+        + '</div>'
+        + '<div class="tile-body">'
+        +   '<div class="service-list">'
+        +   (items.length > 0 ? items.map(i => svcRow(i)).join('') : '<div class="info-row"><span class="lbl">Keine Services konfiguriert</span></div>')
+        +   '</div>';
+
+      if (phases.length > 0) {
+        html += '<div class="info-group" style="margin-top:8px">'
+          + '<div style="font-size:12px;color:var(--muted);padding:4px 2px;text-transform:uppercase;letter-spacing:0.5px">\xD8 Phase-Dauer (30 Tage)</div>'
+          + phases.map(p =>
+              '<div class="info-row"><span class="lbl">' + p.phase + '</span>'
+            + '<span class="val ' + (p.failed > 0 ? 'red' : 'green') + '">'
+            + p.avg_duration_sec + 's'
+            + (p.failed > 0 ? ' (' + p.failed + ' Fehler)' : '')
+            + '</span></div>'
+            ).join('')
+          + '</div>';
+      }
+
+      if (failedBackups.length > 0) {
+        html += '<div class="info-group" style="margin-top:8px">'
+          + '<div style="font-size:12px;color:var(--muted);padding:4px 2px;text-transform:uppercase;letter-spacing:0.5px">Letzte Fehler (7 Tage)</div>'
+          + failedBackups.map(f =>
+              '<div class="info-row">'
+            + '<span class="lbl" style="color:var(--red)">' + (f.snapshot||'\u2014') + '</span>'
+            + '<span class="val" title="' + esc(f.error||'') + '">' + trunc(f.error||'\u2014', 30) + '</span>'
+            + '</div>'
+            ).join('')
+          + '</div>';
+      }
+
+      html += '</div></div>';
+      return html;
+    }
+
+    // ---- Full detail sections ----------------------------------
+
+    function renderDetails(svc, rtb, cloud, reports, status) {
+      const el = document.getElementById('detail-sections');
+      if (!el) return;
+      let html = '';
+
+      // Backup detail
+      const recent = ((reports||{}).recent_backups||[]).slice(0, 10);
+      html += '<div class="detail-section">'
+        + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
+        + '<div class="card-grid">'
+        + detailCardRTB(rtb)
+        + detailCardPCloud(cloud, reports, rtb)
+        + (recent.length > 0 ? detailCardRecentBackups(recent) : '')
+        + '</div></div>';
+
+      // Malware detail
+      const mNames = ['entropywatcher-nas','entropywatcher-os','entropywatcher-nas-av','entropywatcher-os-av','honeyfile-monitor'];
+      const mItems = mNames.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
+      const missingFiles = ((reports||{}).entropywatcher||{}).missing_files || [];
+      const flaggedFilesDetailed = ((reports||{}).entropywatcher||{}).flagged_files_detailed || [];
+      if (mItems.length > 0 || missingFiles.length > 0 || flaggedFilesDetailed.length > 0) {
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\uD83D\uDEE1\uFE0F Malware &amp; Integrit\xe4t \u2013 Details</span></div>'
+          + '<div class="card-grid">'
+          + mItems.map(i => detailCardService(i)).join('')
+          + (flaggedFilesDetailed.length > 0 ? detailCardFlaggedFiles(flaggedFilesDetailed) : '')
+          + (missingFiles.length > 0 ? detailCardMissingFiles(missingFiles) : '')
+          + '</div></div>';
+      }
+
+      // System detail
+      const sNames = ['cleanup-samba-recycle','backup-pipeline'];
+      const sItems = sNames.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
+      const failedBk = ((reports||{}).failed_backups||[]).slice(0, 5);
+      if (sItems.length > 0 || failedBk.length > 0) {
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\uD83D\uDDA5\uFE0F System \u2013 Details</span></div>'
+          + '<div class="card-grid">'
+          + sItems.map(i => detailCardService(i)).join('');
+        if (failedBk.length > 0) {
+          html += '<div class="dcard"><div class="dcard-header"><span>Letzte Fehler (7d)</span></div>'
+            + '<div class="dcard-body">'
+            + failedBk.map(f => drow(f.snapshot||'\u2014', f.error||'\u2014', 'red', 80)).join('')
+            + '</div></div>';
+        }
+        html += '</div></div>';
+      }
+
+      // Safety-Gate Forecast
+      const forecast = status.safety_gate_forecast || {};
+      if (forecast.next_run) {
+        const fCls = forecast.predicted_status === 'GREEN' ? 'green'
+                   : forecast.predicted_status === 'YELLOW' ? 'yellow'
+                   : forecast.predicted_status === 'RED' ? 'red'
+                   : 'gray';
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\uD83D\uDD2E Safety-Gate Forecast</span></div>'
+          + '<div class="card-grid">'
+          + '<div class="dcard">'
+          + '<div class="dcard-header"><span>Prognose für nächsten geplanten Lauf</span></div>'
+          + '<div class="dcard-body">'
+          + drow('Nächster Lauf', forecast.next_run)
+          + drow('Prognostizierter Status', forecast.predicted_status, fCls)
+          + (forecast.reason ? drow('Begründung', forecast.reason, '', 120) : '')
+          + '</div></div>'
+          + '</div></div>';
+      }
+
+      // Timer Status
+      const timers = status.timers || [];
+      if (timers.length > 0) {
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\u23F0 Timer-Status</span></div>'
+          + '<div class="card-grid">'
+          + detailCardTimers(timers)
+          + '</div></div>';
+      }
+
+      el.innerHTML = html;
+    }
+
+    // ---- Detail card: systemd service --------------------------
+
+    function detailCardService(item) {
+      const blocked  = (item.exit_code||'').includes('(blocked)');
+      const hasTimer = item.next_run && item.next_run !== 'N/A' && item.next_run !== 'never';
+      const stalled  = item.timer_stalled === true || item.timer_stalled === 'true';
+      // inactive+enabled=yes OR has a timer = healthy dormant state UNLESS stalled
+      const effectiveDot = stalled ? 'stalled'
+        : blocked ? 'blocked'
+        : (item.status === 'inactive' && (item.enabled === 'yes' || hasTimer)) ? 'active'
+        : (item.status || 'unknown');
+      const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      let rows = ''
+        + drow('Status',       item.status || 'unknown', statusValCls(item.status, blocked, item.enabled, item.next_run))
+        + drow('Enabled',      item.enabled || 'unknown')
+        + drow('Letzter Lauf', fmtTs(item.last_start))
+        + drow('Exit Code',    item.exit_code || 'N/A', blocked ? 'yellow' : item.exit_code === '0' ? 'green' : '');
+      if (stalled)
+        rows += drow('⚠ Timer Status', 'STALLED - Missed scheduled run!', 'red');
+      if (item.next_run && item.next_run !== 'N/A')
+        rows += drow('N\xe4chster Run', item.next_run);
+      // backup-pipeline: live safety-gate status
+      if (item.live_safety_gate)
+        rows += drow('Live Safety-Gate', item.live_safety_gate, sgValCls(item.live_safety_gate));
+      if (item.live_sg_details)
+        rows += drow('\u2514 Komponenten', item.live_sg_details, sgValCls(item.live_safety_gate), 200);
+      if (item.message && item.message !== 'N/A')
+        rows += drow('Message', item.message, '', 200);
+      return '<div class="dcard">'
+        + '<div class="dcard-header"><span>' + esc(label) + '</span>'
+        + '<span class="svc-dot ' + effectiveDot + '" style="width:10px;height:10px;display:inline-block"></span></div>'
+        + '<div class="dcard-body">' + rows + '</div>'
+        + '</div>';
+    }
+
+    // ---- Detail card: RTB Wrapper ------------------------------
+
+    function detailCardRTB(rtb) {
+      // ── Aktueller Zustand (NOW) ────────────────────────────────
+      let rows = '';
+      if (rtb.live_safety_gate)
+        rows += drow('Live Safety-Gate', rtb.live_safety_gate, sgValCls(rtb.live_safety_gate));
+      if (rtb.live_sg_details)
+        rows += drow('\u2514 Komponenten', rtb.live_sg_details, sgValCls(rtb.live_safety_gate), 150);
+      // ── Letzter Lauf ──────────────────────────────────────────
+      rows += drow('Status letzter Lauf', rtb.status || 'unknown', rtbCls(rtb.status))
+        + drow('Letzter Lauf', fmtTs(rtb.last_run))
+        + drow('Snapshots', String(rtb.snapshot_count || 0));
+      const drObj = rtbDryRunObj(rtb);
+      if (drObj) rows += drow('N\xe4chstes Backup', drObj.text, drObj.cls);
+      // ── Histor. Safety-Gate + Erklärung zum letzten Lauf ──────
+      if (rtb.safety_gate)
+        rows += drow('Safety-Gate (letzter Lauf)', rtb.safety_gate, sgValCls(rtb.safety_gate));
+      if (rtb.message)
+        rows += drow('Message', rtb.message, '', 200);
+      if (rtb.details)
+        rows += drow('Details', rtb.details, '', 200);
+      return '<div class="dcard">'
+        + '<div class="dcard-header"><span>\uD83D\uDD04 RTB Wrapper</span>'
+        + '<span class="svc-dot ' + rtbCls(rtb.status) + '" style="width:10px;height:10px"></span></div>'
+        + '<div class="dcard-body">' + rows + '</div>'
+        + '</div>';
+    }
+
+    // ---- Detail card: pCloud -----------------------------------
+
+    function snapshotAge(snapName) {
+      // Parse snapshot name like '2026-04-18-004404' → {hours, label}
+      if (!snapName || snapName === 'unknown' || snapName === 'none') return null;
+      try {
+        // Format: YYYY-MM-DD-HHMMSS
+        const d = snapName.match(/^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})$/);
+        if (!d) return null;
+        const ts = new Date(+d[1], +d[2]-1, +d[3], +d[4], +d[5], +d[6]);
+        const h = Math.round((Date.now() - ts.getTime()) / 3600000);
+        const label = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
+        return { hours: h, label };
+      } catch(e) { return null; }
+    }
+
+    function detailCardPCloud(cloud, reports, rtb) {
+      const sc  = cloud.status_code !== undefined ? cloud.status_code : 3;
+      const cls = sc === 0 ? 'green' : sc === 1 ? 'yellow' : 'red';
+      let rows = ''
+        + drow('Status',   cloud.status_text || 'UNKNOWN', cls)
+        + drow('Hostname', cloud.hostname || 'N/A');
+
+      const ba = (cloud.checks||{}).backup_age || {};
+
+      // ---- Sync-Analyse ----
+      const syncRow = buildSyncAnalysis(ba, reports);
+      rows += drow('Sync-Status', syncRow.text, syncRow.cls);
+
+      if (ba.snapshot_count !== undefined) rows += drow('RTB Snapshots',    String(ba.snapshot_count));
+      if (ba.manifest_count !== undefined) rows += drow('pCloud Manifests', String(ba.manifest_count));
+      if (ba.snapshot_count !== undefined && ba.manifest_count !== undefined) {
+        const diff = ba.snapshot_count - ba.manifest_count;
+        if (diff > 0)
+          rows += drow('Fehlend auf pCloud', diff + ' Snapshot(s)', 'red');
+        else if (diff < 0)
+          rows += drow('pCloud \xfcberschu\xdf', Math.abs(diff) + ' Manifest(s) mehr als RTB lokal (OK)', 'green');
+      }
+
+      if (ba.message) rows += drow('Health-Check Msg', ba.message, '', 200);
+
+      // Newest local snapshot: prefer rtb.latest_snapshot (aggregate_status.sh reads filesystem directly)
+      // Fall back to ba.rtb_snapshot (pcloud_health_check.sh, same filesystem but separate process)
+      const localSnap = (rtb && rtb.latest_snapshot && rtb.latest_snapshot !== '') ? rtb.latest_snapshot
+                      : (ba.rtb_snapshot && ba.rtb_snapshot !== 'unknown') ? ba.rtb_snapshot : null;
+      if (localSnap) {
+        // Compute age from snapshot name (always accurate, no stale JSON field)
+        const ag = snapshotAge(localSnap);
+        const h  = ag ? ag.hours : (ba.rtb_age_hours || 0);
+        const ageLbl = ag ? ag.label : (h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago');
+        rows += drow('Neuester Snapshot (lokal)', localSnap + ' (' + ageLbl + ')', h < 48 ? 'green' : h < 72 ? 'yellow' : 'red');
+      }
+      // pcloud_snapshot = last DB-recorded pCloud upload (requires PCLOUD_ENABLE_DB=1)
+      if (ba.pcloud_snapshot && ba.pcloud_snapshot !== 'none' && ba.pcloud_snapshot !== 'unknown') {
+        const h = ba.pcloud_age_hours || 0;
+        const age = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
+        const isSame = localSnap === ba.pcloud_snapshot;
+        rows += drow('Letzter DB-Eintrag (pCloud)', ba.pcloud_snapshot + ' (' + age + ')' + (isSame ? '' : ' ⚠ abweichend!'), isSame ? '' : 'yellow');
+      }
+
+      const pq = (cloud.checks||{}).pcloud_quota || {};
+      if (pq.message) rows += drow('Quota', pq.message);
+      else if ((pq.details||{}).free_gb !== undefined)
+        rows += drow('Quota', pq.details.free_gb + ' GB frei (' + pq.details.usage_percent + '%)');
+
+      return '<div class="dcard">'
+        + '<div class="dcard-header"><span>\u2601\uFE0F pCloud Backup</span>'
+        + '<span class="svc-dot ' + cls + '" style="width:10px;height:10px"></span></div>'
+        + '<div class="dcard-body">' + rows + '</div>'
+        + '</div>';
+    }
+
+    // ---- Sync-Analyse: RTB ↔ pCloud ----------------------------
+    // Combines health-check data (status.json) with DB data (reports.json)
+
+    function buildSyncAnalysis(ba, reports) {
+      // 1. DB-basiert: l\xe4uft gerade ein Upload? Letzter fehlgeschlagen?
+      const recent = ((reports||{}).recent_backups || []);
+      const latest = recent[0] || null;
+
+      if (latest && latest.status === 'RUNNING') {
+        return { text: '\u21BB Upload l\xe4uft (' + (latest.snapshot||'') + ') \u2014 .upload_complete noch nicht gesetzt', cls: 'blue' };
+      }
+      if (latest && latest.status === 'FAILED') {
+        const err = latest.error ? ' \u2014 ' + trunc(latest.error, 60) : '';
+        return { text: '\u274C Letzter Upload FEHLGESCHLAGEN: ' + (latest.snapshot||'') + err, cls: 'red' };
+      }
+
+      // 2. Health-Check status_code
+      const sc = ba ? (typeof ba === 'object' ? undefined : 0) : undefined; // ba is checks.backup_age
+      // pCloud health-check already computed sync via snapshot name comparison
+      const msg = (ba||{}).message || '';
+      const isInSync = msg.toLowerCase().includes('in sync') || msg.toLowerCase().includes('synchron');
+      if (isInSync) {
+        // Check if there's a known gap: snapshot_count > manifest_count means pCloud is missing some
+        const diff = ((ba||{}).snapshot_count||0) - ((ba||{}).manifest_count||0);
+        if (diff > 0) {
+          return { text: '\u26A0\uFE0F Neuester Snapshot OK, aber ' + diff + ' Snapshot(s) fehlen auf pCloud (GAP)', cls: 'yellow' };
+        }
+        return { text: '\u2713 Synchron \u2014 pCloud und RTB auf gleichem Stand', cls: 'green' };
+      }
+
+      // Not in sync
+      const pcloudSnap = (ba||{}).pcloud_snapshot || 'unbekannt';
+      const h = (ba||{}).pcloud_age_hours || 0;
+      
+      // Handle "none" case (no DB tracking or no successful backups)
+      if (pcloudSnap === 'none' || pcloudSnap === 'unbekannt') {
+        return {
+          text: '\u26A0\uFE0F pCloud Sync-Status unbekannt (DB-Tracking prüfen: PCLOUD_ENABLE_DB=1)',
+          cls: 'yellow'
+        };
+      }
+      
+      const age = h < 48 ? h + 'h' : Math.floor(h/24) + 'd';
+      return {
+        text: '\u26A0\uFE0F NICHT synchron \u2014 neuester pCloud-Snap: ' + pcloudSnap + ' (' + age + ' alt)',
+        cls: 'yellow'
+      };
+    }
+
+    // ---- Detail card: Recent Backups table ---------------------
+
+    function detailCardRecentBackups(recent) {
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header"><span>\uD83D\uDCCB Letzte Backup-L\xe4ufe</span></div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<table class="report-table">'
+        + '<thead><tr>'
+        + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th><th>GB</th><th>Fehler</th>'
+        + '</tr></thead><tbody>'
+        + recent.map(r => '<tr>'
+            + '<td>' + esc(r.snapshot||'\u2014') + '</td>'
+            + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + esc(r.status||'\u2014') + '</span></td>'
+            + '<td>' + fmtTs(r.started_at) + '</td>'
+            + '<td>' + fmtTs(r.finished_at) + '</td>'
+            + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
+            + '<td>' + (r.files_uploaded || '\u2014') + '</td>'
+            + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
+            + '<td title="' + esc(r.error||'') + '">' + esc(trunc(r.error||'', 35)) + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>'
+        + '</div></div>';
+    }
+
+    // ---- Detail card: Missing Files table ----------------------
+
+    function detailCardMissingFiles(files) {
+      // Group by source for better overview
+      const bySource = {};
+      files.forEach(f => {
+        const src = f.source || 'unknown';
+        if (!bySource[src]) bySource[src] = [];
+        bySource[src].push(f);
+      });
+
+      let html = '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header">'
+        + '<span>\uD83D\uDDD1\uFE0F Fehlende Dateien (' + files.length + ' Total)</span>'
+        + '</div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">';
+
+      // Table per source
+      Object.keys(bySource).sort().forEach(src => {
+        const items = bySource[src];
+        html += '<div style="margin:8px 12px">'
+          + '<div style="font-size:12px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">'
+          + '<span class="badge ' + src + '">' + src + '</span> (' + items.length + ' Dateien)'
+          + '</div>'
+          + '<table class="report-table">'
+          + '<thead><tr><th>Pfad</th><th>Vermisst seit</th></tr></thead>'
+          + '<tbody>'
+          + items.map(f => '<tr>'
+              + '<td style="font-family:monospace;font-size:11px;max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(f.path||'') + '">' + esc(f.path||'\u2014') + '</td>'
+              + '<td>' + (f.missing_since||'\u2014') + '</td>'
+            + '</tr>').join('')
+          + '</tbody></table></div>';
+      });
+
+      html += '</div></div>';
+      return html;
+    }
+
+    // ---- Detail card: Flagged Files ----------------------------
+
+    function detailCardFlaggedFiles(files) {
+      // Group by source for better overview
+      const bySource = {};
+      files.forEach(f => {
+        const src = f.source || 'unknown';
+        if (!bySource[src]) bySource[src] = [];
+        bySource[src].push(f);
+      });
+
+      let html = '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header">'
+        + '<span>\u26A0\uFE0F Flagged Dateien (' + files.length + ' Total)</span>'
+        + '</div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">';
+
+      // Table per source
+      Object.keys(bySource).sort().forEach(src => {
+        const items = bySource[src];
+        html += '<div style="margin:8px 12px">'
+          + '<div style="font-size:12px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">'
+          + '<span class="badge ' + src + '">' + src + '</span> (' + items.length + ' Dateien)'
+          + '</div>'
+          + '<table class="report-table">'
+          + '<thead><tr><th>Pfad</th><th>Entropie</th><th>Grund</th></tr></thead>'
+          + '<tbody>'
+          + items.map(f => '<tr>'
+              + '<td style="font-family:monospace;font-size:11px;max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(f.path||'') + '">' + esc(f.path||'\u2014') + '</td>'
+              + '<td>' + (f.entropy||'\u2014') + '</td>'
+              + '<td style="font-size:11px">' + esc(f.reason||'\u2014') + '</td>'
+            + '</tr>').join('')
+          + '</tbody></table></div>';
+      });
+
+      html += '</div></div>';
+      return html;
+    }
+
+    // ---- Detail card: Timer Status table -----------------------
+
+    function detailCardTimers(timers) {
+      if (!timers || timers.length === 0) return '';
+      
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header"><span>\u23F0 EntropyWatcher / Backup-Pipeline Timer-Status</span></div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<table class="report-table">'
+        + '<thead><tr>'
+        + '<th>Unit</th><th>Enabled</th><th>Active</th><th>LastRun</th><th>NextRun</th>'
+        + '</tr></thead><tbody>'
+        + timers.map(t => {
+            // Status badge for enabled/active
+            const enabledCls = t.enabled === 'enabled' ? 'success' : t.enabled === 'disabled' ? 'failed' : '';
+            const activeCls = t.active === 'active' ? 'success' : t.active === 'inactive' ? 'failed' : '';
+            
+            // Format last/next run with delta
+            const lastDisplay = t.last_run !== 'n/a' && t.last_delta !== 'n/a'
+              ? t.last_run + ' (' + t.last_delta + ')'
+              : '\u2014';
+            const nextDisplay = t.next_run !== 'n/a' && t.next_delta !== 'n/a'
+              ? t.next_run + ' (' + t.next_delta + ')'
+              : '\u2014';
+            
+            return '<tr>'
+              + '<td>' + esc(t.unit || '\u2014') + '</td>'
+              + '<td><span class="badge ' + enabledCls + '">' + esc(t.enabled || '\u2014') + '</span></td>'
+              + '<td><span class="badge ' + activeCls + '">' + esc(t.active || '\u2014') + '</span></td>'
+              + '<td>' + esc(lastDisplay) + '</td>'
+              + '<td>' + esc(nextDisplay) + '</td>'
+              + '</tr>';
+          }).join('')
+        + '</tbody></table>'
+        + '</div></div>';
+    }
+
+    // ---- Helper: single detail row -----------------------------
+
+    function drow(label, value, cls, maxLen) {
+      const full = String(value);
+      const disp = maxLen ? trunc(full, maxLen) : full;
+      return '<div class="dcard-row">'
+        + '<span class="dcard-lbl">' + esc(label) + '</span>'
+        + '<span class="dcard-val' + (cls ? ' ' + cls : '') + '" title="' + esc(full) + '">' + esc(disp) + '</span>'
+        + '</div>';
+    }
+
+    function statusValCls(status, blocked, enabled, next_run) {
+      const hasTimer = next_run && next_run !== 'N/A' && next_run !== 'never';
+      if (blocked)             return 'yellow';
+      if (status === 'active') return 'green';
+      if (status === 'inactive' && (enabled === 'yes' || hasTimer)) return 'green';
+      if (status === 'failed') return 'red';
+      return '';
+    }
+    function sgValCls(sg) {
+      return sg === 'GREEN' ? 'green' : sg === 'YELLOW' ? 'yellow' : sg === 'RED' ? 'red' : '';
+    }
+
+    // ---- Detail toggle -----------------------------------------
+
+    function toggleDetail(id) {
+      const panel = document.getElementById('detail-' + id);
+      const btn   = document.getElementById('btn-' + id);
+      if (!panel) return;
+      const isOpen = panel.classList.toggle('open');
+      if (btn) btn.classList.toggle('open', isOpen);
+    }
+
+    // ---- Helpers -----------------------------------------------
+
+    function overallClass(s) {
+      if (s === 'OK')       return 'ok';
+      if (s === 'WARNING')  return 'warning';
+      if (s === 'CRITICAL') return 'critical';
+      if (s === 'RUNNING')  return 'running';
+      return '';
+    }
+
+    function buildOverallExplain(data) {
+      const s        = data.overall_status || '';
+      const services = data.services || {};
+      const rtb      = ((data.scripts||{}).rtb_wrapper  || {});
+      const pcloud   = ((data.scripts||{}).pcloud_backup || {});
+
+      if (s === 'OK')       return '\u2713 Alle Systeme funktionieren normal.';
+      if (s === 'RUNNING')  return 'Backup l\xe4uft gerade \u2014 bitte nicht manuell unterbrechen.';
+      if (s === 'CRITICAL') return '\uD83D\uDEA8 Kritischer Fehler \u2014 sofortige Aktion erforderlich!';
+
+      if (s === 'WARNING') {
+        const parts = [];
+        // Blocked services
+        const blocked = Object.entries(services)
+          .filter(([,v]) => (v.exit_code||'').includes('(blocked)'))
+          .map(([k]) => k);
+        if (blocked.length > 0)
+          parts.push('Blockiert: ' + blocked.join(', ') + ' \u2014 Safety-Gate hat letzten Lauf gestoppt (Ransomware-Schutz).');
+        // Explain why not GREEN
+        if (blocked.includes('backup-pipeline') && rtb.live_safety_gate === 'GREEN')
+          parts.push('Live Safety-Gate ist GR\xdcN \u2014 System aktuell sicher. Status wird GREEN nach n\xe4chstem Backup-Lauf.');
+        // pCloud OK
+        if ((pcloud.status_code||3) === 0)
+          parts.push('pCloud Backup: \u2713 synchronisiert.');
+        // Failed services (non-blocked)
+        const failed = Object.entries(services)
+          .filter(([,v]) => v.status === 'failed' && !(v.exit_code||'').includes('(blocked)'))
+          .map(([k]) => k);
+        if (failed.length > 0)
+          parts.push('Fehler: ' + failed.join(', ') + ' \u2014 ben\xf6tigt Aufmerksamkeit.');
+        return parts.join(' \u2002|\u2002 ');
+      }
+      return '';
+    }
+
+    // Returns {text, cls} for the dry-run pre-check result, or null
+    function rtbDryRunObj(rtb) {
+      const r  = rtb.dry_run_result;
+      const ts = rtb.dry_run_ts ? '  (' + fmtTs(rtb.dry_run_ts) + ')' : '';
+      if (r === 'changes_detected')
+        return { text: '\u26a1 \xc4nderungen erkannt \u2014 Backup steht bevor' + ts, cls: 'yellow' };
+      if (r === 'no_changes')
+        return { text: '\u2713 Keine \xc4nderungen \u2014 kein Backup n\xf6tig' + ts, cls: 'green' };
+      return null;
+    }
+    // Inline HTML for the tile info-row
+    function rtbDryRunHTML(rtb) {
+      const o = rtbDryRunObj(rtb);
+      if (!o) return '';
+      return '<div class="info-row"><span class="lbl">N\xe4chstes Backup</span>'
+           + '<span class="val ' + o.cls + '">' + o.text + '</span></div>';
+    }
+
+    function rtbCls(status) {
+      if (status === 'success') return 'green';
+      if (status === 'failed')  return 'red';
+      if (status === 'blocked') return 'yellow';
+      if (status === 'running') return 'blue';
+      return 'gray';
+    }
+    function rtbIcon(status) {
+      if (status === 'success') return '\u2713';
+      if (status === 'failed')  return '\u2717';
+      if (status === 'blocked') return '\u2296';
+      if (status === 'running') return '\u21BB';
+      return '?';
+    }
+    function cloudStatusCls(cloud) {
+      const c = cloud.status_code !== undefined ? cloud.status_code : 3;
+      return c === 0 ? 'green' : c === 1 ? 'yellow' : 'red';
+    }
+    function cloudIcon(cloud) {
+      const c = cloud.status_code !== undefined ? cloud.status_code : 3;
+      return c === 0 ? '\u2713' : c === 1 ? '!' : '\u2717';
+    }
+
+    function renderPCloudAge(ba) {
+      if (!ba) return '';
+      const msg = ba.message || (() => {
+        const h = (ba.details||{}).rtb_age_hours;
+        return h !== undefined ? (h < 24 ? h + 'h' : Math.floor(h/24) + 'd ' + (h%24) + 'h') : '\u2014';
+      })();
+      return '<div class="info-row"><span class="lbl">pCloud Backup-Alter</span><span class="val">' + msg + '</span></div>';
+    }
+
+    function renderPCloudQuota(pq) {
+      if (!pq) return '';
+      const msg = pq.message || (() => {
+        const d = pq.details || {};
+        return d.free_gb !== undefined ? d.free_gb + ' GB frei (' + d.usage_percent + '%)' : '\u2014';
+      })();
+      return '<div class="info-row"><span class="lbl">pCloud Quota</span><span class="val">' + msg + '</span></div>';
+    }
+
+    function svcRow(item) {
+      const blocked  = (item.exit_code||'').includes('(blocked)');
+      const hasTimer = item.next_run && item.next_run !== 'N/A' && item.next_run !== 'never';
+      const stalled  = item.timer_stalled === true || item.timer_stalled === 'true';
+      // inactive+enabled=yes OR has a timer = healthy dormant state UNLESS stalled
+      const effectiveStatus = stalled ? 'stalled'
+        : blocked ? 'blocked'
+        : (item.status === 'inactive' && (item.enabled === 'yes' || hasTimer)) ? 'active'
+        : (item.status || 'unknown');
+      const dotCls  = effectiveStatus;
+      const label   = item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      const detail  = stalled ? '\u26A0 STALLED - missed run!'
+        : (item.next_run && item.next_run !== 'N/A')
+        ? 'n\xe4chster: ' + item.next_run
+        : (item.last_start && item.last_start !== 'unknown' ? fmtTs(item.last_start) : '');
+      return '<div class="service-item">'
+        + '<span class="svc-dot ' + dotCls + '"></span>'
+        + '<span class="svc-name">' + label + '</span>'
+        + '<span class="svc-detail" title="' + esc(detail) + '">' + trunc(detail, 40) + '</span>'
+        + '</div>';
+    }
+
+    function fmtTs(ts) {
+      if (!ts || ts === 'never' || ts === 'unknown' || ts === 'N/A') return ts || '\u2014';
+      try {
+        return new Date(ts).toLocaleString('de-DE', {
+          day:'2-digit', month:'2-digit', year:'numeric',
+          hour:'2-digit', minute:'2-digit'
+        });
+      } catch(e) { return ts; }
+    }
+
+    function trunc(str, n) {
+      if (!str || str.length <= n) return str || '';
+      return str.slice(0, n) + '\u2026';
+    }
+
+    function esc(str) {
+      return (str||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function resetCountdown() {
+      countdown = REFRESH_SEC;
+      if (countdownInterval) clearInterval(countdownInterval);
+      countdownInterval = setInterval(() => {
+        countdown -= 1;
+        const el = document.getElementById('countdown');
+        if (el) el.textContent = countdown;
+        if (countdown <= 0) fetchAll();
+      }, 1000);
+    }
+
+    fetchAll();
+  </script>
+</body>
+</html>
