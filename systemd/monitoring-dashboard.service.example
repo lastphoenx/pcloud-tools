@@ -1,0 +1,39 @@
+[Unit]
+Description=Monitoring Dashboard Web Server
+Documentation=https://github.com/lastphoenx/pcloud-tools
+After=network.target
+Wants=monitoring-status-update.timer
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+Restart=on-failure
+RestartSec=10s
+
+# Environment
+WorkingDirectory=/opt/apps/pcloud-tools/main/dashboard
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Execution
+# Python HTTP server with custom handler for cache control
+ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/dashboard/server.py
+
+# Security
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/opt/apps/pcloud-tools/main/dashboard
+ReadOnlyPaths=/opt/apps/monitoring
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=1024
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monitoring-dashboard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+# Apprise Configuration File
+# ================================
+# Move this file to: /opt/apps/pcloud-tools/main/apprise.yml
+# Then configure your notification endpoints below.
+#
+# Documentation: https://github.com/caronc/apprise
+# ================================
+
+# Version (required)
+version: 1
+
+# URLs: Define your notification endpoints
+# Multiple services can be configured - Apprise will send to all
+urls:
+  # === Telegram ===
+  # 1. Create a bot via @BotFather on Telegram
+  # 2. Get your bot token (looks like: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz)
+  # 3. Get your chat_id (send a message to your bot, then visit):
+  #    https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
+  # Format: tgram://{bot_token}/{chat_id}/
+  - tgram://123456789:ABCdefGHIjklMNOpqrsTUVwxyz/987654321/:
+      tag: telegram
+      
+  # === Discord ===
+  # 1. Create a webhook in Discord Server Settings > Integrations > Webhooks
+  # 2. Copy the webhook URL
+  # Format: discord://{webhook_id}/{webhook_token}/
+  - discord://1234567890123456789/AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCdEfGhIjKlMnOpQrStUvWxYz/:
+      tag: discord
+      
+  # === ntfy.sh (Self-hosted or ntfy.sh) ===
+  # 1. Choose a unique topic name (e.g., pi-nas-alerts)
+  # 2. Install ntfy app on your phone
+  # 3. Subscribe to the topic
+  # Format: ntfy://{topic}/ or ntfys://{server}/{topic}/ for self-hosted
+  - ntfy://pi-nas-backup-alerts/:
+      tag: ntfy
+      
+  # === Gotify (Self-hosted) ===
+  # 1. Install Gotify server
+  # 2. Create an application token
+  # Format: gotify://{hostname}/{token}/
+  # - gotify://gotify.yourdomain.de/AAAAAA/:
+  #     tag: gotify
+      
+  # === Email (SMTP) ===
+  # Format: mailto://{user}:{password}@{domain}
+  # - mailto://your-email@gmail.com:app-password@gmail.com/:
+  #     to: your-email@gmail.com
+  #     tag: email
+
+# Asset configuration (optional)
+# assets:
+#   # Custom image/icon for notifications
+#   image_url_mask: "https://example.com/icon.png"
+#   image_url_logo: "https://example.com/logo.png"

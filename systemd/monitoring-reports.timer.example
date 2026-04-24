@@ -1,0 +1,20 @@
+[Unit]
+Description=pCloud Monitoring - Reports generator timer (every 15min)
+Documentation=https://github.com/example/pcloud-tools
+
+[Timer]
+# Run 2 minutes after boot (give mariadb time to start)
+OnBootSec=2min
+# Then every 15 minutes
+OnUnitActiveSec=15min
+# Align to 15-min slots (00:00, 00:15, 00:30, 00:45, ...)
+OnCalendar=*:0/15
+# Run immediately after backup-pipeline completes (if the service is present)
+# Requires: add to backup-pipeline.service: [Unit] OnSuccess=monitoring-reports.service
+# AccuracySec keeps the jitter low for near-real-time dashboard updates
+AccuracySec=30s
+
+Persistent=true
+
+[Install]
+WantedBy=timers.target

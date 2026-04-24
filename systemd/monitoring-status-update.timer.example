@@ -1,0 +1,19 @@
+[Unit]
+Description=Monitoring Status Update Timer - Event-triggered + fallback
+Documentation=https://github.com/lastphoenx/pcloud-tools
+Requires=monitoring-status-update.service
+
+[Timer]
+# Run every minute for near-realtime status updates
+# Critical for Safety-Gate status visibility in dashboard
+OnCalendar=*:*:00
+# Startup: Run 2 minutes after boot to populate initial status
+OnBootSec=2min
+
+# Tolerance: Allow jitter to spread load across multiple timers
+AccuracySec=1m
+# Persistence: Still run if system was off at scheduled time
+Persistent=true
+
+[Install]
+WantedBy=timers.target
