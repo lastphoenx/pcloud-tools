@@ -299,3 +299,33 @@ Via Apprise (100+ services):
 - Gotify, Pushover, Slack, Matrix, Email, and many more
 
 See [Apprise documentation](https://github.com/caronc/apprise/wiki) for full list.
+
+---
+
+## Virtual Environment Setup
+
+### Development (Local `.venv`)
+
+```bash
+# Linux/macOS
+./scripts/setup_venv.sh
+
+# Windows
+.\scripts\setup_venv.ps1
+
+# Aktivieren
+source .venv/bin/activate     # Linux/macOS
+.\.venv\Scripts\Activate.ps1   # Windows
+```
+
+### Production (Datierte venvs mit Rotation)
+
+```bash
+# Erstelle datierte venv mit Rotation (behält letzte 3)
+sudo /opt/apps/venv_rotate.sh --keep 3 /opt/apps/pcloud-tools
+
+# Schnell in Projekt wechseln + venv aktivieren
+source venv_switch.sh pcloud-tools
+```
+
+**Siehe:** [../docs/VENV_MANAGEMENT.md](../docs/VENV_MANAGEMENT.md) für Details.
