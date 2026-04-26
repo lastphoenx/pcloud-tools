@@ -69,6 +69,10 @@ MET_PROMOTED       = 0
 MET_REMOVED_NODES  = 0
 MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional Zähler aus Lib/Wrapper
 
+# --- Chunked Upload Configuration ---
+RESUME_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_RESUME_THRESHOLD_GB", "5")) * 1024**3  # Default: 5 GB
+RESUME_CHUNK_SIZE = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128")) * 1024**2  # Default: 128 MB
+
 # ----------------- Utilities -----------------
 
 def _ensure_parent(cfg, remote_path: str, *, dry: bool = False) -> None:
@@ -79,6 +83,253 @@ def _ensure_parent(cfg, remote_path: str, *, dry: bool = False) -> None:
     if dry:
         return
     pc.ensure_parent_dirs(cfg, remote_path)
+
+
+def _get_resume_state_dir() -> str:
+    """
+    Ermittelt State-Verzeichnis für Resume-Uploads (analog zu poc_chunked_resume.py).
+    
+    Priorität:
+    1. ENV: PCLOUD_RESUME_DIR
+    2. /srv/pcloud-archive/resume/ (production)
+    3. ~/.pcloud_resume/ (user home)
+    4. /tmp/pcloud_resume/ (fallback)
+    """
+    if "PCLOUD_RESUME_DIR" in os.environ:
+        state_dir = os.environ["PCLOUD_RESUME_DIR"]
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            return state_dir
+        except Exception:
+            pass
+    
+    production_dir = "/srv/pcloud-archive/resume"
+    if os.path.exists("/srv"):
+        try:
+            os.makedirs(production_dir, exist_ok=True)
+            test_file = os.path.join(production_dir, ".write_test")
+            with open(test_file, "w") as f:
+                f.write("test")
+            os.remove(test_file)
+            return production_dir
+        except Exception:
+            pass
+    
+    home_dir = os.path.expanduser("~/.pcloud_resume")
+    try:
+        os.makedirs(home_dir, exist_ok=True)
+        return home_dir
+    except Exception:
+        pass
+    
+    tmp_dir = "/tmp/pcloud_resume"
+    os.makedirs(tmp_dir, exist_ok=True)
+    return tmp_dir
+
+
+def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
+                          *, dry: bool = False) -> dict:
+    """
+    Chunked Upload mit automatischem Resume (basierend auf poc_chunked_resume.py).
+    
+    Features:
+    - State-Persistenz nach jedem Chunk
+    - upload_info() Server-Sync vor Resume
+    - Automatische Offset-Korrektur
+    - SHA256-Verifikation nach Upload
+    
+    Returns:
+        Dict mit 'metadata' (kompatibel mit pc.upload_file)
+    """
+    import hashlib
+    
+    if dry:
+        _log(f"[dry] chunked upload: {remote_path} <- {local_path}")
+        return {"metadata": {"fileid": None, "hash": None, "size": os.path.getsize(local_path)}}
+    
+    state_dir = _get_resume_state_dir()
+    file_size = os.path.getsize(local_path)
+    
+    # State-File basierend auf remote_path (eindeutig!)
+    import hashlib as hl
+    state_key = hl.sha256(remote_path.encode()).hexdigest()[:16]
+    filename_base = os.path.basename(local_path)
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename_base)
+    state_file = os.path.join(state_dir, f"{safe_name}_{state_key}.state.json")
+    
+    # SHA256 berechnen (für Verifikation)
+    _log(f"[chunked] Berechne SHA256 für {filename_base} ({file_size/1024**3:.2f} GB)...")
+    h = hashlib.sha256()
+    with open(local_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024**2), b""):
+            h.update(chunk)
+    file_hash = h.hexdigest()
+    
+    # State laden (falls vorhanden)
+    uploadid = None
+    upload_offset = 0
+    chunks_uploaded = 0
+    
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r") as f:
+                state = json.load(f)
+            
+            # Hash-Validierung
+            if state.get("file_hash") != file_hash:
+                _log(f"[chunked] Datei geändert seit letztem Upload - starte neu")
+                os.remove(state_file)
+            elif state.get("remote_path") != remote_path:
+                _log(f"[chunked] Zielpfad geändert - starte neu")
+                os.remove(state_file)
+            else:
+                uploadid = state.get("uploadid")
+                upload_offset = state.get("offset", 0)
+                chunks_uploaded = state.get("chunks_uploaded", 0)
+                
+                _log(f"[chunked] Resume @ {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
+                
+                # Server-Sync via upload_info()
+                try:
+                    server_info = pc.upload_info(cfg, uploadid)
+                    server_offset = server_info.get("size", 0)
+                    
+                    if server_offset != upload_offset:
+                        _log(f"[chunked] Offset-Korrektur: Lokal={upload_offset:,} Server={server_offset:,}")
+                        upload_offset = server_offset
+                        chunks_uploaded = server_offset // RESUME_CHUNK_SIZE
+                        globals()["MET_RESUMED_FILES"] += 1
+                except Exception as e:
+                    _log(f"[chunked] upload_info fehlgeschlagen: {e} - erstelle neuen Upload")
+                    uploadid = None
+                    upload_offset = 0
+                    chunks_uploaded = 0
+        except Exception as e:
+            _log(f"[chunked] State-Load fehlgeschlagen: {e}")
+            uploadid = None
+    
+    # Upload-Session erstellen (falls nötig)
+    if not uploadid:
+        _log(f"[chunked] Erstelle Upload-Session...")
+        resp = pc.upload_create(cfg)
+        uploadid = resp.get("uploadid")
+        _log(f"[chunked] uploadid: {uploadid}")
+    
+    # Chunks hochladen
+    _log(f"[chunked] Starte Upload: {file_size/1024**3:.2f} GB @ {RESUME_CHUNK_SIZE/1024**2:.0f} MB Chunks")
+    
+    with open(local_path, "rb") as fh:
+        fh.seek(upload_offset)
+        chunk_number = chunks_uploaded
+        
+        while upload_offset < file_size:
+            chunk_data = fh.read(RESUME_CHUNK_SIZE)
+            if not chunk_data:
+                break
+            
+            chunk_number += 1
+            
+            try:
+                pc.upload_write(cfg, uploadid, upload_offset, chunk_data)
+            except Exception as e:
+                _log(f"[chunked] Chunk {chunk_number} fehlgeschlagen: {e}")
+                # State speichern vor Exit
+                with open(state_file, "w") as f:
+                    json.dump({
+                        "uploadid": uploadid,
+                        "offset": upload_offset,
+                        "chunks_uploaded": chunk_number - 1,
+                        "file_hash": file_hash,
+                        "file_size": file_size,
+                        "remote_path": remote_path,
+                        "status": "error",
+                        "error": str(e),
+                        "updated_at": time.time()
+                    }, f)
+                raise
+            
+            upload_offset += len(chunk_data)
+            
+            # State speichern nach jedem Chunk
+            with open(state_file, "w") as f:
+                json.dump({
+                    "uploadid": uploadid,
+                    "offset": upload_offset,
+                    "chunks_uploaded": chunk_number,
+                    "file_hash": file_hash,
+                    "file_size": file_size,
+                    "remote_path": remote_path,
+                    "status": "in_progress",
+                    "updated_at": time.time()
+                }, f)
+            
+            # Progress Log (alle 10 Chunks)
+            if chunk_number % 10 == 0:
+                progress_pct = upload_offset / file_size * 100
+                _log(f"[chunked] Progress: {upload_offset:,}/{file_size:,} Bytes ({progress_pct:.1f}%)")
+    
+    # Finalisierung
+    _log(f"[chunked] Finalisiere Upload...")
+    dest_dir = os.path.dirname(remote_path.rstrip("/")) or "/"
+    dest_filename = os.path.basename(remote_path)
+    dest_folderid = pc.ensure_path(cfg, dest_dir)
+    
+    result = pc.upload_save(cfg, uploadid, folderid=dest_folderid, name=dest_filename)
+    
+    metadata = result.get("metadata", {})
+    if isinstance(metadata, list):
+        metadata = metadata[0] if metadata else {}
+    
+    _log(f"[chunked] Upload abgeschlossen: FileID={metadata.get('fileid')}")
+    
+    # SHA256-Verifikation
+    remote_fileid = metadata.get('fileid')
+    if remote_fileid:
+        try:
+            checksum_data = pc.checksumfile(cfg, fileid=int(remote_fileid))
+            remote_sha256 = checksum_data.get("sha256", "").lower()
+            
+            if file_hash.lower() == remote_sha256:
+                _log(f"[chunked] ✓ SHA256 verifiziert")
+            else:
+                _log(f"[chunked] ✗ SHA256 MISMATCH! Lokal={file_hash[:16]}... Remote={remote_sha256[:16]}...")
+        except Exception as e:
+            _log(f"[chunked] SHA256-Verifikation fehlgeschlagen: {e}")
+    
+    # State aufräumen
+    try:
+        os.remove(state_file)
+    except Exception:
+        pass
+    
+    return result
+
+
+def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
+                      *, dry: bool = False) -> dict:
+    """
+    Smart Upload: Standard-Upload für kleine Files, Chunked-Resume für große Files.
+    
+    Args:
+        cfg: pCloud Config
+        local_path: Lokale Quelldatei
+        remote_path: Ziel in pCloud (voller Pfad inkl. Dateiname)
+        dry: Dry-run Mode
+    
+    Returns:
+        Upload-Response mit 'metadata' Dict
+    """
+    file_size = os.path.getsize(local_path)
+    
+    # Große Dateien: Chunked Upload mit Resume
+    if file_size > RESUME_THRESHOLD_BYTES:
+        return _upload_file_resumable(cfg, local_path, remote_path, dry=dry)
+    
+    # Kleine Dateien: Standard-Upload (schneller!)
+    return pc.call_with_backoff(pc.upload_file, cfg,
+                                local_path=local_path,
+                                remote_path=remote_path,
+                                attempts=12, max_sleep=60.0)
 
 
 def write_hardlink_stub_1to1(cfg, snapshots_root, snapshot_name, relpath, file_item, node, dry=False):
@@ -745,7 +996,7 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
                 print(f"[dry] upload object: {obj_path}  <- {it.get('source_path')}")
             else:
                 ensure_parent_dirs(cfg, obj_path, dry=False)
-                pc.upload_streaming(cfg, it["source_path"], dest_path=obj_path, filename=os.path.basename(obj_path))
+                _upload_file_smart(cfg, it["source_path"], obj_path, dry=dry)
             uploaded += 1
 
     print(f"objects: uploaded={uploaded} skipped={skipped}")
@@ -932,7 +1183,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             print(f"[upload] Starte Upload: {os.path.basename(dst_path)} ({file_size/1024**2:.1f} MB)", flush=True)
 
         t0 = time.time()
-        res = pc.call_with_backoff(pc.upload_file, cfg, local_path=abs_src, remote_path=dst_path, attempts=12, max_sleep=60.0)
+        res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)
         upload_ms += (time.time() - t0) * 1000.0
 
         # Metrics (Prometheus-freundlich), wenn definiert
@@ -1946,7 +2197,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             _log(f"[dry] upload: {dst_path} <- {abs_src}")
             return (None, None)
         
-        res = pc.call_with_backoff(pc.upload_file, cfg, local_path=abs_src, remote_path=dst_path, attempts=12, max_sleep=60.0)
+        res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)
         
         try:
             md = (res or {}).get("metadata") or {}
