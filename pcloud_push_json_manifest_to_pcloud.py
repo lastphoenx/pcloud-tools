@@ -157,37 +157,35 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename_base)
     state_file = os.path.join(state_dir, f"{safe_name}_{state_key}.state.json")
     
-    # SHA256 berechnen (für Verifikation)
-    _log(f"[chunked] Berechne SHA256 für {filename_base} ({file_size/1024**3:.2f} GB)...")
-    h = hashlib.sha256()
-    with open(local_path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024**2), b""):
-            h.update(chunk)
-    file_hash = h.hexdigest()
-    
-    # State laden (falls vorhanden)
+    # State laden (falls vorhanden) - VOR SHA256-Berechnung!
     uploadid = None
     upload_offset = 0
     chunks_uploaded = 0
+    file_hash = None
+    is_resume = False
     
     if os.path.exists(state_file):
         try:
             with open(state_file, "r") as f:
                 state = json.load(f)
             
-            # Hash-Validierung
-            if state.get("file_hash") != file_hash:
-                _log(f"[chunked] Datei geändert seit letztem Upload - starte neu")
-                os.remove(state_file)
-            elif state.get("remote_path") != remote_path:
-                _log(f"[chunked] Zielpfad geändert - starte neu")
-                os.remove(state_file)
-            else:
+            # Hash aus State übernehmen (falls vorhanden)
+            file_hash = state.get("file_hash")
+            
+            if state.get("remote_path") == remote_path and state.get("file_size") == file_size:
                 uploadid = state.get("uploadid")
                 upload_offset = state.get("offset", 0)
                 chunks_uploaded = state.get("chunks_uploaded", 0)
+                is_resume = True
                 
+                _log(f"[chunked] Lade State: {os.path.basename(state_file)}")
                 _log(f"[chunked] Resume @ {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
+                
+                # FIX 1: Metrik HIER hochzählen (bei jedem Resume, nicht nur bei Offset-Mismatch)
+                try:
+                    globals()["MET_RESUMED_FILES"] += 1
+                except Exception:
+                    pass
                 
                 # Server-Sync via upload_info()
                 try:
@@ -198,15 +196,29 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                         _log(f"[chunked] Offset-Korrektur: Lokal={upload_offset:,} Server={server_offset:,}")
                         upload_offset = server_offset
                         chunks_uploaded = server_offset // RESUME_CHUNK_SIZE
-                        globals()["MET_RESUMED_FILES"] += 1
                 except Exception as e:
                     _log(f"[chunked] upload_info fehlgeschlagen: {e} - erstelle neuen Upload")
                     uploadid = None
                     upload_offset = 0
                     chunks_uploaded = 0
+                    is_resume = False
+            else:
+                _log(f"[chunked] State ungültig (Pfad/Größe geändert) - starte neu")
+                os.remove(state_file)
+                file_hash = None
         except Exception as e:
             _log(f"[chunked] State-Load fehlgeschlagen: {e}")
             uploadid = None
+            file_hash = None
+    
+    # FIX 3: SHA256 nur berechnen wenn nicht aus State geladen
+    if not file_hash:
+        _log(f"[chunked] Berechne SHA256 für {filename_base} ({file_size/1024**3:.2f} GB)...")
+        h = hashlib.sha256()
+        with open(local_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024**2), b""):
+                h.update(chunk)
+        file_hash = h.hexdigest()
     
     # Upload-Session erstellen (falls nötig)
     if not uploadid:
@@ -229,24 +241,37 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
             
             chunk_number += 1
             
-            try:
-                pc.upload_write(cfg, uploadid, upload_offset, chunk_data)
-            except Exception as e:
-                _log(f"[chunked] Chunk {chunk_number} fehlgeschlagen: {e}")
-                # State speichern vor Exit
-                with open(state_file, "w") as f:
-                    json.dump({
-                        "uploadid": uploadid,
-                        "offset": upload_offset,
-                        "chunks_uploaded": chunk_number - 1,
-                        "file_hash": file_hash,
-                        "file_size": file_size,
-                        "remote_path": remote_path,
-                        "status": "error",
-                        "error": str(e),
-                        "updated_at": time.time()
-                    }, f)
-                raise
+            # FIX 2: Retry-Logik für Chunk-Upload (transiente Netzwerkfehler)
+            chunk_uploaded = False
+            for retry in range(1, 6):  # 5 Versuche pro Chunk
+                try:
+                    pc.upload_write(cfg, uploadid, upload_offset, chunk_data)
+                    chunk_uploaded = True
+                    break
+                except Exception as e:
+                    if retry == 5:
+                        _log(f"[chunked] Chunk {chunk_number} fehlgeschlagen nach 5 Versuchen: {e}")
+                        # State speichern vor Exit
+                        with open(state_file, "w") as f:
+                            json.dump({
+                                "uploadid": uploadid,
+                                "offset": upload_offset,
+                                "chunks_uploaded": chunk_number - 1,
+                                "file_hash": file_hash,
+                                "file_size": file_size,
+                                "remote_path": remote_path,
+                                "status": "error",
+                                "error": str(e),
+                                "updated_at": time.time()
+                            }, f)
+                        raise
+                    else:
+                        wait_time = 2 ** retry  # Exponential backoff: 2, 4, 8, 16 Sekunden
+                        _log(f"[chunked] Chunk {chunk_number} Retry {retry}/5 nach {wait_time}s: {e}")
+                        time.sleep(wait_time)
+            
+            if not chunk_uploaded:
+                raise RuntimeError(f"Chunk {chunk_number} konnte nicht hochgeladen werden")
             
             upload_offset += len(chunk_data)
             
@@ -268,13 +293,29 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                 progress_pct = upload_offset / file_size * 100
                 _log(f"[chunked] Progress: {upload_offset:,}/{file_size:,} Bytes ({progress_pct:.1f}%)")
     
-    # Finalisierung
+    # Finalisierung mit Retry-Logik
     _log(f"[chunked] Finalisiere Upload...")
     dest_dir = os.path.dirname(remote_path.rstrip("/")) or "/"
     dest_filename = os.path.basename(remote_path)
     dest_folderid = pc.ensure_path(cfg, dest_dir)
     
-    result = pc.upload_save(cfg, uploadid, folderid=dest_folderid, name=dest_filename)
+    # FIX 2: Retry-Logik auch für upload_save (kritisch!)
+    result = None
+    for retry in range(1, 6):  # 5 Versuche für Finalisierung
+        try:
+            result = pc.upload_save(cfg, uploadid, folderid=dest_folderid, name=dest_filename)
+            break
+        except Exception as e:
+            if retry == 5:
+                _log(f"[chunked] upload_save fehlgeschlagen nach 5 Versuchen: {e}")
+                raise
+            else:
+                wait_time = 2 ** retry
+                _log(f"[chunked] upload_save Retry {retry}/5 nach {wait_time}s: {e}")
+                time.sleep(wait_time)
+    
+    if not result:
+        raise RuntimeError("upload_save konnte nicht abgeschlossen werden")
     
     metadata = result.get("metadata", {})
     if isinstance(metadata, list):
