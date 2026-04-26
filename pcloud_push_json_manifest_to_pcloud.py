@@ -151,8 +151,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     file_size = os.path.getsize(local_path)
     
     # State-File basierend auf remote_path (eindeutig!)
-    import hashlib as hl
-    state_key = hl.sha256(remote_path.encode()).hexdigest()[:16]
+    state_key = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
     filename_base = os.path.basename(local_path)
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename_base)
     state_file = os.path.join(state_dir, f"{safe_name}_{state_key}.state.json")
