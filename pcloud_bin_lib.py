@@ -519,6 +519,143 @@ def upload_info(cfg: Dict[str, Any], uploadid: int) -> Dict[str, Any]:
             pass
 
 
+def upload_create(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Erstellt eine neue Upload-Session und liefert die uploadid zurück.
+    
+    Dies ist der erste Schritt des Chunked-Upload-Workflows:
+    1. upload_create() → uploadid erhalten
+    2. upload_write() mehrfach aufrufen (Chunks hochladen)
+    3. upload_save() aufrufen (Finalisierung zur Datei)
+    
+    Returns:
+        Dict mit Feldern:
+        - result: 0 bei Erfolg
+        - uploadid: Die Upload-Session-ID (für nachfolgende upload_write/save Calls)
+    """
+    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    tls = _connect(cfg["host"], cfg["port"], cfg["timeout"])
+    try:
+        req = _build_request("upload_create", params, 0)
+        tls.sendall(req)
+        resp_len = struct.unpack(LE_U32, _recv_exact(tls, 4))[0]
+        payload = _recv_exact(tls, resp_len)
+        top = _BinReader(payload)._read_value()
+        _expect_ok(top)
+        return top
+    finally:
+        try:
+            tls.close()
+        except:
+            pass
+
+
+def upload_write(cfg: Dict[str, Any], uploadid: int, uploadoffset: int, data: bytes) -> Dict[str, Any]:
+    """
+    Schreibt einen Daten-Chunk an einen spezifischen Offset in eine Upload-Session.
+    
+    Dies ist das Arbeitspferd des Chunked-Uploads. Kann beliebig oft aufgerufen werden,
+    solange die Upload-Session (uploadid) aktiv ist.
+    
+    WICHTIG:
+    - uploadoffset MUSS exakt dem Server-Offset entsprechen!
+    - Nutze upload_info() vor Resume, um Server-Offset zu synchronisieren
+    - Bei Offset-Mismatch gibt pCloud Error 2068 zurück
+    
+    Args:
+        cfg: Config-Dict mit token, device, host, port, timeout
+        uploadid: Upload-Session-ID (von upload_create() oder State)
+        uploadoffset: Byte-Offset wohin die Daten geschrieben werden (0-basiert)
+        data: Die Bytes die hochgeladen werden sollen (typisch 2-128 MB)
+    
+    Returns:
+        Dict mit {'result': 0} bei Erfolg
+        
+    Raises:
+        RuntimeError: Bei Error 2068 (Offset-Mismatch), 1900 (Upload not found), etc.
+    """
+    params = {
+        "access_token": cfg["token"],
+        "device": cfg["device"],
+        "uploadid": int(uploadid),
+        "uploadoffset": int(uploadoffset)
+    }
+    tls = _connect(cfg["host"], cfg["port"], cfg["timeout"])
+    try:
+        # Header bauen mit Angabe der Datenlänge
+        req = _build_request("upload_write", params, len(data))
+        tls.sendall(req)
+        # Daten direkt hinterher schicken
+        tls.sendall(data)
+        
+        resp_len = struct.unpack(LE_U32, _recv_exact(tls, 4))[0]
+        payload = _recv_exact(tls, resp_len)
+        top = _BinReader(payload)._read_value()
+        _expect_ok(top)
+        return top
+    finally:
+        try:
+            tls.close()
+        except:
+            pass
+
+
+def upload_save(cfg: Dict[str, Any], uploadid: int, *,
+                path: Optional[str] = None,
+                folderid: Optional[int] = None,
+                name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Schließt eine Upload-Session ab und speichert sie als echte Datei.
+    
+    Dies ist der finale Schritt des Chunked-Upload-Workflows. Nach diesem Call
+    ist die uploadid ungültig und die Datei existiert in pCloud.
+    
+    Args:
+        cfg: Config-Dict
+        uploadid: Upload-Session-ID
+        path: Zielpfad inkl. Dateiname (z.B. "/Backup/test.img")
+              ODER
+        folderid + name: Zielordner-ID + Dateiname separat
+    
+    Returns:
+        Dict mit Feldern:
+        - result: 0 bei Erfolg
+        - metadata: Datei-Metadaten (fileid, size, hash, created, modified, etc.)
+        
+    Raises:
+        RuntimeError: Bei API-Fehlern
+    """
+    if not path and (not folderid or not name):
+        raise ValueError("upload_save: Entweder 'path' ODER 'folderid + name' angeben")
+    
+    params = {
+        "access_token": cfg["token"],
+        "device": cfg["device"],
+        "uploadid": int(uploadid)
+    }
+    
+    if path:
+        params["path"] = _norm_remote_path(path)
+    else:
+        params["folderid"] = int(folderid)
+        params["name"] = name
+    
+    tls = _connect(cfg["host"], cfg["port"], cfg["timeout"])
+    try:
+        req = _build_request("upload_save", params, 0)
+        tls.sendall(req)
+        resp_len = struct.unpack(LE_U32, _recv_exact(tls, 4))[0]
+        payload = _recv_exact(tls, resp_len)
+        top = _BinReader(payload)._read_value()
+        _expect_ok(top)
+        return top
+    finally:
+        try:
+            tls.close()
+        except:
+            pass
+
+
 def stat_folder(cfg: Dict[str, Any], *, path: Optional[str]=None, folderid: Optional[int]=None) -> Dict[str, Any]:
     """
     Liefert Metadaten für einen Ordner (pfad- oder id-basiert). Wirft 2055-Fehler, wenn nicht vorhanden.
