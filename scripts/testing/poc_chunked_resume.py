@@ -261,13 +261,45 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
         chunks_uploaded = state.get("chunks_uploaded", 0)
         
         log(f"[RESUME] State geladen:", "INFO")
-        log(f"  uploadid: {uploadid}")
-        log(f"  offset: {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
-        log(f"  chunks_uploaded: {chunks_uploaded}")
+        log(f"  Local uploadid: {uploadid}")
+        log(f"  Local offset: {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
+        log(f"  Local chunks_uploaded: {chunks_uploaded}")
         log("")
-        log("[RESUME] Versuche optimistisch fortzusetzen (ohne Test)...", "INFO")
-        log("[RESUME] Bei Error 2068 → automatischer Fallback auf Neustart", "INFO")
-        log("")
+        
+        # === KRITISCH: Server nach ECHTEM Offset fragen! ===
+        log("[RESUME] Frage Server nach echtem Upload-Status (upload_info)...", "INFO")
+        try:
+            server_info = pc.upload_info(cfg, uploadid)
+            server_offset = server_info.get("size", 0)
+            
+            log(f"[RESUME] Server-Status:", "OK")
+            log(f"  Server uploadid: {server_info.get('uploadid')}")
+            log(f"  Server size: {server_offset:,} Bytes")
+            log("")
+            
+            # Offset-Korrektur wenn Server weniger hat als wir dachten!
+            if server_offset != upload_offset:
+                log(f"[FIX] Offset-Mismatch erkannt!", "WARN")
+                log(f"  Lokal dachten wir: {upload_offset:,} Bytes ({chunks_uploaded} Chunks)", "WARN")
+                log(f"  Server hat aber nur: {server_offset:,} Bytes", "WARN")
+                log(f"  → Setze Offset auf {server_offset:,} zurück (verlorene Chunks werden neu gesendet)", "WARN")
+                upload_offset = server_offset
+                # Berechne chunks_uploaded neu basierend auf Server-Offset
+                chunks_uploaded = server_offset // CHUNK_SIZE
+                log(f"  → Neu berechnete chunks_uploaded: {chunks_uploaded}", "WARN")
+                log("")
+            else:
+                log("[RESUME] Offset-Check OK - lokal und Server sind synchron! ✓", "OK")
+                log("")
+                
+        except Exception as e:
+            log(f"[RESUME] upload_info fehlgeschlagen: {e}", "WARN")
+            log(f"[RESUME] Mögliche Ursache: uploadid {uploadid} existiert nicht mehr (Error 1900)", "WARN")
+            log(f"[RESUME] → FALLBACK: Erstelle neue Upload-Session", "WARN")
+            uploadid = None
+            upload_offset = 0
+            chunks_uploaded = 0
+            log("")
     
     # === Upload-Session erstellen (falls nötig) ===
     session = pc._get_session()

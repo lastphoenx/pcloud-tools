@@ -468,6 +468,57 @@ def _expect_ok(top: Dict[str,Any]) -> None:
         err = top.get("error")
         raise RuntimeError(f"API error {res}: {err}")
 
+
+def upload_info(cfg: Dict[str, Any], uploadid: int) -> Dict[str, Any]:
+    """
+    Fragt den aktuellen Status einer Upload-Session beim pCloud-Server ab.
+    
+    WICHTIG für Resume: Das Feld 'size' in der Antwort ist der einzig wahre Server-Offset!
+    Wenn der Server sagt "size: 350MB", dann hat er nur 350MB empfangen - egal was
+    dein lokales State-File sagt!
+    
+    Returns:
+        Dict mit Feldern wie:
+        - result: 0 bei Erfolg
+        - size: Anzahl Bytes die der Server tatsächlich empfangen hat (DER WAHRE OFFSET!)
+        - uploadid: Die Upload-Session-ID
+        
+    Raises:
+        RuntimeError: Bei Error 1900 (Upload not found) oder anderen API-Fehlern
+    """
+    params = {
+        "access_token": cfg["token"],
+        "device": cfg["device"],
+        "uploadid": int(uploadid)
+    }
+    
+    # Binary Protocol verwenden (wie bei stat_folder etc.)
+    tls = _connect(cfg["host"], cfg["port"], cfg["timeout"])
+    try:
+        # Request ohne Daten-Payload (data_len=0)
+        req = _build_request("upload_info", params, 0)
+        tls.sendall(req)
+        
+        # Antwort-Länge lesen (4 Byte)
+        resp_len_data = _recv_exact(tls, 4)
+        resp_len = struct.unpack(LE_U32, resp_len_data)[0]
+        
+        # Payload lesen und dekodieren
+        payload = _recv_exact(tls, resp_len)
+        reader = _BinReader(payload)
+        top = reader._read_value()
+        
+        # Prüfen ob pCloud die Upload-Session noch kennt
+        _expect_ok(top)
+        
+        return top
+    finally:
+        try:
+            tls.close()
+        except:
+            pass
+
+
 def stat_folder(cfg: Dict[str, Any], *, path: Optional[str]=None, folderid: Optional[int]=None) -> Dict[str, Any]:
     """
     Liefert Metadaten für einen Ordner (pfad- oder id-basiert). Wirft 2055-Fehler, wenn nicht vorhanden.
