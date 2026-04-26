@@ -501,8 +501,39 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
     
     log(f"[FINALIZE] ✓ Upload erfolgreich abgeschlossen!", "OK")
     log(f"  FileID: {metadata.get('fileid')}")
-    log(f"  Hash: {metadata.get('hash')}")
+    log(f"  pCloud Hash: {metadata.get('hash')}")
     log(f"  Größe: {metadata.get('size'):,} Bytes")
+    log("")
+    
+    # === SHA256 Verifikation ===
+    log("[VERIFY] Verifiziere Upload-Integrität (SHA256)...", "INFO")
+    try:
+        remote_fileid = metadata.get('fileid')
+        if not remote_fileid:
+            log("[VERIFY] Keine FileID erhalten - Verifikation übersprungen", "WARN")
+        else:
+            # SHA256 vom Server abrufen
+            log(f"[VERIFY] Hole SHA256 von pCloud (FileID: {remote_fileid})...")
+            checksum_data = pc.checksumfile(cfg, fileid=int(remote_fileid))
+            
+            remote_sha256 = checksum_data.get("sha256")
+            if not remote_sha256:
+                log("[VERIFY] Server hat keine SHA256 berechnet (noch in Verarbeitung?)", "WARN")
+                log(f"[VERIFY] Server Response: {checksum_data}", "INFO")
+            else:
+                # Vergleich
+                log(f"[VERIFY] Lokale  SHA256: {file_hash}")
+                log(f"[VERIFY] Remote  SHA256: {remote_sha256}")
+                
+                if file_hash.lower() == remote_sha256.lower():
+                    log("[VERIFY] ✅ SHA256 MATCH - Upload erfolgreich verifiziert!", "OK")
+                else:
+                    log("[VERIFY] ❌ SHA256 MISMATCH - DATENKORRUPTION ERKANNT!", "ERROR")
+                    log("[VERIFY] WARNUNG: Hochgeladene Datei ist NICHT identisch mit Original!", "ERROR")
+    except Exception as e:
+        log(f"[VERIFY] Verifikation fehlgeschlagen: {e}", "WARN")
+        log("[VERIFY] Upload ist abgeschlossen, aber Integrität konnte nicht verifiziert werden", "WARN")
+    
     log("")
     
     # State aufräumen
