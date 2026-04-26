@@ -158,6 +158,16 @@ def cleanup_state(state_file: str, response_log: str):
 
 def test_uploadid_valid(cfg: Dict[str, Any], uploadid: int, expected_offset: int = 0) -> bool:
     """
+    [DEPRECATED - NICHT MEHR IN VERWENDUNG]
+    
+    Diese Funktion wurde entfernt weil sie DESTRUKTIV ist:
+    - Schreibt Test-Byte am erwarteten Offset
+    - Überschreibt dadurch den nächsten Chunk-Slot
+    - Führt zu Error 2068 beim echten upload_write!
+    
+    Neue Strategie: Optimistisch direkt versuchen, bei Error 2068 → Fallback.
+    
+    [Original-Dokumentation für Archiv-Zwecke]
     Testet ob uploadid noch gültig ist UND ob die Chunks noch vorhanden sind.
     Schreibt 1-Byte-Test-Chunk am erwarteten Offset.
     
@@ -165,47 +175,8 @@ def test_uploadid_valid(cfg: Dict[str, Any], uploadid: int, expected_offset: int
         True = uploadid gültig UND Chunks noch da (Resume möglich)
         False = uploadid abgelaufen ODER Chunks gelöscht (Neustart nötig)
     """
-    log(f"Teste uploadid {uploadid} @ Offset {expected_offset:,}...", "TEST")
-    
-    session = pc._get_session()
-    base_url = pc._rest_base(cfg)
-    
-    try:
-        # Sende 1-Byte-Test-Chunk am erwarteten Offset
-        # (nicht 0 Bytes @ Offset 0 - das prüft nur ob uploadid existiert!)
-        r = session.post(f"{base_url}/upload_write", params={
-            "access_token": cfg["token"],
-            "uploadid": uploadid,
-            "uploadoffset": expected_offset
-        }, data=b"X", headers={
-            "Content-Type": "application/octet-stream"
-        }, timeout=(10, 10))
-        
-        j = r.json()
-        
-        # Error 1900 = "Upload not found" (uploadid existiert nicht mehr)
-        if j.get("result") == 1900:
-            log(f"uploadid {uploadid} existiert NICHT mehr (Error 1900)", "WARN")
-            return False
-        
-        # Error 2068 = "Error writing to upload" (uploadid existiert, aber Chunks wurden gelöscht!)
-        if j.get("result") == 2068:
-            log(f"uploadid {uploadid} existiert, aber Chunks wurden GELÖSCHT (Error 2068)", "WARN")
-            log(f"  → Serverseitiger Upload-State wurde zurückgesetzt (Timeout?)", "WARN")
-            return False
-        
-        # result=0 = SUCCESS (uploadid existiert UND Chunks noch da!)
-        if j.get("result") == 0:
-            log(f"uploadid {uploadid} ist GÜLTIG und Chunks sind noch vorhanden ✓", "OK")
-            return True
-        
-        # Andere Fehler: Log und False zurückgeben
-        log(f"uploadid-Test fehlgeschlagen: {j}", "WARN")
-        return False
-        
-    except Exception as e:
-        log(f"uploadid-Test Exception: {e}", "WARN")
-        return False
+    log(f"[DEPRECATED] test_uploadid_valid() wird nicht mehr verwendet!", "WARN")
+    return False
 
 
 def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path: str, 
@@ -270,15 +241,8 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
         log(f"  offset: {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
         log(f"  chunks_uploaded: {chunks_uploaded}")
         log("")
-        
-        # uploadid-Gültigkeit testen (mit echtem Offset-Test!)
-        if not test_uploadid_valid(cfg, uploadid, upload_offset):
-            log("[RESUME] uploadid/Chunks nicht mehr gültig → FALLBACK: Neuer Upload", "WARN")
-            uploadid = None
-            upload_offset = 0
-            chunks_uploaded = 0
-        else:
-            log("[RESUME] uploadid gültig und Chunks vorhanden → Resume", "OK")
+        log("[RESUME] Versuche optimistisch fortzusetzen (ohne Test)...", "INFO")
+        log("[RESUME] Bei Error 2068 → automatischer Fallback auf Neustart", "INFO")
         log("")
     
     # === Upload-Session erstellen (falls nötig) ===
@@ -352,21 +316,79 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
             })
             
             if j.get("result") != 0:
-                log(f"FEHLER: upload_write fehlgeschlagen: {j}", "ERROR")
-                # State trotzdem speichern (für Debugging)
-                save_state(state_file, {
-                    "uploadid": uploadid,
-                    "offset": upload_offset,
-                    "chunks_uploaded": chunk_number - 1,
-                    "file_hash": file_hash,
-                    "file_size": file_size,
-                    "local_path": local_path,
-                    "remote_path": remote_path,
-                    "status": "error",
-                    "error": j,
-                    "updated_at": time.time()
-                })
-                sys.exit(1)
+                # Error 2068 = "Error writing to upload" (uploadid existiert, aber Chunks gelöscht)
+                # Bei ERSTEM Chunk nach Resume → Automatischer Fallback auf Neustart
+                if j.get("result") == 2068 and mode == "resume" and chunk_number == chunks_uploaded + 1:
+                    log(f"[RESUME] Error 2068 beim ersten Chunk → uploadid-Chunks wurden gelöscht!", "WARN")
+                    log(f"[RESUME] FALLBACK: Erstelle neue Upload-Session und starte von vorne...", "WARN")
+                    
+                    # Neue Upload-Session erstellen
+                    r_create = session.post(f"{base_url}/upload_create", params={
+                        "access_token": cfg["token"]
+                    }, timeout=(60, 30))
+                    j_create = r_create.json()
+                    
+                    if j_create.get("result") != 0:
+                        log(f"FEHLER: upload_create fehlgeschlagen: {j_create}", "ERROR")
+                        sys.exit(1)
+                    
+                    uploadid = j_create.get("uploadid")
+                    log(f"[FALLBACK] Neue uploadid erhalten: {uploadid}", "OK")
+                    
+                    # Reset und von vorne starten
+                    upload_offset = 0
+                    chunk_number = 0
+                    fh.seek(0)
+                    chunk_data = fh.read(CHUNK_SIZE)
+                    chunk_number = 1
+                    chunk_start_time = time.time()
+                    
+                    log(f"[FALLBACK] Starte Upload von vorne mit neuem uploadid...", "INFO")
+                    log(f"[CHUNK {chunk_number}] Lade {len(chunk_data):,} Bytes @ Offset 0...")
+                    
+                    # Chunk nochmal hochladen mit neuer uploadid
+                    r = session.post(f"{base_url}/upload_write", params={
+                        "access_token": cfg["token"],
+                        "uploadid": uploadid,
+                        "uploadoffset": 0
+                    }, data=chunk_data, headers={
+                        "Content-Type": "application/octet-stream",
+                        "Connection": "keep-alive"
+                    }, timeout=(60, 120))
+                    
+                    j = r.json()
+                    chunk_duration = time.time() - chunk_start_time
+                    
+                    log_response(response_log, {
+                        "step": "upload_write_after_fallback",
+                        "chunk_number": chunk_number,
+                        "offset": 0,
+                        "size": len(chunk_data),
+                        "duration_s": round(chunk_duration, 2),
+                        "response": j
+                    })
+                    
+                    if j.get("result") != 0:
+                        log(f"FEHLER: upload_write nach Fallback fehlgeschlagen: {j}", "ERROR")
+                        sys.exit(1)
+                
+                else:
+                    # Anderer Fehler oder nicht beim ersten Resume-Chunk
+                    log(f"FEHLER: upload_write fehlgeschlagen: {j}", "ERROR")
+                    # State trotzdem speichern (für Debugging)
+                    save_state(state_file, {
+                        "uploadid": uploadid,
+                        "offset": upload_offset,
+                        "chunks_uploaded": chunk_number - 1,
+                        "file_hash": file_hash,
+                        "file_size": file_size,
+                        "local_path": local_path,
+                        "remote_path": remote_path,
+                        "status": "error",
+                        "error": j,
+                        "updated_at": time.time()
+                    })
+                    sys.exit(1)
             
             # Erfolg!
             upload_offset += len(chunk_data)
