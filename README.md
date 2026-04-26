@@ -70,12 +70,15 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 |---|---|
 | `wrapper_pcloud_sync_1to1.sh` | Orchestrator: ruft alle Phasen in Reihenfolge auf |
 | `pcloud_json_manifest.py` | Manifest-Erstellung (Smart-Hashing via inode/mtime) |
-| `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication |
+| `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication, **Chunked-Upload** |
 | `pcloud_quick_delta.py` | Post-Upload-Verifikation (Delta-Check) |
-| `pcloud_bin_lib.py` | pCloud Binary-API-Bibliothek (Connection, Retry, Chunked Upload) |
+| `pcloud_bin_lib.py` | pCloud Binary-API-Bibliothek (Connection, Retry, **Chunked Upload with Resume**) |
 | `create_folder_template.py` | Einmaliges Setup des `_folder_template`-Cache (SAFE-MODE Beschleunigung) |
 | `pcloud_health_check.sh` | Backup-Status, Quota, Alter — Nagios/Zabbix-kompatibel |
 | `pcloud_status.sh` | Interaktives Status-Dashboard aus MariaDB |
+
+**Neu seit April 2026:** Chunked-Upload mit automatischem Resume für große Dateien (>5 GB).  
+→ Details: [docs/DEVELOPER_GUIDE.md § Chunked Upload with Resume](docs/DEVELOPER_GUIDE.md#-chunked-upload-with-resume-large-file-support)
 
 ---
 
@@ -94,6 +97,14 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
 | `scripts/pcloud_restore.py` | ⚠️ Stellt Snapshots von pCloud wieder her (Notfall-Tool) |
 | `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
+
+**Testing & Development:**
+
+| Datei | Funktion |
+|---|---|
+| `scripts/test_chunked_rtb_snapshot.sh` | Production-Grade-Test: Chunked-Upload mit RTB-Snapshot (End-to-End) |
+| `scripts/testing/poc_chunked_resume.py` | PoC: Chunked-Upload-Basics mit 200 MB Test-Datei |
+| `scripts/README_test_chunked.md` | Dokumentation des Chunked-Upload-Tests (Sicherheit, Isolation) |
 
 ---
 

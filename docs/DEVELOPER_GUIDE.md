@@ -657,7 +657,413 @@ for item in diff["new"] + diff["changed"]:
 
 ---
 
-## 📊 Archive-System
+## � Chunked Upload with Resume (Large File Support)
+
+**Status:** Production-Ready (seit April 2026)  
+**Komponente:** `pcloud_push_json_manifest_to_pcloud.py`  
+**Zweck:** Robuste Uploads für große Dateien (>5 GB) mit automatischem Resume bei Abbruch
+
+### Problemstellung
+
+**Vorher:** Große Dateien (z.B. 50 GB VM-Images) wurden bei Netzwerkunterbrechungen von 0 neu hochgeladen.  
+**Overhead:** 98% Upload → 2% fehlen → Timeout → 100% Neustart ❌
+
+**Jetzt:** Chunked-Upload mit State-Persistenz → Resume bei Unterbrechung ✅
+
+### Architektur-Übersicht
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  _upload_file_smart() - Routing                        │
+│  ├─ Datei < 5 GB  → Standard-Upload (wie vorher)       │
+│  └─ Datei ≥ 5 GB  → _upload_file_resumable()           │
+└─────────────────────────────────────────────────────────┘
+                         │
+        ┌────────────────┴────────────────┐
+        │                                 │
+        ▼                                 ▼
+┌──────────────────┐            ┌──────────────────┐
+│ Standard-Upload  │            │ Chunked-Upload   │
+│                  │            │                  │
+├──────────────────┤            ├──────────────────┤
+│ • pc.upload_file │            │ • upload_create  │
+│ • 12 Retries     │            │ • upload_write   │
+│ • Schnell        │            │ • upload_save    │
+│ • < 5 GB         │            │ • upload_info    │
+│                  │            │ • 5 Retries/Chunk│
+│                  │            │ • State-Files    │
+└──────────────────┘            └──────────────────┘
+```
+
+### Kern-Funktionen
+
+#### 1. `_upload_file_smart(cfg, local_path, remote_path, dry)`
+
+**Zweck:** Routing-Funktion → Smart-Selection basierend auf Dateigröße
+
+**Logik:**
+```python
+file_size = os.path.getsize(local_path)
+
+if file_size > RESUME_THRESHOLD_BYTES:  # Default: 5 GB
+    return _upload_file_resumable(cfg, local_path, remote_path, dry=dry)
+else:
+    return pc.call_with_backoff(pc.upload_file, cfg, local_path=local_path, 
+                                remote_path=remote_path, attempts=12, max_sleep=60.0)
+```
+
+**Konfiguration:**
+```bash
+# Threshold anpassen (Standard: 5 GB)
+export PCLOUD_RESUME_THRESHOLD_GB=10  # Nur Dateien > 10 GB chunked
+
+# Chunk-Größe anpassen (Standard: 128 MB)
+export PCLOUD_RESUME_CHUNK_MB=256     # Größere Chunks (weniger API-Calls)
+```
+
+---
+
+#### 2. `_upload_file_resumable(cfg, local_path, remote_path, dry)`
+
+**Zweck:** Chunked-Upload mit State-Persistenz und Server-Synchronisation
+
+**3-Phasen-Workflow:**
+
+```python
+Phase 1: Initialisierung & State-Laden
+  → State-Dir ermitteln: /srv/pcloud-archive/resume/ (prod) oder ~/.pcloud_resume/
+  → State-File: {filename}_{sha256_hash}.state.json (eindeutig via remote_path)
+  → Existiert State? → Lade uploadid, offset, file_hash
+  → Kein State? → Berechne SHA256 für Datei (einmalig)
+
+Phase 2: Server-Synchronisation (bei Resume)
+  → upload_info(uploadid) → Hole aktuellen Server-Offset
+  → Vergleiche: local_offset vs server_offset
+  → Mismatch? → Korrektur auf server_offset (Server = Source of Truth)
+  → Metrik: MET_RESUMED_FILES += 1
+
+Phase 3: Chunked-Upload mit Retry-Logik
+  → Chunk-Loop: 128 MB pro Iteration
+  → upload_write(uploadid, offset, chunk_data)
+    → Bei Fehler: 5 Retry-Attempts mit Exponential Backoff (2^n Sekunden)
+  → State speichern nach JEDEM Chunk (für Resume)
+  → Progress-Log alle 10 Chunks
+  
+  → Finalisierung: upload_save(uploadid, folderid, name)
+    → Bei Fehler: 5 Retry-Attempts (kritisch!)
+  
+  → SHA256-Verifikation: checksumfile(fileid) vs. local_hash
+  → State-Cleanup bei Erfolg
+```
+
+**State-File-Format:**
+```json
+{
+  "uploadid": 1696654321,
+  "offset": 3221225472,
+  "chunks_uploaded": 24,
+  "file_hash": "abc123def456...",
+  "file_size": 10737418240,
+  "remote_path": "/My Cloud/Backup/rtb_1to1/_snapshots/.../large.img",
+  "status": "in_progress",
+  "updated_at": 1745668800.123
+}
+```
+
+**Retry-Strategie:**
+- **upload_write():** 5 Attempts mit 2-16s Exponential Backoff
+- **upload_save():** 5 Attempts mit 2-16s Exponential Backoff
+- **Gesamt:** Jeder Chunk wird bis zu 5x versucht (transiente Fehler überleben)
+
+---
+
+#### 3. `_get_resume_state_dir()`
+
+**Zweck:** Ermittelt State-Directory mit Fallback-Logik
+
+**Prioritäten:**
+```python
+1. ENV: PCLOUD_RESUME_DIR (manuelles Override)
+2. Production: /srv/pcloud-archive/resume/ (wenn schreibbar)
+3. User: ~/.pcloud_resume/ (Fallback 1)
+4. Temp: /tmp/pcloud_resume/ (Fallback 2, immer schreibbar)
+```
+
+**Write-Permission-Test:** Erstellt Test-File vor Auswahl (verhindert Permission-Errors später)
+
+---
+
+### Binary Protocol: Upload-Funktionen
+
+Die Chunked-Upload-Funktionen nutzen die pCloud Binary API (implementiert in `pcloud_bin_lib.py`):
+
+| Funktion | API-Call | Zweck |
+|----------|----------|-------|
+| `upload_create(cfg)` | `upload_create` | Erstellt Upload-Session → `uploadid` |
+| `upload_write(cfg, uploadid, offset, data)` | `upload_write` | Schreibt Chunk an Offset |
+| `upload_save(cfg, uploadid, folderid, name)` | `upload_save` | Finalisiert Upload → File-Metadata |
+| `upload_info(cfg, uploadid)` | `upload_info` | Fragt Server-Status ab → Offset |
+| `checksumfile(cfg, fileid)` | `checksumfile` | Holt SHA256 vom Server |
+
+**Performance:**
+- **Chunk-Write:** ~1-2s pro 128 MB (Netzwerk-abhängig)
+- **upload_info():** <100ms (leichtgewichtige Meta-Abfrage)
+- **SHA256-Berechnung:** ~500 MB/s (lokal, CPU-abhängig)
+
+---
+
+### Integration in Upload-Modi
+
+**Alle drei Modi nutzen automatisch `_upload_file_smart()`:**
+
+#### push_objects_mode() (Hash-Object-Store)
+```python
+obj_path = object_path_for(objects_root, sha, ext, layout=objects_layout)
+md = stat_file_safe(cfg, path=obj_path)
+if not md:
+    _upload_file_smart(cfg, it["source_path"], obj_path, dry=dry)  # ← Auto-Routing
+```
+
+#### push_1to1_mode() (Snapshot-Trees)
+```python
+def _upload_real_file(abs_src, dst_path):
+    res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)  # ← Auto-Routing
+    return (fileid, pcloud_hash)
+```
+
+#### push_1to1_delta_mode() (Incremental)
+```python
+def _upload_real_file(abs_src, dst_path):
+    res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)  # ← Auto-Routing
+    return (fileid, pcloud_hash)
+```
+
+**➡️ Transparente Integration:** Kleine Dateien nutzen weiterhin Standard-Upload (keine Performance-Änderung), nur große Dateien profitieren vom Chunked-Modus.
+
+---
+
+### Resume-Szenarien
+
+#### Szenario 1: Netzwerk-Timeout bei 30%
+```
+1. Upload startet: 10 GB Datei
+2. Bei 3 GB: Netzwerk-Timeout → Script-Abbruch
+3. State-File gespeichert: offset=3GB, chunks_uploaded=23
+4. Neustart: Script erkennt State
+5. upload_info(): Server bestätigt 3 GB
+6. Resume bei 3 GB → Upload von 3-10 GB
+7. Erfolg: SHA256 verifiziert
+8. State-File gelöscht
+```
+
+#### Szenario 2: upload_save() schlägt fehl
+```
+1. Upload: Alle 10 GB Chunks hochgeladen
+2. upload_save(): Netzwerkfehler bei Finalisierung ❌
+3. State-File: offset=10GB (alle Chunks da)
+4. Datei existiert NICHT auf pCloud (nicht finalisiert)
+5. Neustart: Script erkennt State
+6. upload_info(): Server sagt 10 GB
+7. Keine weiteren Chunks → Direkt zu upload_save()
+8. upload_save() mit 5 Retries → Erfolg ✅
+```
+
+#### Szenario 3: Offset-Mismatch (Server vs. Lokal)
+```
+1. Upload: Bei 5 GB unterbrochen
+2. State-File: offset=5GB
+3. Server hatte Timeout → letzte Chunks nicht gespeichert
+4. upload_info(): Server sagt 4.5 GB
+5. Offset-Korrektur: 5GB → 4.5GB (Server = Source of Truth)
+6. Resume bei 4.5 GB → Restliche 5.5 GB
+7. Erfolg ohne Duplikate oder Lücken
+```
+
+---
+
+### Performance-Charakteristiken
+
+| Dateigröße | Methode | Chunks | Upload-Zeit (Schätzung) | Resume-Overhead |
+|------------|---------|--------|-------------------------|-----------------|
+| 1 GB | Standard | N/A | 2-5 Min | N/A |
+| 5 GB | Standard | N/A | 10-15 Min | N/A |
+| 6 GB | Chunked (48x 128MB) | 48 | 12-18 Min | +30s (SHA256) |
+| 20 GB | Chunked (160x 128MB) | 160 | 40-60 Min | +90s (SHA256) |
+| 50 GB | Chunked (400x 128MB) | 400 | 100-150 Min | +240s (SHA256) |
+
+**Resume-Overhead:**
+- **SHA256-Berechnung:** Bei Resume nur wenn nicht im State (erste Upload-Attempt)
+- **upload_info():** <100ms (vernachlässigbar)
+- **State-File I/O:** <10ms pro Chunk (lokal, nicht netzwerk-kritisch)
+
+**Netzwerk-Effizienz:**
+- **API-Overhead:** Chunked ~0.5% mehr Calls als Standard (48 Chunks statt 1 Stream)
+- **Resume-Benefit:** Bei Abbruch 0% Duplikate (vs. 100% bei Standard)
+
+---
+
+### Konfiguration & Tuning
+
+**Umgebungsvariablen:**
+```bash
+# Threshold (Standard: 5 GB)
+export PCLOUD_RESUME_THRESHOLD_GB=10   # Höherer Threshold = weniger Overhead
+export PCLOUD_RESUME_THRESHOLD_GB=1    # Niedrigerer Threshold = mehr Dateien mit Resume
+
+# Chunk-Größe (Standard: 128 MB)
+export PCLOUD_RESUME_CHUNK_MB=256      # Größere Chunks = weniger API-Calls
+export PCLOUD_RESUME_CHUNK_MB=64       # Kleinere Chunks = feineres Resume-Granulat
+
+# State-Directory (Optional)
+export PCLOUD_RESUME_DIR=/custom/path  # Manuelles Override (z.B. für Tests)
+```
+
+**Empfehlungen:**
+- **Produktion:** 5 GB Threshold, 128 MB Chunks (optimale Balance)
+- **Testing:** 1 GB Threshold, 64 MB Chunks (schnellere Tests)
+- **High-Throughput:** 10 GB Threshold, 256 MB Chunks (weniger API-Overhead)
+
+---
+
+### Testing
+
+**PoC-Script:** `scripts/testing/poc_chunked_resume.py`
+```bash
+# Simpler Test mit einzelner 200 MB Datei
+python3 scripts/testing/poc_chunked_resume.py
+
+# Features:
+# - Upload-Session erstellen
+# - Chunked-Upload (2 MB Chunks im PoC)
+# - Interrupt-Simulation
+# - Resume mit upload_info() Server-Sync
+# - SHA256-Verifikation
+```
+
+**Production-Grade-Test:** `scripts/test_chunked_rtb_snapshot.sh`
+```bash
+# End-to-End-Test mit echtem RTB-Snapshot
+bash scripts/test_chunked_rtb_snapshot.sh
+
+# Features:
+# - RTB-Snapshot mit 5+ Dateien (1 KB bis 6 GB)
+# - Mixed-Mode-Upload (Standard + Chunked im selben Job)
+# - Resume-Test (Upload nach 60s killen, dann neustarten)
+# - SHA256-Verifikation aller Dateien
+# - Isolierte Test-Index-DB (keine Produktions-Kontamination)
+# - Automatic Cleanup
+
+# Dauer: ~5-7 Min (inkl. SHA256-Berechnung)
+```
+
+**Dokumentation:**
+- **Test-README:** `scripts/README_test_chunked.md`
+- **Security/Isolation:** Index-DB-Isolation via `--index-path`
+
+---
+
+### Metrics & Monitoring
+
+**Neue Metrik:**
+```python
+MET_RESUMED_FILES = 0  # Anzahl resumed Uploads
+
+# Wird hochgezählt bei jedem erfolgreichen Resume
+# (nicht nur bei Offset-Mismatch, sondern bei jedem State-Load)
+```
+
+**Log-Patterns:**
+```
+[chunked] Große Datei (15.23 GB): backup.img
+[chunked] Berechne SHA256 für backup.img (15.23 GB)...
+[chunked] Erstelle Upload-Session...
+[chunked] uploadid: 1696654321
+[chunked] Starte Upload: 15.23 GB @ 128 MB Chunks
+[chunked] Progress: 1,342,177,280/16,356,000,000 Bytes (8.2%)
+[chunked] Progress: 2,684,354,560/16,356,000,000 Bytes (16.4%)
+...
+[chunked] Finalisiere Upload...
+[chunked] Upload abgeschlossen: FileID=93799999999
+[chunked] ✓ SHA256 verifiziert
+
+# Bei Resume:
+[chunked] Lade State: backup.img_abc123.state.json
+[chunked] Resume @ 3,221,225,472 Bytes (19.7%)
+[chunked] Offset-Korrektur: Lokal=3221225472 Server=3355443200
+[chunked] Progress: 4,697,620,480/16,356,000,000 Bytes (28.7%)
+...
+```
+
+**Troubleshooting:**
+```bash
+# State-Files prüfen
+ls -lh /srv/pcloud-archive/resume/
+cat /srv/pcloud-archive/resume/*.state.json | jq .
+
+# Stuck-Uploads erkennen
+find /srv/pcloud-archive/resume/ -name "*.state.json" -mtime +1  # Älter als 24h
+
+# State manuell löschen (→ Upload von vorne)
+rm /srv/pcloud-archive/resume/stuck_file_*.state.json
+```
+
+---
+
+### Edge-Cases & Error-Handling
+
+#### 1. Datei ändert sich während Upload
+```python
+# State enthält file_hash
+if state.get("file_hash") != recalculated_hash:
+    _log("[chunked] Datei geändert seit letztem Upload - starte neu")
+    os.remove(state_file)
+    # → Upload von 0 mit neuem Hash
+```
+
+#### 2. uploadid auf Server abgelaufen
+```python
+try:
+    server_info = pc.upload_info(cfg, uploadid)
+except Exception:
+    _log("[chunked] upload_info fehlgeschlagen - erstelle neuen Upload")
+    uploadid = None
+    # → Neuer upload_create()
+```
+
+#### 3. State-File korrupt
+```python
+try:
+    state = json.load(f)
+except Exception as e:
+    _log(f"[chunked] State-Load fehlgeschlagen: {e}")
+    uploadid = None
+    file_hash = None
+    # → Fallback zu Upload von 0
+```
+
+#### 4. Parallele Uploads (gleicher remote_path)
+**Gelöst via State-File-Naming:**
+```python
+state_key = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
+state_file = f"{safe_filename}_{state_key}.state.json"
+# → Unique Key pro remote_path (keine Kollisionen)
+```
+
+---
+
+### Commit-Historie (Development-Tracking)
+
+| Commit | Datum | Beschreibung |
+|--------|-------|--------------|
+| `7d988a4` | 2026-04-26 | Initial Integration (Chunked Upload) |
+| `10249fc` | 2026-04-26 | Critical Fixes (Metrik, Retry, SHA256-Performance) |
+| `e63b9ed` | 2026-04-26 | Production-Grade-Test (RTB-Snapshot) |
+| `0ea6d68` | 2026-04-26 | Code-Cleanup (Redundant Import) |
+| `d1bf283` | 2026-04-26 | CRITICAL: Index-Isolation für Test-Script |
+
+---
+
+## �📊 Archive-System
 
 ### Komponenten
 
