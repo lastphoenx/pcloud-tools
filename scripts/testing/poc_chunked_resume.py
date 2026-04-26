@@ -52,14 +52,62 @@ except ImportError:
 
 # ==================== Konfiguration ====================
 
-# State-Verzeichnis (für persistent state + response logs)
-STATE_DIR = os.path.expanduser("~/.pcloud_poc_state")
 REMOTE_TEST_DIR = "/Backup/rtb_1to1/testing_purpose"
 
 # Chunk-Größe (klein für schnelle Tests, z.B. 2 MB)
 CHUNK_SIZE = int(os.environ.get("POC_CHUNK_SIZE", str(2 * 1024**2)))  # 2 MB default
 
 # ==================== Hilfsfunktionen ====================
+
+def get_state_dir() -> str:
+    """
+    Ermittelt das State-Verzeichnis mit Fallback-Logik.
+    
+    Priorität:
+    1. ENV: PCLOUD_RESUME_DIR (falls gesetzt)
+    2. /srv/pcloud-archive/resume/ (production - systemd/cron friendly)
+    3. ~/.pcloud_resume/ (user home - wenn /srv nicht verfügbar)
+    4. /tmp/pcloud_resume/ (fallback - wenn home nicht schreibbar)
+    
+    Returns:
+        Absoluter Pfad zum State-Verzeichnis (wird erstellt falls nötig)
+    """
+    # 1. ENV überschreibt alles
+    if "PCLOUD_RESUME_DIR" in os.environ:
+        state_dir = os.environ["PCLOUD_RESUME_DIR"]
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            return state_dir
+        except Exception as e:
+            log(f"[WARN] PCLOUD_RESUME_DIR nicht nutzbar: {e}", "WARN")
+    
+    # 2. Production-Pfad: /srv/pcloud-archive/resume/
+    production_dir = "/srv/pcloud-archive/resume"
+    if os.path.exists("/srv"):
+        try:
+            os.makedirs(production_dir, exist_ok=True)
+            # Test ob schreibbar
+            test_file = os.path.join(production_dir, ".write_test")
+            with open(test_file, "w") as f:
+                f.write("test")
+            os.remove(test_file)
+            return production_dir
+        except Exception:
+            pass  # Fallback zu Home
+    
+    # 3. User Home: ~/.pcloud_resume/
+    home_dir = os.path.expanduser("~/.pcloud_resume")
+    try:
+        os.makedirs(home_dir, exist_ok=True)
+        return home_dir
+    except Exception:
+        pass  # Fallback zu /tmp
+    
+    # 4. Letzter Fallback: /tmp/pcloud_resume/
+    tmp_dir = "/tmp/pcloud_resume"
+    os.makedirs(tmp_dir, exist_ok=True)
+    log(f"[WARN] Nutze Fallback State-Dir: {tmp_dir}", "WARN")
+    return tmp_dir
 
 def log(msg: str, level: str = "INFO"):
     """Logging mit Timestamp"""
@@ -95,23 +143,21 @@ def compute_file_hash(filepath: str, show_progress: bool = True) -> str:
     return h.hexdigest()
 
 
-def ensure_state_dir():
-    """State-Verzeichnis erstellen"""
-    os.makedirs(STATE_DIR, exist_ok=True)
-
 
 def get_state_file(local_path: str) -> str:
     """State-Datei-Pfad für eine lokale Datei"""
+    state_dir = get_state_dir()
     filename = os.path.basename(local_path)
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
-    return os.path.join(STATE_DIR, f"{safe_name}.state.json")
+    return os.path.join(state_dir, f"{safe_name}.state.json")
 
 
 def get_response_log_file(local_path: str) -> str:
     """Response-Log-Datei-Pfad"""
+    state_dir = get_state_dir()
     filename = os.path.basename(local_path)
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
-    return os.path.join(STATE_DIR, f"{safe_name}.responses.jsonl")
+    return os.path.join(state_dir, f"{safe_name}.responses.jsonl")
 
 
 def load_state(state_file: str) -> Optional[Dict[str, Any]]:
@@ -194,8 +240,7 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
         abort_after_chunks: Bei 'abort-after': Nach N Chunks abbrechen
         timeout_minutes: Bei 'timeout-test': Minuten warten vor Resume
     """
-    ensure_state_dir()
-    
+    state_dir = get_state_dir()
     state_file = get_state_file(local_path)
     response_log = get_response_log_file(local_path)
     
@@ -230,6 +275,7 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
     log(f"Modus: {mode}")
     if quick:
         log(f"Quick-Mode: AKTIV (Hash-Validierung übersprungen!)", "WARN")
+    log(f"State-Dir: {state_dir}")
     log(f"State-File: {state_file}")
     log(f"Response-Log: {response_log}")
     log("")
