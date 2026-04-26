@@ -180,7 +180,8 @@ def test_uploadid_valid(cfg: Dict[str, Any], uploadid: int, expected_offset: int
 
 
 def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path: str, 
-                                mode: str = "normal", abort_after_chunks: int = 0,
+                                mode: str = "normal", quick: bool = False,
+                                abort_after_chunks: int = 0,
                                 timeout_minutes: int = 0) -> Dict[str, Any]:
     """
     Chunked Upload mit persistentem State und Resume-Unterstützung.
@@ -199,7 +200,25 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
     response_log = get_response_log_file(local_path)
     
     file_size = os.path.getsize(local_path)
-    file_hash = compute_file_hash(local_path)
+    
+    # Hash-Berechnung (kann bei großen Dateien 2+ Minuten dauern!)
+    # Bei --quick: Überspringen um Resume-Timeout zu vermeiden
+    file_hash = None
+    if not quick:
+        file_hash = compute_file_hash(local_path, show_progress=True)
+    elif mode == "resume":
+        # Bei quick resume: Hash aus State-File übernehmen (keine Validierung!)
+        state = load_state(state_file)
+        if state:
+            file_hash = state.get("file_hash")
+            log(f"[QUICK] Hash aus State übernommen (KEINE Validierung!)", "WARN")
+        else:
+            log("FEHLER: Quick-Resume ohne State-File nicht möglich!", "ERROR")
+            sys.exit(1)
+    else:
+        # Normal mode OHNE quick: Hash ist Pflicht
+        file_hash = compute_file_hash(local_path, show_progress=True)
+    
     filename = os.path.basename(remote_path)
     
     log(f"=== Chunked Upload PoC ===")
@@ -209,6 +228,8 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
     log(f"Chunk-Größe: {CHUNK_SIZE:,} Bytes ({CHUNK_SIZE/1024**2:.2f} MB)")
     log(f"Ziel: {remote_path}")
     log(f"Modus: {mode}")
+    if quick:
+        log(f"Quick-Mode: AKTIV (Hash-Validierung übersprungen!)", "WARN")
     log(f"State-File: {state_file}")
     log(f"Response-Log: {response_log}")
     log("")
@@ -225,12 +246,15 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
             log("FEHLER: Kein State-File gefunden für Resume!", "ERROR")
             sys.exit(1)
         
-        # Validierung
-        if state.get("file_hash") != file_hash:
-            log("FEHLER: Datei wurde seit Abbruch geändert (Hash-Mismatch)!", "ERROR")
-            log(f"  Erwartet: {state.get('file_hash')}")
-            log(f"  Aktuell:  {file_hash}")
-            sys.exit(1)
+        # Hash-Validierung (nur wenn NICHT quick!)
+        if not quick:
+            if state.get("file_hash") != file_hash:
+                log("FEHLER: Datei wurde seit Abbruch geändert (Hash-Mismatch)!", "ERROR")
+                log(f"  Erwartet: {state.get('file_hash')}")
+                log(f"  Aktuell:  {file_hash}")
+                sys.exit(1)
+        else:
+            log("[QUICK] Hash-Validierung übersprungen - RISIKO: Datei könnte geändert sein!", "WARN")
         
         uploadid = state.get("uploadid")
         upload_offset = state.get("offset", 0)
@@ -465,6 +489,8 @@ def main():
     parser.add_argument("--remote-dir", default=REMOTE_TEST_DIR, help=f"Zielordner in pCloud (default: {REMOTE_TEST_DIR})")
     parser.add_argument("--mode", choices=["normal", "abort-after", "resume", "timeout-test"], 
                        default="normal", help="Test-Modus")
+    parser.add_argument("--quick", action="store_true",
+                       help="Schnelles Resume: Überspringt Hash-Validierung (nur bei < 1 Min Unterbrechung!)")
     parser.add_argument("--abort-after-chunks", type=int, default=3, 
                        help="Bei 'abort-after': Nach N Chunks abbrechen (default: 3)")
     parser.add_argument("--timeout-minutes", type=int, default=10,
@@ -496,6 +522,7 @@ def main():
             local_path=args.file,
             remote_path=remote_path,
             mode=args.mode,
+            quick=args.quick,
             abort_after_chunks=args.abort_after_chunks,
             timeout_minutes=args.timeout_minutes
         )
@@ -505,7 +532,8 @@ def main():
         log("=== ABBRUCH DURCH BENUTZER (Ctrl+C) ===", "WARN")
         state_file = get_state_file(args.file)
         log(f"State wurde gespeichert in: {state_file}", "INFO")
-        log(f"Zum Resume: python {sys.argv[0]} --file {args.file} --mode resume", "INFO")
+        log(f"Zum Resume (schnell < 1 Min): python {sys.argv[0]} --file {args.file} --mode resume --quick", "INFO")
+        log(f"Zum Resume (sicher > 3 Min): python {sys.argv[0]} --file {args.file} --mode resume", "INFO")
         sys.exit(130)
     except Exception as e:
         log(f"FEHLER: {e}", "ERROR")
