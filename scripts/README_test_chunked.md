@@ -3,6 +3,23 @@
 ## Übersicht
 Vollständiger End-to-End-Test für Chunked Upload Integration mit echtem RTB-Snapshot.
 
+## 🛡️ Sicherheit & Isolation
+
+**KRITISCH:** Dieser Test ist vollständig von der Produktion isoliert!
+
+| Komponente | Produktions-Pfad | Test-Pfad | Isoliert? |
+|------------|------------------|-----------|-----------|
+| **pCloud Daten** | `/My Cloud/Backup/rtb_1to1/` | `/My Cloud/TEST_CHUNKED_RTB/` | ✅ |
+| **Lokale Daten** | `/mnt/rtb/snapshots/` | `/tmp/test_chunked_rtb_*/` | ✅ |
+| **Index-DB** | `content_index.json` (prod) | `$TEST_ROOT/index_dir/test_index.json` | ✅ |
+| **Manifeste** | `/srv/manifests/` | `/tmp/test_chunked_rtb_*/manifests/` | ✅ |
+| **State-Files** | `/srv/pcloud-archive/resume/` | `/srv/pcloud-archive/resume/` | ⚠️ Shared* |
+
+*State-Files werden durch SHA256-basierte Unique Keys isoliert (keine Kollision möglich).
+
+**➡️ Produktions-Datenbank wird NICHT verändert!**  
+Der Test nutzt `--index-path "$TEST_ROOT/index_dir/test_index.json"` um die zentrale Index-DB zu schützen.
+
 ## Was wird getestet?
 
 ### ✅ Realistische Szenarien:
@@ -44,8 +61,10 @@ bash scripts/test_chunked_rtb_snapshot.sh
 │       └── config.db (500 KB)
 ├── snapshots/
 │   └── test_snapshot_2026-04-26-HHMMSS/
-└── manifests/
-    └── test_snapshot_2026-04-26-HHMMSS.json
+├── manifests/
+│   └── test_snapshot_2026-04-26-HHMMSS.json
+└── index_dir/                          ← Isolierte Test-Index-DB!
+    └── test_index.json
 ```
 
 ### Schritt 2: RTB-Snapshot
