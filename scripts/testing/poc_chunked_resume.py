@@ -273,8 +273,8 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
             server_offset = server_info.get("size", 0)
             
             log(f"[RESUME] Server-Status:", "OK")
-            log(f"  Server uploadid: {server_info.get('uploadid')}")
-            log(f"  Server size: {server_offset:,} Bytes")
+            log(f"  Verwendete uploadid: {uploadid}")
+            log(f"  Server empfangene Bytes: {server_offset:,}")
             log("")
             
             # Offset-Korrektur wenn Server weniger hat als wir dachten!
