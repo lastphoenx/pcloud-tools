@@ -132,11 +132,15 @@ echo "    - Kleine Dateien (< 5 GB): Standard-Upload"
 echo "    - large_video.mkv (6 GB): Chunked-Upload mit Progress-Logs"
 echo ""
 
+# KRITISCH: Separater Index-Pfad um Produktions-DB nicht zu kontaminieren!
+mkdir -p "$TEST_ROOT/index_dir"
+
 cd "$SCRIPT_DIR/../pcloud-tools"
 python3 pcloud_push_json_manifest_to_pcloud.py \
   --manifest "$TEST_ROOT/manifests/${SNAPSHOT_NAME}.json" \
   --dest-root "$PCLOUD_TEST_ROOT" \
-  --snapshot-mode 1to1
+  --snapshot-mode 1to1 \
+  --index-path "$TEST_ROOT/index_dir/test_index.json"
 
 echo ""
 echo "✓ Upload abgeschlossen"
@@ -193,7 +197,8 @@ PYEOF
     python3 pcloud_push_json_manifest_to_pcloud.py \
       --manifest "$TEST_ROOT/manifests/${SNAPSHOT_NAME}.json" \
       --dest-root "$PCLOUD_TEST_ROOT" \
-      --snapshot-mode 1to1 &
+      --snapshot-mode 1to1 \
+      --index-path "$TEST_ROOT/index_dir/test_index.json" &
     
     UPLOAD_PID=$!
     echo "Upload-PID: $UPLOAD_PID"
@@ -213,7 +218,8 @@ PYEOF
     python3 pcloud_push_json_manifest_to_pcloud.py \
       --manifest "$TEST_ROOT/manifests/${SNAPSHOT_NAME}.json" \
       --dest-root "$PCLOUD_TEST_ROOT" \
-      --snapshot-mode 1to1
+      --snapshot-mode 1to1 \
+      --index-path "$TEST_ROOT/index_dir/test_index.json"
     
     echo ""
     echo "✓ Resume-Test abgeschlossen"
