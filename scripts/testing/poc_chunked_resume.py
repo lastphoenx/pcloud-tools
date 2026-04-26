@@ -67,12 +67,31 @@ def log(msg: str, level: str = "INFO"):
     print(f"{ts} [{level}] {msg}", flush=True)
 
 
-def compute_file_hash(filepath: str) -> str:
-    """SHA256-Hash einer Datei berechnen"""
+def compute_file_hash(filepath: str, show_progress: bool = True) -> str:
+    """SHA256-Hash einer Datei berechnen (mit optionalem Progress)"""
     h = hashlib.sha256()
+    file_size = os.path.getsize(filepath)
+    bytes_read = 0
+    last_progress = 0
+    
+    if show_progress:
+        print(f"Berechne SHA256-Hash ({file_size/1024**2:.1f} MB)...", end="", flush=True)
+    
     with open(filepath, "rb") as f:
         while chunk := f.read(8192):
             h.update(chunk)
+            bytes_read += len(chunk)
+            
+            # Progress alle 10% anzeigen
+            if show_progress and file_size > 0:
+                progress = int((bytes_read / file_size) * 100)
+                if progress >= last_progress + 10:
+                    print(f" {progress}%", end="", flush=True)
+                    last_progress = progress
+    
+    if show_progress:
+        print(" ✓", flush=True)
+    
     return h.hexdigest()
 
 
