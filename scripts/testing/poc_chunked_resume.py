@@ -302,26 +302,19 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
             log("")
     
     # === Upload-Session erstellen (falls nötig) ===
-    session = pc._get_session()
-    base_url = pc._rest_base(cfg)
-    
     if not uploadid:
         log("[INIT] Erstelle neue Upload-Session (upload_create)...", "INFO")
         
-        r = session.post(f"{base_url}/upload_create", params={
-            "access_token": cfg["token"]
-        }, timeout=(60, 30))
-        
-        j = r.json()
-        log_response(response_log, {"step": "upload_create", "response": j})
-        
-        if j.get("result") != 0:
-            log(f"FEHLER: upload_create fehlgeschlagen: {j}", "ERROR")
+        try:
+            j = pc.upload_create(cfg)
+            log_response(response_log, {"step": "upload_create", "response": j})
+            
+            uploadid = j.get("uploadid")
+            log(f"[INIT] uploadid erhalten: {uploadid}", "OK")
+            log("")
+        except Exception as e:
+            log(f"FEHLER: upload_create fehlgeschlagen: {e}", "ERROR")
             sys.exit(1)
-        
-        uploadid = j.get("uploadid")
-        log(f"[INIT] uploadid erhalten: {uploadid}", "OK")
-        log("")
     
     # === Chunks hochladen ===
     log("[UPLOAD] Starte Chunk-Upload...", "INFO")
@@ -349,16 +342,20 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
             # === Chunk hochladen ===
             log(f"[CHUNK {chunk_number}] Lade {len(chunk_data):,} Bytes @ Offset {upload_offset:,}...")
             
-            r = session.post(f"{base_url}/upload_write", params={
-                "access_token": cfg["token"],
-                "uploadid": uploadid,
-                "uploadoffset": upload_offset
-            }, data=chunk_data, headers={
-                "Content-Type": "application/octet-stream",
-                "Connection": "keep-alive"
-            }, timeout=(60, 120))
+            try:
+                j = pc.upload_write(cfg, uploadid, upload_offset, chunk_data)
+            except Exception as e:
+                # Bei Fehler in dict umwandeln für einheitliches Error-Handling
+                error_msg = str(e)
+                if "error" in error_msg.lower():
+                    # Versuche Error-Code zu extrahieren (z.B. "API error 2068: ...")
+                    import re
+                    match = re.search(r'error (\d+)', error_msg)
+                    error_code = int(match.group(1)) if match else 9999
+                    j = {"result": error_code, "error": error_msg}
+                else:
+                    j = {"result": 9999, "error": error_msg}
             
-            j = r.json()
             chunk_duration = time.time() - chunk_start_time
             
             # Response loggen
@@ -379,17 +376,14 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
                     log(f"[RESUME] FALLBACK: Erstelle neue Upload-Session und starte von vorne...", "WARN")
                     
                     # Neue Upload-Session erstellen
-                    r_create = session.post(f"{base_url}/upload_create", params={
-                        "access_token": cfg["token"]
-                    }, timeout=(60, 30))
-                    j_create = r_create.json()
-                    
-                    if j_create.get("result") != 0:
-                        log(f"FEHLER: upload_create fehlgeschlagen: {j_create}", "ERROR")
+                    try:
+                        j_create = pc.upload_create(cfg)
+                        
+                        uploadid = j_create.get("uploadid")
+                        log(f"[FALLBACK] Neue uploadid erhalten: {uploadid}", "OK")
+                    except Exception as e:
+                        log(f"FEHLER: upload_create fehlgeschlagen: {e}", "ERROR")
                         sys.exit(1)
-                    
-                    uploadid = j_create.get("uploadid")
-                    log(f"[FALLBACK] Neue uploadid erhalten: {uploadid}", "OK")
                     
                     # Reset und von vorne starten
                     upload_offset = 0
@@ -403,16 +397,15 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
                     log(f"[CHUNK {chunk_number}] Lade {len(chunk_data):,} Bytes @ Offset 0...")
                     
                     # Chunk nochmal hochladen mit neuer uploadid
-                    r = session.post(f"{base_url}/upload_write", params={
-                        "access_token": cfg["token"],
-                        "uploadid": uploadid,
-                        "uploadoffset": 0
-                    }, data=chunk_data, headers={
-                        "Content-Type": "application/octet-stream",
-                        "Connection": "keep-alive"
-                    }, timeout=(60, 120))
+                    try:
+                        j = pc.upload_write(cfg, uploadid, 0, chunk_data)
+                    except Exception as e:
+                        error_msg = str(e)
+                        import re
+                        match = re.search(r'error (\d+)', error_msg)
+                        error_code = int(match.group(1)) if match else 9999
+                        j = {"result": error_code, "error": error_msg}
                     
-                    j = r.json()
                     chunk_duration = time.time() - chunk_start_time
                     
                     log_response(response_log, {
@@ -483,18 +476,11 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
     dest_dir = os.path.dirname(remote_path.rstrip("/")) or "/"
     dest_folderid = pc.ensure_path(cfg, dest_dir)
     
-    r = session.post(f"{base_url}/upload_save", params={
-        "access_token": cfg["token"],
-        "uploadid": uploadid,
-        "folderid": dest_folderid,
-        "name": filename
-    }, timeout=(60, 60))
-    
-    j = r.json()
-    log_response(response_log, {"step": "upload_save", "response": j})
-    
-    if j.get("result") != 0:
-        log(f"FEHLER: upload_save fehlgeschlagen: {j}", "ERROR")
+    try:
+        j = pc.upload_save(cfg, uploadid, folderid=dest_folderid, name=filename)
+        log_response(response_log, {"step": "upload_save", "response": j})
+    except Exception as e:
+        log(f"FEHLER: upload_save fehlgeschlagen: {e}", "ERROR")
         sys.exit(1)
     
     metadata = (j.get("metadata") or [{}])[0] if isinstance(j.get("metadata"), list) else j.get("metadata", {})
