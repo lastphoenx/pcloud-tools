@@ -1,0 +1,32 @@
+# Auto-detect text files and perform LF normalization
+* text=auto
+
+# Force LF line endings for scripts (even on Windows)
+*.sh text eol=lf
+*.bash text eol=lf
+*.py text eol=lf
+
+# Force CRLF line endings for Windows batch files
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mov binary
+*.mp4 binary
+*.mp3 binary
+*.flv binary
+*.fla binary
+*.swf binary
+*.gz binary
+*.zip binary
+*.7z binary
+*.ttf binary
+*.eot binary
+*.woff binary
+*.woff2 binary
+*.pyc binary

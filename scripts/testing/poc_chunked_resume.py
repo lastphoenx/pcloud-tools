@@ -35,11 +35,18 @@ import argparse
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-# pcloud_bin_lib laden
+# pcloud_bin_lib laden (aus parent/parent directory = main/)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_lib_dir = os.path.abspath(os.path.join(_script_dir, "..", ".."))
+if _lib_dir not in sys.path:
+    sys.path.insert(0, _lib_dir)
+
 try:
     import pcloud_bin_lib as pc
 except ImportError:
-    print("FEHLER: pcloud_bin_lib.py nicht gefunden. Skript muss im selben Verzeichnis liegen.", file=sys.stderr)
+    print(f"FEHLER: pcloud_bin_lib.py nicht gefunden in {_lib_dir}", file=sys.stderr)
+    print(f"Skript liegt in: {_script_dir}", file=sys.stderr)
+    print(f"PYTHONPATH: {sys.path}", file=sys.stderr)
     sys.exit(2)
 
 
