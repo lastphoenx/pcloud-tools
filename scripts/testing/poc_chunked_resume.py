@@ -156,37 +156,55 @@ def cleanup_state(state_file: str, response_log: str):
 
 # ==================== Upload-Logik ====================
 
-def test_uploadid_valid(cfg: Dict[str, Any], uploadid: int) -> bool:
+def test_uploadid_valid(cfg: Dict[str, Any], uploadid: int, expected_offset: int = 0) -> bool:
     """
-    Testet ob uploadid noch gültig ist.
-    Sendet einen leeren upload_write-Request als Probe.
+    Testet ob uploadid noch gültig ist UND ob die Chunks noch vorhanden sind.
+    Schreibt 1-Byte-Test-Chunk am erwarteten Offset.
+    
+    Returns:
+        True = uploadid gültig UND Chunks noch da (Resume möglich)
+        False = uploadid abgelaufen ODER Chunks gelöscht (Neustart nötig)
     """
-    log(f"Teste uploadid {uploadid} auf Gültigkeit...", "TEST")
+    log(f"Teste uploadid {uploadid} @ Offset {expected_offset:,}...", "TEST")
     
     session = pc._get_session()
     base_url = pc._rest_base(cfg)
     
     try:
-        # Sende 0-Byte-Test an offset 0
+        # Sende 1-Byte-Test-Chunk am erwarteten Offset
+        # (nicht 0 Bytes @ Offset 0 - das prüft nur ob uploadid existiert!)
         r = session.post(f"{base_url}/upload_write", params={
             "access_token": cfg["token"],
             "uploadid": uploadid,
-            "uploadoffset": 0
-        }, data=b"", timeout=(10, 10))
+            "uploadoffset": expected_offset
+        }, data=b"X", headers={
+            "Content-Type": "application/octet-stream"
+        }, timeout=(10, 10))
         
         j = r.json()
         
-        # Error 1900 = "Upload not found"
+        # Error 1900 = "Upload not found" (uploadid existiert nicht mehr)
         if j.get("result") == 1900:
-            log(f"uploadid {uploadid} ist NICHT mehr gültig (Error 1900)", "WARN")
+            log(f"uploadid {uploadid} existiert NICHT mehr (Error 1900)", "WARN")
             return False
         
-        # Andere Fehler ignorieren wir (wichtig ist nur ob uploadid bekannt ist)
-        log(f"uploadid {uploadid} ist GÜLTIG (result={j.get('result')})", "OK")
-        return True
+        # Error 2068 = "Error writing to upload" (uploadid existiert, aber Chunks wurden gelöscht!)
+        if j.get("result") == 2068:
+            log(f"uploadid {uploadid} existiert, aber Chunks wurden GELÖSCHT (Error 2068)", "WARN")
+            log(f"  → Serverseitiger Upload-State wurde zurückgesetzt (Timeout?)", "WARN")
+            return False
+        
+        # result=0 = SUCCESS (uploadid existiert UND Chunks noch da!)
+        if j.get("result") == 0:
+            log(f"uploadid {uploadid} ist GÜLTIG und Chunks sind noch vorhanden ✓", "OK")
+            return True
+        
+        # Andere Fehler: Log und False zurückgeben
+        log(f"uploadid-Test fehlgeschlagen: {j}", "WARN")
+        return False
         
     except Exception as e:
-        log(f"uploadid-Test fehlgeschlagen: {e}", "WARN")
+        log(f"uploadid-Test Exception: {e}", "WARN")
         return False
 
 
@@ -253,14 +271,14 @@ def chunked_upload_with_resume(cfg: Dict[str, Any], local_path: str, remote_path
         log(f"  chunks_uploaded: {chunks_uploaded}")
         log("")
         
-        # uploadid-Gültigkeit testen
-        if not test_uploadid_valid(cfg, uploadid):
-            log("[RESUME] uploadid abgelaufen → FALLBACK: Neuer Upload", "WARN")
+        # uploadid-Gültigkeit testen (mit echtem Offset-Test!)
+        if not test_uploadid_valid(cfg, uploadid, upload_offset):
+            log("[RESUME] uploadid/Chunks nicht mehr gültig → FALLBACK: Neuer Upload", "WARN")
             uploadid = None
             upload_offset = 0
             chunks_uploaded = 0
         else:
-            log("[RESUME] uploadid gültig → Upload wird fortgesetzt", "OK")
+            log("[RESUME] uploadid gültig und Chunks vorhanden → Resume", "OK")
         log("")
     
     # === Upload-Session erstellen (falls nötig) ===
