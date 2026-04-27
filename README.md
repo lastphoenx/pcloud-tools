@@ -97,7 +97,7 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/cleanup_orphaned_manifests.sh` | Entfernt Manifeste ohne zugehörigen Snapshot |
 | `scripts/fix_stubs_missing_fileid.py` | Repariert Stubs ohne FileID (nach API-Fehlern) |
 | `scripts/rewrite_stubs_from_index.py` | Regeneriert alle Stubs eines Snapshots aus dem Index |
-| `scripts/pcloud_manifest_diff.py` | Vergleicht zwei Manifeste (Diff-Ansicht) |
+| `pcloud_manifest_diff.py` | Vergleicht zwei Manifeste (Diff-Ansicht) |
 | `scripts/pcloud_integrity_check.py` | Tiefenprüfung: Hashes, FileIDs, Holder-Konsistenz |
 | `scripts/pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
 | `scripts/pcloud_restore.py` | ⚠️ Stellt Snapshots von pCloud wieder her (Notfall-Tool) |

@@ -57,7 +57,7 @@ Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
 │  • pcloud_json_manifest.py    (Manifest-Erzeugung)     │
 │  • pcloud_push_...py          (Upload + Delta-Copy)    │
 │  • pcloud_quick_delta.py      (Tamper-Detection)       │
-│  • scripts/pcloud_manifest_diff.py (Manifest-Diff)     │
+│  • pcloud_manifest_diff.py    (Manifest-Diff)          │
 │                                                         │
 │  Recovery-Tools (scripts/):                            │
 │  • pcloud_restore.py          (Snapshot-Download)      │
@@ -611,7 +611,7 @@ by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter)
 
 ## 📦 Manifest-Diff (Delta-Copy-Basis)
 
-### scripts/pcloud_manifest_diff.py
+### pcloud_manifest_diff.py
 
 **Kategorisierung:**
 
