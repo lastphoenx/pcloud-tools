@@ -385,42 +385,66 @@ build_and_push() {
     _db_run_start "$SNAPNAME" "$SNAP"
   fi
 
-  # Manifest im PCLOUD_TEMP_DIR erstellen (statt system /tmp)
-  local mani; mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.$$.json"
-  # TRAP ENTFERNT: Würde Manifest bei jedem Fehler löschen (FileNotFoundError!)  
-  # Cleanup erfolgt explizit am Ende
+  # === Manifest: Deterministischer Filename (ohne PID für Resume/Reuse) ===
+  local mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.json"
+  local mani_jsonl="${mani}.tmp.jsonl"
+  local manifest_exists=0
+  local manifest_incomplete=0
+  
+  # Prüfe ob Manifest bereits vollständig vorhanden
+  if [[ -f "$mani" ]]; then
+    # Manifest existiert - prüfe ob gültig
+    if jq -e '.items' "$mani" >/dev/null 2>&1; then
+      manifest_exists=1
+      _log INFO "✓ Verwende existierendes Manifest: $(basename "$mani")"
+    else
+      _log INFO "⚠ Manifest existiert aber ist ungültig - neu generieren"
+      rm -f "$mani"
+    fi
+  elif [[ -f "$mani_jsonl" ]]; then
+    # JSONL-Checkpoint vorhanden - unvollständige Generierung
+    manifest_incomplete=1
+    local jsonl_lines=$(wc -l < "$mani_jsonl" 2>/dev/null || echo 0)
+    _log INFO "⚠ Unvollständige Manifest-Generierung erkannt (${jsonl_lines} Items) - setze fort"
+  fi
 
   local T0=$(date +%s)
-  _db_phase_log "manifest" "start"
   
-  # Smart-Mode: Auto-detect letztes Manifest als Referenz (Schema v3)
-  local MANIFEST_MODE="${PCLOUD_MANIFEST_MODE:-smart}"  # smart|full
-  local ref_manifest_arg=""
-  
-  if [[ "$MANIFEST_MODE" == "smart" ]]; then
-    # Suche letztes Manifest im manifests/-Unterordner (Push-Tool archiviert dort)
-    local last_manifest
-    last_manifest="$(find "${PCLOUD_ARCHIVE_DIR}/manifests" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort -r | head -n1)"
+  # Nur neu generieren wenn nötig
+  if [[ $manifest_exists -eq 0 ]]; then
+    _db_phase_log "manifest" "start"
     
-    if [[ -n "$last_manifest" && -f "$last_manifest" ]]; then
-      ref_manifest_arg="--ref-manifest $last_manifest"
-      _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$last_manifest")"
+    # Smart-Mode: Auto-detect letztes Manifest als Referenz (Schema v3)
+    local MANIFEST_MODE="${PCLOUD_MANIFEST_MODE:-smart}"  # smart|full
+    local ref_manifest_arg=""
+    
+    if [[ "$MANIFEST_MODE" == "smart" ]]; then
+      # Suche letztes Manifest im manifests/-Unterordner (Push-Tool archiviert dort)
+      local last_manifest
+      last_manifest="$(find "${PCLOUD_ARCHIVE_DIR}/manifests" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort -r | head -n1)"
+      
+      if [[ -n "$last_manifest" && -f "$last_manifest" ]]; then
+        ref_manifest_arg="--ref-manifest $last_manifest"
+        _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$last_manifest")"
+      else
+        _log INFO "Manifest: Full-Mode (kein Referenz-Manifest)"
+      fi
     else
-      _log INFO "Manifest: Full-Mode (kein Referenz-Manifest)"
+      _log INFO "Manifest: Full-Mode (PCLOUD_MANIFEST_MODE=full)"
     fi
+    
+    "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256 $ref_manifest_arg || {
+      _db_phase_log "manifest" "end" "FAILED"
+      return 1
+    }
+    
+    local manifest_duration=$(( $(date +%s) - T0 ))
+    _db_phase_log "manifest" "end" "SUCCESS"
+    _db_update_metrics "manifest_duration_sec = $manifest_duration"
+    [[ "${PCLOUD_TIMING:-0}" == "1" ]] && _log INFO "Manifest done (${manifest_duration}s)"
   else
-    _log INFO "Manifest: Full-Mode (PCLOUD_MANIFEST_MODE=full)"
+    _log INFO "Manifest-Generierung übersprungen (bereits vorhanden)"
   fi
-  
-  "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256 $ref_manifest_arg || {
-    _db_phase_log "manifest" "end" "FAILED"
-    return 1
-  }
-  
-  local manifest_duration=$(( $(date +%s) - T0 ))
-  _db_phase_log "manifest" "end" "SUCCESS"
-  _db_update_metrics "manifest_duration_sec = $manifest_duration"
-  [[ "${PCLOUD_TIMING:-0}" == "1" ]] && _log INFO "Manifest done (${manifest_duration}s)"
 
   local RET=""
   [[ "$(need_retention_sync)" == "YES" ]] && RET="--retention-sync"
@@ -442,7 +466,7 @@ build_and_push() {
   
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET $DELTA_FLAG --env-file "$ENV_FILE" || {
     _db_phase_log "upload" "end" "FAILED"
-    rm -f "$mani" 2>/dev/null || true
+    rm -f "$mani" "$mani_jsonl" 2>/dev/null || true
     return 1
   }
   
@@ -484,7 +508,7 @@ build_and_push() {
   # === Ende Delta-Check ===
   
   # Explizites Cleanup (statt trap RETURN)
-  rm -f "$mani" 2>/dev/null || true
+  rm -f "$mani" "$mani_jsonl" 2>/dev/null || true
 }
 
 # ========= Start =========
