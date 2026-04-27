@@ -588,7 +588,7 @@ fixed = finalize_index_fileids(cfg, snapshots_root)
 print(f"[finalize] index fileids fixed={fixed}")
 PY
   _db_run_end SUCCESS 0
-  _log INFO "Bootstrap completed successfully"
+  _log INFO "Bootstrap completed successfully (folder template will be auto-created by pcloud_push)"
   exit 0
 fi
 
