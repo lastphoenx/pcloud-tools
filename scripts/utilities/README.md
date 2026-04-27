@@ -9,6 +9,7 @@ Alle Utilities haben eine dedizierte Markdown-Dokumentation im gleichen Verzeich
 | Tool | Zweck | Dokumentation |
 |------|-------|---------------|
 | `cleanup_aborted_upload.sh` | Cleanup abgebrochener Uploads | [→ Docs](cleanup_aborted_upload.md) |
+| `prepare_fresh_test.sh` | Clean-State für Workflow-Tests | [→ Docs](prepare_fresh_test.md) |
 | `pcloud_restore.py` | Snapshot-Wiederherstellung von pCloud | [→ Docs](pcloud_restore.md) |
 | `fix_stubs_missing_fileid.py` | FileID-Reparatur (Stubs + Index) | [→ Docs](fix_stubs_missing_fileid.md) |
 | `pcloud_integrity_check.py` | 7-Ebenen Integritäts-Check | [→ Docs](pcloud_integrity_check.md) |
@@ -43,6 +44,9 @@ python scripts/utilities/pcloud_integrity_check.py \
 Details siehe jeweilige `.md`-Dokumentation.
 
 ## 📖 Kategorien
+
+**Testing/Maintenance:**
+- prepare_fresh_test.sh → Clean-State für Tests (nach Refactoring)
 
 **Recovery-Tools:**
 - cleanup_aborted_upload.sh → Upload-Cleanup & Restart
