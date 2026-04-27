@@ -1278,6 +1278,9 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             print(f"[warn] Konnte Started-Marker nicht setzen: {e}")
     # === ENDE NEU ===
 
+    # Lock für shared state (muss VOR Hilfsfunktionen definiert werden!)
+    _state_lock = threading.Lock()
+
     # --- kleine Helfer ---
     def _ensure(path: str) -> None:
         nonlocal ensure_ms
@@ -1535,8 +1538,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     # === Ende Diff-basierte Ordner-Anlage ===
 
     # === Parallel Upload für kleine Dateien ===
-    # Lock für shared state (items dict, seen_inodes, counters)
-    _state_lock = threading.Lock()
+    # (_state_lock bereits oben definiert - wird hier wiederverwendet)
     
     # File-Processing-Funktion (thread-safe)
     def _process_file_item(it: dict) -> None:
