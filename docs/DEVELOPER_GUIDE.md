@@ -1717,6 +1717,95 @@ if exists(".upload_started") and not exists(".upload_complete"):
 → Kein Re-Upload nötig!
 ```
 
+**Detaillierter Mechanismus: Wie werden bereits hochgeladene Dateien erkannt?**
+
+Das Skript verwendet **drei aufeinander aufbauende Mechanismen**, um unnötige Uploads zu vermeiden:
+
+**1. Lokaler Index-Check (SCHNELL, KEINE API-Calls)**
+
+```python
+# Zeile 1579-1589 in pcloud_push_json_manifest_to_pcloud.py
+with _state_lock:
+    node = items.setdefault(sha256, {"holders": []})
+    
+    # Prüfen ob DIESER Snapshot + relpath bereits im Index
+    already_in_snapshot = any(
+        h.get("snapshot") == snapshot_name and 
+        h.get("relpath") == relpath
+        for h in node.get("holders", [])
+    )
+    
+    if already_in_snapshot:
+        resumed += 1  # ← Im Log als "resumed=603" sichtbar
+        return        # ← SKIP ohne API-Call!
+```
+
+**Wann greift dieser Check:**
+- Bei Resume nach Absturz/Unterbrechung
+- Lokaler Index aus `/srv/pcloud-temp/pcloud_index_{snapshot}.json` vorhanden
+- Datei wurde in diesem Snapshot bereits verarbeitet
+- **Ergebnis:** Datei wird übersprungen, KEIN API-Call zu pCloud
+
+**2. Deduplizierung via SHA256 (Index-basiert)**
+
+```python
+# Zeile 1608-1615 in pcloud_push_json_manifest_to_pcloud.py
+if sha in known_anchors:
+    anchor_path, anchor_fid = known_anchors[sha]
+    # Verwende anchor_path → Stub statt Upload!
+    stubs += 1  # ← Im Log als "stubs=1688" sichtbar
+    _queue_stub(relpath, item, node)
+    return
+```
+
+**Wann greift dieser Check:**
+- Datei mit identischem SHA256 wurde bereits in anderem Snapshot hochgeladen
+- `anchor_path` zeigt auf erste Upload-Instanz (z.B. älterer Snapshot)
+- **Ergebnis:** Nur `.meta.json` Stub wird erstellt, KEIN Upload der Datei
+
+**3. Echter Upload (NUR wenn nicht im Index)**
+
+```python
+# Zeile 1619-1630 in pcloud_push_json_manifest_to_pcloud.py
+if not anchor_path:
+    # Datei ist neu → Upload erforderlich
+    fid, pcloud_hash = _upload_real_file(src_abs, dst_path)
+    uploaded += 1  # ← Im Log als "uploaded=17294" sichtbar
+    
+    # Index aktualisieren für künftige Deduplizierung
+    with _state_lock:
+        node["anchor_path"] = dst_path
+        node["fileid"] = fid
+        node["pcloud_hash"] = pcloud_hash
+```
+
+**Wann wird wirklich hochgeladen:**
+- Datei ist neu (SHA256 nicht im Index)
+- Keine frühere Upload-Instanz bekannt (kein `anchor_path`)
+- **Ergebnis:** Echter API-Upload zu pCloud
+
+**Beispiel-Log-Ausgabe erklärt:**
+
+```
+[push] 19643/19808 (99%) | 53.45/89.59 GB (60%) | uploaded=17351 resumed=603 stubs=1688
+```
+
+- **uploaded=17351:** Neue Dateien hochgeladen (kein Index-Eintrag, kein anchor_path)
+- **resumed=603:** Im Index gefunden → Skip OHNE API-Call (Mechanismus 1)
+- **stubs=1688:** Deduplizierte Dateien (SHA256 Match) → Stub statt Upload (Mechanismus 2)
+- **Total:** 17351 + 603 + 1688 = 19642 Dateien verarbeitet
+
+**Effizienz-Gewinn:**
+- Nur **17351 echte API-Calls** (Uploads) statt 19642
+- **~12% API-Calls gespart** durch Index-basierte Checks
+- Resume nach Absturz: 603 Dateien nicht erneut hochgeladen
+- Deduplizierung: 1688 Dateien nicht doppelt gespeichert
+
+**Index-Speicherorte:**
+- **Laufend:** `/srv/pcloud-temp/pcloud_index_{snapshot}.json` (lokaler Cache)
+- **Abschluss:** `/srv/pcloud-archive/indexes/pcloud_index_{snapshot}.json` (Archiv)
+- **Remote:** `/pCloud/snapshots/.indexes/pcloud_index_{snapshot}.json` (auf pCloud)
+
 > **⚠️ Kein Resume in `push_1to1_delta_mode`:**
 > Der Delta-Copy-Modus hat keinen eigenen Resume-Mechanismus — kein
 > Marker-Check am Anfang, keinen lokalen Index-Cache, kein periodisches
