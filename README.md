@@ -70,15 +70,20 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 |---|---|
 | `wrapper_pcloud_sync_1to1.sh` | Orchestrator: ruft alle Phasen in Reihenfolge auf |
 | `pcloud_json_manifest.py` | Manifest-Erstellung (Smart-Hashing via inode/mtime) |
-| `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication, **Chunked-Upload** |
+| `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication, **Chunked-Upload**, **Parallel Uploads** |
 | `pcloud_quick_delta.py` | Post-Upload-Verifikation (Delta-Check) |
 | `pcloud_bin_lib.py` | pCloud Binary-API-Bibliothek (Connection, Retry, **Chunked Upload with Resume**) |
 | `create_folder_template.py` | Einmaliges Setup des `_folder_template`-Cache (SAFE-MODE Beschleunigung) |
 | `pcloud_health_check.sh` | Backup-Status, Quota, Alter — Nagios/Zabbix-kompatibel |
 | `pcloud_status.sh` | Interaktives Status-Dashboard aus MariaDB |
 
-**Neu seit April 2026:** Chunked-Upload mit automatischem Resume für große Dateien (>5 GB).  
-→ Details: [docs/DEVELOPER_GUIDE.md § Chunked Upload with Resume](docs/DEVELOPER_GUIDE.md#-chunked-upload-with-resume-large-file-support)
+**Neu seit April 2026:**  
+- **Chunked-Upload mit automatischem Resume** für große Dateien (>5 GB)  
+- **Parallel Uploads** für kleine Dateien (<50 MB): 30-40% Speedup bei vielen kleinen Files  
+- **Thread-safe Metrics** für präzises Monitoring  
+- **Resume-State-Validierung** mit automatischem Cleanup verwaister States  
+
+→ Details: [docs/DEVELOPER_GUIDE.md § Chunked Upload](docs/DEVELOPER_GUIDE.md#-chunked-upload-with-resume-large-file-support) | [§ Parallel Uploads](docs/DEVELOPER_GUIDE.md#-parallel-uploads-small-files-optimization)
 
 ---
 
