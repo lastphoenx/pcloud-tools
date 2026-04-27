@@ -51,9 +51,10 @@ import threading
 
 # ==================== Globals ====================
 
-# Chunk-Größe für große Dateien (50 MB)
-CHUNK_SIZE_THRESHOLD = 50 * 1024**2  # Ab 50 MB → chunked
-CHUNK_SIZE = 10 * 1024**2            # 10 MB Chunks
+# Chunk-Konfiguration (konsistent mit pcloud_push_json_manifest_to_pcloud.py)
+# Via .env steuerbar: PCLOUD_RESUME_THRESHOLD_GB, PCLOUD_RESUME_CHUNK_MB
+CHUNK_SIZE_THRESHOLD = int(os.environ.get("PCLOUD_RESUME_THRESHOLD_GB", "5")) * 1024**3  # Default: 5 GB
+CHUNK_SIZE = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128")) * 1024**2            # Default: 128 MB
 
 # Globale Statistiken (thread-safe)
 _stats_lock = threading.Lock()
@@ -532,7 +533,7 @@ def upload_worker(pc, cfg: Dict[str, Any], file_info: Dict[str, Any], destinatio
     if size < CHUNK_SIZE_THRESHOLD:
         result = upload_file_direct(pc, cfg, local_path, remote_path)
     else:
-        log(f"  → Chunked Upload (Datei ≥50MB)", "INFO")
+        log(f"  → Chunked Upload (Datei ≥{CHUNK_SIZE_THRESHOLD/1024**3:.1f} GB, Chunk-Size: {CHUNK_SIZE/1024**2:.0f} MB)", "INFO")
         result = upload_file_chunked(pc, cfg, local_path, remote_path)
     
     duration = time.time() - start_time
