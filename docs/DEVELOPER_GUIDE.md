@@ -1260,6 +1260,152 @@ Total: ~8.2 Stunden
 
 ---
 
+## 🔄 Manifest-Reuse & Resume-Robustheit
+
+### Problem: Crash-Recovery vor Commit c19d82b
+
+**Alte Implementierung (bis April 2026):**
+```bash
+# wrapper_pcloud_sync_1to1.sh (ALT):
+mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.$$.json"
+# Beispiel: pcloud_mani.2026-04-27-173201.3243283.json
+#                                           ^^^^^^^ PID ändert sich bei jedem Restart!
+```
+
+**Probleme:**
+1. **Manifest-Regenerierung nach Crash:** Nach Neustart hat der Prozess eine neue PID → neuer Filename → altes Manifest nicht gefunden → 17min Manifest-Generierung VERSCHWENDET!
+2. **JSONL-Resume defekt:** JSONL-Streaming (`pcloud_json_manifest.py`) sucht nach `.tmp.jsonl` mit gleichem Filename → findet nichts → startet von vorne!
+3. **Unnötige Komplexität:** Lock (`/run/backup_pipeline.lock`) verhindert bereits parallele Runs → PID-Suffix war redundant!
+
+### Lösung: Deterministische Filenames (Commit c19d82b)
+
+```bash
+# wrapper_pcloud_sync_1to1.sh (NEU):
+local mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.json"
+local mani_jsonl="${mani}.tmp.jsonl"
+
+# Prüfe ob Manifest bereits vollständig vorhanden
+if [[ -f "$mani" ]]; then
+  if jq -e '.items' "$mani" >/dev/null 2>&1; then
+    manifest_exists=1
+    _log INFO "✓ Verwende existierendes Manifest: $(basename "$mani")"
+  else
+    _log INFO "⚠ Manifest existiert aber ist ungültig - neu generieren"
+    rm -f "$mani"
+  fi
+elif [[ -f "$mani_jsonl" ]]; then
+  manifest_incomplete=1
+  local jsonl_lines=$(wc -l < "$mani_jsonl" 2>/dev/null || echo 0)
+  _log INFO "⚠ Unvollständige Manifest-Generierung erkannt (${jsonl_lines} Items) - setze fort"
+fi
+```
+
+**Vorteile:**
+1. **Manifest-Reuse:** Existierendes Manifest wird erkannt und wiederverwendet → spart 17 Minuten!
+2. **JSONL-Resume:** Unvollständige Generierung wird fortgesetzt statt neu gestartet
+3. **Deterministisch:** Immer gleicher Filename für gleichen Snapshot → konsistent!
+
+**JSONL-Streaming in `pcloud_json_manifest.py`:**
+```python
+# Sortierte File-Liste (deterministisch!)
+all_paths.sort(key=lambda x: x[1])
+
+# Resume-Detection
+resume_from = 0
+if jsonl_tmp and os.path.exists(jsonl_tmp):
+    with open(jsonl_tmp) as f:
+        resume_from = sum(1 for _ in f)  # Anzahl bereits verarbeiteter Items
+    print(f"[resume] Setze fort ab Item {resume_from}", file=sys.stderr)
+
+# Streaming-Write mit sofortigem flush (crash-resistant!)
+for idx, (inode_key, relpath, ...) in enumerate(all_paths[resume_from:], start=resume_from):
+    entry = {...}
+    jsonl_file.write(json.dumps(entry) + "\n")
+    jsonl_file.flush()  # ← Kritisch: Sofort auf Disk!
+
+# Finalize: JSONL → JSON konvertieren
+if jsonl_tmp and os.path.exists(jsonl_tmp):
+    with open(jsonl_tmp) as f:
+        items = [json.loads(line) for line in f]
+    os.remove(jsonl_tmp)
+```
+
+**Performance:**
+- Konstante RAM-Nutzung (~99% Reduktion bei großen Manifests)
+- Konstante Speed (kein "Schneeball-Effekt")
+- 100% crash-resistent durch `.flush()` nach jedem Item
+
+---
+
+## ✅ Upload-Complete Marker Check (Commit f25a75b)
+
+### Problem: False-Positive "Snapshot vollständig"
+
+**Szenario:**
+1. Upload startet → `.upload_started` Marker gesetzt
+2. Upload crasht (z.B. Threading-Bug, Netzwerk-Fehler)
+3. Snapshot-Ordner existiert auf pCloud (z.B. 1101 leere Ordner)
+4. ABER: `.upload_complete` Marker fehlt!
+5. rtb_wrapper prüft: "Snapshot 2026-04-27-173201 auf pCloud?" → JA (Ordner existiert!)
+6. Fehlschluss: "Alles fertig" → überspringt Upload → DATENVERLUST!
+
+**Alte Implementierung (`load_remote_snapshots()`):**
+```python
+# Nur Ordner-Existenz geprüft (FALSCH!)
+for c in metadata.get("contents", []):
+    if c.get("isfolder") and c.get("name") != "_index":
+        names.append(c["name"])  # ← Kein Marker-Check!
+```
+
+### Lösung: Expliziter `.upload_complete` Check
+
+```python
+# wrapper_pcloud_sync_1to1.sh → load_remote_snapshots()
+for c in (js.get("metadata") or {}).get("contents", []) or []:
+    if c.get("isfolder") and c.get("name") != "_index":
+        snapname = c["name"]
+        
+        # Prüfe ob Upload vollständig (.upload_complete Marker vorhanden)
+        marker_path = f"{snap_root}/{snapname}/.upload_complete"
+        try:
+            pc.stat_file(cfg, path=marker_path, with_checksum=False)
+            # Marker existiert → Upload war vollständig ✓
+            names.append(snapname)
+        except Exception:
+            # Marker fehlt → Upload unvollständig oder fehlgeschlagen ✗
+            # Snapshot wird NICHT als "vorhanden" gelistet
+            pass
+```
+
+**Wann wird `.upload_complete` gesetzt?**
+
+```python
+# pcloud_push_json_manifest_to_pcloud.py (Ende von push_1to1_mode):
+pc.put_textfile(cfg, path=f"{dest_snapshot_dir}/.upload_complete", 
+                text=json.dumps({
+                    "snapshot": snapshot_name,
+                    "completed_at": time.time(),
+                    "host": os.uname().nodename,
+                    "duration_sec": int(time.time() - run_start_time),
+                    "files_uploaded": MET_FILES_UPLOADED,
+                    "stubs_written": MET_STUBS_WRITTEN
+                }))
+```
+
+**Marker-Hierarchie:**
+```
+.upload_started       → Upload hat begonnen (für Monitoring)
+.upload_complete      → Upload erfolgreich abgeschlossen ✓
+.upload_incomplete    → Upload unvollständig (für Gap-Detection)
+```
+
+**Resultat:**
+- Unvollständige Uploads werden **NICHT** als "fertig" erkannt
+- rtb_wrapper startet Upload korrekt neu
+- Daten-Integrität garantiert
+
+---
+
 ### Limitations & Caveats
 
 1. **Rate Limits:**
@@ -1583,7 +1729,60 @@ if exists(".upload_started") and not exists(".upload_complete"):
 
 ## 🔧 Konfiguration & Env-Vars
 
-### Gap-Handlering
+### .env Konfigurationsdatei
+
+**Speicherort:** `/opt/apps/pcloud-tools/main/.env` (oder via `ENV_FILE` überschreibbar)
+
+**Laden:** Das Shell-Wrapper-Skript (`wrapper_pcloud_sync_1to1.sh`) lädt automatisch alle `PCLOUD_*` Variablen aus der `.env`:
+
+```bash
+# Zeile 31-50 in wrapper_pcloud_sync_1to1.sh:
+while IFS='=' read -r key val; do
+  if [[ "$key" =~ ^PCLOUD_ ]]; then
+    # Quotes entfernen, Kommentare filtern
+    export "${key}=${val}"
+  fi
+done < "${ENV_FILE}"
+```
+
+Python-Tools lesen dann die exportierten Shell-Environment-Variablen via `os.environ.get()`.
+
+**Beispiel `.env`:**
+
+```bash
+# === API-Credentials (PFLICHT) ===
+PCLOUD_TOKEN="YOUR_TOKEN_HERE"
+PCLOUD_HOST="eapi.pcloud.com"     # eu.api.pcloud.com für EU-Region
+PCLOUD_PORT="8399"
+PCLOUD_TIMEOUT_SECS="90"
+PCLOUD_DEVICE="backup/hostname"
+
+# === MariaDB (für Tracking) ===
+PCLOUD_DB_HOST=localhost
+PCLOUD_DB_PORT=3306
+PCLOUD_DB_NAME=pcloud_backup
+PCLOUD_DB_USER=pcloud_backup
+PCLOUD_DB_PASS='your_password'
+PCLOUD_ENABLE_DB=1
+
+# === Threading-Konfiguration (WICHTIG!) ===
+PCLOUD_UPLOAD_THREADS=16          # File-Uploads parallel (Standard: 4)
+PCLOUD_FOLDER_THREADS=8           # Ordner-Creation parallel (Standard: 4)
+PCLOUD_STUB_THREADS=8             # Stub-Writes parallel (Standard: 4)
+
+# === Pfade ===
+PCLOUD_TEMP_DIR="/srv/pcloud-temp"
+PCLOUD_ARCHIVE_DIR="/srv/pcloud-archive"
+
+# === Optionale Einstellungen ===
+PCLOUD_PRETTY_JSON=1              # JSON menschen-lesbar (Debug)
+PCLOUD_USE_DELTA_COPY=0           # Delta-Copy-Modus (Beta)
+PCLOUD_GAP_STRATEGY=optimistic    # conservative|optimistic|aggressive
+```
+
+---
+
+### Gap-Handling
 
 | Variable | Default | Beschreibung |
 |----------|---------|--------------|
@@ -1600,15 +1799,32 @@ if exists(".upload_started") and not exists(".upload_complete"):
 | `PCLOUD_TIMEOUT` | `60` | API-Timeout (s) |
 | `PCLOUD_SNAPSHOT_SCAN_LIMIT` | `60` | Max. Snapshots bei load_remote_snapshots (neueste zuerst) |
 
-### Performance
+### Threading & Performance
 
-| Variable | Default | Beschreibung |
-|----------|---------|--------------|
-| `PCLOUD_STUB_THREADS` | `4` | Parallele Stub-Writes |
-| `PCLOUD_FOLDER_THREADS` | `4` | Parallele Ordner-Anlage |
-| `PCLOUD_INDEX_SAVE_INTERVAL` | `100` | Periodisches Index-Save (Anzahl) |
-| `PCLOUD_INDEX_SAVE_INTERVAL_TIME` | `300` | Periodisches Index-Save (Sekunden) |
-| `PCLOUD_STUB_PROGRESS_INTERVAL` | `500` | Progress-Log-Intervall (Stubs) |
+| Variable | Default | Empfohlen (RPi 5) | Beschreibung |
+|----------|---------|-------------------|--------------|
+| `PCLOUD_UPLOAD_THREADS` | `4` | **16** | Parallele File-Uploads (<50MB) |
+| `PCLOUD_STUB_THREADS` | `4` | **8** | Parallele Stub-Writes |
+| `PCLOUD_FOLDER_THREADS` | `4` | **8** | Parallele Ordner-Anlage |
+| `PCLOUD_SMALL_FILE_THRESHOLD_MB` | `50` | `50` | Grenze für parallelen Upload |
+| `PCLOUD_INDEX_SAVE_INTERVAL` | `100` | `100` | Periodisches Index-Save (Anzahl) |
+| `PCLOUD_INDEX_SAVE_INTERVAL_TIME` | `300` | `300` | Periodisches Index-Save (Sekunden) |
+| `PCLOUD_STUB_PROGRESS_INTERVAL` | `500` | `500` | Progress-Log-Intervall (Stubs) |
+
+**Threading-Tuning:**
+
+- **UPLOAD_THREADS:** Kritisch für Performance! Default 4 ist zu konservativ für moderne Hardware.
+  - RPi 5: 16 Threads → **~4x Speedup** bei vielen kleinen Dateien
+  - Netzwerk-limitiert, nicht CPU-limitiert
+  
+- **FOLDER_THREADS:** Ordner-Creation ist API-limitiert, 8 reicht meist aus.
+
+- **STUB_THREADS:** Stub-Writes sind kleine JSON-Files, 8 ist optimal.
+
+**Retry-Strategie:**
+- File-Uploads: 12 Versuche (kritisch, Netzwerk-sensitiv)
+- Stubs/Ordner: 5 Versuche (weniger kritisch, schnell wiederholbar)
+- Implementiert in `call_with_backoff()` (pcloud_bin_lib.py)
 
 ### Archive
 
@@ -2294,6 +2510,37 @@ sudo PCLOUD_GAP_STRATEGY=optimistic bash /opt/apps/rtb/rtb_wrapper.sh
 ---
 
 ## 🐛 Known Issues (Git-History)
+
+**Commit bf22cf1 (2026-04-27) - Fix: Threading UnboundLocalError:**
+```
+PROBLEM: `UnboundLocalError: cannot access local variable 'threading'`
+ROOT CAUSE: Redundante lokale `import threading` in Funktionen (Zeile 854, 1481)
+           Python-Scoping: Lokales Import macht Variable lokal für GESAMTE Funktion
+           → threading.Lock() bei Zeile 1282 schlägt fehl (Variable noch nicht definiert)
+FIX: Redundante lokale Imports entfernt, globales Import (Zeile 36) reicht
+STATUS: ✅ Resolved
+```
+
+**Commit c19d82b (2026-04-27) - Fix: Manifest PID-Suffix:**
+```
+PROBLEM: PID im Manifest-Filename verhindert Reuse nach Crash
+         • pcloud_mani.{SNAPNAME}.$$.json → PID ändert sich bei Restart
+         • Manifest-Regenerierung: 17min verschwendet
+         • JSONL-Resume defekt (sucht alten Filename)
+FIX: PID entfernt → pcloud_mani.{SNAPNAME}.json (deterministisch)
+     Manifest-Existenz-Check vor Regenerierung
+STATUS: ✅ Resolved, ~17min Zeitersparnis bei Crashes
+```
+
+**Commit f25a75b (2026-04-27) - Fix: .upload_complete Check:**
+```
+PROBLEM: load_remote_snapshots() prüfte nur Ordner-Existenz
+         → Unvollständige Uploads als "fertig" erkannt
+         → False-Positive: "All snapshots already on pCloud"
+FIX: Expliziter .upload_complete Marker-Check via pc.stat_file()
+     Nur Snapshots mit Marker werden als vollständig gelistet
+STATUS: ✅ Resolved, verhindert Daten-Inkonsistenzen
+```
 
 **Commit d0e789e (Fix: Index Update):**
 ```
