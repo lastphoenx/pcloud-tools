@@ -33,6 +33,7 @@ Benötigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
 from __future__ import annotations
 import os, sys, json, argparse, time, datetime
 import concurrent.futures
+import threading
 from typing import Dict, Any, Optional, Tuple
 
 
@@ -72,6 +73,13 @@ MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional 
 # --- Chunked Upload Configuration ---
 RESUME_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_RESUME_THRESHOLD_GB", "5")) * 1024**3  # Default: 5 GB
 RESUME_CHUNK_SIZE = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128")) * 1024**2  # Default: 128 MB
+
+# --- Parallel Upload Configuration ---
+SMALL_FILE_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_SMALL_FILE_THRESHOLD_MB", "50")) * 1024**2  # Default: 50 MB
+PARALLEL_UPLOAD_THREADS = int(os.environ.get("PCLOUD_UPLOAD_THREADS", "4"))  # Default: 4 threads
+
+# --- Global Metrics Lock (Thread-Safety) ---
+_metrics_lock = threading.Lock()
 
 # ----------------- Utilities -----------------
 
@@ -127,6 +135,81 @@ def _get_resume_state_dir() -> str:
     return tmp_dir
 
 
+def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, verbose: bool = False) -> int:
+    """
+    Bereinigt verwaiste/alte Resume-State-Files.
+    
+    L\u00f6scht:
+    - Files \u00e4lter als max_age_days (Standard: 7 Tage)
+    - Error-Status Files \u00e4lter als 24 Stunden
+    - Files mit korruptem JSON
+    
+    Returns:
+        Anzahl gel\u00f6schter Files
+    """
+    if not os.path.exists(state_dir):
+        return 0
+    
+    deleted = 0
+    now = time.time()
+    max_age_seconds = max_age_days * 86400
+    error_max_age = 86400  # 24 Stunden
+    
+    try:
+        for filename in os.listdir(state_dir):
+            if not filename.endswith(".state.json"):
+                continue
+            
+            filepath = os.path.join(state_dir, filename)
+            
+            try:
+                # File-Age pr\u00fcfen
+                mtime = os.path.getmtime(filepath)
+                age = now - mtime
+                
+                # Alte Files l\u00f6schen
+                if age > max_age_seconds:
+                    if verbose:
+                        _log(f\"[cleanup] L\u00f6sche altes State-File ({age/86400:.1f} Tage alt): {filename}\")
+                    os.remove(filepath)
+                    deleted += 1
+                    continue
+                
+                # State laden und pr\u00fcfen
+                try:
+                    with open(filepath, \"r\") as f:
+                        state = json.load(f)
+                    
+                    # Error-Status Files nach 24h l\u00f6schen
+                    if state.get(\"status\") == \"error\" and age > error_max_age:
+                        if verbose:
+                            _log(f\"[cleanup] L\u00f6sche Error-State ({age/3600:.1f}h alt): {filename}\")
+                        os.remove(filepath)
+                        deleted += 1
+                        continue
+                    
+                except json.JSONDecodeError:
+                    # Korruptes JSON l\u00f6schen
+                    if verbose:
+                        _log(f\"[cleanup] L\u00f6sche korruptes State-File: {filename}\")
+                    os.remove(filepath)
+                    deleted += 1
+                    continue
+                
+            except Exception as e:
+                if verbose:
+                    _log(f\"[cleanup] Fehler bei {filename}: {e}\")
+                continue
+    
+    except Exception as e:
+        _log(f\"[cleanup] Cleanup-Fehler: {e}\")
+    
+    if deleted > 0 and verbose:
+        _log(f\"[cleanup] {deleted} verwaiste State-Files gel\u00f6scht\")
+    
+    return deleted
+
+
 def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                           *, dry: bool = False) -> dict:
     """
@@ -137,11 +220,14 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     - upload_info() Server-Sync vor Resume
     - Automatische Offset-Korrektur
     - SHA256-Verifikation nach Upload
+    - Snapshot-Validierung (State gehört zu aktuellem Snapshot)
+    - Automatisches Cleanup ungültiger/alter State-Files
     
     Returns:
         Dict mit 'metadata' (kompatibel mit pc.upload_file)
     """
     import hashlib
+    import re
     
     if dry:
         _log(f"[dry] chunked upload: {remote_path} <- {local_path}")
@@ -149,6 +235,26 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     
     state_dir = _get_resume_state_dir()
     file_size = os.path.getsize(local_path)
+    
+    # Einmalige Cleanup-Routine (pro Prozess)
+    global _resume_cleanup_done
+    try:
+        _resume_cleanup_done
+    except NameError:
+        _resume_cleanup_done = False
+    
+    if not _resume_cleanup_done and os.environ.get("PCLOUD_RESUME_CLEANUP", "1") != "0":
+        max_age = int(os.environ.get("PCLOUD_RESUME_CLEANUP_DAYS", "7"))
+        verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
+        _cleanup_orphaned_resume_states(state_dir, max_age_days=max_age, verbose=verbose)
+        _resume_cleanup_done = True
+    
+    # Snapshot-Name aus remote_path extrahieren (wichtig für Validierung!)
+    # Format: /_snapshots/<snapshot_name>/...
+    snapshot_name = None
+    match = re.search(r'/_snapshots/([^/]+)/', remote_path)
+    if match:
+        snapshot_name = match.group(1)
     
     # State-File basierend auf remote_path (eindeutig!)
     state_key = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
@@ -171,7 +277,22 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
             # Hash aus State übernehmen (falls vorhanden)
             file_hash = state.get("file_hash")
             
-            if state.get("remote_path") == remote_path and state.get("file_size") == file_size:
+            # Validierung 1: Pfad & Größe müssen matchen
+            if state.get("remote_path") != remote_path:
+                _log(f"[chunked] State ungültig (remote_path geändert) - lösche State")
+                os.remove(state_file)
+                file_hash = None
+            elif state.get("file_size") != file_size:
+                _log(f"[chunked] State ungültig (file_size geändert) - lösche State")
+                os.remove(state_file)
+                file_hash = None
+            # Validierung 2: Snapshot-Name muss matchen (wenn vorhanden)
+            elif snapshot_name and state.get("snapshot_name") != snapshot_name:
+                _log(f"[chunked] State ungültig (Snapshot geändert: {state.get('snapshot_name')} -> {snapshot_name}) - lösche State")
+                os.remove(state_file)
+                file_hash = None
+            else:
+                # State ist valide - versuche Resume
                 uploadid = state.get("uploadid")
                 upload_offset = state.get("offset", 0)
                 chunks_uploaded = state.get("chunks_uploaded", 0)
@@ -180,9 +301,10 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                 _log(f"[chunked] Lade State: {os.path.basename(state_file)}")
                 _log(f"[chunked] Resume @ {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
                 
-                # FIX 1: Metrik HIER hochzählen (bei jedem Resume, nicht nur bei Offset-Mismatch)
+                # Metrik hochzählen
                 try:
-                    globals()["MET_RESUMED_FILES"] += 1
+                    with _metrics_lock:
+                        globals()["MET_RESUMED_FILES"] += 1
                 except Exception:
                     pass
                 
@@ -196,17 +318,23 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                         upload_offset = server_offset
                         chunks_uploaded = server_offset // RESUME_CHUNK_SIZE
                 except Exception as e:
-                    _log(f"[chunked] upload_info fehlgeschlagen: {e} - erstelle neuen Upload")
+                    _log(f"[chunked] upload_info fehlgeschlagen: {e} - lösche State und starte neu")
+                    # Wichtig: State-File löschen, nicht überschreiben!
+                    try:
+                        os.remove(state_file)
+                    except Exception:
+                        pass
                     uploadid = None
                     upload_offset = 0
                     chunks_uploaded = 0
                     is_resume = False
-            else:
-                _log(f"[chunked] State ungültig (Pfad/Größe geändert) - starte neu")
-                os.remove(state_file)
-                file_hash = None
+                    file_hash = None  # SHA256 neu berechnen
         except Exception as e:
-            _log(f"[chunked] State-Load fehlgeschlagen: {e}")
+            _log(f"[chunked] State-Load fehlgeschlagen: {e} - starte neu")
+            try:
+                os.remove(state_file)
+            except Exception:
+                pass
             uploadid = None
             file_hash = None
     
@@ -259,6 +387,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                                 "file_hash": file_hash,
                                 "file_size": file_size,
                                 "remote_path": remote_path,
+                                "snapshot_name": snapshot_name,
                                 "status": "error",
                                 "error": str(e),
                                 "updated_at": time.time()
@@ -283,6 +412,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                     "file_hash": file_hash,
                     "file_size": file_size,
                     "remote_path": remote_path,
+                    "snapshot_name": snapshot_name,
                     "status": "in_progress",
                     "updated_at": time.time()
                 }, f)
@@ -370,57 +500,6 @@ def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
                                 local_path=local_path,
                                 remote_path=remote_path,
                                 attempts=12, max_sleep=60.0)
-
-
-def write_hardlink_stub_1to1(cfg, snapshots_root, snapshot_name, relpath, file_item, node, dry=False):
-    """
-    Schreibt die .meta.json für einen 1:1-Hardlink-Stub und sorgt dafür,
-    dass 'fileid' (falls möglich) gesetzt und im Index-Node mitgeführt wird.
-    """
-    meta_path = f"{snapshots_root.rstrip('/')}/{snapshot_name}/{relpath}.meta.json"
-
-    # Ordner sicherstellen (nur via Lib-Helper)
-    _ensure_parent(cfg, meta_path, dry=dry)
-
-    # fileid nachziehen, falls im Node noch None
-    fileid = node.get("fileid")
-    if not fileid and node.get("anchor_path"):
-        fid = pc.resolve_fileid_cached(cfg, path=node.get("anchor_path"), cache=_fid_cache_shared)
-        if fid:
-            fileid = fid
-            node["fileid"] = fid
-
-    payload = {
-        "type":   "hardlink",
-        "sha256": (file_item.get("sha256") or "").lower(),
-        "size":   int(file_item.get("size") or 0),
-        "mtime":  float(file_item.get("mtime") or 0.0),
-        "inode":  {
-            "dev":   int(((file_item.get("inode") or {}).get("dev")  or 0)),
-            "ino":   int(((file_item.get("inode") or {}).get("ino")  or 0)),
-            "nlink": int(((file_item.get("inode") or {}).get("nlink") or 1)),
-        },
-        "anchor_path": node.get("anchor_path"),
-        "fileid": fileid if fileid is not None else None,
-        "snapshot": snapshot_name,
-        "relpath": relpath,
-    }
-
-    if dry:
-        print(f"[dry] stub: {meta_path} -> {node.get('anchor_path')}")
-    else:
-        pc.write_json_at_path(cfg, path=meta_path, obj=payload)
-
-    # Metrics
-    globals()["MET_STUBS_WRITTEN"] += 1
-
-    # holders[] pflegen
-    holders = node.setdefault("holders", [])
-    h = {"snapshot": snapshot_name, "relpath": relpath}
-    if h not in holders:
-        holders.append(h)
-
-    return meta_path, payload
 
 
 def stat_file_safe(cfg: dict, *, path: Optional[str]=None, fileid: Optional[int]=None) -> Optional[dict]:
@@ -965,10 +1044,11 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             _log(f"[warn] Stub-Write fehlgeschlagen ({_stubs_failed}): {parent}/{name}: {e}")
             return False
         
-        # --- metriken: nur bei erfolgreichem write inkrementieren
+        # --- metriken: nur bei erfolgreichem write inkrementieren (thread-safe)
         try:
             if ret:
-                globals()["MET_STUBS_WRITTEN"] += 1
+                with _metrics_lock:
+                    globals()["MET_STUBS_WRITTEN"] += 1
         except Exception:
             pass
         
@@ -1018,28 +1098,72 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
 
     _log(f"[plan] objects={objects_root} snapshot={snapshots_root}/{snapshot}")
 
-    # 1) echte Objekte sicherstellen
-    for it in items:
-        if it.get("type") != "file": continue
+    # === Parallel Upload für Objects-Mode ===
+    _state_lock = threading.Lock()
+    
+    # 1) echte Objekte sicherstellen (mit Parallelisierung)
+    _file_items = [it for it in items if it.get("type") == "file"]
+    
+    def _upload_object(it: dict) -> None:
+        """Upload ein Objekt (thread-safe)"""
+        nonlocal uploaded, skipped
+        
         sha = it.get("sha256")
         ext = (it.get("ext") or "").lstrip(".")
         if not sha:
             print(f"[warn] file ohne sha256: {it.get('relpath')}", file=sys.stderr)
-            continue
+            return
 
         obj_path = object_path_for(objects_root, sha, ext, layout=objects_layout)
+        
+        # stat_file_safe ist thread-safe (nur lesen)
         md = stat_file_safe(cfg, path=obj_path)
+        
         if md:
-            skipped += 1
+            with _state_lock:
+                skipped += 1
         else:
             if dry:
                 print(f"[dry] upload object: {obj_path}  <- {it.get('source_path')}")
             else:
                 ensure_parent_dirs(cfg, obj_path, dry=False)
                 _upload_file_smart(cfg, it["source_path"], obj_path, dry=dry)
-            uploaded += 1
+            
+            with _state_lock:
+                uploaded += 1
+    
+    # Files klassifizieren (small vs large)
+    _small_objects = [f for f in _file_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
+    _large_objects = [f for f in _file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
+    
+    if _small_objects and _large_objects:
+        _log(f"[objects] {len(_small_objects)} kleine Objekte parallel, {len(_large_objects)} große sequentiell")
+    elif _small_objects:
+        _log(f"[objects] {len(_small_objects)} kleine Objekte parallel")
+    else:
+        _log(f"[objects] {len(_large_objects)} große Objekte sequentiell")
+    
+    # Kleine Objekte parallel
+    if _small_objects and PARALLEL_UPLOAD_THREADS > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
+            list(ex.map(_upload_object, _small_objects))
+    else:
+        for obj in _small_objects:
+            _upload_object(obj)
+    
+    # Große Objekte sequentiell
+    for obj in _large_objects:
+        _upload_object(obj)
+    # === Ende Parallel Upload (Objects-Mode) ===
 
     print(f"objects: uploaded={uploaded} skipped={skipped}")
+    
+    # Update global metrics (thread-safe)
+    try:
+        with _metrics_lock:
+            globals()["MET_UPLOADED_FILES"] += uploaded
+    except Exception:
+        pass
 
     # 2) Snapshot-Stubs erzeugen
     for it in items:
@@ -1063,6 +1187,13 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
         stubs += 1
 
     print(f"stubs: {stubs} (snapshot={snapshot})")
+    
+    # Update global metrics (thread-safe)
+    try:
+        with _metrics_lock:
+            globals()["MET_STUBS_WRITTEN"] += stubs
+    except Exception:
+        pass
 
 
 def ensure_snapshots_layout(cfg: dict, dest_root: str, *, dry: bool = False) -> None:
@@ -1158,7 +1289,8 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             return
         t0 = time.time()
         pc.call_with_backoff(pc.ensure_path, cfg, path)
-        ensure_ms += (time.time() - t0) * 1000.0
+        with _state_lock:
+            ensure_ms += (time.time() - t0) * 1000.0
 
     def _delete_if_exists(path: str) -> None:
         if dry:
@@ -1224,11 +1356,16 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
 
         t0 = time.time()
         res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)
-        upload_ms += (time.time() - t0) * 1000.0
-
-        # Metrics (Prometheus-freundlich), wenn definiert
+        elapsed_ms = (time.time() - t0) * 1000.0
+        
+        # Thread-safe metrics update
+        with _state_lock:
+            upload_ms += elapsed_ms
+        
+        # Global metrics (thread-safe)
         try:
-            globals()["MET_UPLOADED_FILES"] += 1
+            with _metrics_lock:
+                globals()["MET_UPLOADED_FILES"] += 1
         except Exception:
             pass
 
@@ -1397,28 +1534,33 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         _log(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits")
     # === Ende Diff-basierte Ordner-Anlage ===
 
-    for it in manifest.get("items") or []:
-        if it.get("type") == "dir":
-            # Ordner wurden bereits oben in Batch angelegt
-            continue
-        if it.get("type") != "file":
-            continue
+    # === Parallel Upload für kleine Dateien ===
+    # Lock für shared state (items dict, seen_inodes, counters)
+    _state_lock = threading.Lock()
+    
+    # File-Processing-Funktion (thread-safe)
+    def _process_file_item(it: dict) -> None:
+        """Verarbeitet ein File-Item (thread-safe für parallele Ausführung)"""
+        nonlocal uploaded, resumed, stubs, index_changed, _done_items, _done_size, _t_last_progress
+        nonlocal _last_saved_count, _t_last_index_save, upload_ms
 
-        _done_items += 1
-        _done_size += it.get("size") or 0
-        _now = time.time()
-        if _now - _t_last_progress >= _PROGRESS_INTERVAL:
-            _elapsed = _now - _t_loop_start
-            _pct = _done_items / _total_items * 100 if _total_items else 0
-            _pct_b = _done_size / _total_size * 100 if _total_size else 0
-            _eta = (_elapsed / _done_size * (_total_size - _done_size)) if _done_size else 0
-            _eta_str = f"~{int(_eta/60)}min" if _eta > 60 else f"~{int(_eta)}s"
-            _log(
-                f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
-                f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
-                f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend"
-            )
-            _t_last_progress = _now
+        # Progress-Tracking (ohne Lock für Performance, nicht kritisch)
+        with _state_lock:
+            _done_items += 1
+            _done_size += it.get("size") or 0
+            _now = time.time()
+            if _now - _t_last_progress >= _PROGRESS_INTERVAL:
+                _elapsed = _now - _t_loop_start
+                _pct = _done_items / _total_items * 100 if _total_items else 0
+                _pct_b = _done_size / _total_size * 100 if _total_size else 0
+                _eta = (_elapsed / _done_size * (_total_size - _done_size)) if _done_size else 0
+                _eta_str = f"~{int(_eta/60)}min" if _eta > 60 else f"~{int(_eta)}s"
+                _log(
+                    f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
+                    f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
+                    f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend"
+                )
+                _t_last_progress = _now
 
         relpath = it.get("relpath") or ""
         src_abs = it.get("source_path") or ""
@@ -1430,86 +1572,119 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
 
         dst_path = f"{dest_snapshot_dir}/{relpath}"
 
-        node = items.setdefault(sha, {"holders": []})
-        
-        # === Index-Driven Skip: Prüfen ob bereits im Index für diesen Snapshot ===
-        already_in_snapshot = any(
-            h.get("snapshot") == snapshot_name and h.get("relpath") == relpath
-            for h in node.get("holders", [])
-        )
-        if already_in_snapshot:
-            # Bereits verarbeitet → skip
-            # WICHTIG: Inode registrieren, damit weitere Hardlinks erkannt werden
-            seen_inodes[ino_key] = relpath
-            resumed += 1
-            continue
-        # === Ende Index-Driven Skip ===
-        
-        # --- NEU: Content-SHA auch als Feld im Node mitführen (Denormalisierung) ---
-        # Der Index nutzt die SHA bereits als Key; das Feld erhöht Lesbarkeit/Tooling
-        # und macht SHA-Checks im Quick-Checker robuster.
-        if sha and node.get("sha256") != sha:
-            node["sha256"] = sha
-            index_changed = True
-        
-        if sha in known_anchors:
-            anchor_path, anchor_fid = known_anchors[sha]
-            if not node.get("anchor_path"):
-                node["anchor_path"] = anchor_path
-            if not node.get("fileid"):
-                node["fileid"] = anchor_fid
-        else:
-            anchor_path = node.get("anchor_path") or ""
-        
-        is_anchor_here = (anchor_path == dst_path)
-
-        if ino_key in seen_inodes:
-            if not is_anchor_here:
-                _queue_stub(relpath, it, node)
+        # Index-Zugriff (thread-safe)
+        with _state_lock:
+            node = items.setdefault(sha, {"holders": []})
+            
+            # === Index-Driven Skip: Prüfen ob bereits im Index für diesen Snapshot ===
+            already_in_snapshot = any(
+                h.get("snapshot") == snapshot_name and h.get("relpath") == relpath
+                for h in node.get("holders", [])
+            )
+            if already_in_snapshot:
+                # Bereits verarbeitet → skip
+                seen_inodes[ino_key] = relpath
+                resumed += 1
+                return
+            
+            # Content-SHA auch als Feld im Node mitführen
+            if sha and node.get("sha256") != sha:
+                node["sha256"] = sha
+                index_changed = True
+            
+            # Anchor-Info aus Cache
+            if sha in known_anchors:
+                anchor_path, anchor_fid = known_anchors[sha]
+                if not node.get("anchor_path"):
+                    node["anchor_path"] = anchor_path
+                if not node.get("fileid"):
+                    node["fileid"] = anchor_fid
             else:
-                _delete_if_exists(f"{dst_path}.meta.json")
-            continue
+                anchor_path = node.get("anchor_path") or ""
+            
+            is_anchor_here = (anchor_path == dst_path)
 
+            # Hardlink-Check
+            if ino_key in seen_inodes:
+                if not is_anchor_here:
+                    _queue_stub(relpath, it, node)
+                else:
+                    _delete_if_exists(f"{dst_path}.meta.json")
+                return
+
+        # Upload (außerhalb Lock für Parallelität!)
         fid = None
         pcloud_hash = None
         if not anchor_path:
             fid, pcloud_hash = _upload_real_file(src_abs, dst_path)
-            if node.get("anchor_path") != dst_path:
-                node["anchor_path"] = dst_path
-                index_changed = True
-            if fid and node.get("fileid") != fid:
-                node["fileid"] = fid
-                index_changed = True
-            if pcloud_hash and node.get("pcloud_hash") != pcloud_hash:
-                node["pcloud_hash"] = pcloud_hash
-                index_changed = True
-            uploaded += 1
+            
+            # Index-Updates (thread-safe)
+            with _state_lock:
+                if node.get("anchor_path") != dst_path:
+                    node["anchor_path"] = dst_path
+                    index_changed = True
+                if fid and node.get("fileid") != fid:
+                    node["fileid"] = fid
+                    index_changed = True
+                if pcloud_hash and node.get("pcloud_hash") != pcloud_hash:
+                    node["pcloud_hash"] = pcloud_hash
+                    index_changed = True
+                uploaded += 1
+            
             _delete_if_exists(f"{dst_path}.meta.json")
         else:
-            if is_anchor_here:
-                resumed += 1
-                _delete_if_exists(f"{dst_path}.meta.json")
-            else:
-                _queue_stub(relpath, it, node)
+            with _state_lock:
+                if is_anchor_here:
+                    resumed += 1
+                    _delete_if_exists(f"{dst_path}.meta.json")
+                else:
+                    _queue_stub(relpath, it, node)
 
-        h = {"snapshot": snapshot_name, "relpath": relpath}
-        if h not in node["holders"]:
-            node["holders"].append(h)
-            index_changed = True
+        # Holder registrieren (thread-safe)
+        with _state_lock:
+            h = {"snapshot": snapshot_name, "relpath": relpath}
+            if h not in node["holders"]:
+                node["holders"].append(h)
+                index_changed = True
+            seen_inodes[ino_key] = relpath
 
-        seen_inodes[ino_key] = relpath
+            # Periodisches Index-Save (thread-safe)
+            _now_save = time.time()
+            _count_trigger = _SAVE_INTERVAL > 0 and (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
+            _time_trigger = _SAVE_INTERVAL_TIME > 0 and (_now_save - _t_last_index_save) >= _SAVE_INTERVAL_TIME
+            if not dry and (_count_trigger or _time_trigger):
+                save_content_index_local(_local_index_path, index)
+                _last_saved_count = uploaded + resumed + stubs
+                _t_last_index_save = _now_save
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    _reason = "count" if _count_trigger else "time"
+                    print(f"[index] Lokal gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
 
-        # Periodisches lokales Index-Save (Hybrid: Anzahl ODER Zeit)
-        _now_save = time.time()
-        _count_trigger = _SAVE_INTERVAL > 0 and (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
-        _time_trigger = _SAVE_INTERVAL_TIME > 0 and (_now_save - _t_last_index_save) >= _SAVE_INTERVAL_TIME
-        if not dry and (_count_trigger or _time_trigger):
-            save_content_index_local(_local_index_path, index)
-            _last_saved_count = uploaded + resumed + stubs
-            _t_last_index_save = _now_save
-            if os.environ.get("PCLOUD_VERBOSE") == "1":
-                _reason = "count" if _count_trigger else "time"
-                print(f"[index] Lokal gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
+    # Files klassifizieren (nur echte Files, keine Dirs)
+    _file_items = [it for it in (manifest.get("items") or []) if it.get("type") == "file"]
+    _small_files = [f for f in _file_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
+    _large_files = [f for f in _file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
+    
+    if _small_files and _large_files:
+        _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel, "
+             f"{len(_large_files)} große Dateien sequentiell")
+    elif _small_files:
+        _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel")
+    else:
+        _log(f"[parallel] {len(_large_files)} große Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
+
+    # Kleine Dateien parallel hochladen
+    if _small_files and PARALLEL_UPLOAD_THREADS > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
+            list(ex.map(_process_file_item, _small_files))
+    else:
+        for f in _small_files:
+            _process_file_item(f)
+
+    # Große Dateien sequentiell (volle Bandbreite pro File)
+    for f in _large_files:
+        _process_file_item(f)
+    # === Ende Parallel Upload ===
 
 
     # --- Batch: Stubs & Index schreiben (einmaliges Ensure + Writes) ---
@@ -1619,8 +1794,12 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         total_ms = (time.time() - t_phase_start) * 1000.0
         print(f"[timing] push_1to1: total={total_ms/1000:.2f}s, ensure={ensure_ms:.0f}ms, upload={upload_ms:.0f}ms, writes={write_ms:.0f}ms")
 
-    # Update global metrics
-    globals()["MET_RESUMED_FILES"] += resumed
+    # Update global metrics (thread-safe)
+    try:
+        with _metrics_lock:
+            globals()["MET_RESUMED_FILES"] += resumed
+    except Exception:
+        pass
 
     print(f"1to1: uploaded={uploaded} resumed={resumed} stubs={stubs} (snapshot={snapshot_name})")
     return {"uploaded": uploaded, "resumed": resumed, "stubs": stubs}
@@ -1921,9 +2100,13 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
     msg = f"[retention] promoted={promoted} removed_nodes={removed_nodes}"
     print(msg if not dry else "[dry] " + msg[1:])
-    # Metrics
-    globals()["MET_PROMOTED"] += int(promoted)
-    globals()["MET_REMOVED_NODES"] += int(removed_nodes)
+    # Metrics (thread-safe)
+    try:
+        with _metrics_lock:
+            globals()["MET_PROMOTED"] += int(promoted)
+            globals()["MET_REMOVED_NODES"] += int(removed_nodes)
+    except Exception:
+        pass
 
 
 # ----------------- Delta-Copy Mode (PoC) -----------------
@@ -2288,11 +2471,16 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             stubs_to_write.append((meta_path, payload))
         stubs += 1
     
-    # Hauptschleife für WRITE
-    for file_item in write_items:
+    # === Parallel Upload für kleine Dateien (Delta-Mode) ===
+    _state_lock = threading.Lock()
+    
+    def _process_write_item(file_item: dict) -> None:
+        """Verarbeitet ein write-item (thread-safe)"""
+        nonlocal uploaded, stubs, index_changed
+        
         relpath = file_item.get("relpath")
         if not relpath:
-            continue
+            return
         
         sha = (file_item.get("sha256") or "").lower()
         abs_src = file_item.get("source_path")
@@ -2300,9 +2488,9 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         
         if not sha or not abs_src:
             _log(f"[delta-copy][5/6][warn] Überspringe {relpath} (kein SHA256 oder source_path)")
-            continue
+            return
         
-        # Hardlink-Dedupe (innerhalb desselben Snapshots)
+        # Hardlink-Dedupe (thread-safe)
         ino_data = file_item.get("inode")
         key = None
         if ino_data and isinstance(ino_data, dict):
@@ -2311,49 +2499,77 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             if dev and ino:
                 key = (dev, ino)
         
-        if key and key in seen_inodes:
-            # Hardlink zu bereits verarbeitetem File
-            _queue_stub(relpath, file_item, items_dict.get(sha, {}))
-            continue
-        
-        # Prüfe ob SHA256 bereits im Index existiert
-        node = items_dict.get(sha)
+        with _state_lock:
+            if key and key in seen_inodes:
+                # Hardlink zu bereits verarbeitetem File
+                _queue_stub(relpath, file_item, items_dict.get(sha, {}))
+                return
+            
+            # Prüfe ob SHA256 bereits im Index existiert
+            node = items_dict.get(sha)
         
         if node:
             # Hash existiert bereits → Stub schreiben
-            _queue_stub(relpath, file_item, node)
-            if key:
-                seen_inodes[key] = sha
+            with _state_lock:
+                _queue_stub(relpath, file_item, node)
+                if key:
+                    seen_inodes[key] = sha
         else:
-            # Neue Datei → Upload + Anchor registrieren
+            # Neue Datei → Upload + Anchor registrieren (außerhalb Lock!)
             dst_path = f"{dest_snapshot_dir}/{relpath}"
-            
             fileid, pcloud_hash = _upload_real_file(abs_src, dst_path)
-            uploaded += 1
             
-            # Index-Eintrag erstellen
-            node = {
-                "anchor_path": dst_path,
-                "anchor_snapshot": snapshot_name,
-                "holders": [{"snapshot": snapshot_name, "relpath": relpath}],
-                "ext": ext,
-            }
-            if fileid:
-                node["fileid"] = fileid
-            if pcloud_hash:
-                node["pcloud_hash"] = pcloud_hash
-            
-            items_dict[sha] = node
-            index_changed = True
-            
-            if key:
-                seen_inodes[key] = sha
+            # Index-Updates (thread-safe)
+            with _state_lock:
+                uploaded += 1
+                
+                # Index-Eintrag erstellen
+                node = {
+                    "anchor_path": dst_path,
+                    "anchor_snapshot": snapshot_name,
+                    "holders": [{"snapshot": snapshot_name, "relpath": relpath}],
+                    "ext": ext,
+                }
+                if fileid:
+                    node["fileid"] = fileid
+                if pcloud_hash:
+                    node["pcloud_hash"] = pcloud_hash
+                
+                items_dict[sha] = node
+                index_changed = True
+                
+                if key:
+                    seen_inodes[key] = sha
+    
+    # Files klassifizieren (small vs large)
+    _small_writes = [f for f in write_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
+    _large_writes = [f for f in write_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
+    
+    if _small_writes and _large_writes:
+        _log(f"[delta-copy][5/6] {len(_small_writes)} kleine Dateien parallel, {len(_large_writes)} große sequentiell")
+    elif _small_writes:
+        _log(f"[delta-copy][5/6] {len(_small_writes)} kleine Dateien parallel")
+    else:
+        _log(f"[delta-copy][5/6] {len(_large_writes)} große Dateien sequentiell")
+    
+    # Kleine Dateien parallel
+    if _small_writes and PARALLEL_UPLOAD_THREADS > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
+            list(ex.map(_process_write_item, _small_writes))
+    else:
+        for f in _small_writes:
+            _process_write_item(f)
+    
+    # Große Dateien sequentiell
+    for f in _large_writes:
+        _process_write_item(f)
+    # === Ende Parallel Upload (Delta-Mode) ===
     
     # Stubs schreiben (Batch)
+    # Note: MET_STUBS_WRITTEN wird in _batch_write_stubs() hochgezählt
     if stubs_to_write and not dry:
         _log(f"[delta-copy][5/6] Schreibe {len(stubs_to_write)} Stubs...")
         _batch_write_stubs(cfg, stubs_to_write, dry=dry)
-        globals()["MET_STUBS_WRITTEN"] += len(stubs_to_write)
     
     t_write_ms = (time.time() - t_write_start) * 1000.0
     _log(f"[delta-copy][5/6] ✓ WRITE abgeschlossen: {uploaded} uploads, {stubs} stubs ({t_write_ms:.0f}ms)")
@@ -2469,8 +2685,12 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     _log(f"[delta-copy]   WRITE: {uploaded} uploads, {stubs} stubs, {t_write_ms:.0f}ms")
     _log(f"[delta-copy]   Index: {t_index_ms:.0f}ms")
     
-    # Metrics
-    globals()["MET_UPLOADED_FILES"] += uploaded
+    # Metrics (thread-safe)
+    try:
+        with _metrics_lock:
+            globals()["MET_UPLOADED_FILES"] += uploaded
+    except Exception:
+        pass
     
     return {
         "uploaded": uploaded,
