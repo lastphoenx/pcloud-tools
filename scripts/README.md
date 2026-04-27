@@ -1,8 +1,25 @@
 # pCloud-Tools Scripts
 
-Helper scripts for monitoring and alerting.
+Helper scripts for monitoring, alerting, and maintenance.
 
-## Available Scripts
+## 📁 Verzeichnisstruktur
+
+- **`/scripts/`** → Produktions-Scripts (Monitoring & Alerting)
+- **`/scripts/utilities/`** → Developer-Tools & Wartung ([→ README](utilities/README.md))
+- **`/scripts/archiv/`** → Obsolete Scripts ([→ README](archiv/README.md))
+- **`/scripts/testing/`** → Test-Scripts & PoC
+
+## ⚠️ Wichtig: NICHT VERSCHIEBEN
+
+Folgende Scripts werden aktiv von systemd-Services verwendet:
+- `aggregate_status.sh` → monitoring-status-update.service
+- `send_aggregated_alert.sh` → monitoring-alert.service
+- `send_alert.sh` → Legacy Apprise (noch dokumentiert)
+- `telegram_commander.py` → telegram-commander.service
+- `generate_reports.sh` → monitoring-reports.service
+- Config-Dateien: `telegram_commander.conf.example`, `sudoers-telegram-commander.example`
+
+## Production Scripts
 
 ### `aggregate_status.sh` ⭐ NEW
 
