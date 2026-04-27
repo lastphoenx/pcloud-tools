@@ -208,6 +208,198 @@ def _resolve_cached(host, port):
 
 ---
 
+### Folder-Template für schnelle Ordner-Erstellung
+
+**Problem:** Bei jedem neuen Snapshot müssen 1000+ Ordner einzeln angelegt werden (5+ Minuten bei 1101 Ordnern).
+
+**Lösung:** Intelligentes Template-System mit auto-management:
+- Erstes Upload: Template wird nach Ordner-Anlage erstellt (Ordner leer!)
+- Weitere Uploads: Template via `copyfolder` kopieren statt 1101× `ensure_path`
+- Delta-Korrektur: Fehlende anlegen, Überflüssige löschen
+- Auto-Update: Template bei Struktur-Änderung aktualisieren
+
+#### Mechanismus
+
+**Erstes Upload (Bootstrap oder neuer Snapshot):**
+
+```python
+# pcloud_push_json_manifest_to_pcloud.py
+# 1. Ordner einzeln anlegen (parallel, nach Tiefe)
+_create_folders_parallel(manifest_folders, threads=4)
+
+# 2. Template erstellen (JETZT - Ordner sind leer!)
+if len(manifest_folders) > 50:
+    pc.copyfolder(dest_snapshot_dir → template_path)
+    _save_template_manifest(folders, snapshot_name)
+```
+
+**Timing-Fenster:** Template wird erstellt **nachdem** Ordner angelegt wurden, aber **bevor** Dateien hochgeladen werden → Ordner sind leer → kein Datei-Löschaufwand!
+
+**Weiteres Upload:**
+
+```python
+# 1. IST-Zustand von pCloud laden (pCloud = Single Source of Truth!)
+template_folders = _list_remote_folders_from_template(cfg, template_path)
+
+# 2. SOLL-Zustand aus aktuellem Manifest
+manifest_folders = set(...)
+
+# 3. Diff berechnen
+to_add = manifest_folders - template_folders       # Neue Ordner
+to_delete = template_folders - manifest_folders    # Überflüssige
+
+# 4. Template kopieren (1 API-Call statt 1101!)
+pc.copyfolder(template_path → dest_snapshot_dir)
+
+# 5. Delta-Korrektur
+for folder in to_delete:
+    pc.delete_folder(folder, recursive=False)  # Tiefste zuerst
+for folder in to_add:
+    pc.ensure_path(folder)  # Parallel nach Tiefe
+
+# 6. Template aktualisieren (bei Struktur-Änderung)
+if to_add or to_delete:
+    pc.delete_folder(template_path, recursive=True)
+    pc.copyfolder(dest_snapshot_dir → template_path)
+    _save_template_manifest(manifest_folders, snapshot_name)
+```
+
+**Resultat:** `/Backup/rtb_1to1/_folder_template/` mit 1101 leeren Ordnern
+
+#### Performance-Gewinn
+
+**Ohne Template (Erstes Upload):**
+```
+[folders] 1101 Ordner einzeln mit ensure_path() anlegen
+[folders] 4 Threads, ebenenweise
+[folders] ✓ 1101 Ordner erfolgreich angelegt (298s)
+[template] Erstelle initiales Template (Ordner sind noch leer)...
+[template] ✓ Template erstellt via copyfolder
+→ Dauer: ~5 Minuten + Template-Erstellung
+```
+
+**Mit Template (Weitere Uploads):**
+```
+[template] Lade aktuellen Template-Zustand von pCloud... (1.2s, 1101 folders)
+[template] Überlapp: 1095/1101 (99%) | Delta: +6 neue, -0 überflüssige
+[template] Kopiere Template → 2026-04-28-120000 ...
+[template] ✓ Template kopiert (~2-5s statt ~5min)
+[template] Lege 6 fehlende Ordner an... (parallel)
+→ Dauer: ~5 Sekunden
+→ Speedup: 60× schneller! 🚀
+```
+
+#### Implementation Details
+
+**Code-Location:** `pcloud_push_json_manifest_to_pcloud.py` Zeilen ~1540-1750
+
+**Wichtige Funktionen:**
+```python
+def _list_remote_folders_from_template(cfg, template_path):
+    """Lädt IST-Zustand des Templates von pCloud (1 API-Call)."""
+    # listfolder(recursive=True, nofiles=True)
+    # → Set von Ordner-relpaths
+
+def _load_template_manifest(archive_dir):
+    """Lädt lokales Manifest (nur für Dokumentation)."""
+    # Gibt None zurück wenn fehlt
+
+def _save_template_manifest(archive_dir, template_path, folders, snapshot_name):
+    """Speichert Manifest nach Template-Update (atomic write)."""
+    # /srv/pcloud-archive/folder_template_manifest.json
+```
+
+**pCloud = Single Source of Truth:**
+- IST-Zustand: Via `listfolder` von pCloud (nicht lokales Manifest!)
+- SOLL-Zustand: Aus aktuellem Snapshot-Manifest
+- Diff: IST vs. SOLL
+- Vorteil: Robust gegen Manifest-Korruption, immer aktuell
+
+**Lokales Manifest:**
+- Wird **nur zum Speichern** verwendet (Dokumentation)
+- **Nicht für Diff-Berechnung** (zu gefährlich!)
+- Zeigt letzten bekannten Stand
+
+#### Environment Variables
+
+```bash
+# Pfad zum Archiv-Verzeichnis (für Manifest-Speicherung)
+export PCLOUD_ARCHIVE_DIR="/srv/pcloud-archive"  # default
+
+# Parallele Threads für Ordner-Anlage
+export PCLOUD_FOLDER_THREADS=4  # default
+
+# Template-Verzeichnisname (hardcoded: _folder_template)
+```
+
+#### Log-Ausgabe
+
+**Erstes Upload (Template-Erstellung):**
+```
+[folders] Einzeln anlegen (kein Template vorhanden)...
+[folders] Erstelle 1101 Ordner (4 Threads, nach Tiefe)...
+[folders] ✓ 1101 Ordner erfolgreich angelegt (298s)
+[template] Erstelle initiales Template (Ordner sind noch leer)...
+[template] ✓ Template erstellt: /Backup/rtb_1to1/_folder_template
+[template] Manifest gespeichert: 1101 Ordner
+```
+
+**Weiteres Upload (Template-Nutzung):**
+```
+[template] Lade aktuellen Template-Zustand von pCloud...
+[template] Template hat 1101 Ordner (1.2s)
+[template] Überlapp: 1095/1101 (99%)
+[template] Delta: +6 neue, -0 überflüssige
+[template] Kopiere Template → 2026-04-28-120000 ...
+[template] ✓ Template kopiert (~2-5s statt ~5min)
+[template] Lege 6 fehlende Ordner an...
+[template] ✓ 6 neue Ordner angelegt (0.8s)
+```
+
+**Template-Update (Struktur-Änderung):**
+```
+[template] Delta: +50 neue, -10 überflüssige
+[template] Aktualisiere Template mit neuer Struktur...
+[template] ✓ Template aktualisiert (1141 Ordner)
+```
+
+#### Verifikation
+
+Prüfe ob Template korrekt erstellt wurde:
+
+```bash
+# 1. Template-Existenz
+ls -la /srv/pcloud-archive/folder_template_manifest.json
+
+# 2. Via pCloud API
+python3 -c "
+import pcloud_bin_lib as pc
+cfg = pc.effective_config()
+result = pc.listfolder(cfg, path='/Backup/rtb_1to1/_folder_template', recursive=True, nofiles=True)
+folders = [c['name'] for c in result['metadata']['contents']]
+print(f'Template: {len(folders)} Ordner')
+"
+
+# Erwartung: 1101 Ordner, KEINE Dateien
+```
+
+#### Troubleshooting
+
+**Template fehlt nach erstem Upload:**
+- Check: Snapshot hatte < 50 Ordner? (Threshold nicht erreicht)
+- Lösung: Template wird beim nächsten Upload automatisch erstellt
+
+**Template veraltet:**
+- Symptom: Viele Delta-Korrekturen bei jedem Upload
+- Auto-Fix: Template wird automatisch aktualisiert (bei Delta > 0)
+- Manuell: Template löschen → wird beim nächsten Upload neu erstellt
+
+**Template-Manifest fehlt:**
+- Unkritisch: Wird beim nächsten Update neu erstellt
+- Lokales Manifest ist nur Dokumentation (nicht für Diff!)
+
+---
+
 ## 🔍 Säule 2: Gap-Handling & Upload-Orchestrierung
 
 ### 1. Implementierung (wrapper_pcloud_sync_1to1.sh, 645 Zeilen)
