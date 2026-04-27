@@ -139,13 +139,13 @@ def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, ve
     """
     Bereinigt verwaiste/alte Resume-State-Files.
     
-    L\u00f6scht:
-    - Files \u00e4lter als max_age_days (Standard: 7 Tage)
-    - Error-Status Files \u00e4lter als 24 Stunden
+    Löscht:
+    - Files älter als max_age_days (Standard: 7 Tage)
+    - Error-Status Files älter als 24 Stunden
     - Files mit korruptem JSON
     
     Returns:
-        Anzahl gel\u00f6schter Files
+        Anzahl gelöschter Files
     """
     if not os.path.exists(state_dir):
         return 0
@@ -163,49 +163,49 @@ def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, ve
             filepath = os.path.join(state_dir, filename)
             
             try:
-                # File-Age pr\u00fcfen
+                # File-Age prüfen
                 mtime = os.path.getmtime(filepath)
                 age = now - mtime
                 
-                # Alte Files l\u00f6schen
+                # Alte Files löschen
                 if age > max_age_seconds:
                     if verbose:
-                        _log(f\"[cleanup] L\u00f6sche altes State-File ({age/86400:.1f} Tage alt): {filename}\")
+                        _log(f"[cleanup] Lösche altes State-File ({age/86400:.1f} Tage alt): {filename}")
                     os.remove(filepath)
                     deleted += 1
                     continue
                 
-                # State laden und pr\u00fcfen
+                # State laden und prüfen
                 try:
-                    with open(filepath, \"r\") as f:
+                    with open(filepath, "r") as f:
                         state = json.load(f)
                     
-                    # Error-Status Files nach 24h l\u00f6schen
-                    if state.get(\"status\") == \"error\" and age > error_max_age:
+                    # Error-Status Files nach 24h löschen
+                    if state.get("status") == "error" and age > error_max_age:
                         if verbose:
-                            _log(f\"[cleanup] L\u00f6sche Error-State ({age/3600:.1f}h alt): {filename}\")
+                            _log(f"[cleanup] Lösche Error-State ({age/3600:.1f}h alt): {filename}")
                         os.remove(filepath)
                         deleted += 1
                         continue
                     
                 except json.JSONDecodeError:
-                    # Korruptes JSON l\u00f6schen
+                    # Korruptes JSON löschen
                     if verbose:
-                        _log(f\"[cleanup] L\u00f6sche korruptes State-File: {filename}\")
+                        _log(f"[cleanup] Lösche korruptes State-File: {filename}")
                     os.remove(filepath)
                     deleted += 1
                     continue
                 
             except Exception as e:
                 if verbose:
-                    _log(f\"[cleanup] Fehler bei {filename}: {e}\")
+                    _log(f"[cleanup] Fehler bei {filename}: {e}")
                 continue
     
     except Exception as e:
-        _log(f\"[cleanup] Cleanup-Fehler: {e}\")
+        _log(f"[cleanup] Cleanup-Fehler: {e}")
     
     if deleted > 0 and verbose:
-        _log(f\"[cleanup] {deleted} verwaiste State-Files gel\u00f6scht\")
+        _log(f"[cleanup] {deleted} verwaiste State-Files gelöscht")
     
     return deleted
 
