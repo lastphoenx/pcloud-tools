@@ -3,12 +3,12 @@
 # Erstellt eine .venv im Root-Verzeichnis des Projekts und installiert alle Dependencies.
 # 
 # Verwendung:
-#   .\scripts\setup_venv.ps1
-#   .\scripts\setup_venv.ps1 -Force    # Überschreibt existierende venv
+#   .\scripts\utilities\setup_venv.ps1
+#   .\scripts\utilities\setup_venv.ps1 -Force    # Überschreibt existierende venv
 #
 # Nach dem Setup:
 #   .\.venv\Scripts\Activate.ps1       # venv aktivieren
-#   python scripts\analyze_manifest_duplicates.py --help
+#   python scripts\utilities\analyze_manifest_duplicates.py --help
 
 param(
     [switch]$Force,
@@ -23,9 +23,10 @@ function Write-Info { param($msg) Write-Host "ℹ $msg" -ForegroundColor Cyan }
 function Write-Warning { param($msg) Write-Host "⚠ $msg" -ForegroundColor Yellow }
 function Write-Error { param($msg) Write-Host "✗ $msg" -ForegroundColor Red }
 
-# === Projektverzeichnis ermitteln (ein Level über scripts/) ===
+# === Projektverzeichnis ermitteln (zwei Level über scripts/utilities/) ===
 $ScriptDir = Split-Path -Parent $PSCommandPath
-$ProjectRoot = Split-Path -Parent $ScriptDir
+$ScriptsDir = Split-Path -Parent $ScriptDir
+$ProjectRoot = Split-Path -Parent $ScriptsDir
 
 Write-Info "Projekt-Root: $ProjectRoot"
 Set-Location $ProjectRoot
