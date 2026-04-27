@@ -156,141 +156,181 @@ def walk(root: str,
          store_hardlink_target: bool,
          store_symlink_target: bool,
          progress_interval: float = 30.0,
-         ref_cache: Optional[ReferenceCache] = None) -> List[Dict[str, Any]]:
+         ref_cache: Optional[ReferenceCache] = None,
+         jsonl_tmp: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Scannt Verzeichnisbaum und erzeugt Manifest-Items.
+    
+    NEU: JSONL-Streaming für crash-resistente, RAM-schonende Verarbeitung.
+    - Wenn jsonl_tmp gegeben: Items werden sofort als JSONL geschrieben (append-only)
+    - Resume: Existierende Zeilen in jsonl_tmp werden übersprungen
+    - Return: Leere Liste (Items sind in jsonl_tmp), oder vollständige Liste falls jsonl_tmp=None
+    """
 
-    items: List[Dict[str, Any]] = []
     base = os.path.abspath(root)
 
-    # Für optionale Hardlink-Zielverfolgung: erste Sicht pro (dev,ino)
-    first_seen: dict[tuple[int,int], str] = {}
-
-    # Für Fortschritts-Reporting: Gesamtgröße vorab ermitteln
+    # === 1. Sortierte File-Liste erstellen (deterministisch!) ===
+    _log("[scan] Erstelle sortierte File-Liste...")
+    all_paths = []
     total_bytes = 0
-    total_files = 0
+    
     for cur, dirs, files in os.walk(base, followlinks=follow_symlinks):
+        rel_cur = os.path.relpath(cur, base).replace("\\", "/")
+        if rel_cur == ".": rel_cur = ""
+        
+        # Verzeichnis als Item
+        all_paths.append(("dir", rel_cur, None, 0))
+        
+        # Dateien/Symlinks
         for name in files:
             ab = os.path.join(cur, name)
-            if not os.path.islink(ab) and os.path.isfile(ab):
-                try:
-                    total_bytes += os.path.getsize(ab)
-                    total_files += 1
-                except OSError:
-                    pass
-    print(f"[manifest] Starte: {total_files} Dateien, {_fmt_bytes(total_bytes)}", file=sys.stderr)
-
+            rel = (os.path.join(rel_cur, name) if rel_cur else name).replace("\\", "/")
+            
+            try:
+                st = os.lstat(ab)
+                size = int(st.st_size) if not os.path.islink(ab) else 0
+                all_paths.append(("file", rel, ab, size))
+                if not os.path.islink(ab):
+                    total_bytes += size
+            except (FileNotFoundError, OSError):
+                continue
+    
+    # Sortieren (garantiert identische Reihenfolge bei Resume)
+    all_paths.sort(key=lambda x: x[1])  # Nach relpath sortieren
+    total_files = sum(1 for t, _, _, _ in all_paths if t == "file")
+    
+    _log(f"[manifest] Starte: {total_files} Dateien, {_fmt_bytes(total_bytes)}")
+    
+    # === 2. Resume: Wie viele Items bereits verarbeitet? ===
+    resume_from = 0
+    if jsonl_tmp and os.path.exists(jsonl_tmp):
+        with open(jsonl_tmp, encoding="utf-8") as f:
+            resume_from = sum(1 for _ in f)
+        _log(f"[resume] ✓ {resume_from}/{len(all_paths)} Items bereits verarbeitet - setze fort")
+    
+    # === 3. Streaming Processing ===
+    items: List[Dict[str, Any]] = []  # Leer bei JSONL-Mode
+    first_seen: dict[tuple[int,int], str] = {}
+    
+    jsonl_file = None
+    if jsonl_tmp:
+        jsonl_file = open(jsonl_tmp, "a", encoding="utf-8")
+    
     done_files = 0
     done_bytes = 0
     t_start = time.monotonic()
     t_last_progress = t_start
-
-    for cur, dirs, files in os.walk(base, followlinks=follow_symlinks):
-        rel_cur = os.path.relpath(cur, base).replace("\\", "/")
-        if rel_cur == ".": rel_cur = ""
-
-        # DIR
-        items.append({
-            "snapshot": snapshot,
-            "relpath": rel_cur,
-            "type": "dir",
-        })
-
-        # FILES
-        for name in files:
-            ab = os.path.join(cur, name)
-            rel = (os.path.join(rel_cur, name) if rel_cur else name).replace("\\", "/")
-
+    
+    for idx, (item_type, relpath, abs_path, size) in enumerate(all_paths):
+        # Skip bereits verarbeitete Items (Resume)
+        if idx < resume_from:
+            continue
+        
+        entry: Dict[str, Any] = {}
+        
+        # === DIR ===
+        if item_type == "dir":
+            entry = {
+                "snapshot": snapshot,
+                "relpath": relpath,
+                "type": "dir",
+            }
+        
+        # === FILE/SYMLINK ===
+        else:
             try:
-                st = os.lstat(ab)  # lstat! (Symlink-Metadaten)
-            except FileNotFoundError:
-                # Zwischenzeitlich verschwunden – überspringen
+                st = os.lstat(abs_path)
+            except (FileNotFoundError, OSError):
                 continue
-
+            
             # Symlink?
-            if os.path.islink(ab):
-                entry: Dict[str, Any] = {
+            if os.path.islink(abs_path):
+                entry = {
                     "snapshot": snapshot,
-                    "relpath": rel,
+                    "relpath": relpath,
                     "type": "symlink",
                     "lmode": oct(st.st_mode),
                 }
                 if store_symlink_target:
                     try:
-                        entry["target"] = os.readlink(ab)
+                        entry["target"] = os.readlink(abs_path)
                     except OSError as e:
                         entry["target_error"] = str(e)
-                items.append(entry)
-                continue
-
-            # Nur reguläre Dateien erfassen (keine Sockets/Devices/…)
-            if not os.path.isfile(ab):
-                continue
-
-            # Inode/Hardlink-Infos
-            dev = int(st.st_dev); ino = int(st.st_ino); nlink = int(st.st_nlink)
-            inode_obj = {"dev": dev, "ino": ino, "nlink": nlink}
-
-            # Extension bestimmen
-            _, ext = os.path.splitext(rel)
-            ext = ext if ext else None
-
-            # Hash via Smart-Cache oder Berechnung
-            file_hash = None
-            if hash_algo == "sha256":
-                # Strategie: Versuche Cache-Lookup, sonst berechne
-                if ref_cache:
-                    file_hash = ref_cache.lookup(rel, float(st.st_mtime), int(st.st_size), dev, ino)
+            
+            # Reguläre Datei
+            elif os.path.isfile(abs_path):
+                dev = int(st.st_dev); ino = int(st.st_ino); nlink = int(st.st_nlink)
+                inode_obj = {"dev": dev, "ino": ino, "nlink": nlink}
                 
-                if not file_hash:
-                    # Kein Cache-Hit → berechne SHA256
-                    try:
-                        file_hash = sha256_file(ab)
-                        if ref_cache:
-                            ref_cache.record_calculated(rel, file_hash, float(st.st_mtime), int(st.st_size), dev, ino)
-                    except Exception as e:
-                        print(f"[warn] hash fail: {ab}: {e}", file=sys.stderr)
-
-            entry: Dict[str, Any] = {
-                "snapshot": snapshot,
-                "type": "file",
-                "relpath": rel,
-                "size": int(st.st_size),
-                "mtime": float(st.st_mtime),
-                "source_path": os.path.abspath(ab),
-                "ext": ext,
-                "inode": inode_obj,
-            }
-            if file_hash:
-                entry["sha256"] = file_hash
-
-            done_files += 1
-            done_bytes += int(st.st_size)
-
-            # Fortschritt alle progress_interval Sekunden
-            now = time.monotonic()
-            if now - t_last_progress >= progress_interval:
-                elapsed = now - t_start
-                pct_files = done_files / total_files * 100 if total_files else 0
-                pct_bytes = done_bytes / total_bytes * 100 if total_bytes else 0
-                eta_s = (elapsed / done_bytes * (total_bytes - done_bytes)) if done_bytes else 0
-                eta_str = f"~{int(eta_s/60)}min" if eta_s > 60 else f"~{int(eta_s)}s"
-                _log(
-                    f"[manifest] {done_files}/{total_files} Dateien ({pct_files:.0f}%) | "
-                    f"{_fmt_bytes(done_bytes)} / {_fmt_bytes(total_bytes)} ({pct_bytes:.0f}%) | "
-                    f"{eta_str} verbleibend"
-                )
-                t_last_progress = now
-
-            # Hardlink-Ziel optional festhalten
-            if store_hardlink_target and nlink > 1:
-                key = (dev, ino)
-                if key in first_seen:
-                    entry["hardlink_of"] = first_seen[key]  # relpath der ersten Sicht
-                else:
-                    first_seen[key] = rel
-                    entry["hardlink_master"] = True
-
-            items.append(entry)
-
+                _, ext = os.path.splitext(relpath)
+                ext = ext if ext else None
+                
+                # Hash via Smart-Cache oder Berechnung
+                file_hash = None
+                if hash_algo == "sha256":
+                    if ref_cache:
+                        file_hash = ref_cache.lookup(relpath, float(st.st_mtime), int(st.st_size), dev, ino)
+                    
+                    if not file_hash:
+                        try:
+                            file_hash = sha256_file(abs_path)
+                            if ref_cache:
+                                ref_cache.record_calculated(relpath, file_hash, float(st.st_mtime), int(st.st_size), dev, ino)
+                        except Exception as e:
+                            print(f"[warn] hash fail: {abs_path}: {e}", file=sys.stderr)
+                
+                entry = {
+                    "snapshot": snapshot,
+                    "type": "file",
+                    "relpath": relpath,
+                    "size": int(st.st_size),
+                    "mtime": float(st.st_mtime),
+                    "source_path": os.path.abspath(abs_path),
+                    "ext": ext,
+                    "inode": inode_obj,
+                }
+                if file_hash:
+                    entry["sha256"] = file_hash
+                
+                done_files += 1
+                done_bytes += int(st.st_size)
+                
+                # Hardlink-Ziel optional festhalten
+                if store_hardlink_target and nlink > 1:
+                    key = (dev, ino)
+                    if key in first_seen:
+                        entry["hardlink_of"] = first_seen[key]
+                    else:
+                        first_seen[key] = relpath
+                        entry["hardlink_master"] = True
+                
+                # Progress
+                now = time.monotonic()
+                if now - t_last_progress >= progress_interval:
+                    elapsed = now - t_start
+                    pct_files = done_files / total_files * 100 if total_files else 0
+                    pct_bytes = done_bytes / total_bytes * 100 if total_bytes else 0
+                    eta_s = (elapsed / done_bytes * (total_bytes - done_bytes)) if done_bytes else 0
+                    eta_str = f"~{int(eta_s/60)}min" if eta_s > 60 else f"~{int(eta_s)}s"
+                    _log(
+                        f"[manifest] {done_files}/{total_files} Dateien ({pct_files:.0f}%) | "
+                        f"{_fmt_bytes(done_bytes)} / {_fmt_bytes(total_bytes)} ({pct_bytes:.0f}%) | "
+                        f"{eta_str} verbleibend"
+                    )
+                    t_last_progress = now
+        
+        # === Write: JSONL oder Memory ===
+        if entry:
+            if jsonl_file:
+                jsonl_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                jsonl_file.flush()  # Sofort auf Disk (crash-resistent)
+            else:
+                items.append(entry)
+    
+    # Cleanup
+    if jsonl_file:
+        jsonl_file.close()
+    
     return items
 
 # ---------------- main ----------------
@@ -331,7 +371,12 @@ def main() -> None:
     if args.ref_manifest:
         ref_cache = ReferenceCache(args.ref_manifest)
     
-    # Items sammeln (mit optionalem Cache)
+    # JSONL-Streaming: Nur wenn --out gegeben (sonst stdout → kein Resume sinnvoll)
+    jsonl_tmp = None
+    if args.out:
+        jsonl_tmp = f"{args.out}.tmp.jsonl"
+    
+    # Items sammeln (JSONL-Streaming oder Memory)
     items = walk(
         root,
         snap,
@@ -341,7 +386,17 @@ def main() -> None:
         store_hardlink_target=bool(args.store_hardlink_target),
         store_symlink_target=bool(args.store_symlink_target),
         ref_cache=ref_cache,
+        jsonl_tmp=jsonl_tmp,
     )
+    
+    # Finalize: JSONL → Items laden (wenn JSONL-Modus aktiv war)
+    if jsonl_tmp and os.path.exists(jsonl_tmp):
+        _log("[finalize] Konvertiere JSONL → JSON...")
+        with open(jsonl_tmp, encoding="utf-8") as f:
+            items = [json.loads(line) for line in f if line.strip()]
+        # Cleanup JSONL (erfolgreich abgeschlossen)
+        os.remove(jsonl_tmp)
+        _log(f"[finalize] ✓ {len(items)} Items geladen")
     
     # Schema 3 wenn Smart-Mode, sonst Schema 2 (backward compat)
     schema_version = 3 if ref_cache else 2
