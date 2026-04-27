@@ -851,7 +851,6 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     Erweitert Payload um menschenlesbare Felder: format_version, kind, holder_type, mtime_iso
     """
     import datetime
-    import threading
 
     if not stubs:
         return
@@ -1478,7 +1477,6 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         
         # Nach Tiefe gruppieren (Parents zuerst, dann parallel innerhalb Ebene)
         from collections import defaultdict
-        import threading
         
         folders_by_depth = defaultdict(list)
         for reldir in missing_folders:
