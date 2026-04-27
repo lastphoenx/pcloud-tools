@@ -4,12 +4,12 @@
 # Erstellt eine .venv im Root-Verzeichnis des Projekts und installiert alle Dependencies.
 # 
 # Verwendung:
-#   ./scripts/setup_venv.sh
-#   ./scripts/setup_venv.sh --force    # Überschreibt existierende venv
+#   ./scripts/utilities/setup_venv.sh
+#   ./scripts/utilities/setup_venv.sh --force    # Überschreibt existierende venv
 #
 # Nach dem Setup:
 #   source .venv/bin/activate          # venv aktivieren
-#   python scripts/analyze_manifest_duplicates.py --help
+#   python scripts/utilities/analyze_manifest_duplicates.py --help
 
 set -e
 
@@ -48,7 +48,7 @@ done
 
 # === Projektverzeichnis ermitteln ===
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 log_info "Projekt-Root: $PROJECT_ROOT"
 cd "$PROJECT_ROOT"
@@ -121,7 +121,7 @@ if [ "$SKIP_TEST" = false ]; then
     log_info "Teste Installation..."
     
     # Test 1: analyze_manifest_duplicates.py --help
-    TEST_SCRIPT="$PROJECT_ROOT/scripts/analyze_manifest_duplicates.py"
+    TEST_SCRIPT="$PROJECT_ROOT/scripts/utilities/analyze_manifest_duplicates.py"
     if [ -f "$TEST_SCRIPT" ]; then
         if "$VENV_PATH/bin/python" "$TEST_SCRIPT" --help &> /dev/null; then
             log_success "analyze_manifest_duplicates.py funktioniert"
@@ -143,6 +143,6 @@ log_success "Setup abgeschlossen!"
 echo ""
 log_info "Nächste Schritte:"
 echo -e "  1. Aktiviere venv:  ${YELLOW}source .venv/bin/activate${NC}"
-echo -e "  2. Teste Skript:    ${YELLOW}python scripts/analyze_manifest_duplicates.py --help${NC}"
+echo -e "  2. Teste Skript:    ${YELLOW}python scripts/utilities/analyze_manifest_duplicates.py --help${NC}"
 echo ""
 log_info "Tipp: VS Code erkennt die venv automatisch (Statusleiste unten links)"
