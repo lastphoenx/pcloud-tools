@@ -285,7 +285,17 @@ if int(js.get("result", -1)) != 0:
 names = []
 for c in (js.get("metadata") or {}).get("contents", []) or []:
     if c.get("isfolder") and c.get("name") != "_index":
-        names.append(c["name"])
+        snapname = c["name"]
+        # Prüfe ob Upload vollständig (.upload_complete Marker vorhanden)
+        marker_path = f"{snap_root}/{snapname}/.upload_complete"
+        try:
+            pc.stat_file(cfg, path=marker_path, with_checksum=False)
+            # Marker existiert → Upload war vollständig
+            names.append(snapname)
+        except Exception:
+            # Marker fehlt → Upload unvollständig oder fehlgeschlagen
+            # Snapshot wird NICHT als "vorhanden" gelistet
+            pass
 for n in sorted(names):
     print(n)
 PY
