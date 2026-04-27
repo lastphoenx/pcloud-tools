@@ -1060,6 +1060,259 @@ state_file = f"{safe_filename}_{state_key}.state.json"
 | `e63b9ed` | 2026-04-26 | Production-Grade-Test (RTB-Snapshot) |
 | `0ea6d68` | 2026-04-26 | Code-Cleanup (Redundant Import) |
 | `d1bf283` | 2026-04-26 | CRITICAL: Index-Isolation für Test-Script |
+| `7d3b011` | 2026-04-26 | Documentation Updates (DEVELOPER_GUIDE + README) |
+| `996a2c6` | 2026-04-27 | Parallel Uploads mit Thread-Safety |
+
+---
+
+## 🚀 Parallel Uploads (Small Files Optimization)
+
+### Problem
+
+**Sequentielle Uploads verschwenden Bandbreite bei kleinen Dateien:**
+
+API-Overhead (Latenz, Handshake, Finalisierung) dominiert bei kleinen Files:
+- Kleine Datei (1 MB): Upload 0.1s, Overhead 0.3s → **75% overhead**
+- Große Datei (5 GB): Upload 500s, Overhead 0.3s → **0.06% overhead**
+
+**Beispiel: 17,000 kleine Dateien (5 MB Durchschnitt)**
+```
+Sequentiell:  17,000 × 0.8s = 13,600s = 3.8 Stunden ❌
+Parallel (4×): 17,000 × 0.8s / 4 = 3,400s = 57 Minuten ✅
+→ 4× Speedup!
+```
+
+### Lösung
+
+**Size-basierte Parallelisierung:**
+
+```python
+# Configuration (ENV-Variablen)
+SMALL_FILE_THRESHOLD_BYTES = 50 * 1024**2  # 50 MB (default)
+PARALLEL_UPLOAD_THREADS = 4                # 4 Threads (default)
+
+# Files klassifizieren
+small_files = [f for f in files if f['size'] < 50 MB]
+large_files = [f for f in files if f['size'] >= 50 MB]
+
+# Small files: Parallel (API-Overhead kompensieren)
+with ThreadPoolExecutor(max_workers=4) as ex:
+    ex.map(_process_file, small_files)
+
+# Large files: Sequentiell (volle Bandbreite nutzen)
+for large in large_files:
+    _process_file(large)
+```
+
+**Warum 50 MB Threshold?**
+- < 50 MB: API-Overhead signifikant (parallelisieren!)
+- ≥ 50 MB: Upload-Zeit dominiert (sequentiell für volle Bandbreite)
+- Bei 10 MB/s Upload dauert 50 MB nur ~5s → Overhead wird vernachlässigbar
+
+---
+
+### Thread-Safe Implementation
+
+**Shared State (benötigt Locks):**
+- `items` dict (Content-Index)
+- `seen_inodes` dict (Hardlink-Tracking)
+- `uploaded`, `resumed`, `stubs` counters
+- Globale Metriken (`MET_UPLOADED_FILES`, `MET_STUBS_WRITTEN`, etc.)
+
+**Lock-Strategie:**
+
+```python
+import threading
+
+# Global: Für alle MET_* Metriken
+_metrics_lock = threading.Lock()
+
+# Lokal: Für mode-spezifischen State
+_state_lock = threading.Lock()
+
+def _process_file_item(it: dict):
+    # Index-Zugriff (thread-safe)
+    with _state_lock:
+        node = items.setdefault(sha, {"holders": []})
+        # ... Index-Checks ...
+    
+    # Upload (außerhalb Lock für Parallelität!)
+    fileid, hash = _upload_real_file(src, dst)
+    
+    # Index-Updates (thread-safe)
+    with _state_lock:
+        node["fileid"] = fileid
+        uploaded += 1
+    
+    # Globale Metriken (thread-safe)
+    with _metrics_lock:
+        globals()["MET_UPLOADED_FILES"] += 1
+```
+
+**Kritisch:** Uploads passieren **außerhalb** der Locks → volle Parallelität!
+
+---
+
+### Integration in alle 3 Modi
+
+#### 1. `push_objects_mode()` (Object-Store)
+
+```python
+_small_objects = [f for f in file_items if f["size"] < SMALL_FILE_THRESHOLD_BYTES]
+_large_objects = [f for f in file_items if f["size"] >= SMALL_FILE_THRESHOLD_BYTES]
+
+# Objects parallel hochladen (Dedupe-Store profitiert extrem!)
+if _small_objects and PARALLEL_UPLOAD_THREADS > 1:
+    with ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
+        list(ex.map(_upload_object, _small_objects))
+
+# Große sequentiell
+for obj in _large_objects:
+    _upload_object(obj)
+```
+
+#### 2. `push_1to1_mode()` (Snapshot-Upload)
+
+```python
+_file_items = [it for it in items if it["type"] == "file"]
+_small_files = [f for f in _file_items if f["size"] < SMALL_FILE_THRESHOLD_BYTES]
+_large_files = [f for f in _file_items if f["size"] >= SMALL_FILE_THRESHOLD_BYTES]
+
+_log(f"[parallel] {len(_small_files)} kleine Dateien parallel, "
+     f"{len(_large_files)} große sequentiell")
+
+# Small files parallel
+if _small_files and PARALLEL_UPLOAD_THREADS > 1:
+    with ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
+        list(ex.map(_process_file_item, _small_files))
+
+# Large files sequentiell
+for f in _large_files:
+    _process_file_item(f)
+```
+
+#### 3. `push_1to1_delta_mode()` (Inkrementelles Update)
+
+Gleiche Strategie, aber für `write_items` (new + changed):
+
+```python
+_small_writes = [f for f in write_items if f["size"] < SMALL_FILE_THRESHOLD_BYTES]
+_large_writes = [f for f in write_items if f["size"] >= SMALL_FILE_THRESHOLD_BYTES]
+
+# Parallel für kleine, sequentiell für große
+```
+
+**Besonders effektiv:** Delta-Uploads haben oft viele kleine geänderte Dateien!
+
+---
+
+### Configuration
+
+**Umgebungsvariablen:**
+
+```bash
+# Threshold für "kleine" Dateien (Default: 50 MB)
+export PCLOUD_SMALL_FILE_THRESHOLD_MB=50
+
+# Anzahl paralleler Upload-Threads (Default: 4)
+export PCLOUD_UPLOAD_THREADS=4
+
+# Resume-State Cleanup (Default: enabled, 7 Tage)
+export PCLOUD_RESUME_CLEANUP=1
+export PCLOUD_RESUME_CLEANUP_DAYS=7
+```
+
+**Tuning-Empfehlungen:**
+
+| Upload-Speed | THRESHOLD_MB | THREADS | Begründung |
+|--------------|--------------|---------|------------|
+| 5-10 MB/s    | 50           | 4       | Standard (Safe Zone) |
+| 10-25 MB/s   | 100          | 4-6     | Mehr Bandbreite, größerer Threshold |
+| 25-50 MB/s   | 200          | 6-8     | High-Speed (Cave: Rate Limits!) |
+| > 50 MB/s    | 500          | 8       | Gigabit+ (selten nötig) |
+
+**Warnung:** Mehr als 8 Threads können pCloud Rate-Limits auslösen!
+
+---
+
+### Performance-Beispiel
+
+**Szenario:** 17,000 Dateien, 98 GB total
+- 80% kleine Files (< 50 MB): 13,600 files, ~20 GB
+- 20% große Files (≥ 50 MB): 3,400 files, ~78 GB
+
+**Vor Optimierung (sequentiell):**
+```
+Small: 13,600 × 0.8s = 10,880s = 3.0 Stunden
+Large: 3,400 × 8s = 27,200s = 7.6 Stunden
+Total: ~10.6 Stunden
+```
+
+**Nach Optimierung (parallel):**
+```
+Small: 13,600 × 0.8s / 4 threads = 2,720s = 45 Minuten ✅
+Large: 3,400 × 8s = 27,200s = 7.6 Stunden
+Total: ~8.2 Stunden
+→ 23% Speedup
+```
+
+**Bei 95% kleine Files:** Speedup → ~60-70%! 🚀
+
+---
+
+### Limitations & Caveats
+
+1. **Rate Limits:**
+   - pCloud hat Account-basierte Rate-Limits
+   - 4 Threads = Safe Zone (getestet)
+   - > 8 Threads können zu 429 Errors führen
+
+2. **Hardlink-Detection:**
+   - Läuft thread-safe mit `seen_inodes` Lock
+   - Keine Race Conditions mehr
+
+3. **Index-Locking:**
+   - Alle Index-Updates thread-safe (Lock)
+   - Minimaler Overhead (~µs pro Lock)
+
+4. **Chunked Upload + Parallel:**
+   - Files > 5 GB nutzen Chunked Upload (sequentiell)
+   - Files < 50 MB parallel
+   - → Beide koexistieren perfekt!
+
+---
+
+### Resume-State Management
+
+**Snapshot-Validierung:**
+
+State-Files enthalten jetzt `snapshot_name`:
+```json
+{
+  "uploadid": "...",
+  "file_hash": "sha256...",
+  "remote_path": "/_snapshots/2026-04-27-backup/file.dat",
+  "snapshot_name": "2026-04-27-backup",
+  "status": "in_progress"
+}
+```
+
+**Validierungen:**
+1. `remote_path` muss matchen
+2. `file_size` muss matchen
+3. **`snapshot_name` muss matchen** (verhindert Snapshots-Mixup)
+4. `upload_info()` prüft Server-Status
+
+**Bei Mismatch:** State-File wird gelöscht, Upload startet neu.
+
+**Auto-Cleanup:**
+```python
+_cleanup_orphaned_resume_states(state_dir, max_age_days=7)
+```
+- Löscht Files älter als 7 Tage
+- Löscht Error-Status Files nach 24h
+- Löscht korrupte JSON-Files
+- Läuft automatisch beim ersten Upload (einmalig pro Prozess)
 
 ---
 
