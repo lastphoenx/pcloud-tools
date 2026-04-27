@@ -25,9 +25,12 @@ Ad-hoc-Uploads ohne komplexes Setup:
 - **Connection-Pooling:** `requests.Session()` pooled Connections
 
 ### ✅ Intelligente Upload-Strategie
-- **Kleine Dateien (<50 MB):** Direkter Upload (`putfile`)
-- **Große Dateien (≥50 MB):** Chunked Upload mit **Resume-Mechanismus**
+- **Kleine Dateien (<5 GB):** Direkter Upload (`putfile`)
+- **Große Dateien (≥5 GB):** Chunked Upload mit **Resume-Mechanismus**
 - Automatische Entscheidung basierend auf Dateigröße
+- **Konfigurierbar via .env:**
+  - `PCLOUD_RESUME_THRESHOLD_GB=5` (Default: 5 GB)
+  - `PCLOUD_RESUME_CHUNK_MB=128` (Default: 128 MB Chunks)
 
 ### ✅ Paralleles Threading
 - **PCLOUD_UPLOAD_THREADS:** Parallele File-Uploads (aus .env)
@@ -174,12 +177,21 @@ python3 pcloud_simple_upload.py \
 | `PCLOUD_API_HOST` | API-Hostname | `binapi.pcloud.com` |
 | `PCLOUD_API_PORT` | API-Port (TLS: 8398, Plain: 8388) | `8398` |
 
-### Optional: Threading-Tuning
+### Optional: Performance-Tuning
+
+**Threading:**
 
 | Variable | Default | Empfohlen (RPi 5) | Empfohlen (x86) | Beschreibung |
 |----------|---------|-------------------|-----------------|--------------|
 | `PCLOUD_UPLOAD_THREADS` | 4 | 16 | 32 | Parallele File-Uploads |
 | `PCLOUD_FOLDER_THREADS` | 4 | 8 | 16 | Parallele Ordner-Erstellung |
+
+**Chunked-Upload (für sehr große Dateien):**
+
+| Variable | Default | Beschreibung |
+|----------|---------|------------|
+| `PCLOUD_RESUME_THRESHOLD_GB` | 5 | Ab dieser Dateigröße wird Chunked Upload verwendet |
+| `PCLOUD_RESUME_CHUNK_MB` | 128 | Chunk-Größe (MB) beim Chunked Upload |
 
 **Tuning-Tipps:**
 - **Raspberry Pi 5:** 16 Upload-Threads, 8 Folder-Threads (getestet!)
@@ -197,6 +209,10 @@ PCLOUD_API_PORT=8398
 # Threading-Tuning (RPi 5 optimiert)
 PCLOUD_UPLOAD_THREADS=16
 PCLOUD_FOLDER_THREADS=8
+
+# Chunked-Upload-Konfiguration (optional)
+PCLOUD_RESUME_THRESHOLD_GB=5   # Chunked ab 5 GB (default)
+PCLOUD_RESUME_CHUNK_MB=128     # 128 MB Chunks (default)
 
 # Optional: Debug-Logging (falls implementiert)
 # PCLOUD_DEBUG=1
@@ -338,15 +354,15 @@ Tool erkennt automatisch und startet neu von 0%.
 ### Chunked Upload mit Progress
 
 ```
-2026-04-27 21:00:00 [INFO ] ⬆ Upload: bigfile.bin (512.00 MB)
-2026-04-27 21:00:00 [INFO ]   → Chunked Upload (Datei ≥50MB)
-2026-04-27 21:00:05 [INFO ]   Progress: 10% (51.2/512.0 MB)
-2026-04-27 21:00:10 [INFO ]   Progress: 20% (102.4/512.0 MB)
-2026-04-27 21:00:15 [INFO ]   Progress: 30% (153.6/512.0 MB)
+2026-04-27 21:00:00 [INFO ] ⬆ Upload: bigfile.bin (8.50 GB)
+2026-04-27 21:00:00 [INFO ]   → Chunked Upload (Datei ≥5.0 GB, Chunk-Size: 128 MB)
+2026-04-27 21:00:05 [INFO ]   Progress: 10% (0.85/8.50 GB)
+2026-04-27 21:00:10 [INFO ]   Progress: 20% (1.70/8.50 GB)
+2026-04-27 21:00:15 [INFO ]   Progress: 30% (2.55/8.50 GB)
 ...
-2026-04-27 21:05:00 [INFO ]   Progress: 100% (512.0/512.0 MB)
-2026-04-27 21:05:01 [INFO ] Berechne SHA256-Hash (512.0 MB)...
-2026-04-27 21:05:15 [OK  ] ✓ bigfile.bin (315.2s)
+2026-04-27 21:05:00 [INFO ]   Progress: 100% (8.50/8.50 GB)
+2026-04-27 21:05:01 [INFO ] Berechne SHA256-Hash (8.50 GB)...
+2026-04-27 21:05:35 [OK  ] ✓ bigfile.bin (335.2s)
 ```
 
 ---
