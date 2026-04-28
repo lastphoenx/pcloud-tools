@@ -11,7 +11,8 @@ Download von pCloud-Snapshots mit:
 - Ordnerstruktur vom Snapshot beibehalten (relpath)
 """
 from __future__ import annotations
-import os, sys, json, argparse, hashlib, time, datetime
+import os, sys, json, argparse, hashlib, time, datetime, threading
+import concurrent.futures
 from typing import Dict, List, Any, Optional
 
 try:
@@ -26,6 +27,10 @@ def log(msg: str, level: str = "info"):
     print(f"[{ts}] [{level}] {msg}", file=sys.stderr if level == "error" else sys.stdout)
 
 CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB
+
+# === Parallel Download Configuration ===
+SMALL_FILE_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_DOWNLOAD_SMALL_THRESHOLD", str(50 * 1024 * 1024)))  # 50 MB
+PARALLEL_DOWNLOAD_THREADS = int(os.environ.get("PCLOUD_DOWNLOAD_THREADS", "16"))
 
 
 class IndexLoadError(Exception):
@@ -229,6 +234,125 @@ def load_manifest(manifest_path: str, snapshot_name: str) -> dict:
 
     return manifest
 
+def _extract_files_from_listfolder(result: dict, base_path: str = "") -> List[Dict[str, Any]]:
+    """
+    Extrahiert File-Items aus listfolder-Response (rekursiv).
+    
+    Args:
+        result: listfolder API-Response
+        base_path: Basis-Pfad für relpath-Konstruktion
+    
+    Returns:
+        Liste mit File-Items (kompatibel mit Snapshot-Items)
+    """
+    items = []
+    
+    def _traverse(obj: dict, parent_path: str = ""):
+        if not isinstance(obj, dict):
+            return
+        
+        if obj.get("isfolder"):
+            # Folder: traverse children
+            folder_name = obj.get("name", "")
+            current_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
+            for child in obj.get("contents", []):
+                _traverse(child, current_path)
+        else:
+            # File gefunden
+            file_name = obj.get("name", "unknown")
+            rel_path = f"{parent_path}/{file_name}" if parent_path else file_name
+            items.append({
+                "type": "file",
+                "relpath": rel_path,
+                "sha256": None,  # Nicht verfügbar bei listfolder
+                "fileid": obj.get("fileid"),
+                "anchor_path": None,  # Wird via fileid downloaded
+                "size": obj.get("size", 0),
+            })
+    
+    metadata = result.get("metadata", {})
+    _traverse(metadata, base_path)
+    
+    return items
+
+def load_direct_folder(cfg: Dict, *, folder_path: str = None, folderid: int = None) -> List[Dict[str, Any]]:
+    """
+    Lädt Files aus einem pCloud-Ordner (rekursiv) via Pfad oder ID.
+    
+    Args:
+        cfg: pCloud Config
+        folder_path: Ordner-Pfad (optional)
+        folderid: Ordner-ID (optional)
+    
+    Returns:
+        Liste mit File-Items
+    """
+    if not folder_path and not folderid:
+        raise ValueError("Entweder folder_path oder folderid erforderlich")
+    
+    log(f"Lade Ordner-Inhalt: {folder_path or f'FolderID={folderid}'} (rekursiv)")
+    
+    try:
+        if folder_path:
+            result = pc.listfolder(cfg, path=folder_path, recursive=True)
+            base_path = os.path.basename(folder_path.rstrip("/"))
+        else:
+            result = pc.listfolder(cfg, folderid=folderid, recursive=True)
+            # Base-Path aus Metadata extrahieren
+            metadata = result.get("metadata", {})
+            base_path = metadata.get("name", "")
+        
+        items = _extract_files_from_listfolder(result, base_path="")
+        log(f"✓ {len(items)} Dateien gefunden")
+        return items
+    
+    except Exception as e:
+        log(f"Ordner-Laden fehlgeschlagen: {e}", "error")
+        raise
+
+def load_direct_file(cfg: Dict, *, file_path: str = None, fileid: int = None) -> List[Dict[str, Any]]:
+    """
+    Lädt ein einzelnes File via Pfad oder ID.
+    
+    Args:
+        cfg: pCloud Config
+        file_path: Datei-Pfad (optional)
+        fileid: Datei-ID (optional)
+    
+    Returns:
+        Liste mit einem File-Item
+    """
+    if not file_path and not fileid:
+        raise ValueError("Entweder file_path oder fileid erforderlich")
+    
+    log(f"Lade Datei-Info: {file_path or f'FileID={fileid}'}")
+    
+    try:
+        if file_path:
+            stat = pc.stat_file(cfg, path=file_path, with_checksum=False)
+            relpath = os.path.basename(file_path)
+            anchor = file_path
+        else:
+            stat = pc.stat_file(cfg, fileid=fileid, with_checksum=False)
+            relpath = stat.get("name", f"file_{fileid}")
+            anchor = None  # Wird via fileid downloaded
+        
+        item = {
+            "type": "file",
+            "relpath": relpath,
+            "sha256": None,  # Nicht verfügbar bei stat
+            "fileid": stat.get("fileid") or fileid,
+            "anchor_path": anchor,
+            "size": stat.get("size", 0),
+        }
+        
+        log(f"✓ Datei: {relpath} ({item['size']:,} bytes)")
+        return [item]
+    
+    except Exception as e:
+        log(f"Datei-Laden fehlgeschlagen: {e}", "error")
+        raise
+
 def main():
     ap = argparse.ArgumentParser(
         description="pCloud Snapshot-Restore (Download echter Dateien vom anchor_path)",
@@ -241,8 +365,21 @@ Beispiele:
   # Plan anzeigen
   %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /tmp/restore
 
-  # Download mit SHA256-Verifikation
+  # Download mit SHA256-Verifikation (PARALLEL)
   %(prog)s --manifest pcloud --snapshot 2025-11-23-082336 --out-dir /srv/pcloud-temp/restore --download --verify
+
+  # === NEU: Direct Download ===
+  # Einzelne Datei via Pfad
+  %(prog)s --manifest pcloud --file /Backup/rtb_1to1/docs/README.md --out-dir /tmp/restore --download
+
+  # Einzelne Datei via ID
+  %(prog)s --manifest pcloud --fileid 123456789 --out-dir /tmp/restore --download
+
+  # Ordner rekursiv via Pfad
+  %(prog)s --manifest pcloud --folder /Backup/rtb_1to1/docs --out-dir /tmp/restore --download
+
+  # Ordner rekursiv via ID
+  %(prog)s --manifest pcloud --folderid 987654321 --out-dir /tmp/restore --download
         """
     )
     
@@ -251,6 +388,12 @@ Beispiele:
     ap.add_argument("--list-snapshots", action="store_true", help="Verfügbare Snapshots aus dem pCloud-Index anzeigen und beenden")
     ap.add_argument("--out-dir", help="Lokales Restore-Ziel (Basis, Snapshot wird als Unterordner angelegt – nur flat-Modus verpflichtend)")
 
+    # === NEU: Direct Download Parameter ===
+    ap.add_argument("--folder", help="Ordner-Pfad für direkten Download (rekursiv, überschreibt --snapshot)")
+    ap.add_argument("--folderid", type=int, help="Ordner-ID für direkten Download (rekursiv, überschreibt --snapshot)")
+    ap.add_argument("--file", help="Datei-Pfad für einzelnen Download (überschreibt --snapshot)")
+    ap.add_argument("--fileid", type=int, help="Datei-ID für einzelnen Download (überschreibt --snapshot)")
+    
     ap.add_argument("--mode", choices=["flat", "object-store"], default="flat",
                     help="Restore-Modus: 'flat' = direkt in out-dir/snapshot, 'object-store' = lokaler _objects + _snapshots Baum")
 
@@ -302,7 +445,32 @@ Beispiele:
             print(f"  {s}")
         return 0
 
-    if not args.snapshot:
+    # === NEU: Direct-Download-Modus (Folder/File via ID oder Pfad) ===
+    _direct_mode_params = [args.folder, args.folderid, args.file, args.fileid]
+    _direct_mode_active = any(_direct_mode_params)
+    
+    if _direct_mode_active:
+        # Mutual Exclusion prüfen
+        if sum([bool(p) for p in _direct_mode_params]) > 1:
+            log("Bitte nur EINEN der folgenden Parameter verwenden: --folder, --folderid, --file, --fileid", "error")
+            return 2
+        
+        if args.snapshot:
+            log("--snapshot wird ignoriert (Direct-Download-Modus aktiv)", "warn")
+        
+        # out-dir ist im Direct-Mode verpflichtend
+        if not args.out_dir:
+            log("--out-dir ist im Direct-Download-Modus erforderlich", "error")
+            return 2
+        
+        log(f"[Direct-Mode] {'Ordner' if (args.folder or args.folderid) else 'Datei'}-Download")
+    
+    # Snapshot-Mode Validierung (nur wenn nicht Direct-Mode)
+    if not _direct_mode_active and not args.snapshot:
+        log("--snapshot ist erforderlich (oder --list-snapshots für Übersicht, oder Direct-Download-Parameter)", "error")
+        return 2
+
+    if not _direct_mode_active and not args.snapshot:
         log("--snapshot ist erforderlich (oder --list-snapshots für Übersicht)", "error")
         return 2
 
@@ -339,7 +507,17 @@ Beispiele:
     
     # Index / Manifest laden
     try:
-        if args.manifest.lower() == "pcloud":
+        if _direct_mode_active:
+            # === NEU: Direct-Download-Modus ===
+            if args.folder:
+                items = load_direct_folder(cfg, folder_path=args.folder)
+            elif args.folderid:
+                items = load_direct_folder(cfg, folderid=args.folderid)
+            elif args.file:
+                items = load_direct_file(cfg, file_path=args.file)
+            elif args.fileid:
+                items = load_direct_file(cfg, fileid=args.fileid)
+        elif args.manifest.lower() == "pcloud":
             items = load_index_from_pcloud(cfg, args.dest_root, args.snapshot)
         else:
             log(f"Lade lokales Manifest: {args.manifest}")
@@ -348,26 +526,43 @@ Beispiele:
     except (IndexLoadError, ManifestLoadError) as e:
         log(str(e), "error")
         return 2
+    except Exception as e:
+        log(f"Fehler beim Laden: {e}", "error")
+        return 2
     
     # Filtern
     sel = [it for it in items if not args.filter or it.get("relpath", "").startswith(args.filter)]
     
-    log(f"Snapshot: {args.snapshot} @ {args.dest_root}")
+    # Display Info
+    if _direct_mode_active:
+        mode_desc = "Direct-Download"
+        if args.folder:
+            mode_desc += f": {args.folder}"
+        elif args.folderid:
+            mode_desc += f": FolderID={args.folderid}"
+        elif args.file:
+            mode_desc += f": {args.file}"
+        elif args.fileid:
+            mode_desc += f": FileID={args.fileid}"
+        log(mode_desc)
+    else:
+        log(f"Snapshot: {args.snapshot} @ {args.dest_root}")
+    
     log(f"Items (nach Filter): {len(sel)}")
     
     if not sel:
         log("Keine Items", "warn")
         return 0
-    
-    # Basis-Zielpfad: out_dir/snapshot (nur im flat-Modus)
-    base_out_dir = os.path.join(args.out_dir, args.snapshot) if args.out_dir else None
 
     # Verify-only-Modus
     if args.verify_only:
         log("Starte Verify-only (keine Downloads)...")
-        if not base_out_dir:
-            log("--verify-only setzt --out-dir im flat-Modus voraus", "error")
-            return 2
+        # Base-Zielpfad: out_dir/snapshot ODER out_dir (Direct-Mode)
+        if _direct_mode_active:
+            base_out_dir = args.out_dir
+        else:
+            base_out_dir = os.path.join(args.out_dir, args.snapshot)
+        
         stats = verify_files(base_out_dir, sel)
         log("=" * 60)
         log("Verify-only abgeschlossen:")
@@ -396,49 +591,104 @@ Beispiele:
     # Echtes Restore
     log(f"Starte Download: {len(sel)} Dateien von pCloud...")
 
-    # Flat-Modus: direkt in base_out_dir/snapshot/relpath schreiben
+    # Flat-Modus: direkt in base_out_dir/snapshot/relpath schreiben (oder Direct-Mode)
     if args.mode == "flat":
+        # Base-Zielpfad: out_dir/snapshot ODER out_dir (Direct-Mode)
+        if _direct_mode_active:
+            base_out_dir = args.out_dir
+        else:
+            base_out_dir = os.path.join(args.out_dir, args.snapshot)
+        
         os.makedirs(base_out_dir, exist_ok=True)
 
-        stats = {"success": 0, "failed": 0, "skipped": 0}
+        stats = {"success": 0, "failed": 0, "skipped": 0, "downloaded": 0}
         sha_cache = {}  # Deduplizierung: {sha256 → local_path}
-
-        for idx, item in enumerate(sel, 1):
+        _state_lock = threading.Lock()  # Thread-Safe Stats
+        
+        # === Klassifizierung: Small vs Large Files ===
+        small_files = [f for f in sel if f.get("size", 0) < SMALL_FILE_THRESHOLD_BYTES]
+        large_files = [f for f in sel if f.get("size", 0) >= SMALL_FILE_THRESHOLD_BYTES]
+        
+        log(f"Klassifizierung: {len(small_files)} kleine (<50MB), {len(large_files)} große Dateien")
+        
+        # Progress-Tracking
+        start_time = time.time()
+        total_items = len(sel)
+        total_bytes = sum([f.get("size", 0) for f in sel])
+        done_items = 0
+        done_bytes = 0
+        
+        def _log_progress():
+            """Progress + ETA ausgeben"""
+            nonlocal done_items, done_bytes
+            elapsed = time.time() - start_time
+            if done_bytes > 0 and elapsed > 0:
+                speed_mbps = (done_bytes / (1024 * 1024)) / elapsed
+                eta_sec = (total_bytes - done_bytes) / (done_bytes / elapsed) if done_bytes > 0 else 0
+                eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s"
+                log(f"[restore] {done_items}/{total_items} Dateien | {done_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB | {speed_mbps:.1f} MB/s | ETA: {eta_str}")
+            else:
+                log(f"[restore] {done_items}/{total_items} Dateien")
+        
+        def _process_download_item(item_tuple: tuple) -> dict:
+            """
+            Thread-Safe Download einer Datei.
+            
+            Args:
+                item_tuple: (idx, item)
+            
+            Returns:
+                {"success": bool, "size": int, "action": str}
+            """
+            nonlocal stats, sha_cache, done_items, done_bytes
+            
+            idx, item = item_tuple
             relpath = item.get("relpath", f"?_{idx}")
             sha256 = item.get("sha256")
             fileid = item.get("fileid")
             anchor_path = item.get("anchor_path")
+            file_size = item.get("size", 0)
             local_dest = os.path.join(base_out_dir, relpath)
-
-            log(f"[{idx}/{len(sel)}] {relpath}")
-
-            # Path-Traversal-Guard: sicherstellen, dass local_dest unterhalb von base_out_dir liegt
-            expected_prefix_flat = os.path.join(base_out_dir) + os.sep
+            
+            result = {"success": False, "size": file_size, "action": "skipped"}
+            
+            # Path-Traversal-Guard
+            expected_prefix = os.path.join(base_out_dir) + os.sep
             normalized_local_dest = os.path.normpath(local_dest)
-            if not normalized_local_dest.startswith(expected_prefix_flat):
-                log(f"  ✗ Ungültiger relpath (Path-Traversal verhindert): {relpath}", "error")
-                stats["failed"] += 1
-                continue
-
-            # Deduplizierung innerhalb eines Laufs (SHA-Caching)
-            # Beide Dateien müssen lokal existieren, auch wenn sie denselben Inhalt haben!
+            if not normalized_local_dest.startswith(expected_prefix):
+                log(f"  [{idx}/{total_items}] ✗ Path-Traversal verhindert: {relpath}", "error")
+                with _state_lock:
+                    stats["failed"] += 1
+                return result
+            
+            # Deduplizierung: SHA-Cache prüfen
             if sha256 and sha256 in sha_cache:
                 cached_src = sha_cache[sha256]
                 if cached_src != local_dest and not os.path.exists(local_dest):
-                    log("  \u2192 Cache Hit (SHA256): erstelle Hardlink/Kopie")
                     os.makedirs(os.path.dirname(local_dest) or ".", exist_ok=True)
                     try:
                         os.link(cached_src, local_dest)
+                        result["action"] = "hardlink"
                     except OSError:
                         import shutil
                         shutil.copy2(cached_src, local_dest)
-                    stats["success"] += 1
-                else:
-                    log("  \u2192 Cache Hit (SHA256, Ziel bereits vorhanden)")
-                    stats["skipped"] += 1
-                continue
-
-            # Bereits vorhandene lokale Datei prüfen und ggf. überspringen
+                        result["action"] = "copy"
+                    result["success"] = True
+                    with _state_lock:
+                        stats["success"] += 1
+                        stats["skipped"] += 1
+                        done_items += 1
+                        done_bytes += file_size
+                    return result
+                elif os.path.exists(local_dest):
+                    result["success"] = True
+                    with _state_lock:
+                        stats["skipped"] += 1
+                        done_items += 1
+                        done_bytes += file_size
+                    return result
+            
+            # Lokale Datei bereits vorhanden? → SHA prüfen
             if os.path.exists(local_dest) and sha256 and args.verify:
                 try:
                     hash_obj = hashlib.sha256()
@@ -447,52 +697,89 @@ Beispiele:
                             hash_obj.update(chunk)
                     local_sha = hash_obj.hexdigest()
                     if local_sha.lower() == sha256.lower():
-                        log("  → OK (übersprungen, lokale Datei mit korrektem SHA vorhanden)")
-                        stats["skipped"] += 1
-                        # SHA-Caching aktualisieren
-                        sha_cache[sha256] = local_dest
-                        continue
-                    else:
-                        log("  → Lokale Datei existiert, aber SHA stimmt nicht, lade neu...", "warn")
-                except Exception as e:
-                    log(f"  → Lokale Datei konnte nicht geprüft werden, lade neu... ({e})", "warn")
-
+                        result["success"] = True
+                        with _state_lock:
+                            stats["skipped"] += 1
+                            sha_cache[sha256] = local_dest
+                            done_items += 1
+                            done_bytes += file_size
+                        return result
+                except Exception:
+                    pass  # Falls Prüfung fehlschlägt, neu downloaden
+            
             # Verzeichnis erstellen
             os.makedirs(os.path.dirname(local_dest) or ".", exist_ok=True)
-
-            # Download von anchor_path (echte Datei, nicht Stub!), fileid als Fallback
+            
+            # Download durchführen
             verify_hash = sha256 if args.verify else None
-
-            def _try_fileid_fallback() -> bool:
-                if fileid:
-                    log("  \u2192 Fallback: lade via fileid...", "warn")
-                    return download_via_fileid(cfg, fileid, local_dest, verify_hash)
-                log("  \u2717 Kein anchor_path und keine fileid vorhanden", "error")
-                return False
-
+            downloaded = False
+            
             if anchor_path:
-                if download_file_with_verify(cfg, anchor_path, local_dest, verify_hash):
+                downloaded = download_file_with_verify(cfg, anchor_path, local_dest, verify_hash)
+            
+            if not downloaded and fileid:
+                downloaded = download_via_fileid(cfg, fileid, local_dest, verify_hash)
+            
+            if downloaded:
+                result["success"] = True
+                result["action"] = "download"
+                with _state_lock:
                     if sha256:
                         sha_cache[sha256] = local_dest
                     stats["success"] += 1
-                elif _try_fileid_fallback():
-                    if sha256:
-                        sha_cache[sha256] = local_dest
-                    stats["success"] += 1
-                else:
-                    stats["failed"] += 1
-            elif _try_fileid_fallback():
-                if sha256:
-                    sha_cache[sha256] = local_dest
-                stats["success"] += 1
+                    stats["downloaded"] += 1
+                    done_items += 1
+                    done_bytes += file_size
             else:
-                stats["failed"] += 1
+                with _state_lock:
+                    stats["failed"] += 1
+                    done_items += 1
+            
+            return result
+        
+        # === PARALLEL: Kleine Dateien ===
+        if small_files:
+            log(f"[parallel] Starte Download von {len(small_files)} kleinen Dateien ({PARALLEL_DOWNLOAD_THREADS} Threads)...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOAD_THREADS) as executor:
+                # Enumerate mit Index
+                indexed_small = [(i+1, f) for i, f in enumerate(small_files)]
+                futures = [executor.submit(_process_download_item, item) for item in indexed_small]
+                
+                # Progress-Logging alle 10%
+                total_small = len(small_files)
+                for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                    try:
+                        future.result()  # Exception handling
+                    except Exception as e:
+                        log(f"Download-Fehler: {e}", "error")
+                    
+                    if i % max(1, total_small // 10) == 0 or i == total_small:
+                        _log_progress()
+            
+            log(f"[parallel] {len(small_files)} kleine Dateien abgeschlossen")
+        
+        # === SEQUENTIAL: Große Dateien ===
+        if large_files:
+            log(f"[sequential] Starte Download von {len(large_files)} großen Dateien (>= 50MB)...")
+            base_idx = len(small_files) + 1
+            for i, large_file in enumerate(large_files):
+                idx = base_idx + i
+                log(f"[{idx}/{total_items}] {large_file.get('relpath')} ({large_file.get('size', 0):,} bytes)")
+                try:
+                    _process_download_item((idx, large_file))
+                except Exception as e:
+                    log(f"Download-Fehler: {e}", "error")
+                    with _state_lock:
+                        stats["failed"] += 1
+                
+                _log_progress()
 
         log("=" * 60)
         log(f"Restore abgeschlossen (flat-Modus):")
-        log(f"  ✓ Erfolgreich:  {stats['success']}")
-        log(f"  ⊘ Dedupliziert: {stats['skipped']}")
-        log(f"  ✗ Fehler:       {stats['failed']}")
+        log(f"  ✓ Erfolgreich:    {stats['success']}")
+        log(f"  ↓ Downloaded:     {stats['downloaded']}")
+        log(f"  ⊘ Dedupliziert:   {stats['skipped']}")
+        log(f"  ✗ Fehler:         {stats['failed']}")
 
         return 0 if stats["failed"] == 0 else 1
 
