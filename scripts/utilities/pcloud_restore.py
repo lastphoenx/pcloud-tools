@@ -261,6 +261,8 @@ def _extract_files_from_listfolder(result: dict, base_path: str = "") -> List[Di
             # File gefunden
             file_name = obj.get("name", "unknown")
             rel_path = f"{parent_path}/{file_name}" if parent_path else file_name
+            # Führenden Slash entfernen (Path-Traversal-Schutz)
+            rel_path = rel_path.lstrip("/")
             items.append({
                 "type": "file",
                 "relpath": rel_path,
@@ -295,13 +297,10 @@ def load_direct_folder(cfg: Dict, *, folder_path: str = None, folderid: int = No
     try:
         if folder_path:
             result = pc.listfolder(cfg, path=folder_path, recursive=True)
-            base_path = os.path.basename(folder_path.rstrip("/"))
         else:
             result = pc.listfolder(cfg, folderid=folderid, recursive=True)
-            # Base-Path aus Metadata extrahieren
-            metadata = result.get("metadata", {})
-            base_path = metadata.get("name", "")
         
+        # Metadata enthält bereits den Ordner-Namen, base_path="" lassen
         items = _extract_files_from_listfolder(result, base_path="")
         log(f"✓ {len(items)} Dateien gefunden")
         return items
@@ -468,10 +467,6 @@ Beispiele:
     # Snapshot-Mode Validierung (nur wenn nicht Direct-Mode)
     if not _direct_mode_active and not args.snapshot:
         log("--snapshot ist erforderlich (oder --list-snapshots für Übersicht, oder Direct-Download-Parameter)", "error")
-        return 2
-
-    if not _direct_mode_active and not args.snapshot:
-        log("--snapshot ist erforderlich (oder --list-snapshots für Übersicht)", "error")
         return 2
 
     # Modus-Konflikte prüfen
@@ -712,6 +707,11 @@ Beispiele:
             
             # Download durchführen
             verify_hash = sha256 if args.verify else None
+            
+            # Warnung wenn Verifikation gewünscht aber nicht möglich (Direct-Mode)
+            if args.verify and not sha256:
+                log(f"  [{idx}/{total_items}] ⚠ Verifikation nicht möglich (kein SHA für Live-Datei): {relpath}", "warn")
+            
             downloaded = False
             
             if anchor_path:
