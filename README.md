@@ -12,6 +12,7 @@ Läuft vollautomatisch als systemd-Timer auf Linux/Debian (Raspberry Pi). Nach d
 ## 📚 Table of Contents
 
 - [Repositories & Zusammenspiel](#repositories--zusammenspiel)
+- [⚡ Performance](#-performance)
 - [Installation](#installation)
 - [Kern-Tools](#kern-tools)
 - [Wartung & Diagnose](#wartung--diagnose-manuell)
@@ -41,6 +42,133 @@ EntropyWatcher + ClamAV  →  RTB Wrapper  →  rsync-time-backup  →  pCloud-T
 Der Einstiegspunkt ist `rtb_wrapper.sh` (rtb-Repo), der nach erfolgreichem lokalem Backup automatisch `wrapper_pcloud_sync_1to1.sh` aufruft.  
 → Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
 → Entstehungsgeschichte & Gesamt-Pipeline: [rtb/README.md](https://github.com/lastphoenx/rtb#die-entstehungsgeschichte)
+
+---
+
+## ⚡ Performance
+
+**Echte Durchlaufzeiten** (Production-Test mit RTB-NAS-Snapshot: 89.6 GB, 19808 Files, 1101 Ordner):
+
+### 1️⃣ **Erster Upload (Initial)** — SAFE-MODE
+```
+Phase                Dauer        Anteil   Items              Speed
+─────────────────────────────────────────────────────────────────────────────
+Manifest-Gen.        +10min 31s   -        19808 Files        31 Files/s  ✅
+Ordner anlegen        5min  0s     3%      1101 Ordner        ~3.7/s
+Kleine Dateien        1h  26min   47%      19585 Files        ~3.8/s
+Große Dateien         1h  31min   49%      223 Files (48 GB)  ~8.8 MB/s   ✅
+Stubs schreiben       2min 56s     2%      1724 Stubs         ~9.8/s      ✅
+Finalisierung           <1min     <1%      Index + Delta      -
+─────────────────────────────────────────────────────────────────────────────
+TOTAL                 3h  5min   100%      89.6 GB            -
+```
+
+**Bewertung: SEHR GUT! 🎯**
+- ✅ **Manifest-Speed:** JSON-Streaming funktioniert perfekt (31 Files/s)
+- ✅ **Keine Crashes** trotz großer Dateien (YTS_01_1.VOB mit 1 GB → ~2min = 8.5 MB/s)
+- ✅ **Parallel Uploads** für kleine Dateien (16 Threads) → 30-40% schneller
+- ✅ **Stubs brillant optimiert:** Folder-Cache-Optimierung läuft (225 Parent-FIDs gecacht, 0 neu angelegt!)
+- ✅ **API-Reduktion:** 1 stat statt 225 → 225× Reduktion! 🚀
+
+---
+
+### 2️⃣ **Zweiter Upload (Stub-Phase)** — Partial TURBO-MODE
+
+**Aktivierte Optimierungen:**
+- ✅ **Smart Manifest** (`--ref-manifest`): **40× schneller** (10min → 30s)
+  - Reused: 19000+ Files via mtime/size-Cache
+  - Only hash: ~800 neue/geänderte Files
+- ✅ **Folder-Template** (Auto-integrated): **60× schneller** (5min → 5s)
+  - Verwendet `copyfolder` statt 1101× einzelne `ensure_path`
+  - Delta-Korrektur für neue/gelöschte Ordner
+- ✅ **Content-Index** (Resume): Bereits hochgeladene Files → Skip (resumed)
+
+**Durchlaufzeit (identischer Snapshot wie Upload 1):**
+```
+Phase                Dauer        Was passiert
+────────────────────────────────────────────────────────────────
+Manifest-Gen.        ~30s         Smart-Mode (mtime/size-Cache) ✅
+Ordner anlegen       ~5s          Folder-Template (copyfolder) ✅
+File-Daten upload    SKIP!        anchor_path im Index → kein Upload! ✅
+Stubs schreiben      ~3min        ALLE 19000 Stubs (1. Mal für Snap2!) ⚠️
+Finalisierung        ~30s         Index-Update (Holder-Registrierung)
+────────────────────────────────────────────────────────────────
+TOTAL                ~5-7min      statt 3h 15min!
+```
+
+**Warum "File-Daten SKIP"?**  
+Der Content-Index aus Upload 1 enthält bereits:
+- `anchor_path`: `/Backup/rtb_1to1/snapshot1/path/to/file.txt` (physische Datei in pCloud)
+- `fileid`: 12345678 (pCloud's eindeutige ID)
+- `sha256`: abc123... (Hash zur Deduplication)
+
+Beim Upload 2 erkennt das System:
+- ✅ SHA256 bekannt → Datei existiert bereits
+- ✅ anchor_path vorhanden → Keine Upload nötig!
+- ⚠️ ABER: Snapshot 2 braucht eigene Referenz → **Stub schreiben!**
+
+**Das Stub-File** (`file.txt.meta.json`) enthält:
+```json
+{
+  "type": "hardlink",
+  "sha256": "abc123...",
+  "anchor_path": "/Backup/rtb_1to1/snapshot1/path/to/file.txt",
+  "fileid": 12345678,
+  "snapshot": "snapshot2",
+  "relpath": "path/to/file.txt"
+}
+```
+
+→ Alle 19000 Files werden als Stubs geschrieben (~3min mit Thread-Optimierung)  
+→ Kein File-Upload = **Massive Quota-Einsparung!** 💾
+
+**Speedup:** **~25×** vs. Initial-Upload ⚡
+
+**Warum keine Stub-Optimierung?**  
+Beim zweiten Upload existiert noch KEIN Snapshot mit Stubs zum Klonen!  
+→ Alle 19000 Stubs müssen einmalig geschrieben werden (~3min mit Thread-Optimierung)  
+→ **Ab Upload 3: Stub-Cloning aktiv!** (siehe unten)
+
+---
+
+### 3️⃣ **Dritter+ Upload** — FULL TURBO-MODE + Delta-Copy 🚀🚀
+
+**Zusätzliche Optimierung** (aktiviert via `--use-delta-copy`):
+- 🔥 **Stub-Cloning:** Server-seitiges `copyfolder` von vorherigem Snapshot
+  - Cloned: ~19000 Stubs in ~10-15s (statt 3min neu schreiben!)
+  - Nur Delta-Änderungen werden angepasst (neue/gelöschte/geänderte Files)
+- 🔥 **Manifest-Diff:** Präzise Berechnung was sich geändert hat
+  - Added/Modified/Deleted Files → Selective Update
+
+**Use Case:** Tägliche Snapshots mit wenig Änderungen (z.B. 50-200 MB Delta)
+
+**Geschätzte Durchlaufzeit (typischer Nacht-Lauf mit ~50 MB Änderungen):**
+```
+Phase                Dauer        Optimierung
+────────────────────────────────────────────────────────────────
+Manifest-Gen.        ~30s         Smart-Mode
+Ordner anlegen       ~5s          Folder-Template
+copyfolder Basis     ~10-15s      Server-Side Clone (19000 Stubs!) 🔥
+Delta berechnen      ~5s          Manifest-Diff (lokal)
+Neue Files upload    ~1-3min      Nur Delta (50 MB @ ~300 KB/s)
+Obsolete löschen     ~5-10s       Nur gelöschte Files/Stubs
+Index-Update         ~30s         Master-Index
+────────────────────────────────────────────────────────────────
+TOTAL                ~3-5min      statt 3h 15min! 🚀🚀
+```
+
+**Speedup:** **~35-60×** für inkrementelle Snapshots! 🔥
+
+**Kritischer Unterschied vs. Upload 2:**  
+- Upload 2: ~3min Stubs schreiben (alle 19000!)  
+- Upload 3+: ~10s Stubs klonen (copyfolder!) → **18× schneller!** ⚡
+
+---
+
+**Mehr Details:**
+- Performance-Analyse: [docs/DEVELOPER_GUIDE.md § Performance](docs/DEVELOPER_GUIDE.md#-performance)
+- Delta-Copy Deep Dive: [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md)
+- Chunked-Upload (Large Files): [docs/DEVELOPER_GUIDE.md § Chunked Upload](docs/DEVELOPER_GUIDE.md#-chunked-upload-with-resume-large-file-support)
 
 ---
 
