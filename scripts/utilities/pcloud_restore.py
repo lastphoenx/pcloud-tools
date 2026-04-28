@@ -626,18 +626,22 @@ Beispiele:
             pct_items = (done_items / total_items * 100) if total_items else 0
             pct_bytes = (done_bytes / total_bytes * 100) if total_bytes else 0
             
+            # Timestamp wie in pcloud_push
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
             if done_bytes > 0 and elapsed > 0:
                 speed_mbps = (done_bytes / (1024 * 1024)) / elapsed
                 eta_sec = (total_bytes - done_bytes) / (done_bytes / elapsed) if done_bytes > 0 else 0
                 eta_str = f"~{int(eta_sec // 60)}min" if eta_sec > 60 else f"~{int(eta_sec)}s"
-                log(
-                    f"[restore] {done_items}/{total_items} ({pct_items:.0f}%) | "
+                print(
+                    f"{ts} [restore] {done_items}/{total_items} ({pct_items:.0f}%) | "
                     f"{done_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB ({pct_bytes:.0f}%) | "
                     f"downloaded={stats['downloaded']} skipped={stats['skipped']} failed={stats['failed']} | "
-                    f"{speed_mbps:.1f} MB/s | {eta_str} verbleibend"
+                    f"{speed_mbps:.1f} MB/s | {eta_str} verbleibend",
+                    flush=True
                 )
             else:
-                log(f"[restore] {done_items}/{total_items} ({pct_items:.0f}%)")
+                print(f"{ts} [restore] {done_items}/{total_items} ({pct_items:.0f}%)", flush=True)
             
             _t_last_progress = _now
         
