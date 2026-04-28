@@ -612,18 +612,34 @@ Beispiele:
         total_bytes = sum([f.get("size", 0) for f in sel])
         done_items = 0
         done_bytes = 0
+        _t_last_progress = start_time
+        _PROGRESS_INTERVAL = 5.0  # Sekunden
         
-        def _log_progress():
-            """Progress + ETA ausgeben"""
-            nonlocal done_items, done_bytes
-            elapsed = time.time() - start_time
+        def _log_progress(force: bool = False):
+            """Progress + ETA ausgeben (intervall-basiert)"""
+            nonlocal done_items, done_bytes, _t_last_progress
+            _now = time.time()
+            if not force and (_now - _t_last_progress < _PROGRESS_INTERVAL):
+                return
+            
+            elapsed = _now - start_time
+            pct_items = (done_items / total_items * 100) if total_items else 0
+            pct_bytes = (done_bytes / total_bytes * 100) if total_bytes else 0
+            
             if done_bytes > 0 and elapsed > 0:
                 speed_mbps = (done_bytes / (1024 * 1024)) / elapsed
                 eta_sec = (total_bytes - done_bytes) / (done_bytes / elapsed) if done_bytes > 0 else 0
-                eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s"
-                log(f"[restore] {done_items}/{total_items} Dateien | {done_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB | {speed_mbps:.1f} MB/s | ETA: {eta_str}")
+                eta_str = f"~{int(eta_sec // 60)}min" if eta_sec > 60 else f"~{int(eta_sec)}s"
+                log(
+                    f"[restore] {done_items}/{total_items} ({pct_items:.0f}%) | "
+                    f"{done_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB ({pct_bytes:.0f}%) | "
+                    f"downloaded={stats['downloaded']} skipped={stats['skipped']} failed={stats['failed']} | "
+                    f"{speed_mbps:.1f} MB/s | {eta_str} verbleibend"
+                )
             else:
-                log(f"[restore] {done_items}/{total_items} Dateien")
+                log(f"[restore] {done_items}/{total_items} ({pct_items:.0f}%)")
+            
+            _t_last_progress = _now
         
         def _process_download_item(item_tuple: tuple) -> dict:
             """
@@ -683,7 +699,7 @@ Beispiele:
                         done_bytes += file_size
                     return result
             
-            # Lokale Datei bereits vorhanden? → SHA prüfen
+            # Lokale Datei bereits vorhanden? → SHA prüfen (Snapshot-Mode)
             if os.path.exists(local_dest) and sha256 and args.verify:
                 try:
                     hash_obj = hashlib.sha256()
@@ -701,6 +717,22 @@ Beispiele:
                         return result
                 except Exception:
                     pass  # Falls Prüfung fehlschlägt, neu downloaden
+            
+            # === NEU: Size-Check Resume (Direct-Mode ohne SHA) ===
+            if os.path.exists(local_dest) and not sha256:
+                try:
+                    local_size = os.path.getsize(local_dest)
+                    if local_size == file_size:
+                        # Größe stimmt überein → Datei vermutlich komplett
+                        result["success"] = True
+                        result["action"] = "size-match"
+                        with _state_lock:
+                            stats["skipped"] += 1
+                            done_items += 1
+                            done_bytes += file_size
+                        return result
+                except Exception:
+                    pass  # Falls Check fehlschlägt, neu downloaden
             
             # Verzeichnis erstellen
             os.makedirs(os.path.dirname(local_dest) or ".", exist_ok=True)
@@ -745,16 +777,15 @@ Beispiele:
                 indexed_small = [(i+1, f) for i, f in enumerate(small_files)]
                 futures = [executor.submit(_process_download_item, item) for item in indexed_small]
                 
-                # Progress-Logging alle 10%
-                total_small = len(small_files)
+                # Progress-Logging intervall-basiert
                 for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
                     try:
                         future.result()  # Exception handling
                     except Exception as e:
                         log(f"Download-Fehler: {e}", "error")
                     
-                    if i % max(1, total_small // 10) == 0 or i == total_small:
-                        _log_progress()
+                    # Progress-Logging intervall-basiert
+                    _log_progress()
             
             log(f"[parallel] {len(small_files)} kleine Dateien abgeschlossen")
         
@@ -773,6 +804,9 @@ Beispiele:
                         stats["failed"] += 1
                 
                 _log_progress()
+        
+        # Final Progress
+        _log_progress(force=True)
 
         log("=" * 60)
         log(f"Restore abgeschlossen (flat-Modus):")
