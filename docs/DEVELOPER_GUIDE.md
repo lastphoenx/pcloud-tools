@@ -2404,144 +2404,80 @@ WHERE run_start > NOW() - INTERVAL 7 DAY;
 
 ## 🔄 Säule 4: Resilient Restore System (scripts/pcloud_restore.py)
 
-Das Restore-Tool ist das Gegenstück zum Upload: Es kann komplette Snapshots
-von pCloud herunterladen und lokal rekonstruieren — auf zwei sehr unterschiedliche Arten.
+Das Restore-Tool ist das universelle Gegenstück zum Upload. Es wurde von einem einfachen Snapshot-Tool zu einem Hochleistungs-Recovery-System ausgebaut, das sowohl historische Backups als auch Live-Daten effizient wiederherstellen kann.
 
-### Zwei Restore-Modi
+### Architektur & Modi
+
+Das System unterscheidet zwischen zwei grundlegenden Arbeitsweisen:
+
+1.  **Snapshot-Mode**: Nutzt den `content_index.json` (Deduplizierung via SHA256).
+2.  **Direct-Mode**: Lädt Dateien direkt via pCloud-Pfad oder ID (`folderid`, `fileid`), ohne einen Index zu benötigen.
 
 | Modus | Zielstruktur | Use-Case |
-|-------|-------------|----------|
-| **flat** (Default) | `out-dir/snapshot/relpath` | Schnelle Wiederherstellung eines Snapshots |
-| **object-store** | `_objects/ab/sha256` + `_snapshots/snap/relpath` (Hardlinks) | Mehrere Snapshots platzsparend |
+| :--- | :--- | :--- |
+| **flat** (Default) | `out-dir/[snapshot]/relpath` | Klassische Wiederherstellung auf Datei-Ebene. |
+| **object-store** | `_objects/ab/sha256` + `_snapshots/snap/relpath` | Platzsparende Speicherung mehrerer Snapshots via Hardlinks. |
 
-### Binary-Safe by Default
+### Hochleistungs-Parallelisierung
 
-**Das Problem:** Die erste Version nutzte `r.content.decode("utf-8")` zum Download.
-Das funktioniert für Text — aber bei Binärdateien (Fotos, Videos, Archive)
-führt `decode()` zu **Datenkorruption** (Bytes, die kein gültiges UTF-8 sind,
-werden durch Ersatzzeichen ersetzt).
+Um den Durchsatz zu maximieren (insbesondere bei tausenden kleinen Dateien), nutzt das Skript eine hybride Download-Strategie:
 
-**Die Lösung:** Der Restore nutzt ausschließlich `download_binaryfile_to()` aus der
-pcloud_bin_lib.py (siehe Säule 1). Diese Funktion:
-
-1. Streamt die Daten chunksweise (`stream=True` + `iter_content`)
-2. Schreibt rohe Bytes direkt auf Disk (kein `decode()`)
-3. Berechnet SHA256 **während** des Streamens
-4. Löscht die Datei automatisch bei SHA256-Mismatch
-
-→ **Kein RAM-Overflow, keine Korruption, keine kaputten Fotos.**
-
-### FileID-Fallback — Maximale Ausfallsicherheit
-
-Jeder Index-Eintrag hat zwei Wege zum Original:
-
-```
-anchor_path  = "/Backup/rtb_1to1/_snapshots/2026-04-15/photos/bild.jpg"
-fileid       = 12345678  (pCloud-interne numerische ID)
+```mermaid
+flowchart TD
+    A[Start Restore] --> B{Dateigröße?}
+    B -- "< 50 MB" --> C[Parallel Download]
+    B -- ">= 50 MB" --> D[Sequential Download]
+    
+    C --> C1[ThreadPoolExecutor]
+    C1 --> C2[16 Threads gleichzeitig]
+    
+    D --> D1[Volle Bandbreite pro Datei]
+    D1 --> D2[RAM-schonendes Streaming]
+    
+    C2 --> E[Zusammenführung Stats]
+    D2 --> E
+    E --> F[Abschlussbericht]
 ```
 
-**Restore-Strategie (3 Stufen):**
+- **Kleine Dateien (< 50MB)**: Werden standardmäßig mit **16 Threads** parallel verarbeitet (`PARALLEL_DOWNLOAD_THREADS`). Dies kompensiert die Latenz einzelner API-Calls.
+- **Große Dateien (>= 50MB)**: Werden nacheinander geladen, um die verfügbare Bandbreite optimal zu nutzen und den Overhead durch Thread-Context-Switches bei massiven Datenmengen zu vermeiden.
+
+### Smart Resume (Stage 1)
+
+Das System erkennt bereits vorhandene Dateien im Zielverzeichnis und überspringt diese intelligent:
+
+1.  **Snapshot-Mode (SHA-basiert)**: Wenn `local_file` existiert + `SHA256` im Index steht + `--verify` aktiv ist -> Vollständige Inhaltsprüfung vor Skip.
+2.  **Direct-Mode (Size-basiert)**: Da pCloud-Live-Ordner oft keine SHA-Werte direkt liefern, prüft das Tool die Dateigröße. `local_size == remote_size` -> Skip.
+
+### Sicherheitskonzept: Path-Traversal-Guard
+
+Da `relpath`-Werte aus externen Quellen (Index oder API-Response) kommen, wird jeder Zielpfad vor dem Schreiben validiert:
 
 ```python
-# In download_file_with_verify() und download_via_fileid():
-
-# Stufe 1: Versuche anchor_path (Pfad-basiert)
-if anchor_path:
-    if download_file_with_verify(cfg, anchor_path, local_dest, sha256):
-        return SUCCESS
-    
-# Stufe 2: Fallback auf fileid (ID-basiert)
-if fileid:
-    if download_via_fileid(cfg, fileid, local_dest, sha256):
-        return SUCCESS
-
-# Stufe 3: Fail (kein Weg zum Original)
-return FAILED
+# Path-Traversal-Guard
+expected_prefix = os.path.normpath(base_out_dir) + os.sep
+normalized_dest = os.path.normpath(local_dest)
+if not normalized_dest.startswith(expected_prefix):
+    raise SecurityError("Path-Traversal Versuch blockiert")
 ```
 
-**Warum zwei Wege?**
-- `anchor_path` kann veraltet sein (Snapshot umbenannt/verschoben)
-- `fileid` ist permanent (solange die Datei existiert)
-- Umgekehrt: `fileid` fehlt manchmal bei alten Index-Einträgen
-- **Zusammen:** Maximale Chance auf erfolgreichen Download
+Dies stellt sicher, dass keine Dateien außerhalb des definierten `--out-dir` geschrieben werden können (z.B. durch Manipulation von `relpath` zu `../../etc/shadow`).
 
-### SHA-Caching & Deduplizierung
+### Thread-Safety & Stats
 
-Bei Snapshots mit vielen identischen Dateien (z.B. OS-Backups wo sich
-nur wenige Dateien ändern) wäre es Verschwendung, die gleiche Datei
-mehrfach herunterzuladen.
+Alle Status-Updates (Erfolgsrate, Download-Volumen, Fortschritt) werden über einen globalen `threading.Lock()` abgesichert. Die Fortschrittsanzeige berechnet dynamisch die Geschwindigkeit (MB/s) und die verbleibende Zeit (ETA) über den gesamten Batch.
 
-**So funktioniert die Dedup im Flat-Modus:**
-
-```python
-sha_cache = {}  # {sha256_hash → lokaler_pfad}
-
-for item in snapshot_items:
-    sha256 = item["sha256"]
-    
-    # Dedup-Check: Haben wir diese Datei schon heruntergeladen?
-    if sha256 in sha_cache:
-        cached_src = sha_cache[sha256]
-        
-        # Erstelle Hardlink (sehr schnell, kein Platzverbrauch)
-        try:
-            os.link(cached_src, local_dest)
-        except OSError:
-            # Cross-Filesystem? → Normale Kopie
-            shutil.copy2(cached_src, local_dest)
-        continue
-    
-    # Noch nicht im Cache → Download + Verify
-    download_file_with_verify(cfg, anchor_path, local_dest, sha256)
-    sha_cache[sha256] = local_dest  # Für spätere Dedup
-```
-
-**Im Object-Store-Modus** ist die Dedup noch stärker:
-- Jede SHA256-Datei existiert nur einmal in `_objects/ab/sha256`
-- Alle Snapshot-Einträge sind Hardlinks auf das gleiche Object
-- Bei mehreren Snapshots: gigantische Platzersparnis
-
-### Sicherheitsfeature: Path-Traversal-Guard
-
-Weil die `relpath`-Werte aus dem Index kommen (und theoretisch manipuliert
-sein könnten), prüft der Restore:
-
-```python
-# Sicherstellen, dass der Ziel-Pfad INNERHALB des Restore-Verzeichnisses liegt
-expected_prefix = os.path.join(base_out_dir) + os.sep
-normalized = os.path.normpath(local_dest)
-if not normalized.startswith(expected_prefix):
-    log(f"✗ Path-Traversal verhindert: {relpath}", "error")
-    stats["failed"] += 1
-    continue  # Datei wird übersprungen
-```
-
-→ Ein `relpath` wie `../../etc/passwd` kann keinen Schaden anrichten.
-
-### CLI-Beispiele
+### CLI-Anwendungsfälle
 
 ```bash
-# Verfügbare Snapshots auflisten
-python pcloud_restore.py --manifest pcloud --list-snapshots
+# A. Snapshot-Restore (Dedupliziert & Parallel)
+python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-120000 --out-dir /mnt/recovery --download --verify
 
-# Plan anzeigen (kein Download)
-python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
-    --out-dir /tmp/restore
+# B. Direct Folder Download (Kein Index nötig)
+python pcloud_restore.py --manifest pcloud --folder "/Wichtig/Projekte/2026" --out-dir ./local_copy --download
 
-# Echtes Restore mit SHA256-Verifikation (flat)
-python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
-    --out-dir /srv/restore --download --verify
-
-# Object-Store-Modus (mehrere Snapshots, platzsparend)
-python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
-    --mode object-store \
-    --local-objects-root /srv/restore/_objects \
-    --local-snapshots-root /srv/restore/_snapshots \
-    --download --verify
-
-# Bestehenden Restore nur verifizieren (kein erneuter Download)
-python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-093021 \
-    --out-dir /srv/restore --verify-only
+# C. Gezielte Datei-Rettung via ID
+python pcloud_restore.py --manifest pcloud --fileid 12345678 --out-dir . --download
 ```
 
 ---
