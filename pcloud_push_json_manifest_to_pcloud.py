@@ -1586,7 +1586,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             try:
                 if not dry:
                     pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
-                    pc.copyfolder(cfg, path=template_path, topath=dest_snapshot_dir, noover=True)
+                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_path=dest_snapshot_dir, noover=True, copycontentonly=True)
                 _log(f"[template] ✓ Template kopiert (~2-5s statt ~5min)")
                 template_used = True
                 
@@ -1597,7 +1597,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                     for relpath in sorted(to_delete, key=lambda p: -p.count("/")):
                         try:
                             if not dry:
-                                pc.delete_folder(cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=False)
+                                pc.call_with_backoff(pc.delete_folder, cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=False)
                             deleted += 1
                         except Exception as e:
                             _log(f"[warn] Konnte {relpath} nicht löschen: {e}")
@@ -1634,8 +1634,8 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                 if (to_add or to_delete) and not dry:
                     _log("[template] Aktualisiere Template mit neuer Struktur...")
                     try:
-                        pc.delete_folder(cfg, path=template_path, recursive=True)
-                        pc.copyfolder(cfg, path=dest_snapshot_dir, topath=template_path, noover=True)
+                        pc.call_with_backoff(pc.delete_folder, cfg, path=template_path, recursive=True)
+                        pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_path=template_path, noover=True, copycontentonly=True)
                         _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
                         _log("[template] ✓ Template aktualisiert")
                     except Exception as e:
@@ -1726,7 +1726,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             if not template_exists and len(manifest_folders) > 50 and not dry:
                 _log("[template] Erstelle initiales Template (Ordner sind noch leer)...")
                 try:
-                    pc.copyfolder(cfg, path=dest_snapshot_dir, topath=template_path, noover=True)
+                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_path=template_path, noover=True, copycontentonly=True)
                     _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
                     _log("[template] ✓ Template erstellt für zukünftige Snapshots")
                 except Exception as e:
@@ -2273,7 +2273,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             print(f"[dry] delete snapshot dir: {rmpath}")
             print(f"[dry] delete manifest: /srv/pcloud-archive/manifests/{sdel}.json")
         else:
-            pc.delete_folder(cfg, path=rmpath, recursive=True)
+            pc.call_with_backoff(pc.delete_folder, cfg, path=rmpath, recursive=True)
             
             # Paritäts-Cleanup: Manifest löschen wenn Remote-Snapshot gelöscht wird
             manifest_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
@@ -2441,10 +2441,10 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         try:
             # copyfolder mit copycontentonly=True
             # Kopiert NUR den INHALT von basis_snapshot in den neuen Ordner
-            result = pc.copyfolder(cfg, 
-                                   from_path=basis_path, 
-                                   to_path=dest_snapshot_dir, 
-                                   copycontentonly=True)
+            result = pc.call_with_backoff(pc.copyfolder, cfg, 
+                                          from_path=basis_path, 
+                                          to_path=dest_snapshot_dir, 
+                                          copycontentonly=True)
             
             if verbose:
                 _log(f"[delta-copy][2/6] copyfolder result: {json.dumps(result, indent=2)}")
@@ -2477,7 +2477,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
             # Cleanup: Versuche geklonten Snapshot zu löschen
             try:
-                pc.delete_folder(cfg, path=dest_snapshot_dir, recursive=True)
+                pc.call_with_backoff(pc.delete_folder, cfg, path=dest_snapshot_dir, recursive=True)
             except Exception:
                 pass
             return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
@@ -2499,7 +2499,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         # Cleanup
         if not dry:
             try:
-                pc.delete_folder(cfg, path=dest_snapshot_dir, recursive=True)
+                pc.call_with_backoff(pc.delete_folder, cfg, path=dest_snapshot_dir, recursive=True)
             except Exception:
                 pass
         return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
