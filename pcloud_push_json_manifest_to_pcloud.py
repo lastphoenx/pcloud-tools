@@ -1585,8 +1585,8 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             _log(f"[template] Kopiere Template → {snapshot_name} ...")
             try:
                 if not dry:
-                    pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
-                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_path=dest_snapshot_dir, noover=True, copycontentonly=True)
+                    dest_snapshot_fid = pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
+                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_folderid=dest_snapshot_fid, noover=True, copycontentonly=True)
                 _log(f"[template] ✓ Template kopiert (~2-5s statt ~5min)")
                 template_used = True
                 
@@ -1635,7 +1635,8 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                     _log("[template] Aktualisiere Template mit neuer Struktur...")
                     try:
                         pc.call_with_backoff(pc.delete_folder, cfg, path=template_path, recursive=True)
-                        pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_path=template_path, noover=True, copycontentonly=True)
+                        template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
+                        pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
                         _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
                         _log("[template] ✓ Template aktualisiert")
                     except Exception as e:
@@ -1726,8 +1727,8 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             if not template_exists and len(manifest_folders) > 50 and not dry:
                 _log("[template] Erstelle initiales Template (Ordner sind noch leer)...")
                 try:
-                    pc.call_with_backoff(pc.ensure_path, cfg, template_path)
-                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_path=template_path, noover=True, copycontentonly=True)
+                    template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
+                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
                     _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
                     _log("[template] ✓ Template erstellt für zukünftige Snapshots")
                 except Exception as e:
@@ -2430,7 +2431,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     if not dry:
         try:
             pc.ensure_path(cfg, snapshots_root)  # Parent sicherstellen
-            pc.ensure_path(cfg, dest_snapshot_dir)  # Zielordner anlegen!
+            dest_snapshot_fid = pc.ensure_path(cfg, dest_snapshot_dir)  # Zielordner anlegen!
             _log(f"[delta-copy][2/6] ✓ Zielordner angelegt: {dest_snapshot_dir}")
         except Exception as e:
             _log(f"[delta-copy][ERROR] Konnte Zielordner nicht anlegen: {e}")
@@ -2444,7 +2445,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             # Kopiert NUR den INHALT von basis_snapshot in den neuen Ordner
             result = pc.call_with_backoff(pc.copyfolder, cfg, 
                                           from_path=basis_path, 
-                                          to_path=dest_snapshot_dir, 
+                                          to_folderid=dest_snapshot_fid, 
                                           copycontentonly=True)
             
             if verbose:
