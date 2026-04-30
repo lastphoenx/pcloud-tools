@@ -1726,6 +1726,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             if not template_exists and len(manifest_folders) > 50 and not dry:
                 _log("[template] Erstelle initiales Template (Ordner sind noch leer)...")
                 try:
+                    pc.call_with_backoff(pc.ensure_path, cfg, template_path)
                     pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_path=template_path, noover=True, copycontentonly=True)
                     _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
                     _log("[template] ✓ Template erstellt für zukünftige Snapshots")
