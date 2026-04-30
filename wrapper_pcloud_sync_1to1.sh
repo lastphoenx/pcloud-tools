@@ -12,11 +12,11 @@ MANI=${MANI:-${MAIN_DIR}/pcloud_json_manifest.py}
 PUSH=${PUSH:-${MAIN_DIR}/pcloud_push_json_manifest_to_pcloud.py}
 DELTA_CHECK=${DELTA_CHECK:-${MAIN_DIR}/pcloud_quick_delta.py}
 
-# Python-Interpreter (venv bevorzugt)
-if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
-  PY="${VIRTUAL_ENV}/bin/python"
-elif [[ -x "/opt/apps/pcloud-tools/venv/bin/python" ]]; then
+# Python-Interpreter (dedizierte pcloud-venv bevorzugt)
+if [[ -x "/opt/apps/pcloud-tools/venv/bin/python" ]]; then
   PY="/opt/apps/pcloud-tools/venv/bin/python"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+  PY="${VIRTUAL_ENV}/bin/python"
 else
   PY="${PY:-python3}"
 fi
