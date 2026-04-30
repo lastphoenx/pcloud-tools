@@ -225,15 +225,15 @@ last_snapshot_mtime() {
   stat -c %Y "$latest_dir" 2>/dev/null || echo 0
 }
 
-# --- Preflight: liefert Status "OK|OVERQUOTA|DOWN", keine Policy hier ---
+# --- Preflight: liefert Status "OK|OVERQUOTA|DOWN: <reason>", keine Policy hier ---
 preflight_or_mark_down() {
   "${PY}" - <<'PY'
 import os, sys, json, traceback
 sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
 try:
     import pcloud_bin_lib as pc
-except Exception:
-    print("DOWN"); sys.exit(0)
+except Exception as e:
+    print(f"DOWN: Import error: {e}"); sys.exit(0)
 
 try:
     cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
@@ -241,8 +241,11 @@ try:
 
     # 1) Auth/Token + Quota via REST
     ui = pc._rest_get(cfg, "userinfo", {"getauth": 1})
-    if int(ui.get("result", -1)) != 0:
-        print("DOWN"); sys.exit(0)
+    res = int(ui.get("result", -1))
+    if res != 0:
+        print(f"DOWN: Auth/UserInfo failed (Result {res})")
+        sys.exit(0)
+
     info = ui.get("userinfo") or {}
     used = int(info.get("usedquota") or 0)
     quota = int(info.get("quota") or 0)
@@ -251,13 +254,15 @@ try:
 
     # 2) Reachability via listfolder('/')
     lf = pc._rest_get(cfg, "listfolder", {"path": "/", "nofiles": 1, "showpath": 1})
-    if int(lf.get("result", -1)) != 0:
-        print("DOWN"); sys.exit(0)
+    res_lf = int(lf.get("result", -1))
+    if res_lf != 0:
+        print(f"DOWN: API connectivity check failed (Result {res_lf})")
+        sys.exit(0)
 
     print("OK")
-except Exception:
+except Exception as e:
     # Netzwerk/Timeout/etc.
-    print("DOWN")
+    print(f"DOWN: {type(e).__name__}: {str(e)}")
 PY
 }
 
@@ -563,7 +568,7 @@ done
 case "$PF" in
   OK)        ;;
   OVERQUOTA) _log WARN "pCloud Preflight: Konto über Quota – Sync wird übersprungen."; exit 0 ;;
-  DOWN)      _log WARN "pCloud Preflight: API/Auth nicht erreichbar – Sync wird übersprungen (nach ${PCLOUD_PREFLIGHT_RETRIES} Versuch(en))."; exit 0 ;;
+  DOWN*)     _log WARN "pCloud Preflight fehlgeschlagen: $PF – Sync wird übersprungen (nach ${PCLOUD_PREFLIGHT_RETRIES} Versuch(en))."; exit 0 ;;
   *)         _log WARN "pCloud Preflight: unbekannter Status '$PF' – Sync wird übersprungen (nach ${PCLOUD_PREFLIGHT_RETRIES} Versuch(en))."; exit 0 ;;
 esac
 
