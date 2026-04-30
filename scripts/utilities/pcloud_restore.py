@@ -570,8 +570,11 @@ Beispiele:
     if not args.download:
         log("Plan-Modus (keine Downloads, nur Vorschau):")
         for it in sel[:10]:
+            relpath = it.get("relpath") or "<unknown>"
+            sha_raw = it.get("sha256")
+            sha_preview = sha_raw[:8] if isinstance(sha_raw, str) and sha_raw else "?"
             size_str = f", {it['size']:,} B" if it.get("size") is not None else ""
-            print(f"  {it.get('relpath')} [{it.get('sha256', '?')[:8]}]{size_str}")
+            print(f"  {relpath} [{sha_preview}]{size_str}")
         if len(sel) > 10:
             print(f"  ... ({len(sel) - 10} weitere)")
         known_sizes = [it["size"] for it in sel if it.get("size") is not None]
