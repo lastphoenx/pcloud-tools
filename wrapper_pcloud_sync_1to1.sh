@@ -61,6 +61,8 @@ mkdir -p "${PCLOUD_TEMP_DIR}" "${PCLOUD_ARCHIVE_DIR}/manifests" "${PCLOUD_ARCHIV
 LOCKFILE=${LOCKFILE:-/run/backup_pipeline.lock}
 WAIT_SEC=${WAIT_SEC:-7200}
 SAFETY_DELAY_SEC=${SAFETY_DELAY_SEC:-120}
+PCLOUD_PREFLIGHT_RETRIES=${PCLOUD_PREFLIGHT_RETRIES:-3}
+PCLOUD_PREFLIGHT_RETRY_DELAY_SEC=${PCLOUD_PREFLIGHT_RETRY_DELAY_SEC:-5}
 
 # ========= Logging =========
 PCLOUD_LOG=${PCLOUD_LOG:-/var/log/backup/pcloud_sync.log}
@@ -542,12 +544,27 @@ _db_init
 trap '_db_run_end FAILED $? "Script interrupted or failed"; exit' INT TERM ERR
 
 # Preflight (Status) + Policy im Wrapper
-PF="$(preflight_or_mark_down)"
+PF="DOWN"
+attempt=1
+while (( attempt <= PCLOUD_PREFLIGHT_RETRIES )); do
+  PF="$(preflight_or_mark_down)"
+  if [[ "$PF" == "OK" ]]; then
+    _log INFO "pCloud Preflight: OK"
+    break
+  fi
+
+  if (( attempt < PCLOUD_PREFLIGHT_RETRIES )); then
+    _log WARN "pCloud Preflight attempt ${attempt}/${PCLOUD_PREFLIGHT_RETRIES}: ${PF} (retry in ${PCLOUD_PREFLIGHT_RETRY_DELAY_SEC}s)"
+    sleep "$PCLOUD_PREFLIGHT_RETRY_DELAY_SEC"
+  fi
+  attempt=$((attempt + 1))
+done
+
 case "$PF" in
-  OK)        _log INFO "pCloud Preflight: OK" ;;
+  OK)        ;;
   OVERQUOTA) _log WARN "pCloud Preflight: Konto über Quota – Sync wird übersprungen."; exit 0 ;;
-  DOWN)      _log WARN "pCloud Preflight: API/Auth nicht erreichbar – Sync wird übersprungen."; exit 0 ;;
-  *)         _log WARN "pCloud Preflight: unbekannter Status '$PF' – Sync wird übersprungen."; exit 0 ;;
+  DOWN)      _log WARN "pCloud Preflight: API/Auth nicht erreichbar – Sync wird übersprungen (nach ${PCLOUD_PREFLIGHT_RETRIES} Versuch(en))."; exit 0 ;;
+  *)         _log WARN "pCloud Preflight: unbekannter Status '$PF' – Sync wird übersprungen (nach ${PCLOUD_PREFLIGHT_RETRIES} Versuch(en))."; exit 0 ;;
 esac
 
 # Safety-Delay nach RTB
