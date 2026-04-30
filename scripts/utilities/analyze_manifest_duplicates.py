@@ -26,6 +26,32 @@ def load_manifest(manifest_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def resolve_manifest_path(manifest_input: str) -> Path:
+    """Resolve manifest input to a concrete JSON file path.
+
+    Accepts either:
+    - a path to a JSON file
+    - a directory containing JSON manifests (newest *.json is used)
+    """
+    path = Path(manifest_input)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest nicht gefunden: {manifest_input}")
+
+    if path.is_file():
+        return path
+
+    if not path.is_dir():
+        raise ValueError(f"Manifest-Pfad ist weder Datei noch Verzeichnis: {manifest_input}")
+
+    candidates = [p for p in path.glob("*.json") if p.is_file()]
+    if not candidates:
+        raise FileNotFoundError(f"Keine JSON-Manifeste in Verzeichnis gefunden: {manifest_input}")
+
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return newest
+
+
 def extract_file_data(manifest: Dict[str, Any]) -> pd.DataFrame:
     """
     Extrahiere Datei-Informationen aus dem Manifest
@@ -376,7 +402,7 @@ def main():
     parser.add_argument(
         '--manifest',
         required=True,
-        help='Pfad zum JSON-Manifest (z.B. /srv/pcloud-archive/manifests/2026-04-10-075334.json)'
+        help='Pfad zur Manifest-Datei ODER zum Manifest-Verzeichnis (neueste *.json wird gewählt)'
     )
     parser.add_argument(
         '--output',
@@ -386,14 +412,16 @@ def main():
     
     args = parser.parse_args()
     
-    # Validierung
-    if not Path(args.manifest).exists():
-        print(f"✗ Fehler: Manifest nicht gefunden: {args.manifest}", file=sys.stderr)
+    # Validierung + Auflösung Datei/Verzeichnis
+    try:
+        manifest_path = resolve_manifest_path(args.manifest)
+    except Exception as e:
+        print(f"✗ Fehler: {e}", file=sys.stderr)
         sys.exit(1)
     
     # Verarbeitung
-    print(f"Lade Manifest: {args.manifest}")
-    manifest = load_manifest(args.manifest)
+    print(f"Lade Manifest: {manifest_path}")
+    manifest = load_manifest(str(manifest_path))
     
     snapshot_name = manifest.get('snapshot', '?')
     version = manifest.get('version', '?')
