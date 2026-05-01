@@ -399,7 +399,7 @@ build_and_push() {
   local mani_jsonl="${mani}.tmp.jsonl"
   local manifest_exists=0
   local manifest_incomplete=0
-  
+
   # Prüfe ob Manifest bereits vollständig vorhanden
   if [[ -f "$mani" ]]; then
     # Manifest existiert - prüfe ob gültig

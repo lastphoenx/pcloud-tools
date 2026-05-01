@@ -38,6 +38,7 @@ to_yes_no() {
 # === Defaults ===
 RTB_BASE="/mnt/backup/rtb_nas"
 ARCHIVE_BASE="/srv/pcloud-archive"
+PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
 KEEP_SNAPSHOT=""
 KEEP_LOCAL_MANIFEST="yes"
 ASSUME_YES="no"
@@ -206,6 +207,14 @@ if [ "$KEEP_LOCAL_MANIFEST" = "yes" ]; then
         done
         if [ -f "$KEEP_MANIFEST_PATH" ]; then
             echo "   ✓ Keep-Manifest behalten: $KEEP_SNAPSHOT.json"
+            # Manifest auch nach PCLOUD_TEMP_DIR kopieren damit der nächste Lauf es findet
+            TEMP_MANI="${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
+            if [[ "$DRY_RUN" = "yes" ]]; then
+                echo "[dry] cp $KEEP_MANIFEST_PATH $TEMP_MANI"
+            else
+                cp "$KEEP_MANIFEST_PATH" "$TEMP_MANI"
+                echo "   ✓ Manifest nach Temp kopiert: $TEMP_MANI"
+            fi
         else
             echo "   ○ Keep-Manifest nicht vorhanden: $KEEP_SNAPSHOT.json"
         fi
