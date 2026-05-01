@@ -269,22 +269,53 @@ echo "════════════════════════�
 echo "[5/5] Final Check"
 echo "════════════════════════════════════════════════════════════════"
 
-echo "📊 Clean-State Status:"
-echo ""
-echo "RTB-Snapshots:"
-ls -lh "$RTB_BASE" | grep -E '^d' | awk '{print "  " $9 " (" $5 ")"}'
-echo ""
-echo "Latest-Symlink:"
-ls -lh "$RTB_BASE/latest" | awk '{print "  → " $11}'
-echo ""
-echo "Archive:"
-echo "  manifests/: $(ls -1 "$ARCHIVE_BASE/manifests/" 2>/dev/null | wc -l) Dateien"
-echo "  indexes/:   $(ls -1 "$ARCHIVE_BASE/indexes/" 2>/dev/null | wc -l) Dateien"
-if [ "$KEEP_LOCAL_MANIFEST" = "yes" ]; then
-    if [ -f "$KEEP_MANIFEST_PATH" ]; then
-        echo "  keep-manifest: vorhanden ($KEEP_SNAPSHOT.json)"
+if [[ "$DRY_RUN" = "yes" ]]; then
+    # Soll-Zustand berechnen (was nach --execute der Fall wäre)
+    echo "📊 Erwarteter Soll-Zustand nach --execute:"
+    echo ""
+    echo "RTB-Snapshots:"
+    echo "  $KEEP_SNAPSHOT (behalten)"
+    if [ "${#DELETE_SNAPSHOTS[@]}" -gt 0 ]; then
+        for s in "${DELETE_SNAPSHOTS[@]}"; do
+            echo "  $s → gelöscht"
+        done
+    fi
+    echo ""
+    echo "Latest-Symlink:"
+    echo "  → $KEEP_SNAPSHOT"
+    echo ""
+    echo "Archive:"
+    if [ "$KEEP_LOCAL_MANIFEST" = "yes" ]; then
+        _expected_manifests=0
+        if [ -f "$KEEP_MANIFEST_PATH" ]; then
+            _expected_manifests=1
+        fi
+        echo "  manifests/: $_expected_manifests Datei(en) (nur $KEEP_SNAPSHOT.json)"
     else
-        echo "  keep-manifest: nicht vorhanden ($KEEP_SNAPSHOT.json)"
+        echo "  manifests/: 0 Dateien (alle gelöscht)"
+    fi
+    echo "  indexes/:   0 Dateien (alle gelöscht)"
+    echo ""
+    echo "  → Führe '--execute' aus um diesen Zustand herzustellen"
+else
+    # Ist-Zustand nach echter Ausführung
+    echo "📊 Clean-State Status (Ist-Zustand):"
+    echo ""
+    echo "RTB-Snapshots:"
+    ls -lh "$RTB_BASE" | grep -E '^d' | awk '{print "  " $9 " (" $5 ")"}'
+    echo ""
+    echo "Latest-Symlink:"
+    ls -lh "$RTB_BASE/latest" | awk '{print "  → " $11}'
+    echo ""
+    echo "Archive:"
+    echo "  manifests/: $(ls -1 "$ARCHIVE_BASE/manifests/" 2>/dev/null | wc -l) Dateien"
+    echo "  indexes/:   $(ls -1 "$ARCHIVE_BASE/indexes/" 2>/dev/null | wc -l) Dateien"
+    if [ "$KEEP_LOCAL_MANIFEST" = "yes" ]; then
+        if [ -f "$KEEP_MANIFEST_PATH" ]; then
+            echo "  keep-manifest: vorhanden ($KEEP_SNAPSHOT.json)"
+        else
+            echo "  keep-manifest: nicht vorhanden ($KEEP_SNAPSHOT.json)"
+        fi
     fi
 fi
 echo ""
