@@ -665,7 +665,7 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
   fi
   export PCLOUD_SKIP_FINALIZE=1
   for s in "${SNAPS[@]}"; do
-    build_and_push "$RTB/$s"
+    build_and_push "$RTB/$s" || exit 1
   done
   # einmaliges Finalize
   "${PY}" - <<'PY'

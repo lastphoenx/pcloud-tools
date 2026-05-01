@@ -1370,36 +1370,60 @@ def upload_streaming(cfg: Dict[str, Any],
     if progresshash:
         params["progresshash"] = progresshash
 
-    tls = _connect(cfg["host"], cfg["port"], cfg["timeout"])
-    sent = 0
+    retries_raw = os.environ.get("PCLOUD_API_RETRIES", "3")
     try:
-        req = _build_request("uploadfile", params, fsize)
-        tls.sendall(req)
-        with open(local_path, "rb") as f:
-            while True:
-                buf = f.read(max(64 * 1024, int(chunk_size)))
-                if not buf:
-                    break
-                tls.sendall(buf)
-                sent += len(buf)
-                if progress_cb:
-                    try:
-                        progress_cb(sent, fsize)
-                    except Exception:
-                        pass
-
-        # Antwort lesen
-        resp_len = struct.unpack(LE_U32, _recv_exact(tls, 4))[0]
-        payload = _recv_exact(tls, resp_len)
-        reader = _BinReader(payload)
-        top = reader._read_value()
-        _expect_ok(top)
-        return top
-    finally:
+        max_retries = int(retries_raw)
+    except (TypeError, ValueError):
+        max_retries = 3
+    if max_retries < 1:
+        max_retries = 1
+    last_err = None
+    
+    for attempt in range(max_retries):
+        tls = None
         try:
-            tls.close()
-        except Exception:
-            pass
+            tls = _connect(cfg["host"], cfg["port"], cfg["timeout"])
+            sent = 0
+            req = _build_request("uploadfile", params, fsize)
+            tls.sendall(req)
+            with open(local_path, "rb") as f:
+                while True:
+                    buf = f.read(max(64 * 1024, int(chunk_size)))
+                    if not buf:
+                        break
+                    tls.sendall(buf)
+                    sent += len(buf)
+                    if progress_cb:
+                        try:
+                            progress_cb(sent, fsize)
+                        except Exception:
+                            pass
+
+            # Antwort lesen
+            resp_len_buf = _recv_exact(tls, 4)
+            resp_len = struct.unpack(LE_U32, resp_len_buf)[0]
+            payload = _recv_exact(tls, resp_len)
+            reader = _BinReader(payload)
+            top = reader._read_value()
+            _expect_ok(top)
+            return top
+            
+        except (socket.timeout, TimeoutError, ConnectionError, ssl.SSLError, BrokenPipeError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise last_err
+        finally:
+            if tls:
+                try:
+                    tls.close()
+                except Exception:
+                    pass
+    
+    # Defensive fallback: loop should always run at least once, but keep
+    # an explicit error to avoid raising None on unexpected control flow.
+    raise RuntimeError("upload_streaming failed without captured exception")
 
 def verify_remote_vs_local(cfg: Dict[str, Any],
                            *,
