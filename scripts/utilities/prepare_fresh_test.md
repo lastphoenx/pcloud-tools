@@ -7,6 +7,7 @@ Bereitet einen Clean-State für Workflow-Tests vor:
 - Löscht alle anderen Snapshot-Ordner unter `RTB_BASE`
 - Setzt den `latest`-Symlink auf den Keep-Snapshot
 - Leert Archive (`indexes` immer, `manifests` abhängig von `--keep-local-manifest`)
+- Bei `--keep-local-manifest yes`: kopiert das Keep-Manifest zusätzlich nach `${PCLOUD_TEMP_DIR}/pcloud_mani.<SNAPSHOT>.json`
 - Räumt Temp-Files auf (`/tmp/pcloud_index_*.json`)
 
 **Sicherheitsmodell:**  
@@ -27,6 +28,7 @@ Für echte Ausführung muss `--execute` explizit angegeben werden.
 | `--yes` | nein | — | Ohne Rückfrage (nur mit `--execute` sinnvoll) |
 | `--rtb-base <PATH>` | nein | `/mnt/backup/rtb_nas` | RTB Basis-Pfad |
 | `--archive-base <PATH>` | nein | `/srv/pcloud-archive` | Archiv-Basis |
+| `--env-file <PATH>` | nein | `/opt/apps/pcloud-tools/main/.env` | Quelle für `PCLOUD_TEMP_DIR`, `PCLOUD_DEST`, `PCLOUD_DB_NAME` |
 | `-h`, `--help` | nein | — | Hilfe anzeigen |
 
 ---
@@ -98,6 +100,38 @@ bash /opt/apps/pcloud-tools/main/scripts/utilities/prepare_fresh_test.sh \
 
 ### Nach Cleanup: Upload starten
 
+### Vor dem Upload: DB und pCloud-Remote manuell bereinigen
+
+```bash
+# 1) DB prüfen
+sudo mysql -e "SELECT snapshot_name, status, started_at, finished_at FROM pcloud_backup.backup_runs ORDER BY started_at DESC LIMIT 50;"
+
+# 2) Nur verwaiste Runs löschen (alles außer Keep-Snapshot)
+sudo mysql -e "DELETE FROM pcloud_backup.backup_runs WHERE snapshot_name <> '2026-04-27-173201';"
+
+# 3) Optional Full-Reset (nur wenn Remote wirklich leer ist)
+sudo mysql -e "DELETE FROM pcloud_backup.backup_runs;"
+
+# 4) Verifikation (wichtig: COUNT(*) statt COUNT())
+sudo mysql -e "SELECT COUNT(*) AS runs FROM pcloud_backup.backup_runs; SELECT COUNT(*) AS phases FROM pcloud_backup.backup_phases; SELECT COUNT(*) AS backfills FROM pcloud_backup.gap_backfills;"
+```
+
+```bash
+# pCloud Remote manuell prüfen/bereinigen
+# Snapshot-Ordner:
+/Backup/rtb_1to1/_snapshots/<SNAPSHOT_NAME>
+
+# Aktiver Index:
+/Backup/rtb_1to1/_snapshots/_index/content_index.json
+
+# Optionales Restore aus Archiv:
+/Backup/rtb_1to1/_snapshots/_index/archive/2026-04-27-173201_index.json
+# -> nach:
+/Backup/rtb_1to1/_snapshots/_index/content_index.json
+```
+
+### Dann Upload starten
+
 ```bash
 # venv aktivieren
 source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
@@ -132,7 +166,7 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 
 ```bash
 /opt/apps/pcloud-tools/venv/bin/python /opt/apps/pcloud-tools/main/pcloud_push_json_manifest_to_pcloud.py \
-  --manifest /tmp/pcloud_mani.2026-04-27-173201.json \
+  --manifest /srv/pcloud-temp/pcloud_mani.2026-04-27-173201.json \
   --dest-root /Backup/rtb_1to1 \
   --snapshot-mode 1to1 \
   --use-delta-copy \
@@ -158,6 +192,7 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 | RTB-Snapshots | Alle außer `--keep-snapshot` werden gelöscht |
 | `latest`-Symlink | Wird auf `--keep-snapshot` gesetzt |
 | `manifests/*.json` | Bei `--keep-local-manifest yes`: alle außer `<keep-snapshot>.json`; bei `no`: alle |
+| `${PCLOUD_TEMP_DIR}/pcloud_mani.<keep-snapshot>.json` | Bei `--keep-local-manifest yes`: wird als Keep-Kopie angelegt; bei `no`: keine Keep-Kopie |
 | `indexes/*.json` | Immer alle gelöscht |
 | `/tmp/pcloud_index_*.json` | Immer gelöscht |
 | **pCloud (remote)** | **Nicht berührt** — muss manuell geleert werden |
@@ -260,6 +295,8 @@ Latest-Symlink:
 
 Archive:
   manifests/: 1 Datei(en) (nur 2026-04-27-173201.json)
+  keep-local-manifest: yes -> Keep-Manifest bleibt im Archiv
+  temp-manifest: /srv/pcloud-temp/pcloud_mani.2026-04-27-173201.json (wird aus Keep-Manifest kopiert, falls vorhanden)
   indexes/:   0 Dateien (alle gelöscht)
 
   → Führe '--execute' aus um diesen Zustand herzustellen
