@@ -15,8 +15,8 @@ Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
 | # | Säule | Hauptkomponente | Zweck |
 |---|-------|-----------------|-------|
 | 1 | **Fundament** | `pcloud_bin_lib.py` | Binary-API, Streaming, RAM-Schutz |
-| 2 | **Upload & Gap-Handling** | `wrapper_pcloud_sync_1to1.sh` | Orchestrierung, Lückenreparatur |
-| 3 | **Delta-Copy (TURBO)** | `pcloud_push_json_manifest_to_pcloud.py` | Server-seitiges Klonen |
+| 2 | **Orchestrierung & Smart-Sync** | `wrapper_pcloud_sync_1to1.sh` | Strategiewahl, Lückenreparatur, Flag-Passthrough |
+| 3 | **Upload-Engine (Smart-Controller)** | `pcloud_push_json_manifest_to_pcloud.py` | Turbo-Mode, Template-Safe, Safe-Mode |
 | 4 | **Resilient Restore** | `scripts/pcloud_restore.py` | Binary-safe Download, Dedup |
 | 5 | **Recovery & Time-Travel** | `scripts/pcloud_repair_index.py` | Index-Reparatur, Snapshot-Rekonstruktion |
 
@@ -33,19 +33,19 @@ Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
 │  rtb_wrapper.sh (Orchestrator)                         │
 │  ├─ EntropyWatcher Safety Gate                         │
 │  ├─ rsync_tmbackup.sh                                  │
-│  └─ wrapper_pcloud_sync_1to1.sh ⬅ HAUPTKOMPONENTE     │
+│  └─ wrapper_pcloud_sync_1to1.sh ⬅ Orchestrator         │
 └─────────────────────────────────────────────────────────┘
                          │
         ┌────────────────┴────────────────┐
         │                                 │
         ▼                                 ▼
 ┌──────────────────┐            ┌──────────────────┐
-│ Gap-Detection    │            │ Upload-Modi      │
-│ & Repair         │            │                  │
+│ Gap-Detection    │            │ Smart-Strategy   │
+│ & Repair         │            │ (Controller) ⭐  │
 ├──────────────────┤            ├──────────────────┤
-│ • Conservative   │            │ • Full Mode      │
-│ • Optimistic ⭐  │            │ • Delta Mode ⚡  │
-│ • Aggressive     │            │ • Resume         │
+│ • Conservative   │            │ • TURBO-MODE ⚡  │
+│ • Optimistic ⭐  │            │ • TEMPLATE-SAFE  │
+│ • Aggressive     │            │ • SAFE-MODE      │
 └──────────────────┘            └──────────────────┘
         │                                 │
         └────────────┬────────────────────┘
@@ -75,6 +75,69 @@ Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
         │  + Archive-System           │
         └─────────────────────────────┘
 ```
+
+---
+
+## 🧠 Säule 3: Die Smart-Upload-Engine — SmartStrategyController
+
+Seit dem Architektur-Refactoring (v1.2) verfügt die Pipeline über eine zentrale Entscheidungs-Instanz: den **SmartStrategyController**. Dieser verhindert inkonsistente Upload-Entscheidungen und schützt die Quota durch eine deterministische Strategiewahl.
+
+### Der Single-Point-of-Decision
+
+Früher war die Entscheidung zwischen "Delta" und "Normal" über mehrere Skripte verteilt. Jetzt gibt es genau einen Eintrittspunkt:
+
+```python
+# pcloud_push_json_manifest_to_pcloud.py
+def push_1to1_smart_controller(cfg, manifest, dest_root, ...):
+    # 1. Metriken einheitlich erfassen (unified source)
+    metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
+    
+    # 2. Strategie deterministisch wählen
+    controller = SmartStrategyController()
+    strategy = controller.decide(metrics)
+    
+    # 3. Entscheidung loggen (maschinenlesbar für Auditing)
+    controller.log_decision(strategy, metrics, snapshot_name)
+    
+    # 4. An Executor übergeben (mit klarem Modus)
+    if strategy == SyncStrategy.TURBO_MODE:
+        return push_1to1_delta_mode(..., basis_snapshot=metrics["basis_snapshot"])
+    else:
+        return push_1to1_mode(..., strategy_mode=strategy.value)
+```
+
+### CLI-Flags & Wrapper-Passthrough
+
+Der `wrapper_pcloud_sync_1to1.sh` unterstützt nun eine Whitelist für CLI-Flags, die direkt an die Upload-Engine durchgereicht werden:
+
+| Flag | Wirkung |
+|------|---------|
+| `--dry-run` | Führt keine API-Änderungen durch (Upload/Delete/Copy), loggt aber alle geplanten Aktionen. |
+| `--use-delta-copy` | Erzwingt den **TURBO-MODE** (Delta-Copy), unabhängig von der Smart-Controller Entscheidung (Legacy-Support). |
+
+**Beispiel:**
+```bash
+./wrapper_pcloud_sync_1to1.sh 2026-05-01-120000 --dry-run
+```
+
+
+### Die drei Strategien
+
+| Strategie | Technischer Ablauf | Bedingung |
+|-----------|--------------------|-----------|
+| **TURBO-MODE** | `copyfolder` (Cloning) + Delta-Delete/Write | Hohe Übereinstimmung & Hohe Stub-Quote (Quota-Schutz) |
+| **TEMPLATE-SAFE** | `copyfolder` (Template) + Safe-Upload | Hohe Struktur-Übereinstimmung, aber Quota-Risiko bei Turbo |
+| **SAFE-MODE** | Full-Rebuild der Ordner + Safe-Upload | Keine Basis vorhanden oder API-Fehler (Fallback) |
+
+### Unified Metrics (Die Datenbasis)
+
+Der Controller nutzt nicht mehr lokale Schätzwerte, sondern die **pCloud-Cloud als Single Source of Truth**:
+1. **Source Snapshots**: Zählt valide Manifeste im `manifests/` Archiv.
+2. **Match-Ratio**: Vergleicht das aktuelle Manifest mit dem **echten Remote-Index** (`load_content_index`).
+3. **Stub-Ratio**: Berechnet die exakte Quota-Belastung basierend auf existierenden Stubs in der Cloud.
+
+### Quota-Sicherheitsnetz
+Der Controller wechselt automatisch von `TURBO` zu `TEMPLATE-SAFE`, wenn die `stub_ratio` zu niedrig ist. Dies verhindert, dass durch fehlerhaftes Klonen (viele reale Dateien statt Stubs) das pCloud-Konto unkontrolliert vollgeschrieben wird.
 
 ---
 

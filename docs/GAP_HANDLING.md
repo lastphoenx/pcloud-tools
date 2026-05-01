@@ -1,4 +1,4 @@
-# Gap-Handling System für pCloud-Backups
+mein# Gap-Handling System für pCloud-Backups
 
 **Version:** 1.0.0  
 **Status:** Production-Ready  
@@ -17,8 +17,44 @@ Das **Gap-Handling-System** ermöglicht die intelligente Reparatur von Lücken i
 **Key Benefits:**
 - 🚀 **3x-10x schneller** bei Szenario B (keine unnötigen Re-Uploads)
 - 🔒 **Automatische Integritäts-Reparatur** bei Szenario A
+- 🧠 **Smart Strategy Selection** (Automatischer Schutz vor Quota-Overfill)
 - 🎯 **Flexible Strategien** (Conservative, Optimistic, Aggressive)
 - 📊 **Vollständige Metriken** (Gaps, New, Rebuilt)
+
+---
+
+## 🧠 Smart Strategy Selection (Der Sicherheits-Wächter)
+
+Seit der Einführung des **SmartStrategyControllers** entscheidet das System bei jedem Lauf vollautomatisch über den wirtschaftlichsten und sichersten Weg.
+
+### Wie das System entscheidet:
+
+Das System bewertet drei Faktoren, bevor es den ersten Byte hochlädt:
+1. **Ähnlichkeit**: Wie viele Dateien sind identisch zum letzten Backup?
+2. **Quota-Schutz**: Sind die Dateien in pCloud bereits als platzsparende "Stubs" (Referenzen) vorhanden?
+3. **Struktur**: Passt die Ordner-Struktur zum existierenden Template?
+
+### Die 3 Betriebsmodi (Automatischer Wechsel):
+
+1. **TURBO-MODE (Die Snapshot-Kopie)** ⚡
+   - *Wann:* Wenn fast alles gleich ist und wir sicher sind, dass wir Platz sparen (hohe Stub-Quote).
+   - *Effekt:* pCloud klont das alte Backup intern. Wir löschen nur was weg ist und laden nur das Neue hoch.
+   - *Vorteil:* Höchste Geschwindigkeit.
+   - *Forcieren:* via `--use-delta-copy` Flag.
+
+2. **TEMPLATE-DELTA-SAFE (Der Struktur-Vorteil)** 🛡️
+   - *Wann:* Wenn die Dateien sich stark geändert haben oder wir dem Platzsparen nicht trauen, aber die Ordner gleich geblieben sind.
+   - *Effekt:* Wir kopieren nur das leere Ordner-Gerüst und laden alle Dateien sicher und einzeln hoch.
+   - *Vorteil:* Sicherster Schutz vor vollem pCloud-Speicher bei trotzdem schnellem Start.
+
+3. **SAFE-MODE (Der Neuaufbau)** 🏗️
+   - *Wann:* Erstes Backup, schwere Fehler oder keine Ähnlichkeit.
+   - *Effekt:* Alles wird von Grund auf neu erstellt.
+   - *Vorteil:* Maximale Robustheit.
+
+### Testing & Verification
+Für Entwickler steht das Flag `--dry-run` zur Verfügung. Es erlaubt die vollständige Simulation eines Uploads (inkl. Strategiewahl und Metrik-Berechnung), ohne reale Daten zu übertragen oder zu löschen.
+
 
 ---
 

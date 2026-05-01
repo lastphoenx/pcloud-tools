@@ -109,10 +109,15 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 /opt/apps/rtb/rtb_wrapper.sh
 
 # 3a) Hinweis: --check-only nur im rtb_wrapper vorhanden
-# Direkter pcloud-wrapper hat kein --check-only/--dry-run CLI-Flag
 
 # 3b) Direkter pcloud-tools Produktions-Lauf
 /opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
+
+# 3c) Direkter pcloud-tools Dry-Run
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201 --dry-run
+
+# 3d) Copy/Turbo erzwingen (direkter Wrapper)
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201 --use-delta-copy
 ```
 
 **Modus-Hinweis:**
@@ -122,7 +127,7 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 
 **Wie Modus explizit forcieren?**
 - `rtb_wrapper.sh`: kein direkter Modus-Parameter fuer Smart/Copy; nutzt den pcloud-wrapper-Default (Smart).
-- `wrapper_pcloud_sync_1to1.sh`: ebenfalls kein `--use-delta-copy`-Flag an der CLI.
+- `wrapper_pcloud_sync_1to1.sh`: unterstuetzt jetzt `--dry-run` und `--use-delta-copy` (Passthrough an das Push-Tool).
 - Explizites Forcieren von Copy/Turbo geht aktuell nur im Low-Level Push-Tool:
 
 ```bash
@@ -140,7 +145,8 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
   - `--force` (Safety-Gate umgehen)
   - `--upload-only /mnt/backup/rtb_nas/<SNAPSHOT>` (nur Upload, kein neues RTB-Backup)
 - `wrapper_pcloud_sync_1to1.sh`:
-  - keine `--check-only`/`--dry-run` CLI-Flags
+  - `wrapper_pcloud_sync_1to1.sh [SNAPSHOT|/path/to/SNAPSHOT] [--dry-run] [--use-delta-copy]`
+  - kein `--check-only` (das bleibt rtb_wrapper-only)
   - wichtige ENVs: `PCLOUD_MANIFEST_MODE=smart|full`, `PCLOUD_GAP_STRATEGY=conservative|optimistic|aggressive`
 
 ---
