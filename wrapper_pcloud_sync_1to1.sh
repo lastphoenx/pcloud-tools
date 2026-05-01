@@ -465,7 +465,7 @@ build_and_push() {
   # Upload-Modus: Smart (Automatische Wahl durch Strategy-Controller)
   _log INFO "Upload-Modus: Smart (Strategie-Controller)"
   
-  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE" || {
+  "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE" "${EXTRA_PUSH_ARGS[@]}" || {
     _db_phase_log "upload" "end" "FAILED"
     rm -f "$mani" "$mani_jsonl" 2>/dev/null || true
     return 1
@@ -513,6 +513,64 @@ build_and_push() {
 }
 
 # ========= Start =========
+# Optionaler Direktaufruf:
+#   wrapper_pcloud_sync_1to1.sh [SNAPSHOT|/pfad/zu/SNAPSHOT] [--dry-run] [--use-delta-copy]
+# Flags werden whitelisted und sicher (Array) an das Push-Tool weitergereicht.
+TARGET_SNAPSHOT=""
+declare -a EXTRA_PUSH_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run|--use-delta-copy)
+      EXTRA_PUSH_ARGS+=("$1")
+      shift
+      ;;
+    -h|--help)
+      cat <<EOF
+Usage:
+  $0 [SNAPSHOT|/path/to/SNAPSHOT] [--dry-run] [--use-delta-copy]
+
+Examples:
+  $0
+  $0 2026-04-27-173201 --dry-run
+  $0 /mnt/backup/rtb_nas/2026-04-27-173201 --use-delta-copy
+
+Notes:
+  --dry-run und --use-delta-copy werden an pcloud_push_json_manifest_to_pcloud.py durchgereicht.
+EOF
+      exit 0
+      ;;
+    -*)
+      _log ERROR "Unknown option: $1"
+      exit 2
+      ;;
+    *)
+      if [[ -n "$TARGET_SNAPSHOT" ]]; then
+        _log ERROR "Only one snapshot argument allowed (got: '$TARGET_SNAPSHOT' and '$1')"
+        exit 2
+      fi
+      TARGET_SNAPSHOT="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$TARGET_SNAPSHOT" ]]; then
+  # Falls Pfad übergeben wurde, auf Snapshot-Namen normalisieren
+  if [[ -d "$TARGET_SNAPSHOT" ]]; then
+    TARGET_SNAPSHOT="$(basename "$TARGET_SNAPSHOT")"
+  fi
+  if [[ ! "$TARGET_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}- ]]; then
+    _log ERROR "Invalid snapshot argument: '$TARGET_SNAPSHOT'"
+    exit 2
+  fi
+  _log INFO "Target snapshot mode active: $TARGET_SNAPSHOT"
+fi
+
+if [[ ${#EXTRA_PUSH_ARGS[@]} -gt 0 ]]; then
+  _log INFO "Extra push args: ${EXTRA_PUSH_ARGS[*]}"
+fi
+
 # Lock holen (mit Timeout) – überspringen wenn bereits von rtb_wrapper gehalten
 if [[ "${BACKUP_PIPELINE_LOCKED:-0}" != "1" ]]; then
   exec 9>"$LOCKFILE"
@@ -578,6 +636,14 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
     _db_run_end SUCCESS 0
     exit 0
   fi
+  if [[ -n "$TARGET_SNAPSHOT" ]]; then
+    if ! printf '%s\n' "${SNAPS[@]}" | grep -qx "$TARGET_SNAPSHOT"; then
+      _log ERROR "Target snapshot not found locally: $TARGET_SNAPSHOT"
+      exit 2
+    fi
+    SNAPS=("$TARGET_SNAPSHOT")
+    _log INFO "Bootstrap target filter active: uploading only $TARGET_SNAPSHOT"
+  fi
   export PCLOUD_SKIP_FINALIZE=1
   for s in "${SNAPS[@]}"; do
     build_and_push "$RTB/$s"
@@ -609,10 +675,21 @@ rebuild_count=0
 mapfile -t local_snaps < <(local_snapshot_names)
 mapfile -t remote_snaps < <(remote_snapshot_names)
 
+if [[ -n "$TARGET_SNAPSHOT" ]]; then
+  if ! printf '%s\n' "${local_snaps[@]}" | grep -qx "$TARGET_SNAPSHOT"; then
+    _log ERROR "Target snapshot not found locally: $TARGET_SNAPSHOT"
+    exit 2
+  fi
+fi
+
 # Gap-Strategie (env-var oder default)
 GAP_STRATEGY=${PCLOUD_GAP_STRATEGY:-optimistic}  # conservative|optimistic|aggressive
 
 for s in "${local_snaps[@]}"; do
+  if [[ -n "$TARGET_SNAPSHOT" && "$s" != "$TARGET_SNAPSHOT" ]]; then
+    continue
+  fi
+
   if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
     # Gap-Erkennung: Gibt es einen SPÄTEREN Snapshot, der remote existiert?
     is_gap=0
