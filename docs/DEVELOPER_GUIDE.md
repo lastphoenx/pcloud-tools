@@ -78,66 +78,65 @@ Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
 
 ---
 
-## 🧠 Säule 3: Die Smart-Upload-Engine — SmartStrategyController
+## 🧠 Säule 3: Die Smart-Upload-Engine — SmartStrategyController (v2.0)
 
-Seit dem Architektur-Refactoring (v1.2) verfügt die Pipeline über eine zentrale Entscheidungs-Instanz: den **SmartStrategyController**. Dieser verhindert inkonsistente Upload-Entscheidungen und schützt die Quota durch eine deterministische Strategiewahl.
+Seit dem Architektur-Refactoring (v2.0) nutzt die Pipeline einen **Efficiency-Rating-Algorithmus**. Statt bloßer Prozentwerte entscheidet das System basierend auf der **absoluten API-Last-Einsparung** und einem **proaktiven Quota-Schutz (Safe-Gate)**.
 
 ### Der Single-Point-of-Decision
 
-Früher war die Entscheidung zwischen "Delta" und "Normal" über mehrere Skripte verteilt. Jetzt gibt es genau einen Eintrittspunkt:
+Es gibt genau einen Eintrittspunkt für die Strategiewahl. Der Controller erhält alle relevanten Metriken über den `_get_sync_metrics_unified`-Block.
 
 ```python
 # pcloud_push_json_manifest_to_pcloud.py
 def push_1to1_smart_controller(cfg, manifest, dest_root, ...):
-    # 1. Metriken einheitlich erfassen (unified source)
+    # 1. Metriken einheitlich erfassen (Unified Metrics v2.0)
     metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
     
     # 2. Strategie deterministisch wählen
     controller = SmartStrategyController()
     strategy = controller.decide(metrics)
     
-    # 3. Entscheidung loggen (maschinenlesbar für Auditing)
+    # 3. Entscheidung loggen (mit Performance-Prognose)
     controller.log_decision(strategy, metrics, snapshot_name)
-    
-    # 4. An Executor übergeben (mit klarem Modus)
-    if strategy == SyncStrategy.TURBO_MODE:
-        return push_1to1_delta_mode(..., basis_snapshot=metrics["basis_snapshot"])
-    else:
-        return push_1to1_mode(..., strategy_mode=strategy.value)
+    ...
 ```
 
-### CLI-Flags & Wrapper-Passthrough
+### Die Entscheidungs-Kaskade (2.0)
 
-Der `wrapper_pcloud_sync_1to1.sh` unterstützt nun eine Whitelist für CLI-Flags, die direkt an die Upload-Engine durchgereicht werden:
+Der Controller prüft Bedingungen in einer festen Reihenfolge:
 
-| Flag | Wirkung |
-|------|---------|
-| `--dry-run` | Führt keine API-Änderungen durch (Upload/Delete/Copy), loggt aber alle geplanten Aktionen. |
-| `--use-delta-copy` | Erzwingt den **TURBO-MODE** (Delta-Copy), unabhängig von der Smart-Controller Entscheidung (Legacy-Support). |
+1. **Initial-Gate:** Weniger als 2 Snapshots vorhanden? → **SAFE-MODE** (Full-Upload).
+2. **Quota-Investition (Safe-Gate):** Basis-Snapshot hat eine `stub_ratio` < 80%? → **SAFE-MODE**. 
+   *Grund: Wir erzwingen einen Transformations-Run, um alle Dateien in Stubs zu wandeln, damit zukünftige Backups hocheffizient klonen können.*
+3. **Efficiency-Rating (Turbo-Check):**
+   * `saved_calls` = Identische Dateien (müssen nicht angefasst werden).
+   * `cleanup_calls` = Gelöschte + Geänderte Dateien (müssen in pCloud gelöscht werden).
+   * **TURBO-MODE** wird gewählt, wenn:
+     1. `saved_calls > cleanup_calls` (Netto-Gewinn an API-Calls).
+     2. `saved_calls >= 1000` (Mindestlast, damit sich das Klonen lohnt).
+4. **Template-Fallback:** Wenn Turbo nicht zieht, aber das Ordner-Template zu > 90% passt? → **TEMPLATE-SAFE**.
+5. **Fallback:** Sonst → **SAFE-MODE**.
 
-**Beispiel:**
-```bash
-./wrapper_pcloud_sync_1to1.sh 2026-05-01-120000 --dry-run
-```
+### Unified Metrics (v2.0)
 
+Die Metriken basieren auf dem inhaltlichen Vergleich (SHA256/mtime) und liefern absolute Werte:
 
-### Die drei Strategien
+* **identical_count**: Dateien, die 1:1 übernommen werden können.
+* **new_count / changed_count**: Dateien, die hochgeladen werden müssen.
+* **deleted_count**: Dateien, die aus dem geklonten Snapshot gelöscht werden müssen.
+* **upload_bytes**: Gesamtes Datenvolumen, das übertragen werden muss.
+* **saved_calls**: Einsparung gegenüber SAFE-MODE (entspricht `identical_count`).
+* **cleanup_calls**: API-Overhead im Turbo-Mode (`deleted_count` + `changed_count`).
 
-| Strategie | Technischer Ablauf | Bedingung |
-|-----------|--------------------|-----------|
-| **TURBO-MODE** | `copyfolder` (Cloning) + Delta-Delete/Write | Hohe Übereinstimmung & Hohe Stub-Quote (Quota-Schutz) |
-| **TEMPLATE-SAFE** | `copyfolder` (Template) + Safe-Upload | Hohe Struktur-Übereinstimmung, aber Quota-Risiko bei Turbo |
-| **SAFE-MODE** | Full-Rebuild der Ordner + Safe-Upload | Keine Basis vorhanden oder API-Fehler (Fallback) |
+### CLI-Flags & Environment Overrides
 
-### Unified Metrics (Die Datenbasis)
-
-Der Controller nutzt nicht mehr lokale Schätzwerte, sondern die **pCloud-Cloud als Single Source of Truth**:
-1. **Source Snapshots**: Zählt valide Manifeste im `manifests/` Archiv.
-2. **Match-Ratio**: Vergleicht das aktuelle Manifest mit dem **echten Remote-Index** (`load_content_index`).
-3. **Stub-Ratio**: Berechnet die exakte Quota-Belastung basierend auf existierenden Stubs in der Cloud.
-
-### Quota-Sicherheitsnetz
-Der Controller wechselt automatisch von `TURBO` zu `TEMPLATE-SAFE`, wenn die `stub_ratio` zu niedrig ist. Dies verhindert, dass durch fehlerhaftes Klonen (viele reale Dateien statt Stubs) das pCloud-Konto unkontrolliert vollgeschrieben wird.
+| Flag / ENV | Wirkung |
+|------------|---------|
+| `--dry-run` | Simuliert die gesamte Entscheidung und Planung ohne API-Writes. |
+| `--use-delta-copy` | Erzwingt **TURBO-MODE** (Delta-Copy), ignoriert alle Gates (außer Initial-Gate). |
+| `PCLOUD_SMART_STUB_TRANSFORM_THRESHOLD` | Threshold für Quota-Gate (Default: `0.80`). |
+| `PCLOUD_SMART_SAVED_CALLS_MIN` | Mindestanzahl identischer Dateien für Turbo (Default: `1000`). |
+| `PCLOUD_SMART_TEMPLATE_STRONG_THRESHOLD` | Threshold für Template-Match (Default: `0.90`). |
 
 ---
 

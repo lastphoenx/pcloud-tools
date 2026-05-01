@@ -17,6 +17,7 @@ Alle Utilities haben eine dedizierte Markdown-Dokumentation im gleichen Verzeich
 | `pcloud_verify_index_vs_manifests.py` | Index ↔ Manifest-Validierung | [→ Docs](pcloud_verify_index_vs_manifests.md) |
 | `rewrite_stubs_from_index.py` | Stub-Regenerierung aus Index | [→ Docs](rewrite_stubs_from_index.md) |
 | `analyze_manifest_duplicates.py` | Duplikat-Analyse (Excel-Report) | [→ Docs](analyze_manifest_duplicates.md) |
+| `smart_strategy_decision_simulator.py` | Offline-Simulation Smart-Strategy 2.0 | [→ Docs](smart_strategy_decision_simulator.md) |
 | `setup_venv.sh` / `.ps1` | Virtual Environment Setup | [→ Docs](setup_venv.md) |
 
 ## 🔧 Verwendung
@@ -64,6 +65,7 @@ Details siehe jeweilige `.md`-Dokumentation.
 
 **Development:**
 - setup_venv.sh / .ps1 → Entwicklungsumgebung
+- smart_strategy_decision_simulator.py → Strategie-Simulation (offline)
 
 ## ⚠️ Hinweise
 
