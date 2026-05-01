@@ -100,14 +100,24 @@ bash /opt/apps/pcloud-tools/main/scripts/utilities/prepare_fresh_test.sh \
 
 ```bash
 # venv aktivieren
-source /opt/apps/pcloud-tools/main/venv_switch.sh pcloud-tools
+source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 
-# Dry-Run Test
-./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201 --dry-run
+# 2a) Test-Lauf (read-only) via rtb_wrapper
+/opt/apps/rtb/rtb_wrapper.sh --check-only
 
-# Echter Upload
-./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
+# 2b) Produktions-Lauf via rtb_wrapper
+/opt/apps/rtb/rtb_wrapper.sh
+
+# 3a) Direkter pcloud-tools Dry-Run (falls benoetigt)
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201 --dry-run
+
+# 3b) Direkter pcloud-tools Produktions-Lauf
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
 ```
+
+**Modus-Hinweis:**
+- Copy-Modus: maximale Geschwindigkeit, hoeherer Speicherverbrauch.
+- Smart-Logik: balanciert Upload-Zeit und Speicherverbrauch (empfohlen).
 
 ---
 
@@ -132,25 +142,25 @@ source /opt/apps/pcloud-tools/main/venv_switch.sh pcloud-tools
 **Turbo/Delta-Upload testen** (Basis-Manifest schon lokal vorhanden):
 ```bash
 # Clean-State mit behaltenem Manifest
-bash .../prepare_fresh_test.sh --keep-snapshot 2026-04-27-173201 --keep-local-manifest yes --execute
+bash /opt/apps/pcloud-tools/main/scripts/utilities/prepare_fresh_test.sh --keep-snapshot 2026-04-27-173201 --keep-local-manifest yes --execute
 
 # Upload — Smart-Controller wählt Turbo/Delta
-./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
 ```
 
 **Fresh Full-Upload testen** (ohne jegliches lokales Manifest):
 ```bash
 # Clean-State, alle Archive leer
-bash .../prepare_fresh_test.sh --keep-snapshot 2026-04-27-173201 --keep-local-manifest no --execute
+bash /opt/apps/pcloud-tools/main/scripts/utilities/prepare_fresh_test.sh --keep-snapshot 2026-04-27-173201 --keep-local-manifest no --execute
 
 # Upload — Smart-Controller wählt SAFE-Mode (Full-Upload)
-./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
 ```
 
 **Nach pCloud-Problemen (Re-Upload):**
 ```bash
-bash .../prepare_fresh_test.sh --keep-snapshot 2026-04-27-173201 --execute
-./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
+bash /opt/apps/pcloud-tools/main/scripts/utilities/prepare_fresh_test.sh --keep-snapshot 2026-04-27-173201 --execute
+/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
 ```
 
 ---
