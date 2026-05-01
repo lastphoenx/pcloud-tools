@@ -599,8 +599,8 @@ validate_inputs_or_exit
 # Initialize database
 _db_init
 
-# Trap for cleanup on exit
-trap '_db_run_end FAILED $? "Script interrupted or failed"; exit' INT TERM ERR
+# Trap for cleanup on exit (preserve original non-zero exit code)
+trap '_rc=$?; _db_run_end FAILED "$_rc" "Script interrupted or failed"; exit "$_rc"' INT TERM ERR
 
 # Preflight (Status) + Policy im Wrapper
 PF="DOWN"
