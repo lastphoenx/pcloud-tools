@@ -17,7 +17,8 @@ Parameter:
   --keep-local-manifest <yes|no> Lokales Manifest <SNAPSHOT>.json behalten (Default: yes)
   --keep-lokal-manifest <yes|no> Alias für --keep-local-manifest
   --rtb-base <PATH>              RTB Basis-Pfad (Default: /mnt/backup/rtb_nas)
-  --archive-base <PATH>          Archiv-Basis (Default: /srv/pcloud-archive)
+    --archive-base <PATH>          Archiv-Basis (Default: /srv/pcloud-archive)
+    --env-file <PATH>              .env-Datei für PCLOUD_TEMP_DIR (Default: /opt/apps/pcloud-tools/main/.env)
   --dry-run                      Nur anzeigen was gelöscht/gesetzt würde (Default)
   --execute                      Führt Änderungen wirklich aus (destruktiv!)
   --yes                          Ohne Rückfrage ausführen (nur mit --execute sinnvoll)
@@ -38,6 +39,7 @@ to_yes_no() {
 # === Defaults ===
 RTB_BASE="/mnt/backup/rtb_nas"
 ARCHIVE_BASE="/srv/pcloud-archive"
+ENV_FILE="/opt/apps/pcloud-tools/main/.env"
 PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
 KEEP_SNAPSHOT=""
 KEEP_LOCAL_MANIFEST="yes"
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --archive-base)
             ARCHIVE_BASE="$2"
+            shift 2
+            ;;
+        --env-file)
+            ENV_FILE="$2"
             shift 2
             ;;
         --dry-run)
@@ -91,6 +97,14 @@ if [[ -z "$KEEP_SNAPSHOT" ]]; then
     echo "❌ --keep-snapshot ist erforderlich." >&2
     usage
     exit 2
+fi
+
+# PCLOUD_TEMP_DIR aus .env laden (überschreibt Default /tmp mit realem Wert)
+if [[ -f "$ENV_FILE" ]]; then
+    _env_temp=$(grep -E '^PCLOUD_TEMP_DIR=' "$ENV_FILE" | head -1 | cut -d= -f2- \
+        | sed -e 's/[[:space:]]*#.*//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
+              -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [[ -n "$_env_temp" ]] && PCLOUD_TEMP_DIR="$_env_temp"
 fi
 
 if [[ ! -d "$RTB_BASE/$KEEP_SNAPSHOT" ]]; then
@@ -373,7 +387,7 @@ echo "   - Default: Smart-Logik im /opt/apps/pcloud-tools/main/wrapper_pcloud_sy
 echo ""
 echo "   Copy/Turbo explizit forcieren (Low-Level, ohne Wrapper):"
 echo "   /opt/apps/pcloud-tools/venv/bin/python /opt/apps/pcloud-tools/main/pcloud_push_json_manifest_to_pcloud.py \\" 
-echo "     --manifest /tmp/pcloud_mani.$KEEP_SNAPSHOT.json --dest-root /Backup/rtb_1to1 \\" 
+echo "     --manifest ${PCLOUD_TEMP_DIR}/pcloud_mani.$KEEP_SNAPSHOT.json --dest-root /Backup/rtb_1to1 \\" 
 echo "     --snapshot-mode 1to1 --use-delta-copy --env-file /opt/apps/pcloud-tools/main/.env"
 echo "   (Alternativ jetzt direkt im Wrapper möglich: ...wrapper_pcloud_sync_1to1.sh <SNAPSHOT> --use-delta-copy)"
 echo ""
