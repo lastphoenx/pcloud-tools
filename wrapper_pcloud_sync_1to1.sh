@@ -653,8 +653,15 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
       _log ERROR "Target snapshot not found locally: $TARGET_SNAPSHOT"
       exit 2
     fi
-    SNAPS=("$TARGET_SNAPSHOT")
-    _log INFO "Bootstrap target filter active: uploading only $TARGET_SNAPSHOT"
+    # Filter: Keep all snapshots up to and including the target
+    # This ensures a clean chain when starting from scratch
+    filtered=()
+    for s in "${SNAPS[@]}"; do
+      filtered+=("$s")
+      [[ "$s" == "$TARGET_SNAPSHOT" ]] && break
+    done
+    SNAPS=("${filtered[@]}")
+    _log INFO "Bootstrap target filter active: uploading all snapshots up to $TARGET_SNAPSHOT (${#SNAPS[@]} total)"
   fi
   export PCLOUD_SKIP_FINALIZE=1
   for s in "${SNAPS[@]}"; do
