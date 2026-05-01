@@ -23,32 +23,37 @@ Das **Gap-Handling-System** ermöglicht die intelligente Reparatur von Lücken i
 
 ---
 
-## 🧠 Smart Strategy Selection (Der Sicherheits-Wächter)
+## 🧠 Smart Strategy Selection (v2.0 Efficiency-Rating)
 
-Seit der Einführung des **SmartStrategyControllers** entscheidet das System bei jedem Lauf vollautomatisch über den wirtschaftlichsten und sichersten Weg.
+Seit der Einführung des **SmartStrategyControllers v2.0** entscheidet das System nicht mehr nur nach Prozentwerten, sondern bewertet die **Effizienz (API-Last)** und die **Quota-Sicherheit**.
 
 ### Wie das System entscheidet:
 
-Das System bewertet drei Faktoren, bevor es den ersten Byte hochlädt:
-1. **Ähnlichkeit**: Wie viele Dateien sind identisch zum letzten Backup?
-2. **Quota-Schutz**: Sind die Dateien in pCloud bereits als platzsparende "Stubs" (Referenzen) vorhanden?
-3. **Struktur**: Passt die Ordner-Struktur zum existierenden Template?
+Das System bewertet vier Faktoren, bevor es den ersten Byte hochlädt:
+1. **Initial-Check**: Ist dies das erste oder zweite Backup? (Wenn ja → SAFE-MODE).
+2. **Quota-Investition (Safe-Gate)**: Sind im Basis-Snapshot mindestens 80% der Dateien als platzsparende Stubs vorhanden? 
+   - *Falls nein:* Erzwingt das System einen **SAFE-MODE** Run, um den Remote-Stand zu "bereinigen" (Transformation zu Stubs).
+3. **Efficiency-Rating (Turbo-Check)**:
+   - Wie viele API-Calls sparen wir durch Klonen (`saved_calls`)?
+   - Wie viele API-Calls kostet uns das Löschen/Ändern im geklonten Snapshot (`cleanup_calls`)?
+   - **TURBO-MODE** wird nur gewählt, wenn `saved_calls > cleanup_calls` AND `saved_calls >= 1000`.
+4. **Struktur-Check**: Passt die Ordner-Struktur zum existierenden Template (> 90%)? (Falls ja → TEMPLATE-SAFE).
 
 ### Die 3 Betriebsmodi (Automatischer Wechsel):
 
 1. **TURBO-MODE (Die Snapshot-Kopie)** ⚡
-   - *Wann:* Wenn fast alles gleich ist und wir sicher sind, dass wir Platz sparen (hohe Stub-Quote).
-   - *Effekt:* pCloud klont das alte Backup intern. Wir löschen nur was weg ist und laden nur das Neue hoch.
-   - *Vorteil:* Höchste Geschwindigkeit.
+   - *Wann:* Hohe API-Einsparung (> 1000 Files) und gesicherte Quota (Stub-Ratio > 80%).
+   - *Effekt:* pCloud klont das alte Backup intern (`copyfolder`). Wir löschen nur was weg ist und laden nur das Neue hoch.
+   - *Vorteil:* Maximale Geschwindigkeit bei großen Datenmengen.
    - *Forcieren:* via `--use-delta-copy` Flag.
 
 2. **TEMPLATE-DELTA-SAFE (Der Struktur-Vorteil)** 🛡️
-   - *Wann:* Wenn die Dateien sich stark geändert haben oder wir dem Platzsparen nicht trauen, aber die Ordner gleich geblieben sind.
-   - *Effekt:* Wir kopieren nur das leere Ordner-Gerüst und laden alle Dateien sicher und einzeln hoch.
-   - *Vorteil:* Sicherster Schutz vor vollem pCloud-Speicher bei trotzdem schnellem Start.
+   - *Wann:* Wenn Turbo sich nicht lohnt (wenig identische Dateien) oder das Quota-Gate blockiert, aber die Ordnerstruktur bekannt ist.
+   - *Effekt:* Wir kopieren das leere Ordner-Template und laden alle Dateien einzeln hoch.
+   - *Vorteil:* Schneller Start (kein Ordner-Anlegen), volle Quota-Sicherheit.
 
 3. **SAFE-MODE (Der Neuaufbau)** 🏗️
-   - *Wann:* Erstes Backup, schwere Fehler oder keine Ähnlichkeit.
+   - *Wann:* Erstes Backup, Quota-Bereinigungs-Run oder keine Ähnlichkeit.
    - *Effekt:* Alles wird von Grund auf neu erstellt.
    - *Vorteil:* Maximale Robustheit.
 

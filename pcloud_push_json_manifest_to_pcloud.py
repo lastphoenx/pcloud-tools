@@ -61,6 +61,11 @@ _STUB_THRESHOLD  = float(os.environ.get("PCLOUD_SMART_STUB_THRESHOLD", "0.50"))
 # TEMPLATE_THRESHOLD (Z): Mindest-Übereinstimmung mit Template für TEMPLATE-DELTA-SAFE
 _TEMPLATE_THRESHOLD = float(os.environ.get("PCLOUD_SMART_TEMPLATE_THRESHOLD", "0.70"))
 
+# Smart-Strategy 2.0 (absolute Delta-Metriken + harte Sicherheitsgates)
+_SMART_STUB_TRANSFORM_THRESHOLD = float(os.environ.get("PCLOUD_SMART_STUB_TRANSFORM_THRESHOLD", "0.80"))
+_SMART_SAVED_CALLS_MIN = int(os.environ.get("PCLOUD_SMART_SAVED_CALLS_MIN", "1000"))
+_SMART_TEMPLATE_STRONG_THRESHOLD = float(os.environ.get("PCLOUD_SMART_TEMPLATE_STRONG_THRESHOLD", "0.90"))
+
 _FOLDER_TEMPLATE_DIRNAME = "_folder_template"
 
 
@@ -111,50 +116,44 @@ def push_1to1_smart_controller(cfg, manifest, dest_root, *, dry=False, verbose=F
     
     # Einheitliche Metriken (unified source)
     metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
-    
-    # Entscheidungslogik (einmal, deterministisch)
-    chosen_strategy = "SAFE-MODE"  # Default fallback
-    
-    # FALL 1: Initial (nur ein Snapshot vorhanden)
-    if metrics["source_snapshots"] <= 1:
-        chosen_strategy = "SAFE-MODE"
-        _log(f"[decision] mode=SAFE-MODE | reason=initial_upload | snapshots={metrics['source_snapshots']}")
-    
-    # FALL 2a: TURBO-MODE (hohe Match + hohe Stubs)
-    elif (metrics["match_ratio"] >= _MATCH_THRESHOLD and 
-          metrics["stub_ratio"] >= _STUB_THRESHOLD):
-        chosen_strategy = "TURBO-MODE"
-        _log(f"[decision] mode=TURBO | match={metrics['match_ratio']:.2f} | stub={metrics['stub_ratio']:.2f} | basis={metrics['basis_snapshot']}")
-        
-        # Versuche Delta-Mode
+
+    # Single Source of Truth: zentrale Klasse entscheidet deterministisch
+    controller = SmartStrategyController()
+    strategy = controller.decide(metrics)
+    controller.log_decision(strategy, metrics, snapshot_name)
+
+    if strategy == SyncStrategy.TURBO_MODE:
         try:
             return push_1to1_delta_mode(
-                cfg, manifest, dest_root, 
-                dry=dry, verbose=verbose, 
+                cfg,
+                manifest,
+                dest_root,
+                dry=dry,
+                verbose=verbose,
                 manifest_path=manifest_path,
-                basis_snapshot=metrics.get("basis_snapshot")
+                basis_snapshot=metrics.get("basis_snapshot"),
             )
         except Exception as e:
             _log(f"[fallback] TURBO failed: {e} -> switching to SAFE-MODE")
-            chosen_strategy = "SAFE-MODE"
-            # Fall-through zu Normal-Mode unten
-    
-    # FALL 2b: TEMPLATE-DELTA-SAFE (hohe Match + Template vorhanden + Template Match ok)
-    elif (metrics["match_ratio"] >= _MATCH_THRESHOLD and 
-          metrics["template_exists"] and 
-          metrics["template_match"] >= _TEMPLATE_THRESHOLD):
-        chosen_strategy = "TEMPLATE-DELTA-SAFE"
-        _log(f"[decision] mode=TEMPLATE-SAFE | match={metrics['match_ratio']:.2f} | template_match={metrics['template_match']:.2f}")
-    
-    # FALL 2c: SAFE-MODE (Fallback)
-    else:
-        chosen_strategy = "SAFE-MODE"
-        _log(f"[decision] mode=SAFE-MODE | match={metrics['match_ratio']:.2f} | stub={metrics['stub_ratio']:.2f} | reason=low_match_or_no_template")
-    
-    # Ausführung mit klarem, deterministischem Modus
-    return push_1to1_mode(cfg, manifest, dest_root, 
-                          dry=dry, verbose=verbose, manifest_path=manifest_path,
-                          strategy_mode=chosen_strategy)
+            return push_1to1_mode(
+                cfg,
+                manifest,
+                dest_root,
+                dry=dry,
+                verbose=verbose,
+                manifest_path=manifest_path,
+                strategy_mode=SyncStrategy.SAFE_MODE.value,
+            )
+
+    return push_1to1_mode(
+        cfg,
+        manifest,
+        dest_root,
+        dry=dry,
+        verbose=verbose,
+        manifest_path=manifest_path,
+        strategy_mode=strategy.value,
+    )
 
 
 # Performance-Messung
@@ -834,6 +833,10 @@ class SmartStrategyController:
         self.x_match_ratio = _MATCH_THRESHOLD
         self.y_stub_ratio = _STUB_THRESHOLD
         self.z_template_match = _TEMPLATE_THRESHOLD
+        self.stub_transform_ratio = _SMART_STUB_TRANSFORM_THRESHOLD
+        self.saved_calls_min = _SMART_SAVED_CALLS_MIN
+        self.template_strong_match = _SMART_TEMPLATE_STRONG_THRESHOLD
+        self.last_reason = ""
 
     def decide(self, metrics: dict) -> SyncStrategy:
         """
@@ -843,28 +846,34 @@ class SmartStrategyController:
         3. Safe-Mode ist immer verfügbarer Fallback.
         """
         source_count = metrics.get("source_snapshots", 0)
-        match_ratio = metrics.get("match_ratio", 0.0)
         stub_ratio = metrics.get("stub_ratio", 0.0)
         template_match = metrics.get("template_match", 0.0)
         template_exists = metrics.get("template_exists", False)
+        saved_calls = int(metrics.get("saved_calls", 0))
+        cleanup_calls = int(metrics.get("cleanup_calls", 0))
 
         # Fall 1: Nur ein Snapshot -> SAFE-MODE
         if source_count <= 1:
+            self.last_reason = "initial_upload"
             return SyncStrategy.SAFE_MODE
 
-        # Fall 2a: Hohe Übereinstimmung + Hoher Stub-Anteil -> TURBO-MODE (Snapshot Copy)
-        if match_ratio >= self.x_match_ratio and stub_ratio >= self.y_stub_ratio:
+        # Fall 2: Harter Quota-Schutz + Transformations-Run
+        if stub_ratio < self.stub_transform_ratio:
+            self.last_reason = "transformation_to_stubs"
+            return SyncStrategy.SAFE_MODE
+
+        # Fall 3: Effizienz-Gate via absolute Call-Last
+        if saved_calls > cleanup_calls and saved_calls >= self.saved_calls_min:
+            self.last_reason = "api_efficiency_gain"
             return SyncStrategy.TURBO_MODE
 
-        # Fall 2b: Hohe Übereinstimmung + Template vorhanden -> TEMPLATE-DELTA-SAFE
-        if (
-            match_ratio >= self.x_match_ratio
-            and template_exists
-            and template_match >= self.z_template_match
-        ):
+        # Fall 4: Template als kontrollierter Mittelweg
+        if template_exists and template_match >= self.template_strong_match:
+            self.last_reason = "template_fallback"
             return SyncStrategy.TEMPLATE_DELTA_SAFE
 
-        # Fall 2c: Fallback -> SAFE-MODE
+        # Fall 5: Fallback
+        self.last_reason = "default_safe"
         return SyncStrategy.SAFE_MODE
 
     def log_decision(self, strategy: SyncStrategy, metrics: dict, snapshot_name: str):
@@ -872,10 +881,20 @@ class SmartStrategyController:
         m = metrics
         log_line = (
             f"[decision] mode={strategy.value} | "
+            f"reason={self.last_reason} | "
             f"src_count={m.get('source_snapshots')} | "
             f"match={m.get('match_ratio'):.3f} (target>={self.x_match_ratio}) | "
-            f"stub={m.get('stub_ratio'):.3f} (target>={self.y_stub_ratio}) | "
-            f"tmpl_match={m.get('template_match'):.3f} (target>={self.z_template_match}) | "
+            f"stub={m.get('stub_ratio'):.3f} (transform_if<{self.stub_transform_ratio}) | "
+            f"tmpl_match={m.get('template_match'):.3f} (target>={self.template_strong_match}) | "
+            f"match_count={m.get('match_count', 0)} | "
+            f"saved_calls={m.get('saved_calls', 0)} | "
+            f"cleanup_calls={m.get('cleanup_calls', 0)} | "
+            f"upload_calls={m.get('upload_calls', 0)} | "
+            f"upload_bytes={m.get('upload_bytes', 0)} | "
+            f"identical={m.get('identical_count', 0)} | "
+            f"new={m.get('new_count', 0)} | "
+            f"changed={m.get('changed_count', 0)} | "
+            f"deleted={m.get('deleted_count', 0)} | "
             f"tmpl_exists={m.get('template_exists')} | "
             f"basis={m.get('basis_snapshot')}"
         )
@@ -1020,8 +1039,27 @@ def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive
         "stub_ratio": 0.0,  # ECHT aus Index, nicht Pfad-Proxy
         "template_match": 0.0,
         "template_exists": False,
-        "basis_snapshot": None
+        "basis_snapshot": None,
+        "total_files": 0,
+        "basis_total_files": 0,
+        "match_count": 0,
+        "identical_count": 0,
+        "new_count": 0,
+        "changed_count": 0,
+        "deleted_count": 0,
+        "saved_calls": 0,
+        "cleanup_calls": 0,
+        "upload_calls": 0,
+        "upload_bytes": 0,
     }
+
+    # Aktuelle Dateimenge aus Manifest (fixer Ausgangswert)
+    current_files = {
+        it.get("relpath"): it
+        for it in (manifest.get("items") or [])
+        if it.get("type") == "file" and it.get("relpath")
+    }
+    metrics["total_files"] = len(current_files)
 
     # 1. Source-Snapshots aus dem RICHTIGEN Pfad
     manifests_dir = os.path.join(archive_dir, "manifests")
@@ -1039,8 +1077,79 @@ def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive
         if valid_bases:
             basis_name = valid_bases[-1]
             metrics["basis_snapshot"] = basis_name
+
+            # 2a. Delta-Zahlen aus Manifest-Diff-Logik (identical/new/changed/deleted)
+            basis_manifest_path = os.path.join(manifests_dir, f"{basis_name}.json")
+            try:
+                with open(basis_manifest_path, "r", encoding="utf-8") as f:
+                    basis_manifest = json.load(f)
+
+                basis_files = {
+                    it.get("relpath"): it
+                    for it in (basis_manifest.get("items") or [])
+                    if it.get("type") == "file" and it.get("relpath")
+                }
+
+                metrics["basis_total_files"] = len(basis_files)
+
+                current_paths = set(current_files.keys())
+                basis_paths = set(basis_files.keys())
+
+                new_paths = current_paths - basis_paths
+                deleted_paths = basis_paths - current_paths
+                common_paths = current_paths & basis_paths
+
+                identical_count = 0
+                changed_count = 0
+
+                for relpath in common_paths:
+                    curr_item = current_files[relpath]
+                    base_item = basis_files[relpath]
+                    curr_sha = (curr_item.get("sha256") or "").lower()
+                    base_sha = (base_item.get("sha256") or "").lower()
+                    curr_mtime = curr_item.get("mtime")
+                    base_mtime = base_item.get("mtime")
+                    if curr_sha == base_sha and curr_mtime == base_mtime:
+                        identical_count += 1
+                    else:
+                        changed_count += 1
+
+                new_count = len(new_paths)
+                deleted_count = len(deleted_paths)
+
+                metrics["identical_count"] = identical_count
+                metrics["match_count"] = identical_count
+                metrics["new_count"] = new_count
+                metrics["changed_count"] = changed_count
+                metrics["deleted_count"] = deleted_count
+
+                # Smart-Strategy 2.0 Kernmetriken
+                metrics["saved_calls"] = identical_count
+                metrics["cleanup_calls"] = deleted_count + changed_count
+                metrics["upload_calls"] = new_count + changed_count
+
+                changed_paths = {
+                    relpath
+                    for relpath in common_paths
+                    if (
+                        (current_files[relpath].get("sha256") or "").lower()
+                        != (basis_files[relpath].get("sha256") or "").lower()
+                        or current_files[relpath].get("mtime") != basis_files[relpath].get("mtime")
+                    )
+                }
+                upload_bytes = 0
+                for relpath in (new_paths | changed_paths):
+                    sz = current_files.get(relpath, {}).get("size")
+                    if isinstance(sz, (int, float)):
+                        upload_bytes += int(sz)
+                metrics["upload_bytes"] = upload_bytes
+
+                if metrics["total_files"] > 0:
+                    metrics["match_ratio"] = identical_count / metrics["total_files"]
+            except Exception as e:
+                _log(f"[metrics] Warnung: Konnte Basis-Manifest nicht auswerten: {e}")
             
-            # 2. Match + Stub-Ratio aus UNIFIED SOURCE (Remote Index via load_content_index)
+            # 2b. Stub-Ratio aus UNIFIED SOURCE (Remote Index via load_content_index)
             # NICHT aus lokalem Manifest, sondern aus echter pCloud-Index
             try:
                 snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
@@ -1049,17 +1158,9 @@ def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive
                 # Stub-Ratio EXAKT wie in delta-copy (via _compute_snapshot_stub_ratio)
                 _, _, stub_ratio = _compute_snapshot_stub_ratio(index, basis_name)
                 metrics["stub_ratio"] = stub_ratio
-                
-                # Match-Ratio: Dateien die in beiden Snapshots existieren
-                basis_paths = _get_snapshot_paths(index, basis_name)
-                current_paths = _get_manifest_paths(manifest)
-                if current_paths:
-                    match_ratio = len(basis_paths & current_paths) / len(current_paths)
-                    metrics["match_ratio"] = match_ratio
             except Exception as e:
                 _log(f"[metrics] Warnung: Konnte Index nicht laden: {e}")
                 metrics["stub_ratio"] = 0.0
-                metrics["match_ratio"] = 0.0
     
     # 3. Template Check (wie gehabt, aber konsistent)
     template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
