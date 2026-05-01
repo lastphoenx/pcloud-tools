@@ -35,6 +35,7 @@ import os, sys, json, argparse, time, datetime
 import concurrent.futures
 import threading
 from typing import Dict, Any, Optional, Tuple
+from enum import Enum
 
 
 # ---- Logging mit Timestamp (RTB-Stil) ----
@@ -50,6 +51,110 @@ try:
 except Exception as e:
     print(f"Fehler: pcloud_bin_lib konnte nicht importiert werden: {e}", file=sys.stderr)
     sys.exit(2)
+
+
+# --- Schwellenwerte für Smart-Strategie-Auswahl ---
+# MATCH_THRESHOLD (X): Ab welcher Übereinstimmung lohnt sich Klonen/Template?
+_MATCH_THRESHOLD = float(os.environ.get("PCLOUD_SMART_MATCH_THRESHOLD", "0.85"))
+# STUB_THRESHOLD (Y): Mindest-Stub-Ratio in Basis für TURBO (Quota-Schutz)
+_STUB_THRESHOLD  = float(os.environ.get("PCLOUD_SMART_STUB_THRESHOLD", "0.50"))
+# TEMPLATE_THRESHOLD (Z): Mindest-Übereinstimmung mit Template für TEMPLATE-DELTA-SAFE
+_TEMPLATE_THRESHOLD = float(os.environ.get("PCLOUD_SMART_TEMPLATE_THRESHOLD", "0.70"))
+
+_FOLDER_TEMPLATE_DIRNAME = "_folder_template"
+
+
+def _get_manifest_paths(manifest: dict) -> set[str]:
+    """Extrahiert alle Datei-Pfade aus dem Manifest."""
+    return {it["relpath"] for it in manifest.get("items", []) if it.get("type") == "file" and "relpath" in it}
+
+def _get_manifest_folders(manifest: dict) -> set[str]:
+    """Extrahiert alle Ordner-Pfade aus dem Manifest."""
+    return {it["relpath"] for it in manifest.get("items", []) if it.get("type") == "dir" and "relpath" in it}
+
+def _get_snapshot_paths(index: dict, snapshot_name: str) -> set[str]:
+    """Extrahiert alle Datei-Pfade eines Snapshots aus dem Master-Index."""
+    items = index.get("items") or {}
+    paths = set()
+    for sha, node in items.items():
+        # Anchor check
+        ap = node.get("anchor_path") or ""
+        if "/_snapshots/" in ap:
+            try:
+                parts = ap.split("/_snapshots/")
+                if len(parts) > 1:
+                    subparts = parts[1].split("/", 1)
+                    if subparts[0] == snapshot_name and len(subparts) > 1:
+                        paths.add(subparts[1])
+            except (IndexError, AttributeError):
+                pass
+        
+        # Holders check
+        holders = node.get("holders") or []
+        for h in holders:
+            if h.get("snapshot") == snapshot_name:
+                rp = h.get("relpath")
+                if rp:
+                    paths.add(rp)
+    return paths
+
+
+def push_1to1_smart_controller(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None):
+    """
+    Zentraler Strategy-Controller – EINZIGER Entscheidungspunkt für Strategie.
+    Entscheidet EINMAL, ruft dann Executor mit klarem Modus auf.
+    """
+    snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    
+    _log(f"[smart-controller] Analysiere Strategie für {snapshot_name}...")
+    
+    # Einheitliche Metriken (unified source)
+    metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
+    
+    # Entscheidungslogik (einmal, deterministisch)
+    chosen_strategy = "SAFE-MODE"  # Default fallback
+    
+    # FALL 1: Initial (nur ein Snapshot vorhanden)
+    if metrics["source_snapshots"] <= 1:
+        chosen_strategy = "SAFE-MODE"
+        _log(f"[decision] mode=SAFE-MODE | reason=initial_upload | snapshots={metrics['source_snapshots']}")
+    
+    # FALL 2a: TURBO-MODE (hohe Match + hohe Stubs)
+    elif (metrics["match_ratio"] >= _MATCH_THRESHOLD and 
+          metrics["stub_ratio"] >= _STUB_THRESHOLD):
+        chosen_strategy = "TURBO-MODE"
+        _log(f"[decision] mode=TURBO | match={metrics['match_ratio']:.2f} | stub={metrics['stub_ratio']:.2f} | basis={metrics['basis_snapshot']}")
+        
+        # Versuche Delta-Mode
+        try:
+            return push_1to1_delta_mode(
+                cfg, manifest, dest_root, 
+                dry=dry, verbose=verbose, 
+                manifest_path=manifest_path,
+                basis_snapshot=metrics.get("basis_snapshot")
+            )
+        except Exception as e:
+            _log(f"[fallback] TURBO failed: {e} -> switching to SAFE-MODE")
+            chosen_strategy = "SAFE-MODE"
+            # Fall-through zu Normal-Mode unten
+    
+    # FALL 2b: TEMPLATE-DELTA-SAFE (hohe Match + Template vorhanden + Template Match ok)
+    elif (metrics["match_ratio"] >= _MATCH_THRESHOLD and 
+          metrics["template_exists"] and 
+          metrics["template_match"] >= _TEMPLATE_THRESHOLD):
+        chosen_strategy = "TEMPLATE-DELTA-SAFE"
+        _log(f"[decision] mode=TEMPLATE-SAFE | match={metrics['match_ratio']:.2f} | template_match={metrics['template_match']:.2f}")
+    
+    # FALL 2c: SAFE-MODE (Fallback)
+    else:
+        chosen_strategy = "SAFE-MODE"
+        _log(f"[decision] mode=SAFE-MODE | match={metrics['match_ratio']:.2f} | stub={metrics['stub_ratio']:.2f} | reason=low_match_or_no_template")
+    
+    # Ausführung mit klarem, deterministischem Modus
+    return push_1to1_mode(cfg, manifest, dest_root, 
+                          dry=dry, verbose=verbose, manifest_path=manifest_path,
+                          strategy_mode=chosen_strategy)
 
 
 # Performance-Messung
@@ -709,10 +814,77 @@ def list_local_snapshot_names(manifest_root: str) -> set[str]:
 
 
 # ============================================================================
-# FOLDER TEMPLATE MANAGEMENT
+# SMART STRATEGY CONTROLLER
 # ============================================================================
 
-_FOLDER_TEMPLATE_DIRNAME = "_folder_template"
+class SyncStrategy(Enum):
+    SAFE_MODE = "SAFE-MODE"
+    TURBO_MODE = "TURBO-MODE"
+    TEMPLATE_DELTA_SAFE = "TEMPLATE-DELTA-SAFE"
+
+
+class SmartStrategyController:
+    """
+    Deterministische Wahl der Sync-Strategie basierend auf Metriken.
+    Priorisiert Quota-Sicherheit und Performance.
+    """
+
+    def __init__(self):
+        # Default Schwellenwerte (über ENV steuerbar)
+        self.x_match_ratio = _MATCH_THRESHOLD
+        self.y_stub_ratio = _STUB_THRESHOLD
+        self.z_template_match = _TEMPLATE_THRESHOLD
+
+    def decide(self, metrics: dict) -> SyncStrategy:
+        """
+        Entscheidungslogik gemäß Fachspezifikation:
+        1. Quota-Schutz (Stub-Ratio) ist Bedingung für Turbo.
+        2. Template ist kontrollierte mittlere Stufe.
+        3. Safe-Mode ist immer verfügbarer Fallback.
+        """
+        source_count = metrics.get("source_snapshots", 0)
+        match_ratio = metrics.get("match_ratio", 0.0)
+        stub_ratio = metrics.get("stub_ratio", 0.0)
+        template_match = metrics.get("template_match", 0.0)
+        template_exists = metrics.get("template_exists", False)
+
+        # Fall 1: Nur ein Snapshot -> SAFE-MODE
+        if source_count <= 1:
+            return SyncStrategy.SAFE_MODE
+
+        # Fall 2a: Hohe Übereinstimmung + Hoher Stub-Anteil -> TURBO-MODE (Snapshot Copy)
+        if match_ratio >= self.x_match_ratio and stub_ratio >= self.y_stub_ratio:
+            return SyncStrategy.TURBO_MODE
+
+        # Fall 2b: Hohe Übereinstimmung + Template vorhanden -> TEMPLATE-DELTA-SAFE
+        if (
+            match_ratio >= self.x_match_ratio
+            and template_exists
+            and template_match >= self.z_template_match
+        ):
+            return SyncStrategy.TEMPLATE_DELTA_SAFE
+
+        # Fall 2c: Fallback -> SAFE-MODE
+        return SyncStrategy.SAFE_MODE
+
+    def log_decision(self, strategy: SyncStrategy, metrics: dict, snapshot_name: str):
+        """Schreibt eine maschinenlesbare Log-Zeile für Auditing."""
+        m = metrics
+        log_line = (
+            f"[decision] mode={strategy.value} | "
+            f"src_count={m.get('source_snapshots')} | "
+            f"match={m.get('match_ratio'):.3f} (target>={self.x_match_ratio}) | "
+            f"stub={m.get('stub_ratio'):.3f} (target>={self.y_stub_ratio}) | "
+            f"tmpl_match={m.get('template_match'):.3f} (target>={self.z_template_match}) | "
+            f"tmpl_exists={m.get('template_exists')} | "
+            f"basis={m.get('basis_snapshot')}"
+        )
+        _log(log_line)
+
+
+# ============================================================================
+# FOLDER TEMPLATE MANAGEMENT
+# ============================================================================
 
 
 def _load_template_manifest(archive_dir: str) -> Optional[dict]:
@@ -767,6 +939,143 @@ def _save_template_manifest(archive_dir: str, template_path: str, folders: set, 
         os.replace(tmp, path)
     except Exception as e:
         _log(f"[template] Manifest-Speicherung fehlgeschlagen: {e}")
+
+
+def _get_sync_metrics(cfg: dict, manifest: dict, dest_root: str, archive_dir: str) -> dict:
+    """Berechnet Kennzahlen für die Strategiewahl."""
+    metrics = {
+        "source_snapshots": 0,
+        "match_ratio": 0.0,
+        "stub_ratio": 0.0,
+        "template_match": 0.0,
+        "template_exists": False,
+        "basis_snapshot": None
+    }
+
+    # 1. Source Snapshots zählen (Lokal im Archiv)
+    if os.path.exists(archive_dir):
+        manifests = [f for f in os.listdir(archive_dir) if f.endswith(".json")]
+        metrics["source_snapshots"] = len(manifests)
+        
+        # Basis-Manifest ermitteln (letztes vor dem aktuellen)
+        current_name = manifest.get("snapshot")
+        other_manifests = sorted([m.replace(".json", "") for m in manifests if m.replace(".json", "") != current_name])
+        if other_manifests:
+            basis_name = other_manifests[-1]
+            metrics["basis_snapshot"] = basis_name
+            
+            # Basis laden und Match/Stub Ratio berechnen
+            try:
+                with open(f"{archive_dir}/{basis_name}.json", "r") as f:
+                    basis_manifest = json.load(f)
+                
+                # Sets von (relpath, size, mtime) für Match-Check
+                curr_items = { (it.get("relpath"), it.get("size"), it.get("mtime")) 
+                              for it in manifest.get("items", []) if it.get("type") == "file" }
+                basis_items = { (it.get("relpath"), it.get("size"), it.get("mtime")) 
+                               for it in basis_manifest.get("items", []) if it.get("type") == "file" }
+                
+                if curr_items:
+                    intersection = curr_items & basis_items
+                    metrics["match_ratio"] = len(intersection) / len(curr_items)
+                    
+                    # Stub-Ratio: wie viele curr_items existieren (nach relpath) in basis_items?
+                    basis_paths = { it.get("relpath") for it in basis_manifest.get("items", []) if it.get("type") == "file" }
+                    curr_paths = { it.get("relpath") for it in manifest.get("items", []) if it.get("type") == "file" }
+                    stub_matches = curr_paths & basis_paths
+                    metrics["stub_ratio"] = len(stub_matches) / len(curr_paths)
+            except Exception:
+                pass
+
+    # 2. Template Check (Remote auf pCloud)
+    template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
+    try:
+        template_md = pc.stat_file(cfg, path=template_path, with_checksum=False)
+        if template_md and template_md.get("isfolder"):
+            metrics["template_exists"] = True
+            
+            # Template Match (aus lokalem Cache-Manifest)
+            cached_tmpl = _load_template_manifest(archive_dir)
+            if cached_tmpl:
+                tmpl_folders = set(cached_tmpl.get("folders", []))
+                curr_folders = { it.get("relpath").rstrip("/") for it in manifest.get("items", []) 
+                                if it.get("type") == "dir" and it.get("relpath") }
+                if curr_folders:
+                    shared = tmpl_folders & curr_folders
+                    metrics["template_match"] = len(shared) / len(curr_folders)
+    except Exception:
+        pass
+
+    return metrics
+
+
+def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive_dir: str) -> dict:
+    """
+    Einheitliche Kennzahlenberechnung für alle Entscheidungen.
+    IMMER aus derselben Quelle (Index + Manifest-Archive).
+    """
+    metrics = {
+        "source_snapshots": 0,
+        "match_ratio": 0.0,
+        "stub_ratio": 0.0,  # ECHT aus Index, nicht Pfad-Proxy
+        "template_match": 0.0,
+        "template_exists": False,
+        "basis_snapshot": None
+    }
+
+    # 1. Source-Snapshots aus dem RICHTIGEN Pfad
+    manifests_dir = os.path.join(archive_dir, "manifests")
+    if os.path.exists(manifests_dir):
+        # Zähle nur Snapshots mit abgelautenem .json
+        manifests = [f for f in os.listdir(manifests_dir) if f.endswith(".json")]
+        metrics["source_snapshots"] = len(manifests)
+        
+        # Basis: neuestes Manifest OHNE aktuellen Snapshot
+        current_name = manifest.get("snapshot")
+        valid_bases = sorted([m.replace(".json", "") 
+                             for m in manifests 
+                             if m.replace(".json", "") != current_name])
+        
+        if valid_bases:
+            basis_name = valid_bases[-1]
+            metrics["basis_snapshot"] = basis_name
+            
+            # 2. Match + Stub-Ratio aus UNIFIED SOURCE (Remote Index via load_content_index)
+            # NICHT aus lokalem Manifest, sondern aus echter pCloud-Index
+            try:
+                snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
+                index = load_content_index(cfg, snapshots_root)  # Authoritative Quelle
+                
+                # Stub-Ratio EXAKT wie in delta-copy (via _compute_snapshot_stub_ratio)
+                _, _, stub_ratio = _compute_snapshot_stub_ratio(index, basis_name)
+                metrics["stub_ratio"] = stub_ratio
+                
+                # Match-Ratio: Dateien die in beiden Snapshots existieren
+                basis_paths = _get_snapshot_paths(index, basis_name)
+                current_paths = _get_manifest_paths(manifest)
+                if current_paths:
+                    match_ratio = len(basis_paths & current_paths) / len(current_paths)
+                    metrics["match_ratio"] = match_ratio
+            except Exception as e:
+                _log(f"[metrics] Warnung: Konnte Index nicht laden: {e}")
+                metrics["stub_ratio"] = 0.0
+                metrics["match_ratio"] = 0.0
+    
+    # 3. Template Check (wie gehabt, aber konsistent)
+    template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
+    try:
+        pc.stat_file(cfg, path=template_path, with_checksum=False)
+        metrics["template_exists"] = True
+        
+        # Template Match aus Live-Zustand
+        template_folders = _list_remote_folders_from_template(cfg, template_path)
+        manifest_folders = _get_manifest_folders(manifest)
+        if manifest_folders:
+            metrics["template_match"] = len(template_folders & manifest_folders) / len(manifest_folders)
+    except Exception:
+        pass
+
+    return metrics
 
 
 def _list_remote_folders_from_template(cfg: dict, template_path: str) -> set:
@@ -1312,13 +1621,14 @@ def ensure_snapshots_layout(cfg: dict, dest_root: str, *, dry: bool = False) -> 
     pc.ensure_path(cfg, snapshots_root)
     pc.ensure_path(cfg, index_dir)
 
-def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None):
+def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None, 
+                   strategy_mode="SAFE-MODE"):
     """
-    1:1-Modus mit Resume-Unterstützung:
-      - .upload_started Marker beim Start
-      - .upload_complete Marker beim erfolgreichen Abschluss
-      - Unvollständige Snapshots werden erkannt und neu gestartet
-      - Nach Upload: Manifest-Archivierung (falls manifest_path gegeben)
+    1:1-Modus mit Resume-Unterstützung.
+    Entscheidung zwischen TURBO/TEMPLATE/SAFE erfolgt EXTERN in push_1to1_smart_controller.
+    
+    Args:
+        strategy_mode: "SAFE-MODE", "TEMPLATE-DELTA-SAFE", oder "TURBO-MODE" (wird von Controller gesetzt)
     """
     t_phase_start = time.time()
     ensure_ms = 0.0
@@ -1329,6 +1639,12 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     dest_root = pc._norm_remote_path(dest_root)
     snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
     dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    
+    # Kein Decision-Block mehr hier!
+    # Nur noch Execution basierend auf strategy_mode
+    force_safe = (strategy_mode == "SAFE-MODE")
+    template_force_active = (strategy_mode == "TEMPLATE-DELTA-SAFE")
     
     # === Timeout-Protection für Mass-Uploads ===
     # Ensure minimum timeout (kritisch bei 19k+ Stub-Writes)
@@ -1336,6 +1652,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
         if os.environ.get("PCLOUD_VERBOSE") == "1":
             _log(f"[config] Timeout auf {cfg['timeout']}s gesetzt (Mass-Upload-Protection)")
+
 
     # === NEU: Upload-Status-Marker ===
     marker_started = f"{dest_snapshot_dir}/.upload_started"
@@ -1564,7 +1881,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     # Entscheidung: Template nutzen oder Einzeln anlegen?
     template_used = False
     
-    if template_exists:
+    if template_exists and template_force_active:
         # === Template-basierte Anlage (SCHNELL!) ===
         # 1. IST-Zustand von pCloud laden (pCloud = Single Source of Truth!)
         _log(f"[template] Lade aktuellen Template-Zustand von pCloud...")
@@ -2313,7 +2630,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
 # ----------------- Delta-Copy Mode (PoC) -----------------
 
-def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None):
+def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None, basis_snapshot=None):
     """
     Delta-Copy Mode: Server-seitiges Klonen + Selective Update
     
@@ -2360,36 +2677,38 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     except Exception as e:
         _log(f"[delta-copy][FALLBACK] Konnte content_index.json nicht laden: {e}")
         _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
-        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
-    # Finde letzten Snapshot mit .upload_complete Marker
-    basis_snapshot = None
-    remote_snapshots = list_remote_snapshot_names(cfg, snapshots_root)
-    
-    # Sortiere absteigend (neueste zuerst)
-    sorted_snapshots = sorted(remote_snapshots, reverse=True)
-    
-    for candidate in sorted_snapshots:
-        if candidate == snapshot_name:
-            continue  # Überspringe den neuen Snapshot selbst
+    # Finde letzten Snapshot mit .upload_complete Marker (falls nicht übergeben)
+    if basis_snapshot is None:
+        remote_snapshots = list_remote_snapshot_names(cfg, snapshots_root)
         
-        # Prüfe ob .upload_complete existiert
-        marker_complete = f"{snapshots_root}/{candidate}/.upload_complete"
-        try:
-            pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-            basis_snapshot = candidate
-            _log(f"[delta-copy][1/6] Basis gefunden: {basis_snapshot}")
-            break
-        except Exception:
-            # Kein Complete-Marker → überspringe
-            if verbose:
-                _log(f"[delta-copy][1/6] Überspringe {candidate} (kein Complete-Marker)")
-            continue
+        # Sortiere absteigend (neueste zuerst)
+        sorted_snapshots = sorted(remote_snapshots, reverse=True)
+        
+        for candidate in sorted_snapshots:
+            if candidate == snapshot_name:
+                continue  # Überspringe den neuen Snapshot selbst
+            
+            # Prüfe ob .upload_complete existiert
+            marker_complete = f"{snapshots_root}/{candidate}/.upload_complete"
+            try:
+                pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+                basis_snapshot = candidate
+                _log(f"[delta-copy][1/6] Basis gefunden: {basis_snapshot}")
+                break
+            except Exception:
+                # Kein Complete-Marker → überspringe
+                if verbose:
+                    _log(f"[delta-copy][1/6] Überspringe {candidate} (kein Complete-Marker)")
+                continue
+    else:
+        _log(f"[delta-copy][1/6] Basis via Controller übergeben: {basis_snapshot}")
     
     if not basis_snapshot:
         _log(f"[delta-copy][FALLBACK] Kein vollständiger Basis-Snapshot gefunden")
         _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
-        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
     t_find_ms = (time.time() - t_find_start) * 1000.0
     _log(f"[delta-copy][1/6] ✓ Basis: {basis_snapshot} ({t_find_ms:.0f}ms)")
@@ -2417,7 +2736,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         _log(f"[delta-copy][SAFE-MODE] Baue Snapshot mit frischer Stub-Struktur auf "
              f"(einmalige Transformation, danach TURBO-MODE aktiv)")
         return push_1to1_mode(cfg, manifest, dest_root,
-                              dry=dry, verbose=verbose, manifest_path=manifest_path)
+                              dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
 
     _log(f"[delta-copy][TURBO-MODE] Stub-Ratio OK ({_basis_ratio:.1%}) – nutze copyfolder + Delta")
 
@@ -2435,7 +2754,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             _log(f"[delta-copy][2/6] ✓ Zielordner angelegt: {dest_snapshot_dir}")
         except Exception as e:
             _log(f"[delta-copy][ERROR] Konnte Zielordner nicht anlegen: {e}")
-            return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+            return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
     if dry:
         _log(f"[dry] copyfolder (contentonly): {basis_path} → {dest_snapshot_dir}")
@@ -2482,10 +2801,11 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 pc.call_with_backoff(pc.delete_folder, cfg, path=dest_snapshot_dir, recursive=True)
             except Exception:
                 pass
-            return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+                return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
+    # Timing für copyfolder-Operation
     t_copy_ms = (time.time() - t_copy_start) * 1000.0
-    _log(f"[delta-copy][2/6] ✓ Server-Copy abgeschlossen ({t_copy_ms:.0f}ms = {t_copy_ms/1000:.1f}s)")
+    _log(f"[delta-copy][2/6] copyfolder abgeschlossen: {t_copy_ms:.1f}ms")
     
     # === Schritt 3: Manifest-Diff berechnen ===
     _log(f"[delta-copy][3/6] Berechne Manifest-Diff...")
@@ -2504,7 +2824,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 pc.call_with_backoff(pc.delete_folder, cfg, path=dest_snapshot_dir, recursive=True)
             except Exception:
                 pass
-        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
     # Import pcloud_manifest_diff
     try:
@@ -2512,7 +2832,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     except Exception as e:
         _log(f"[delta-copy][ERROR] Konnte pcloud_manifest_diff nicht importieren: {e}")
         _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
-        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
     # Schreibe current manifest temporär (falls noch nicht gespeichert)
     import tempfile
@@ -2531,7 +2851,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         _log(f"[delta-copy][ERROR] Manifest-Diff fehlgeschlagen: {e}")
         if temp_current:
             os.unlink(temp_current)
-        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path)
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     finally:
         if temp_current and os.path.exists(temp_current):
             os.unlink(temp_current)
@@ -2979,12 +3299,14 @@ def main() -> None:
     if args.snapshot_mode == "objects":
         push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
     else:
-        # 1:1-Modus: Delta-Copy oder Full-Mode
+        # Smart Strategy Selection, aber mit Legacy-Kompatibilität für --use-delta-copy
         if args.use_delta_copy:
-            _log("[mode] Delta-Copy-Modus aktiviert")
+            _log("[legacy] --use-delta-copy Flag erkannt; erzwinge TURBO-MODE (deprecated, nutze Smart-Controller stattdessen)")
+            # Direkt zu Delta-Mode, ohne Metriken zu prüfen
             push_1to1_delta_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
         else:
-            push_1to1_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
+            # Standard: Smart-Entscheidung
+            push_1to1_smart_controller(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
 
 
     # --- metrics summary (einheitlich, greppbar) ---
