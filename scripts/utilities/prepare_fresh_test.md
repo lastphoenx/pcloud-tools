@@ -108,8 +108,8 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 # 2b) Produktions-Lauf via rtb_wrapper
 /opt/apps/rtb/rtb_wrapper.sh
 
-# 3a) Direkter pcloud-tools Dry-Run (falls benoetigt)
-/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201 --dry-run
+# 3a) Hinweis: --check-only nur im rtb_wrapper vorhanden
+# Direkter pcloud-wrapper hat kein --check-only/--dry-run CLI-Flag
 
 # 3b) Direkter pcloud-tools Produktions-Lauf
 /opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-27-173201
