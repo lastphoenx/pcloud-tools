@@ -388,11 +388,16 @@ need_retention_sync() {
 build_and_push() {
   local SNAP="$1" SNAPNAME; SNAPNAME="$(basename "$SNAP")"
   _log INFO "Uploading snapshot: $SNAPNAME"
-  
-  # Log run start (only once per wrapper invocation)
-  if [[ -z "$RUN_ID" ]]; then
-    _db_run_start "$SNAPNAME" "$SNAP"
-  fi
+
+  # DB-Tracking: ein Run pro Snapshot (wichtig für Bootstrap/Kettenläufe)
+  _db_run_start "$SNAPNAME" "$SNAP"
+
+  _db_fail_and_return() {
+    local msg="$1"
+    _db_run_end FAILED "$msg"
+    RUN_ID=""
+    return 1
+  }
 
   # === Manifest: Deterministischer Filename (ohne PID für Resume/Reuse) ===
   local mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.json"
@@ -444,7 +449,7 @@ build_and_push() {
     
     "${PY}" "$MANI" --root "$SNAP" --snapshot "$SNAPNAME" --out "$mani" --hash sha256 $ref_manifest_arg || {
       _db_phase_log "manifest" "end" "FAILED"
-      return 1
+      _db_fail_and_return "manifest_generation_failed"
     }
     
     local manifest_duration=$(( $(date +%s) - T0 ))
@@ -468,7 +473,7 @@ build_and_push() {
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode 1to1 $RET --env-file "$ENV_FILE" "${EXTRA_PUSH_ARGS[@]}" || {
     _db_phase_log "upload" "end" "FAILED"
     rm -f "$mani" "$mani_jsonl" 2>/dev/null || true
-    return 1
+    _db_fail_and_return "upload_failed"
   }
   
   local upload_duration=$(( $(date +%s) - T0 ))
@@ -510,6 +515,10 @@ build_and_push() {
   
   # Explizites Cleanup (statt trap RETURN)
   rm -f "$mani" "$mani_jsonl" 2>/dev/null || true
+
+  # Snapshot-Run erfolgreich abschließen
+  _db_run_end SUCCESS 0
+  RUN_ID=""
 }
 
 # ========= Start =========
@@ -645,7 +654,6 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
   mapfile -t SNAPS < <(find "$RTB" -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' | sort)
   if [[ ${#SNAPS[@]} -eq 0 ]]; then
     _log WARN "No local snapshots found"
-    _db_run_end SUCCESS 0
     exit 0
   fi
   if [[ -n "$TARGET_SNAPSHOT" ]]; then
@@ -678,7 +686,6 @@ snapshots_root = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots"
 fixed = finalize_index_fileids(cfg, snapshots_root)
 print(f"[finalize] index fileids fixed={fixed}")
 PY
-  _db_run_end SUCCESS 0
   _log INFO "Bootstrap completed successfully (folder template will be auto-created by pcloud_push)"
   exit 0
 fi
@@ -733,7 +740,6 @@ for s in "${local_snaps[@]}"; do
           _log ERROR "Gap detected in conservative mode – manual intervention required!"
           _log ERROR "Later snapshots may have broken hardlink chains: ${later_snaps[*]}"
           _log ERROR "Run with PCLOUD_GAP_STRATEGY=optimistic to auto-repair"
-          _db_run_end FAILED 1 "Gap detected (conservative mode)"
           exit 1
           ;;
           
@@ -761,20 +767,17 @@ for s in "${local_snaps[@]}"; do
             for later in "${later_snaps[@]}"; do
               delete_remote_snapshot "$later" || {
                 _log ERROR "Failed to delete $later"
-                _db_run_end FAILED 1 "Gap repair failed (delete)"
                 exit 1
               }
             done
             
             # Upload Gap + alle Folgenden in richtiger Reihenfolge
             build_and_push "$RTB/$s" || {
-              _db_run_end FAILED 1 "Gap backfill failed: $s"
               exit 1
             }
             
             for later in "${later_snaps[@]}"; do
               build_and_push "$RTB/$later" || {
-                _db_run_end FAILED 1 "Rebuild failed: $later"
                 exit 1
               }
               rebuild_count=$((rebuild_count + 1))
@@ -786,7 +789,6 @@ for s in "${local_snaps[@]}"; do
             # Szenario B: Chain intact → nur Gap füllen
             _log INFO "Later snapshots intact – backfilling gap only"
             build_and_push "$RTB/$s" || {
-              _db_run_end FAILED 1 "Gap backfill failed: $s"
               exit 1
             }
             uploaded_count=$((uploaded_count + 1))
@@ -823,7 +825,6 @@ for s in "${local_snaps[@]}"; do
       new_count=$((new_count + 1))
       
       build_and_push "$RTB/$s" || {
-        _db_run_end FAILED 1 "Upload failed for $s"
         exit 1
       }
       uploaded_count=$((uploaded_count + 1))
@@ -849,6 +850,4 @@ if [[ -d "${PCLOUD_TEMP_DIR}" ]]; then
   _log INFO "Cleaned up old temp files (>7d) from ${PCLOUD_TEMP_DIR}"
 fi
 
-# Success!
-_db_run_end SUCCESS 0
 _log INFO "========== pCloud Sync 1to1 Complete =========="
