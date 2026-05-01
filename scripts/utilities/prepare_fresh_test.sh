@@ -19,8 +19,8 @@ Parameter:
   --rtb-base <PATH>              RTB Basis-Pfad (Default: /mnt/backup/rtb_nas)
   --archive-base <PATH>          Archiv-Basis (Default: /srv/pcloud-archive)
     --dry-run                      Nur anzeigen was gelöscht/gesetzt würde (Default)
-    --execute                      Führt Änderungen wirklich aus
-  --yes                          Ohne Rückfrage ausführen
+  --execute                      Führt Änderungen wirklich aus (destruktiv!)
+  --yes                          Ohne Rückfrage ausführen (nur mit --execute sinnvoll)
   -h, --help                     Hilfe anzeigen
 EOF
 }
