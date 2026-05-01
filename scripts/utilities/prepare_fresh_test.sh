@@ -41,6 +41,8 @@ RTB_BASE="/mnt/backup/rtb_nas"
 ARCHIVE_BASE="/srv/pcloud-archive"
 ENV_FILE="/opt/apps/pcloud-tools/main/.env"
 PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
+PCLOUD_DEST="${PCLOUD_DEST:-/Backup/rtb_1to1}"
+PCLOUD_DB_NAME="${PCLOUD_DB_NAME:-pcloud_backup}"
 KEEP_SNAPSHOT=""
 KEEP_LOCAL_MANIFEST="yes"
 ASSUME_YES="no"
@@ -105,6 +107,16 @@ if [[ -f "$ENV_FILE" ]]; then
         | sed -e 's/[[:space:]]*#.*//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
               -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     [[ -n "$_env_temp" ]] && PCLOUD_TEMP_DIR="$_env_temp"
+
+    _env_dest=$(grep -E '^PCLOUD_DEST=' "$ENV_FILE" | head -1 | cut -d= -f2- \
+        | sed -e 's/[[:space:]]*#.*//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
+              -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [[ -n "$_env_dest" ]] && PCLOUD_DEST="$_env_dest"
+
+    _env_db_name=$(grep -E '^PCLOUD_DB_NAME=' "$ENV_FILE" | head -1 | cut -d= -f2- \
+        | sed -e 's/[[:space:]]*#.*//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
+              -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [[ -n "$_env_db_name" ]] && PCLOUD_DB_NAME="$_env_db_name"
 fi
 
 if [[ ! -d "$RTB_BASE/$KEEP_SNAPSHOT" ]]; then
@@ -367,26 +379,54 @@ echo "════════════════════════�
 echo ""
 echo "🚀 Nächste Schritte:"
 echo ""
-echo "1. venv aktivieren (voller Pfad):"
+echo "1. DB prüfen und verwaiste pCloud-Runs manuell entfernen (empfohlen als Erstes):"
+echo "   # 1a) Anzeigen: vorhandene Runs für Keep-Snapshot und andere Snapshots"
+echo "   sudo mysql -e \"SELECT snapshot_name, status, started_at, finished_at FROM ${PCLOUD_DB_NAME}.backup_runs ORDER BY started_at DESC LIMIT 50;\""
+echo ""
+echo "   # 1b) Kandidaten anzeigen (alles außer Keep-Snapshot):"
+echo "   sudo mysql -e \"SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${KEEP_SNAPSHOT}' ORDER BY started_at DESC;\""
+echo ""
+echo "   # 1c) Löschen (manuell freigeben):"
+echo "   sudo mysql -e \"DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${KEEP_SNAPSHOT}';\""
+echo "   # Hinweis: backup_phases/gap_backfills hängen via ON DELETE CASCADE an backup_runs."
+echo ""
+echo "2. pCloud Remote-Cleanup manuell prüfen/bereinigen (vor neuem Lauf):"
+echo "   - Snapshot-Ordner löschen, die nicht mehr gelten:"
+echo "     ${PCLOUD_DEST}/_snapshots/<SNAPSHOT_NAME>"
+echo "   - Aktiven Index prüfen/löschen falls inkonsistent:"
+echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
+echo "   - Optional: aus Archiv wiederherstellen (falls vorhanden):"
+echo "     ${PCLOUD_DEST}/_snapshots/_index/archive/${KEEP_SNAPSHOT}_index.json"
+echo "       -> kopieren nach ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
+echo ""
+if [[ "$KEEP_LOCAL_MANIFEST" = "yes" ]]; then
+    echo "   - Lokal bleibt Keep-Manifest aktiv: ${ARCHIVE_BASE}/manifests/${KEEP_SNAPSHOT}.json"
+    echo "   - Temp-Manifest für Speed-Start: ${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
+else
+    echo "   - Keep-Manifest ist deaktiviert (--keep-local-manifest no):"
+    echo "     nächster Lauf erzeugt Manifest neu (kein Speed-Start aus lokaler Keep-Kopie)."
+fi
+echo ""
+echo "3. venv aktivieren (voller Pfad):"
 echo "   source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools"
 echo ""
-echo "2a. Test-Lauf via rtb_wrapper (check-only, read-only):"
+echo "4a. Test-Lauf via rtb_wrapper (check-only, read-only):"
 echo "   /opt/apps/rtb/rtb_wrapper.sh --check-only"
 echo ""
-echo "2b. Produktions-Lauf via rtb_wrapper:"
+echo "4b. Produktions-Lauf via rtb_wrapper:"
 echo "   /opt/apps/rtb/rtb_wrapper.sh"
 echo ""
-echo "3a. Hinweis: --check-only gibt es nur im rtb_wrapper"
+echo "5a. Hinweis: --check-only gibt es nur im rtb_wrapper"
 echo "   Direkter pcloud-wrapper unterstützt jetzt: --dry-run, --use-delta-copy"
 echo ""
-echo "3b. Direkter pcloud-tools Produktions-Lauf:"
+echo "5b. Direkter pcloud-tools Produktions-Lauf:"
 echo "   /opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/$KEEP_SNAPSHOT"
-echo "3c. Direkter pcloud-tools Dry-Run:"
+echo "5c. Direkter pcloud-tools Dry-Run:"
 echo "   /opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/$KEEP_SNAPSHOT --dry-run"
-echo "3d. Copy/Turbo erzwingen (direkter Wrapper):"
+echo "5d. Copy/Turbo erzwingen (direkter Wrapper):"
 echo "   /opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/$KEEP_SNAPSHOT --use-delta-copy"
 echo ""
-echo "4. Beobachten während Upload:"
+echo "6. Beobachten während Upload:"
 echo "   ✓ Thread-Count (parallele Uploads)"
 echo "   ✓ Debug-Output (CLI-Logs)"
 echo "   ✓ Upload-Speed & Fortschritt"
