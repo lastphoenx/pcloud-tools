@@ -116,8 +116,32 @@ source /opt/apps/safe-ops-cli/main/tools/venv_switch.sh pcloud-tools
 ```
 
 **Modus-Hinweis:**
+- Default: Smart-Logik im `wrapper_pcloud_sync_1to1.sh` (automatische Strategie-Auswahl).
 - Copy-Modus: maximale Geschwindigkeit, hoeherer Speicherverbrauch.
 - Smart-Logik: balanciert Upload-Zeit und Speicherverbrauch (empfohlen).
+
+**Wie Modus explizit forcieren?**
+- `rtb_wrapper.sh`: kein direkter Modus-Parameter fuer Smart/Copy; nutzt den pcloud-wrapper-Default (Smart).
+- `wrapper_pcloud_sync_1to1.sh`: ebenfalls kein `--use-delta-copy`-Flag an der CLI.
+- Explizites Forcieren von Copy/Turbo geht aktuell nur im Low-Level Push-Tool:
+
+```bash
+/opt/apps/pcloud-tools/venv/bin/python /opt/apps/pcloud-tools/main/pcloud_push_json_manifest_to_pcloud.py \
+  --manifest /tmp/pcloud_mani.2026-04-27-173201.json \
+  --dest-root /Backup/rtb_1to1 \
+  --snapshot-mode 1to1 \
+  --use-delta-copy \
+  --env-file /opt/apps/pcloud-tools/main/.env
+```
+
+**Wichtige Parameter (Kurzuebersicht):**
+- `rtb_wrapper.sh`:
+  - `--check-only` (read-only Check)
+  - `--force` (Safety-Gate umgehen)
+  - `--upload-only /mnt/backup/rtb_nas/<SNAPSHOT>` (nur Upload, kein neues RTB-Backup)
+- `wrapper_pcloud_sync_1to1.sh`:
+  - keine `--check-only`/`--dry-run` CLI-Flags
+  - wichtige ENVs: `PCLOUD_MANIFEST_MODE=smart|full`, `PCLOUD_GAP_STRATEGY=conservative|optimistic|aggressive`
 
 ---
 
