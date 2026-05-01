@@ -556,10 +556,22 @@ EOF
 done
 
 if [[ -n "$TARGET_SNAPSHOT" ]]; then
-  # Falls Pfad übergeben wurde, auf Snapshot-Namen normalisieren
-  if [[ -d "$TARGET_SNAPSHOT" ]]; then
-    TARGET_SNAPSHOT="$(basename "$TARGET_SNAPSHOT")"
+  # Falls Pfad/Symlink übergeben wurde, auf echten Snapshot-Namen normalisieren
+  # (wichtig für Aufrufe wie: /mnt/backup/rtb_nas/latest)
+  _target_candidate="$TARGET_SNAPSHOT"
+  if [[ "$TARGET_SNAPSHOT" == "latest" ]]; then
+    _target_candidate="${RTB}/latest"
   fi
+
+  if [[ -e "$_target_candidate" || -L "$_target_candidate" ]]; then
+    _resolved_target="$(readlink -f "$_target_candidate" 2>/dev/null || true)"
+    if [[ -n "$_resolved_target" ]]; then
+      TARGET_SNAPSHOT="$(basename "$_resolved_target")"
+    else
+      TARGET_SNAPSHOT="$(basename "$_target_candidate")"
+    fi
+  fi
+
   if [[ ! "$TARGET_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}- ]]; then
     _log ERROR "Invalid snapshot argument: '$TARGET_SNAPSHOT'"
     exit 2
