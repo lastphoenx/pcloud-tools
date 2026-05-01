@@ -292,6 +292,8 @@ echo "════════════════════════�
 echo "[5/5] Final Check"
 echo "════════════════════════════════════════════════════════════════"
 
+FINAL_TEMP_MANI="${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
+
 if [[ "$DRY_RUN" = "yes" ]]; then
     # Soll-Zustand berechnen (was nach --execute der Fall wäre)
     echo "📊 Erwarteter Soll-Zustand nach --execute:"
@@ -314,8 +316,12 @@ if [[ "$DRY_RUN" = "yes" ]]; then
             _expected_manifests=1
         fi
         echo "  manifests/: $_expected_manifests Datei(en) (nur $KEEP_SNAPSHOT.json)"
+        echo "  keep-local-manifest: yes -> Keep-Manifest bleibt im Archiv"
+        echo "  temp-manifest: $FINAL_TEMP_MANI (wird aus Keep-Manifest kopiert, falls vorhanden)"
     else
         echo "  manifests/: 0 Dateien (alle gelöscht)"
+        echo "  keep-local-manifest: no -> kein Keep-Manifest im Archiv"
+        echo "  temp-manifest: keine Keep-Kopie nach $PCLOUD_TEMP_DIR"
     fi
     echo "  indexes/:   0 Dateien (alle gelöscht)"
     echo ""
@@ -339,6 +345,14 @@ else
         else
             echo "  keep-manifest: nicht vorhanden ($KEEP_SNAPSHOT.json)"
         fi
+        if [ -f "$FINAL_TEMP_MANI" ]; then
+            echo "  temp-manifest: vorhanden ($FINAL_TEMP_MANI)"
+        else
+            echo "  temp-manifest: nicht vorhanden ($FINAL_TEMP_MANI)"
+        fi
+    else
+        echo "  keep-manifest: deaktiviert (--keep-local-manifest no)"
+        echo "  temp-manifest: deaktiviert (keine Keep-Kopie nach $PCLOUD_TEMP_DIR)"
     fi
 fi
 echo ""
