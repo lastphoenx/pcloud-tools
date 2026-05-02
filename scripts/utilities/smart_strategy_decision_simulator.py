@@ -195,8 +195,8 @@ def _compute_stub_ratio_from_index(index_path: str, basis_snapshot_name: str) ->
 
 
 def _detect_template(template_dir: str) -> bool:
-    """Return True if a '_template' subdirectory exists inside template_dir."""
-    return os.path.isdir(os.path.join(template_dir, "_template"))
+    """Return True if a '_folder_template' subdirectory exists inside template_dir."""
+    return os.path.isdir(os.path.join(template_dir, "_folder_template"))
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +231,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Directory containing snapshot manifests for auto-counting "
                         "(defaults to dirname of --current when --auto)")
     p.add_argument("--template-dir", default=None,
-                   help="Directory to check for '_template' subfolder (auto-detect template_exists)")
+                   help="Directory to check for '_folder_template' subfolder (auto-detect template_exists)")
 
     # ---- Threshold overrides ----------------------------------------------
     p.add_argument("--stub-transform-threshold", type=float,
@@ -303,7 +303,7 @@ def main() -> int:
         template_exists = _detect_template(args.template_dir)
         autopilot_log.append(
             f"template_exists = {template_exists}  "
-            f"(checked for '_template' in {args.template_dir})"
+            f"(checked for '_folder_template' in {args.template_dir})"
         )
 
     # -----------------------------------------------------------------------
