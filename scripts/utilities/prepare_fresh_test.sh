@@ -10,12 +10,15 @@ usage() {
     cat <<EOF
 Usage:
     $0 --keep-snapshot <SNAPSHOT> [--keep-local-manifest yes|no] [--dry-run|--execute] [--yes]
-     [--rtb-base <PATH>] [--archive-base <PATH>]
+    [--auto-remote-cleanup yes|no] [--auto-db-cleanup yes|no]
+    [--rtb-base <PATH>] [--archive-base <PATH>]
 
 Parameter:
   --keep-snapshot <SNAPSHOT>     Snapshot der lokal behalten wird (Pflicht)
   --keep-local-manifest <yes|no> Lokales Manifest <SNAPSHOT>.json behalten (Default: yes)
   --keep-lokal-manifest <yes|no> Alias für --keep-local-manifest
+    --auto-remote-cleanup <yes|no> pCloud Remote-Cleanup automatisch ausführen (Default: yes)
+    --auto-db-cleanup <yes|no>     DB-Cleanup automatisch ausführen (Default: yes)
   --rtb-base <PATH>              RTB Basis-Pfad (Default: /mnt/backup/rtb_nas)
     --archive-base <PATH>          Archiv-Basis (Default: /srv/pcloud-archive)
     --env-file <PATH>              .env-Datei für PCLOUD_TEMP_DIR (Default: /opt/apps/pcloud-tools/main/.env)
@@ -43,8 +46,11 @@ ENV_FILE="/opt/apps/pcloud-tools/main/.env"
 PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
 PCLOUD_DEST="${PCLOUD_DEST:-/Backup/rtb_1to1}"
 PCLOUD_DB_NAME="${PCLOUD_DB_NAME:-pcloud_backup}"
+MYSQL_BIN="${MYSQL_BIN:-mysql}"
 KEEP_SNAPSHOT=""
 KEEP_LOCAL_MANIFEST="yes"
+AUTO_REMOTE_CLEANUP="yes"
+AUTO_DB_CLEANUP="yes"
 ASSUME_YES="no"
 DRY_RUN="yes"
 
@@ -57,6 +63,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --keep-local-manifest|--keep-lokal-manifest)
             KEEP_LOCAL_MANIFEST="$(to_yes_no "$2")"
+            shift 2
+            ;;
+        --auto-remote-cleanup)
+            AUTO_REMOTE_CLEANUP="$(to_yes_no "$2")"
+            shift 2
+            ;;
+        --auto-db-cleanup)
+            AUTO_DB_CLEANUP="$(to_yes_no "$2")"
             shift 2
             ;;
         --rtb-base)
@@ -142,6 +156,8 @@ echo "  - Behalte Snapshot: $KEEP_SNAPSHOT"
 echo "  - Lösche alle anderen lokalen Snapshots (${#DELETE_SNAPSHOTS[@]})"
 echo "  - Setze latest → $KEEP_SNAPSHOT"
 echo "  - Leere Archive (indexes immer, manifests abhängig von --keep-local-manifest=$KEEP_LOCAL_MANIFEST)"
+echo "  - pCloud Remote-Cleanup: $AUTO_REMOTE_CLEANUP"
+echo "  - DB-Cleanup: $AUTO_DB_CLEANUP"
 echo "  - Cleanup Temp-Files"
 echo ""
 if [[ "$DRY_RUN" = "yes" ]]; then
@@ -304,6 +320,10 @@ echo "════════════════════════�
 echo "[6/5] pCloud Remote Cleanup & Index Restore"
 echo "════════════════════════════════════════════════════════════════"
 
+if [[ "$AUTO_REMOTE_CLEANUP" != "yes" ]]; then
+    echo "⏭️  Übersprungen (--auto-remote-cleanup no): Remote-Cleanup bleibt manuell."
+else
+
 # Python-Pfad: venv bevorzugen, Fallback auf System-Python
 PCLOUD_PYTHON="${PCLOUD_PYTHON:-/opt/apps/pcloud-tools/venv/bin/python3}"
 if [[ ! -x "$PCLOUD_PYTHON" ]]; then
@@ -397,6 +417,59 @@ DELETE_SNAPSHOTS_CSV="$_CSV_SNAPSHOTS" \
     echo "FAIL Remote-Cleanup-Script fehlgeschlagen (Exit $?)" >&2
     exit 1
 }
+fi
+
+# mysql als root direkt, sonst per sudo (auch für manuelle Hinweise unten)
+MYSQL_PREFIX=()
+if [[ "$EUID" -ne 0 ]]; then
+    MYSQL_PREFIX=(sudo)
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo "[7/5] DB Run-History bereinigen"
+echo "════════════════════════════════════════════════════════════════"
+
+if [[ "$AUTO_DB_CLEANUP" != "yes" ]]; then
+    echo "⏭️  Übersprungen (--auto-db-cleanup no): DB-Cleanup bleibt manuell."
+else
+
+# Snapshot-Name SQL-sicher machen (single quote escapen)
+SQL_KEEP_SNAPSHOT="${KEEP_SNAPSHOT//\'/\'\'}"
+
+if ! command -v "$MYSQL_BIN" >/dev/null 2>&1; then
+    echo "❌ FEHLER: mysql nicht gefunden (MYSQL_BIN=$MYSQL_BIN)" >&2
+    exit 1
+fi
+
+if ! "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -N -e "SELECT 1 FROM ${PCLOUD_DB_NAME}.backup_runs LIMIT 1;" >/dev/null 2>&1; then
+    echo "❌ FEHLER: DB/Tabelle nicht erreichbar: ${PCLOUD_DB_NAME}.backup_runs" >&2
+    echo "   Tipp: DB initialisieren oder PCLOUD_DB_NAME/DB-Rechte prüfen." >&2
+    exit 1
+fi
+
+echo "📋 Kandidaten (alles außer Keep-Snapshot):"
+"${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${SQL_KEEP_SNAPSHOT}' ORDER BY started_at DESC;"
+
+echo ""
+echo "📊 DB-Zähler vor Cleanup:"
+"${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;"
+
+if [[ "$DRY_RUN" = "yes" ]]; then
+    echo ""
+    echo "[dry] DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${SQL_KEEP_SNAPSHOT}';"
+    echo "ℹ️  Dry-Run: keine DB-Änderung durchgeführt"
+else
+    echo ""
+    echo "🗑️  Lösche DB-Runs außer Keep-Snapshot: $KEEP_SNAPSHOT"
+    "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${SQL_KEEP_SNAPSHOT}';"
+    echo "   ✓ DB-Cleanup ausgeführt"
+fi
+
+echo ""
+echo "📊 DB-Zähler nach Cleanup:"
+"${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;"
+fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
@@ -478,30 +551,48 @@ echo "════════════════════════�
 echo ""
 echo "🚀 Nächste Schritte:"
 echo ""
-echo "1. DB prüfen und verwaiste pCloud-Runs manuell entfernen (empfohlen als Erstes):"
-echo "   # 1a) Anzeigen: vorhandene Runs für Keep-Snapshot und andere Snapshots"
-echo "   sudo mysql -e \"SELECT snapshot_name, status, started_at, finished_at FROM ${PCLOUD_DB_NAME}.backup_runs ORDER BY started_at DESC LIMIT 50;\""
+if [[ "$AUTO_DB_CLEANUP" = "yes" ]]; then
+    echo "1. DB-Cleanup wurde von Schritt [7/5] automatisch durchgeführt."
+    echo "   (DELETE auf backup_runs außer Keep-Snapshot; backup_phases/gap_backfills via ON DELETE CASCADE)"
+    echo "   Optional manuell verifizieren:"
+    echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;\""
+else
+    echo "1. DB prüfen und verwaiste pCloud-Runs manuell entfernen (empfohlen als Erstes):"
+    echo "   # 1a) Anzeigen: vorhandene Runs für Keep-Snapshot und andere Snapshots"
+    echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"SELECT snapshot_name, status, started_at, finished_at FROM ${PCLOUD_DB_NAME}.backup_runs ORDER BY started_at DESC LIMIT 50;\""
+    echo ""
+    echo "   # 1b) Kandidaten anzeigen (alles außer Keep-Snapshot):"
+    echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${KEEP_SNAPSHOT}' ORDER BY started_at DESC;\""
+    echo ""
+    echo "   # 1c) Löschen (manuell freigeben):"
+    echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${KEEP_SNAPSHOT}';\""
+    echo "   # Hinweis: backup_phases/gap_backfills hängen via ON DELETE CASCADE an backup_runs."
+    echo ""
+    echo "   # 1d) Verifikation (wichtig: COUNT(*) statt COUNT()):"
+    echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;\""
+    echo ""
+    echo "   # 1e) Optional: Full-Reset aller pCloud-Runs (nur wenn Remote wirklich leer ist):"
+    echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"DELETE FROM ${PCLOUD_DB_NAME}.backup_runs;\""
+fi
 echo ""
-echo "   # 1b) Kandidaten anzeigen (alles außer Keep-Snapshot):"
-echo "   sudo mysql -e \"SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${KEEP_SNAPSHOT}' ORDER BY started_at DESC;\""
-echo ""
-echo "   # 1c) Löschen (manuell freigeben):"
-echo "   sudo mysql -e \"DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${KEEP_SNAPSHOT}';\""
-echo "   # Hinweis: backup_phases/gap_backfills hängen via ON DELETE CASCADE an backup_runs."
-echo ""
-echo "   # 1d) Verifikation (wichtig: COUNT(*) statt COUNT()):"
-echo "   sudo mysql -e \"SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;\""
-echo ""
-echo "   # 1e) Optional: Full-Reset aller pCloud-Runs (nur wenn Remote wirklich leer ist):"
-echo "   sudo mysql -e \"DELETE FROM ${PCLOUD_DB_NAME}.backup_runs;\""
-echo ""
-echo "2. pCloud Remote-Cleanup: wurde von Schritt [6/5] automatisch erledigt."
-echo "   Bei --execute wurden durchgeführt:"
-echo "   [6a] Remote-Snapshot-Ordner gelöscht (alle ausser ${KEEP_SNAPSHOT})"
-echo "   [6b] _index/archive/ bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
-echo "   [6c] content_index.json auf Stand ${KEEP_SNAPSHOT} restored"
-echo "   Bei Problemen manuell prüfen:"
-echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
+if [[ "$AUTO_REMOTE_CLEANUP" = "yes" ]]; then
+    echo "2. pCloud Remote-Cleanup: wurde von Schritt [6/5] automatisch erledigt."
+    echo "   Bei --execute wurden durchgeführt:"
+    echo "   [6a] Remote-Snapshot-Ordner gelöscht (alle ausser ${KEEP_SNAPSHOT})"
+    echo "   [6b] _index/archive/ bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
+    echo "   [6c] content_index.json auf Stand ${KEEP_SNAPSHOT} restored"
+    echo "   Bei Problemen manuell prüfen:"
+    echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
+else
+    echo "2. pCloud Remote-Cleanup manuell prüfen/bereinigen (vor neuem Lauf):"
+    echo "   - Snapshot-Ordner löschen, die nicht mehr gelten:"
+    echo "     ${PCLOUD_DEST}/_snapshots/<SNAPSHOT_NAME>"
+    echo "   - Aktiven Index prüfen/löschen falls inkonsistent:"
+    echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
+    echo "   - Optional: aus Archiv wiederherstellen (falls vorhanden):"
+    echo "     ${PCLOUD_DEST}/_snapshots/_index/archive/${KEEP_SNAPSHOT}_index.json"
+    echo "       -> kopieren nach ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
+fi
 echo ""
 if [[ "$KEEP_LOCAL_MANIFEST" = "yes" ]]; then
     echo "   - Lokal bleibt Keep-Manifest aktiv: ${ARCHIVE_BASE}/manifests/${KEEP_SNAPSHOT}.json"
