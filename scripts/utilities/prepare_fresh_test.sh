@@ -249,14 +249,6 @@ if [ "$KEEP_LOCAL_MANIFEST" = "yes" ]; then
         done
         if [ -f "$KEEP_MANIFEST_PATH" ]; then
             echo "   ✓ Keep-Manifest behalten: $KEEP_SNAPSHOT.json"
-            # Manifest auch nach PCLOUD_TEMP_DIR kopieren damit der nächste Lauf es findet
-            TEMP_MANI="${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
-            if [[ "$DRY_RUN" = "yes" ]]; then
-                echo "[dry] cp $KEEP_MANIFEST_PATH $TEMP_MANI"
-            else
-                cp "$KEEP_MANIFEST_PATH" "$TEMP_MANI"
-                echo "   ✓ Manifest nach Temp kopiert: $TEMP_MANI"
-            fi
         else
             echo "   ○ Keep-Manifest nicht vorhanden: $KEEP_SNAPSHOT.json"
         fi
@@ -277,28 +269,18 @@ else
     fi
 fi
 
-# Indexes leeren (Keep-Snapshot-Index behalten, wie bei Manifests)
-KEEP_INDEX_PATH="$ARCHIVE_BASE/indexes/$KEEP_SNAPSHOT.json"
+# Lokale Indexes immer komplett leeren (Remote-Index wird in Schritt [5/7] verwaltet)
 INDEX_COUNT=$(ls -1 "$ARCHIVE_BASE/indexes/"*.json 2>/dev/null | wc -l)
 if [ "$INDEX_COUNT" -gt 0 ]; then
-    echo "🗑️  Lösche Indexes außer: $KEEP_SNAPSHOT.json"
-    for idx in "$ARCHIVE_BASE/indexes/"*.json; do
-        [ -e "$idx" ] || continue
-        if [ "$(basename "$idx")" != "$KEEP_SNAPSHOT.json" ]; then
-            if [[ "$DRY_RUN" = "yes" ]]; then
-                echo "[dry] rm -f $idx"
-            else
-                rm -f "$idx"
-            fi
-        fi
-    done
-    if [ -f "$KEEP_INDEX_PATH" ]; then
-        echo "   ✓ Keep-Index behalten: $KEEP_SNAPSHOT.json"
+    echo "🗑️  Lösche $INDEX_COUNT lokale Indexes"
+    if [[ "$DRY_RUN" = "yes" ]]; then
+        echo "[dry] rm -f $ARCHIVE_BASE/indexes/*.json"
     else
-        echo "   ○ Keep-Index nicht vorhanden: $KEEP_SNAPSHOT.json"
+        rm -f "$ARCHIVE_BASE/indexes/"*.json
+        echo "   ✓ Lokale Indexes gelöscht"
     fi
 else
-    echo "○  Indexes bereits leer"
+    echo "○  Lokale Indexes bereits leer"
 fi
 
 # Kontrolle
@@ -311,18 +293,32 @@ echo "════════════════════════�
 echo "[4/7] Temp-Files aufräumen"
 echo "════════════════════════════════════════════════════════════════"
 
-# pCloud-Index-Caches
-TEMP_COUNT=$(ls -1 /tmp/pcloud_index_*.json 2>/dev/null | wc -l)
-if [ "$TEMP_COUNT" -gt 0 ]; then
-    echo "🗑️  Lösche $TEMP_COUNT Temp-Files"
+# pCloud-Index-Caches in /tmp
+TMP_INDEX_COUNT=$(ls -1 /tmp/pcloud_index_*.json 2>/dev/null | wc -l)
+if [ "$TMP_INDEX_COUNT" -gt 0 ]; then
+    echo "🗑️  Lösche $TMP_INDEX_COUNT Temp-Index-Files in /tmp"
     if [[ "$DRY_RUN" = "yes" ]]; then
         echo "[dry] rm -f /tmp/pcloud_index_*.json"
     else
         rm -f /tmp/pcloud_index_*.json
-        echo "   ✓ Temp-Files gelöscht"
+        echo "   ✓ Temp-Index-Files gelöscht"
     fi
 else
-    echo "○  Keine Temp-Files gefunden"
+    echo "○  Keine Temp-Index-Files in /tmp gefunden"
+fi
+
+# pCloud Manifest-Temp-Files im PCLOUD_TEMP_DIR immer bereinigen
+TEMP_MANI_COUNT=$(ls -1 "$PCLOUD_TEMP_DIR"/pcloud_mani.*.json 2>/dev/null | wc -l)
+if [ "$TEMP_MANI_COUNT" -gt 0 ]; then
+    echo "🗑️  Lösche $TEMP_MANI_COUNT Temp-Manifests in $PCLOUD_TEMP_DIR"
+    if [[ "$DRY_RUN" = "yes" ]]; then
+        echo "[dry] rm -f $PCLOUD_TEMP_DIR/pcloud_mani.*.json"
+    else
+        rm -f "$PCLOUD_TEMP_DIR"/pcloud_mani.*.json
+        echo "   ✓ Temp-Manifests gelöscht"
+    fi
+else
+    echo "○  Keine Temp-Manifests in $PCLOUD_TEMP_DIR gefunden"
 fi
 
 echo ""
@@ -360,16 +356,32 @@ mode       = "[dry] " if dry else ""
 
 snapshots_root = f"{dest}/_snapshots"
 index_dir      = f"{snapshots_root}/_index"
-archive_dir    = f"{index_dir}/archive"
 target_index   = f"{index_dir}/content_index.json"
-keep_archive   = f"{archive_dir}/{keep}_index.json"
 
 delete_list = [s.strip() for s in os.environ.get("DELETE_SNAPSHOTS_CSV", "").split(",") if s.strip()]
 
 cfg = pc.effective_config(env_file=env_file)
 
+# Index-Archiv robust aufloesen: akzeptiere /archive oder /_archive
+archive_candidates = [f"{index_dir}/archive", f"{index_dir}/_archive"]
+archive_dir = None
+archive_children = []
+for cand in archive_candidates:
+    try:
+        archive_children = pc.list_folder_children(cfg, path=cand, include_files=True)
+        archive_dir = cand
+        break
+    except Exception:
+        continue
+if archive_dir is None:
+    archive_dir = archive_candidates[0]
+    print("   WARN Index-Archiv nicht gefunden (weder /archive noch /_archive)")
+
+keep_archive   = f"{archive_dir}/{keep}_index.json"
+
 # --- 1. Remote-Snapshots loeschen ---
 print("\n  [5a] Remote-Snapshot-Ordner loeschen:")
+print(f"   keep: {snapshots_root}/{keep}")
 if not delete_list:
     print("   o  Nichts zu loeschen (keine DELETE_SNAPSHOTS)")
 for snap in delete_list:
@@ -385,9 +397,9 @@ for snap in delete_list:
 # --- 2. Archiv aufraumen: alle _index.json ausser keep ---
 print("\n  [5b] Remote Index-Archiv bereinigen:")
 try:
-    children = pc.list_folder_children(cfg, path=archive_dir, include_files=True)
-    files = [c for c in children if not c.get("isfolder", False)]
+    files = [c for c in archive_children if not c.get("isfolder", False)]
     keep_filename = f"{keep}_index.json"
+    print(f"   keep: {archive_dir}/{keep_filename}")
     to_delete = [f for f in files if f.get("name") != keep_filename]
     if not to_delete:
         print(f"   o  Archiv bereits sauber (nur {keep_filename} oder leer)")
@@ -506,10 +518,8 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-    echo "[7/7] Final Check"
+echo "[7/7] Final Check"
 echo "════════════════════════════════════════════════════════════════"
-
-FINAL_TEMP_MANI="${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
 
 if [[ "$DRY_RUN" = "yes" ]]; then
     # Soll-Zustand berechnen (was nach --execute der Fall wäre)
@@ -534,17 +544,23 @@ if [[ "$DRY_RUN" = "yes" ]]; then
         fi
         echo "  manifests/: $_expected_manifests Datei(en) (nur $KEEP_SNAPSHOT.json)"
         echo "  keep-local-manifest: yes -> Keep-Manifest bleibt im Archiv"
-        echo "  temp-manifest: $FINAL_TEMP_MANI (wird aus Keep-Manifest kopiert, falls vorhanden)"
+        echo "  temp-manifest: keines (Temp-Manifests werden bereinigt)"
     else
         echo "  manifests/: 0 Dateien (alle gelöscht)"
         echo "  keep-local-manifest: no -> kein Keep-Manifest im Archiv"
         echo "  temp-manifest: keine Keep-Kopie nach $PCLOUD_TEMP_DIR"
     fi
-    _expected_indexes=0
-    if [ -f "$KEEP_INDEX_PATH" ]; then
-        _expected_indexes=1
+    echo "  indexes/:   0 Dateien (lokal alle gelöscht)"
+    echo ""
+    if [[ "$AUTO_REMOTE_CLEANUP" = "yes" ]]; then
+        echo "Remote (${PCLOUD_DEST}/_snapshots):"
+        echo "  Snapshot-Ordner: keep=$KEEP_SNAPSHOT, alle anderen gelöscht"
+        echo "  _index-Archiv (archive/_archive): keep=${KEEP_SNAPSHOT}_index.json, alle anderen gelöscht"
+        echo "  _index/content_index.json: aus ${KEEP_SNAPSHOT}_index.json wiederhergestellt"
+    else
+        echo "Remote (${PCLOUD_DEST}/_snapshots):"
+        echo "  bleibt unverändert (auto-remote-cleanup=no)"
     fi
-    echo "  indexes/:   $_expected_indexes Datei(en) (nur $KEEP_SNAPSHOT.json, falls vorhanden)"
     echo ""
     echo "  → Führe '--execute' aus um diesen Zustand herzustellen"
 else
@@ -566,11 +582,7 @@ else
         else
             echo "  keep-manifest: nicht vorhanden ($KEEP_SNAPSHOT.json)"
         fi
-        if [ -f "$FINAL_TEMP_MANI" ]; then
-            echo "  temp-manifest: vorhanden ($FINAL_TEMP_MANI)"
-        else
-            echo "  temp-manifest: nicht vorhanden ($FINAL_TEMP_MANI)"
-        fi
+        echo "  temp-manifest: keines erwartet (wird in [4/7] bereinigt)"
     else
         echo "  keep-manifest: deaktiviert (--keep-local-manifest no)"
         echo "  temp-manifest: deaktiviert (keine Keep-Kopie nach $PCLOUD_TEMP_DIR)"
@@ -616,7 +628,7 @@ if [[ "$AUTO_REMOTE_CLEANUP" = "yes" ]]; then
     echo "2. pCloud Remote-Cleanup: wurde von Schritt [5/7] automatisch erledigt."
     echo "   Bei --execute wurden durchgeführt:"
     echo "   [5a] Remote-Snapshot-Ordner gelöscht (alle ausser ${KEEP_SNAPSHOT})"
-    echo "   [5b] _index/archive/ bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
+    echo "   [5b] _index-Archiv (archive/_archive) bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
     echo "   [5c] content_index.json auf Stand ${KEEP_SNAPSHOT} restored"
     echo "   Bei Problemen manuell prüfen:"
     echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
@@ -626,14 +638,14 @@ else
     echo "     ${PCLOUD_DEST}/_snapshots/<SNAPSHOT_NAME>"
     echo "   - Aktiven Index prüfen/löschen falls inkonsistent:"
     echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
-    echo "   - Optional: aus Archiv wiederherstellen (falls vorhanden):"
-    echo "     ${PCLOUD_DEST}/_snapshots/_index/archive/${KEEP_SNAPSHOT}_index.json"
+    echo "   - Optional: aus Index-Archiv wiederherstellen (falls vorhanden):"
+    echo "     ${PCLOUD_DEST}/_snapshots/_index/(archive|_archive)/${KEEP_SNAPSHOT}_index.json"
     echo "       -> kopieren nach ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
 fi
 echo ""
 if [[ "$KEEP_LOCAL_MANIFEST" = "yes" ]]; then
     echo "   - Lokal bleibt Keep-Manifest aktiv: ${ARCHIVE_BASE}/manifests/${KEEP_SNAPSHOT}.json"
-    echo "   - Temp-Manifest für Speed-Start: ${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
+    echo "   - Temp-Manifests werden bereinigt: ${PCLOUD_TEMP_DIR}/pcloud_mani.*.json"
 else
     echo "   - Keep-Manifest ist deaktiviert (--keep-local-manifest no):"
     echo "     nächster Lauf erzeugt Manifest neu (kein Speed-Start aus lokaler Keep-Kopie)."
