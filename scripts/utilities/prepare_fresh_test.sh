@@ -173,7 +173,7 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[1/5] RTB-Snapshots aufräumen"
+echo "[1/7] RTB-Snapshots aufräumen"
 echo "════════════════════════════════════════════════════════════════"
 
 # Aktuelle Snapshots anzeigen
@@ -198,7 +198,7 @@ done
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[2/5] Latest-Symlink setzen"
+echo "[2/7] Latest-Symlink setzen"
 echo "════════════════════════════════════════════════════════════════"
 
 # Setze latest-Symlink
@@ -222,7 +222,7 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[3/5] Archive leeren (manifests + indexes)"
+echo "[3/7] Archive leeren (manifests + indexes)"
 echo "════════════════════════════════════════════════════════════════"
 
 if [[ "$DRY_RUN" = "yes" ]]; then
@@ -308,7 +308,7 @@ echo "     indexes/:   $(ls -1 "$ARCHIVE_BASE/indexes/" 2>/dev/null | wc -l) Dat
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[4/5] Temp-Files aufräumen"
+echo "[4/7] Temp-Files aufräumen"
 echo "════════════════════════════════════════════════════════════════"
 
 # pCloud-Index-Caches
@@ -327,12 +327,17 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[6/5] pCloud Remote Cleanup & Index Restore"
+echo "[5/7] pCloud Remote Cleanup & Index Restore"
 echo "════════════════════════════════════════════════════════════════"
 
 if [[ "$AUTO_REMOTE_CLEANUP" != "yes" ]]; then
     echo "⏭️  Übersprungen (--auto-remote-cleanup no): Remote-Cleanup bleibt manuell."
 else
+if [[ "$DRY_RUN" = "yes" ]]; then
+    echo "ℹ️  DRY-RUN: Schritt [5/7] zeigt nur geplante Remote-Operationen (keine API-Schreibzugriffe)."
+else
+    echo "⚠️  EXECUTE: Schritt [5/7] führt Remote-Löschungen und Index-Restore wirklich aus."
+fi
 
 # Python-Pfad: venv bevorzugen, Fallback auf System-Python
 PCLOUD_PYTHON="${PCLOUD_PYTHON:-/opt/apps/pcloud-tools/venv/bin/python3}"
@@ -364,7 +369,7 @@ delete_list = [s.strip() for s in os.environ.get("DELETE_SNAPSHOTS_CSV", "").spl
 cfg = pc.effective_config(env_file=env_file)
 
 # --- 1. Remote-Snapshots loeschen ---
-print("\n  [6a] Remote-Snapshot-Ordner loeschen:")
+print("\n  [5a] Remote-Snapshot-Ordner loeschen:")
 if not delete_list:
     print("   o  Nichts zu loeschen (keine DELETE_SNAPSHOTS)")
 for snap in delete_list:
@@ -378,7 +383,7 @@ for snap in delete_list:
             print(f"   WARN {snap}: {e}", file=sys.stderr)
 
 # --- 2. Archiv aufraumen: alle _index.json ausser keep ---
-print("\n  [6b] Remote Index-Archiv bereinigen:")
+print("\n  [5b] Remote Index-Archiv bereinigen:")
 try:
     children = pc.list_folder_children(cfg, path=archive_dir, include_files=True)
     files = [c for c in children if not c.get("isfolder", False)]
@@ -400,7 +405,7 @@ except Exception as e:
     print(f"   WARN Archiv-Listing fehlgeschlagen (evtl. nicht vorhanden): {e}")
 
 # --- 3. content_index.json aus Keep-Archiv-Eintrag wiederherstellen ---
-print("\n  [6c] content_index.json wiederherstellen:")
+print("\n  [5c] content_index.json wiederherstellen:")
 print(f"   Quelle: {keep_archive}")
 print(f"   Ziel:   {target_index}")
 print(f"   {mode}copyfile(overwrite=True)")
@@ -437,12 +442,18 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[7/5] DB Run-History bereinigen"
+echo "[6/7] DB Run-History bereinigen"
 echo "════════════════════════════════════════════════════════════════"
 
 if [[ "$AUTO_DB_CLEANUP" != "yes" ]]; then
     echo "⏭️  Übersprungen (--auto-db-cleanup no): DB-Cleanup bleibt manuell."
 else
+if [[ "$DRY_RUN" = "yes" ]]; then
+    echo "ℹ️  DRY-RUN: Schritt [6/7] liest nur aus und zeigt den erwarteten Zustand nach DELETE als Simulation."
+else
+    echo "⚠️  EXECUTE: Schritt [6/7] löscht DB-Runs (außer Keep-Snapshot) real aus backup_runs."
+fi
+echo ""
 
 # Snapshot-Name SQL-sicher machen (single quote escapen)
 SQL_KEEP_SNAPSHOT="${KEEP_SNAPSHOT//\'/\'\'}"
@@ -458,32 +469,44 @@ if ! "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -N -e "SELECT 1 FROM ${PCLOUD_DB_NAME}.ba
     exit 1
 fi
 
+    echo "📋 Aktuelle Runs (alle Snapshots):"
+    "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs ORDER BY started_at DESC;"
+
+    echo ""
 echo "📋 Kandidaten (alles außer Keep-Snapshot):"
 "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${SQL_KEEP_SNAPSHOT}' ORDER BY started_at DESC;"
 
 echo ""
-echo "📊 DB-Zähler vor Cleanup:"
+    echo "📊 DB-Zähler aktuell:"
 "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;"
 
 if [[ "$DRY_RUN" = "yes" ]]; then
     echo ""
     echo "[dry] DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${SQL_KEEP_SNAPSHOT}';"
-    echo "ℹ️  Dry-Run: keine DB-Änderung durchgeführt"
+        echo "ℹ️  Dry-Run: keine DB-Änderung durchgeführt"
+        echo ""
+        echo "📋 Erwarteter Restbestand nach Cleanup (Simulation, nur Keep-Snapshot):"
+        "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name = '${SQL_KEEP_SNAPSHOT}' ORDER BY started_at DESC;"
+        echo ""
+        echo "📊 DB-Zähler im Dry-Run (unverändert):"
+        "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;"
 else
     echo ""
     echo "🗑️  Lösche DB-Runs außer Keep-Snapshot: $KEEP_SNAPSHOT"
     "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "DELETE FROM ${PCLOUD_DB_NAME}.backup_runs WHERE snapshot_name <> '${SQL_KEEP_SNAPSHOT}';"
     echo "   ✓ DB-Cleanup ausgeführt"
-fi
-
-echo ""
-echo "📊 DB-Zähler nach Cleanup:"
-"${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;"
+        echo ""
+        echo "📋 Restbestand nach Cleanup (IST):"
+        "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT run_id, snapshot_name, status, started_at FROM ${PCLOUD_DB_NAME}.backup_runs ORDER BY started_at DESC;"
+        echo ""
+        echo "📊 DB-Zähler nach Cleanup (IST):"
+        "${MYSQL_PREFIX[@]}" "$MYSQL_BIN" -e "SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;"
+    fi
 fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "[5/5] Final Check"
+    echo "[7/7] Final Check"
 echo "════════════════════════════════════════════════════════════════"
 
 FINAL_TEMP_MANI="${PCLOUD_TEMP_DIR}/pcloud_mani.${KEEP_SNAPSHOT}.json"
@@ -517,7 +540,11 @@ if [[ "$DRY_RUN" = "yes" ]]; then
         echo "  keep-local-manifest: no -> kein Keep-Manifest im Archiv"
         echo "  temp-manifest: keine Keep-Kopie nach $PCLOUD_TEMP_DIR"
     fi
-    echo "  indexes/:   0 Dateien (alle gelöscht)"
+    _expected_indexes=0
+    if [ -f "$KEEP_INDEX_PATH" ]; then
+        _expected_indexes=1
+    fi
+    echo "  indexes/:   $_expected_indexes Datei(en) (nur $KEEP_SNAPSHOT.json, falls vorhanden)"
     echo ""
     echo "  → Führe '--execute' aus um diesen Zustand herzustellen"
 else
@@ -562,7 +589,7 @@ echo ""
 echo "🚀 Nächste Schritte:"
 echo ""
 if [[ "$AUTO_DB_CLEANUP" = "yes" ]]; then
-    echo "1. DB-Cleanup wurde von Schritt [7/5] automatisch durchgeführt."
+    echo "1. DB-Cleanup wurde von Schritt [6/7] automatisch durchgeführt."
     echo "   (DELETE auf backup_runs außer Keep-Snapshot; backup_phases/gap_backfills via ON DELETE CASCADE)"
     echo "   Optional manuell verifizieren:"
     echo "   ${MYSQL_PREFIX[*]} ${MYSQL_BIN} -e \"SELECT COUNT(*) AS runs FROM ${PCLOUD_DB_NAME}.backup_runs; SELECT COUNT(*) AS phases FROM ${PCLOUD_DB_NAME}.backup_phases; SELECT COUNT(*) AS backfills FROM ${PCLOUD_DB_NAME}.gap_backfills;\""
@@ -586,11 +613,11 @@ else
 fi
 echo ""
 if [[ "$AUTO_REMOTE_CLEANUP" = "yes" ]]; then
-    echo "2. pCloud Remote-Cleanup: wurde von Schritt [6/5] automatisch erledigt."
+    echo "2. pCloud Remote-Cleanup: wurde von Schritt [5/7] automatisch erledigt."
     echo "   Bei --execute wurden durchgeführt:"
-    echo "   [6a] Remote-Snapshot-Ordner gelöscht (alle ausser ${KEEP_SNAPSHOT})"
-    echo "   [6b] _index/archive/ bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
-    echo "   [6c] content_index.json auf Stand ${KEEP_SNAPSHOT} restored"
+    echo "   [5a] Remote-Snapshot-Ordner gelöscht (alle ausser ${KEEP_SNAPSHOT})"
+    echo "   [5b] _index/archive/ bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
+    echo "   [5c] content_index.json auf Stand ${KEEP_SNAPSHOT} restored"
     echo "   Bei Problemen manuell prüfen:"
     echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
 else
