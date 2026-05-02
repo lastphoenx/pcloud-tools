@@ -1303,6 +1303,7 @@ def rebuild_complete_index(args):
         local_master = os.path.join(archive_dir, "content_index_master.json")
         with open(local_master, 'w', encoding='utf-8') as f:
             json.dump(master_index, f, indent=2, ensure_ascii=False)
+        os.chmod(local_master, 0o644)  # Ensure readable by all
         print(f"[phase 5]   Lokal: {local_master}")
         
         # 2. Remote
