@@ -723,6 +723,8 @@ def save_content_index_local(local_path: str, index: dict) -> None:
         json.dump(index, f, separators=(',', ':'))
         temp_path = f.name
     os.replace(temp_path, local_path)
+    # Ensure readable by all (fix for simulator and other utilities)
+    os.chmod(local_path, 0o644)
 
 def load_content_index_local(local_path: str) -> dict:
     """Lädt den Index lokal, falls vorhanden."""
