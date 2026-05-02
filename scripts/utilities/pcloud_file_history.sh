@@ -10,19 +10,38 @@ set -euo pipefail
 MANIFEST_DIR="${PCLOUD_ARCHIVE_DIR:-/srv/pcloud-archive}/manifests"
 
 if [[ $# -lt 1 ]]; then
-    echo "Nutzung: $0 <relativer_dateipfad>"
+    echo "Nutzung: $0 <relativer_dateipfad_oder_voller_snapshot_pfad>"
     exit 1
 fi
 
 # Start-Parameter
-CUR_PATH="$1"
+RAW_INPUT_PATH="$1"
+START_SNAPSHOT=""
+
+# Accept either manifest relpath or full pCloud snapshot path.
+if [[ "$RAW_INPUT_PATH" =~ /_snapshots/([^/]+)/(.+)$ ]]; then
+    START_SNAPSHOT="${BASH_REMATCH[1]}"
+    CUR_PATH="${BASH_REMATCH[2]}"
+else
+    CUR_PATH="${RAW_INPUT_PATH#/}"
+fi
+
+if [[ -z "$CUR_PATH" ]]; then
+    echo "❌ Konnte aus Eingabe keinen Dateipfad ableiten: $RAW_INPUT_PATH"
+    exit 1
+fi
+
 CUR_INODE_INO=""
 CUR_INODE_DEV=""
 CUR_HASH=""
 
 echo "========================================================================================="
-echo "Smart History Trace für: ${CUR_PATH}"
+echo "Smart History Trace für: ${RAW_INPUT_PATH}"
 echo "Strategie: Path -> Inode -> Hash (Rückwärts-Suche)"
+echo "Normalisiert auf relpath: ${CUR_PATH}"
+if [[ -n "$START_SNAPSHOT" ]]; then
+    echo "Start-Snapshot-Hinweis: ${START_SNAPSHOT}"
+fi
 echo "========================================================================================="
 printf "%-25s | %-12s | %-10s | %-7s | %s\n" "Snapshot" "Status" "Größe" "Match" "Pfad / Info"
 echo "--------------------------|--------------|------------|---------|------------------------"
@@ -84,3 +103,11 @@ for manifest in "${manifests[@]}"; do
 done
 
 echo "========================================================================================="
+
+if [[ $found_any -eq 0 ]]; then
+    echo "❌ Keine Treffer in lokalen Manifesten gefunden."
+    echo "Tipps:"
+    echo "  - Prüfe, ob der Pfad im Manifest als relpath existiert."
+    echo "  - Prüfe MANIFEST_DIR: ${MANIFEST_DIR}"
+    exit 2
+fi
