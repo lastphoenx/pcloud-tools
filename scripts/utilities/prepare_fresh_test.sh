@@ -301,6 +301,105 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
+echo "[6/5] pCloud Remote Cleanup & Index Restore"
+echo "════════════════════════════════════════════════════════════════"
+
+# Python-Pfad: venv bevorzugen, Fallback auf System-Python
+PCLOUD_PYTHON="${PCLOUD_PYTHON:-/opt/apps/pcloud-tools/venv/bin/python3}"
+if [[ ! -x "$PCLOUD_PYTHON" ]]; then
+    PCLOUD_PYTHON="$(command -v python3 2>/dev/null || echo python3)"
+fi
+PCLOUD_LIB_DIR="${PCLOUD_LIB_DIR:-/opt/apps/pcloud-tools/main}"
+
+# Inline-Python-Snippet: cfg einmal laden, alle Remote-Ops ausfuehren
+_REMOTE_CLEANUP_PY=$(cat <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["PCLOUD_LIB_DIR"])
+import pcloud_bin_lib as pc
+
+env_file   = os.environ["ENV_FILE"]
+dest       = os.environ["PCLOUD_DEST"].rstrip("/")
+keep       = os.environ["KEEP_SNAPSHOT"]
+dry        = os.environ.get("DRY_RUN", "yes") == "yes"
+mode       = "[dry] " if dry else ""
+
+snapshots_root = f"{dest}/_snapshots"
+index_dir      = f"{snapshots_root}/_index"
+archive_dir    = f"{index_dir}/archive"
+target_index   = f"{index_dir}/content_index.json"
+keep_archive   = f"{archive_dir}/{keep}_index.json"
+
+delete_list = [s.strip() for s in os.environ.get("DELETE_SNAPSHOTS_CSV", "").split(",") if s.strip()]
+
+cfg = pc.effective_config(env_file=env_file)
+
+# --- 1. Remote-Snapshots loeschen ---
+print("\n  [6a] Remote-Snapshot-Ordner loeschen:")
+if not delete_list:
+    print("   o  Nichts zu loeschen (keine DELETE_SNAPSHOTS)")
+for snap in delete_list:
+    remote_snap = f"{snapshots_root}/{snap}"
+    print(f"   {mode}delete_folder(recursive) -> {remote_snap}")
+    if not dry:
+        try:
+            pc.delete_folder(cfg, path=remote_snap, recursive=True)
+            print(f"   OK Geloescht: {snap}")
+        except Exception as e:
+            print(f"   WARN {snap}: {e}", file=sys.stderr)
+
+# --- 2. Archiv aufraumen: alle _index.json ausser keep ---
+print("\n  [6b] Remote Index-Archiv bereinigen:")
+try:
+    children = pc.list_folder_children(cfg, path=archive_dir, include_files=True)
+    files = [c for c in children if not c.get("isfolder", False)]
+    keep_filename = f"{keep}_index.json"
+    to_delete = [f for f in files if f.get("name") != keep_filename]
+    if not to_delete:
+        print(f"   o  Archiv bereits sauber (nur {keep_filename} oder leer)")
+    for f in to_delete:
+        fname = f.get("name", "?")
+        fid   = f.get("fileid")
+        print(f"   {mode}delete_file -> {archive_dir}/{fname}")
+        if not dry:
+            try:
+                pc.delete_file(cfg, fileid=fid)
+                print(f"   OK Geloescht: {fname}")
+            except Exception as e:
+                print(f"   WARN {fname}: {e}", file=sys.stderr)
+except Exception as e:
+    print(f"   WARN Archiv-Listing fehlgeschlagen (evtl. nicht vorhanden): {e}")
+
+# --- 3. content_index.json aus Keep-Archiv-Eintrag wiederherstellen ---
+print("\n  [6c] content_index.json wiederherstellen:")
+print(f"   Quelle: {keep_archive}")
+print(f"   Ziel:   {target_index}")
+print(f"   {mode}copyfile(overwrite=True)")
+if not dry:
+    try:
+        pc.copyfile(cfg, from_path=keep_archive, to_path=target_index, overwrite=True)
+        print(f"   OK Index wiederhergestellt")
+    except Exception as e:
+        print(f"   FAIL copyfile fehlgeschlagen: {e}", file=sys.stderr)
+        sys.exit(1)
+PYEOF
+)
+
+# DELETE_SNAPSHOTS als CSV uebergeben (Bash-Array -> Python)
+_CSV_SNAPSHOTS=$(IFS=,; echo "${DELETE_SNAPSHOTS[*]}")
+
+PCLOUD_LIB_DIR="$PCLOUD_LIB_DIR" \
+ENV_FILE="$ENV_FILE" \
+PCLOUD_DEST="$PCLOUD_DEST" \
+KEEP_SNAPSHOT="$KEEP_SNAPSHOT" \
+DRY_RUN="$DRY_RUN" \
+DELETE_SNAPSHOTS_CSV="$_CSV_SNAPSHOTS" \
+"$PCLOUD_PYTHON" -c "$_REMOTE_CLEANUP_PY" || {
+    echo "FAIL Remote-Cleanup-Script fehlgeschlagen (Exit $?)" >&2
+    exit 1
+}
+
+echo ""
+echo "════════════════════════════════════════════════════════════════"
 echo "[5/5] Final Check"
 echo "════════════════════════════════════════════════════════════════"
 
@@ -396,14 +495,13 @@ echo ""
 echo "   # 1e) Optional: Full-Reset aller pCloud-Runs (nur wenn Remote wirklich leer ist):"
 echo "   sudo mysql -e \"DELETE FROM ${PCLOUD_DB_NAME}.backup_runs;\""
 echo ""
-echo "2. pCloud Remote-Cleanup manuell prüfen/bereinigen (vor neuem Lauf):"
-echo "   - Snapshot-Ordner löschen, die nicht mehr gelten:"
-echo "     ${PCLOUD_DEST}/_snapshots/<SNAPSHOT_NAME>"
-echo "   - Aktiven Index prüfen/löschen falls inkonsistent:"
+echo "2. pCloud Remote-Cleanup: wurde von Schritt [6/5] automatisch erledigt."
+echo "   Bei --execute wurden durchgeführt:"
+echo "   [6a] Remote-Snapshot-Ordner gelöscht (alle ausser ${KEEP_SNAPSHOT})"
+echo "   [6b] _index/archive/ bereinigt (nur ${KEEP_SNAPSHOT}_index.json behalten)"
+echo "   [6c] content_index.json auf Stand ${KEEP_SNAPSHOT} restored"
+echo "   Bei Problemen manuell prüfen:"
 echo "     ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
-echo "   - Optional: aus Archiv wiederherstellen (falls vorhanden):"
-echo "     ${PCLOUD_DEST}/_snapshots/_index/archive/${KEEP_SNAPSHOT}_index.json"
-echo "       -> kopieren nach ${PCLOUD_DEST}/_snapshots/_index/content_index.json"
 echo ""
 if [[ "$KEEP_LOCAL_MANIFEST" = "yes" ]]; then
     echo "   - Lokal bleibt Keep-Manifest aktiv: ${ARCHIVE_BASE}/manifests/${KEEP_SNAPSHOT}.json"
