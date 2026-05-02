@@ -17,11 +17,11 @@ Parameter:
   --keep-snapshot <SNAPSHOT>     Snapshot der lokal behalten wird (Pflicht)
   --keep-local-manifest <yes|no> Lokales Manifest <SNAPSHOT>.json behalten (Default: yes)
   --keep-lokal-manifest <yes|no> Alias für --keep-local-manifest
-    --auto-remote-cleanup <yes|no> pCloud Remote-Cleanup automatisch ausführen (Default: yes)
-    --auto-db-cleanup <yes|no>     DB-Cleanup automatisch ausführen (Default: yes)
+  --auto-remote-cleanup <yes|no> pCloud Remote-Cleanup automatisch ausführen (Default: yes)
+  --auto-db-cleanup <yes|no>     DB-Cleanup automatisch ausführen (Default: yes)
   --rtb-base <PATH>              RTB Basis-Pfad (Default: /mnt/backup/rtb_nas)
-    --archive-base <PATH>          Archiv-Basis (Default: /srv/pcloud-archive)
-    --env-file <PATH>              .env-Datei für PCLOUD_TEMP_DIR (Default: /opt/apps/pcloud-tools/main/.env)
+  --archive-base <PATH>          Archiv-Basis (Default: /srv/pcloud-archive)
+  --env-file <PATH>              .env-Datei für PCLOUD_TEMP_DIR (Default: /opt/apps/pcloud-tools/main/.env)
   --dry-run                      Nur anzeigen was gelöscht/gesetzt würde (Default)
   --execute                      Führt Änderungen wirklich aus (destruktiv!)
   --yes                          Ohne Rückfrage ausführen (nur mit --execute sinnvoll)
@@ -277,15 +277,25 @@ else
     fi
 fi
 
-# Indexes leeren
+# Indexes leeren (Keep-Snapshot-Index behalten, wie bei Manifests)
+KEEP_INDEX_PATH="$ARCHIVE_BASE/indexes/$KEEP_SNAPSHOT.json"
 INDEX_COUNT=$(ls -1 "$ARCHIVE_BASE/indexes/"*.json 2>/dev/null | wc -l)
 if [ "$INDEX_COUNT" -gt 0 ]; then
-    echo "🗑️  Lösche $INDEX_COUNT Indexes"
-    if [[ "$DRY_RUN" = "yes" ]]; then
-        echo "[dry] rm -f $ARCHIVE_BASE/indexes/*.json"
+    echo "🗑️  Lösche Indexes außer: $KEEP_SNAPSHOT.json"
+    for idx in "$ARCHIVE_BASE/indexes/"*.json; do
+        [ -e "$idx" ] || continue
+        if [ "$(basename "$idx")" != "$KEEP_SNAPSHOT.json" ]; then
+            if [[ "$DRY_RUN" = "yes" ]]; then
+                echo "[dry] rm -f $idx"
+            else
+                rm -f "$idx"
+            fi
+        fi
+    done
+    if [ -f "$KEEP_INDEX_PATH" ]; then
+        echo "   ✓ Keep-Index behalten: $KEEP_SNAPSHOT.json"
     else
-        rm -f "$ARCHIVE_BASE/indexes/"*.json
-        echo "   ✓ Indexes gelöscht"
+        echo "   ○ Keep-Index nicht vorhanden: $KEEP_SNAPSHOT.json"
     fi
 else
     echo "○  Indexes bereits leer"
