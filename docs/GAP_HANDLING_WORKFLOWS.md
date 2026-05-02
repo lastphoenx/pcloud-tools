@@ -117,7 +117,7 @@ flowchart TD
     Python --> LoadLib[import pcloud_bin_lib]
     LoadLib --> GetConfig[effective_config]
     GetConfig --> BuildPath[Construct snap_path]
-    BuildPath --> Path[/Backup/rtb_1to1/_snapshots/NAME]
+    BuildPath --> Path["/Backup/rtb_1to1/_snapshots/NAME"]
     
     Path --> APICall{delete_folder API}
     APICall -->|Success| ReturnOK[print 'OK']
