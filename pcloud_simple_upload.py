@@ -350,8 +350,12 @@ def upload_file_direct(pc, cfg: Dict[str, Any], local_path: str, remote_path: st
         {"success": True/False, "fileid": ..., "hash": ..., "error": ...}
     """
     try:
-        # Upload
-        result = pc.putfile(cfg, path=remote_path, data=local_path)
+        # Upload: prefer modern helper available in current pcloud_bin_lib
+        if hasattr(pc, "upload_file"):
+            result = pc.upload_file(cfg, local_path=local_path, remote_path=remote_path)
+        else:
+            # Legacy fallback for older lib variants
+            result = pc.putfile(cfg, path=remote_path, data=local_path)
         
         metadata = result.get("metadata", [])
         if isinstance(metadata, list):
