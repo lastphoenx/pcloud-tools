@@ -637,56 +637,26 @@ def delta_check(pc, cfg: Dict[str, Any], files: List[Dict[str, Any]],
     # Lokale Files als Dict (rel_path → size)
     local_files = {f["rel_path"]: f["size"] for f in files}
     
-    # pCloud rekursiv scannen
-    log(f"Scanne pCloud-Ordner: {destination_base}", "INFO")
+    # Nur erwartete Ziele prüfen (kein Vollscan des gesamten Zielordners)
+    log(f"Prüfe erwartete Zieldateien unter: {destination_base}", "INFO")
     remote_files = {}
-    
-    try:
-        # Rekursive List-Funktion
-        def list_recursive(path):
-            try:
-                if hasattr(pc, "listfolder_path"):
-                    result = pc.listfolder_path(cfg, path=path, recursive=False)
-                else:
-                    # Kompatibel zu aktueller pcloud_bin_lib
-                    result = pc.listfolder(cfg, path=path, recursive=False, showpath=True)
-                metadata = result.get("metadata", {})
-                
-                for item in metadata.get("contents", []):
-                    if item.get("isfolder"):
-                        # Rekursiv in Unterordner
-                        sub_path = item.get("path")
-                        if not sub_path:
-                            # Fallback wenn API kein path pro item liefert
-                            name = str(item.get("name") or "").strip()
-                            if not name:
-                                continue
-                            base = path.rstrip("/") if path != "/" else ""
-                            sub_path = f"{base}/{name}" if base else f"/{name}"
-                        list_recursive(sub_path)
-                    else:
-                        # Datei gefunden
-                        file_path = item.get("path")
-                        file_size = item.get("size", 0)
 
-                        if not file_path:
-                            name = str(item.get("name") or "").strip()
-                            if not name:
-                                continue
-                            base = path.rstrip("/") if path != "/" else ""
-                            file_path = f"{base}/{name}" if base else f"/{name}"
-                        
-                        # Rel-Path berechnen
-                        if file_path.startswith(destination_base):
-                            rel = file_path[len(destination_base):].lstrip("/")
-                            remote_files[rel] = file_size
-            except Exception as e:
-                log(f"✗ Fehler beim Scannen von {path}: {e}", "WARN")
-        
-        list_recursive(destination_base)
-        
-        log(f"✓ {len(remote_files)} Dateien auf pCloud gefunden", "OK")
-    
+    try:
+        base = destination_base.rstrip("/")
+        if not base:
+            base = "/"
+
+        for rel_path in local_files.keys():
+            remote_path = f"{base}/{rel_path.lstrip('/')}" if base != "/" else f"/{rel_path.lstrip('/')}"
+            try:
+                md = pc.stat_file(cfg, path=remote_path, with_checksum=False)
+                remote_files[rel_path] = int(md.get("size", 0))
+            except Exception:
+                # fehlend => wird unten als missing markiert
+                continue
+
+        log(f"✓ {len(remote_files)} erwartete Dateien auf pCloud gefunden", "OK")
+
     except Exception as e:
         log(f"✗ Delta-Check fehlgeschlagen: {e}", "ERROR")
         return {"status": "ERROR", "error": str(e)}
@@ -709,9 +679,7 @@ def delta_check(pc, cfg: Dict[str, Any], files: List[Dict[str, Any]],
         else:
             ok.append(rel_path)
     
-    for rel_path in remote_files:
-        if rel_path not in local_files:
-            extra.append(rel_path)
+    # Kein vollständiger Remote-Scan mehr: extra bleibt bewusst leer.
     
     # Report
     log("", "INFO")
