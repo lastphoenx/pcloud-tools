@@ -645,18 +645,36 @@ def delta_check(pc, cfg: Dict[str, Any], files: List[Dict[str, Any]],
         # Rekursive List-Funktion
         def list_recursive(path):
             try:
-                result = pc.listfolder_path(cfg, path=path, recursive=False)
+                if hasattr(pc, "listfolder_path"):
+                    result = pc.listfolder_path(cfg, path=path, recursive=False)
+                else:
+                    # Kompatibel zu aktueller pcloud_bin_lib
+                    result = pc.listfolder(cfg, path=path, recursive=False, showpath=True)
                 metadata = result.get("metadata", {})
                 
                 for item in metadata.get("contents", []):
                     if item.get("isfolder"):
                         # Rekursiv in Unterordner
                         sub_path = item.get("path")
+                        if not sub_path:
+                            # Fallback wenn API kein path pro item liefert
+                            name = str(item.get("name") or "").strip()
+                            if not name:
+                                continue
+                            base = path.rstrip("/") if path != "/" else ""
+                            sub_path = f"{base}/{name}" if base else f"/{name}"
                         list_recursive(sub_path)
                     else:
                         # Datei gefunden
                         file_path = item.get("path")
                         file_size = item.get("size", 0)
+
+                        if not file_path:
+                            name = str(item.get("name") or "").strip()
+                            if not name:
+                                continue
+                            base = path.rstrip("/") if path != "/" else ""
+                            file_path = f"{base}/{name}" if base else f"/{name}"
                         
                         # Rel-Path berechnen
                         if file_path.startswith(destination_base):
