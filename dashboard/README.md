@@ -14,23 +14,42 @@ Web-basiertes Dashboard zur Überwachung aller Backup- und Monitoring-Services.
 
 ### 1. Dashboard Service einrichten
 
+**WICHTIG: Multi-Repo Setup (April 2026 Update)**
+
+Seit dem Dashboard-Update vom April 2026 verwendet das System **absolute Pfade** (`/pcloud-tools/dashboard/`, `/entropy-watcher-und-clamav-scanner/docs/`). Der Webserver muss daher im **gemeinsamen Parent-Verzeichnis** laufen (normalerweise `/opt/apps/`).
+
 **Option A: Standalone Python-Server (empfohlen)**
 
 ```bash
-# Systemd Service installieren
+# 1. Neuen Server ins Parent-Verzeichnis kopieren
+sudo cp monitoring-dashboard-server.py /opt/apps/monitoring-dashboard-server.py
+sudo chmod +x /opt/apps/monitoring-dashboard-server.py
+
+# 2. Systemd Service installieren
 sudo cp systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
+
+# 3. Service-Datei anpassen (falls Pfade abweichen)
+sudo nano /etc/systemd/system/monitoring-dashboard.service
+# Setze: WorkingDirectory=/opt/apps
+# Setze: ExecStart=/usr/bin/python3 /opt/apps/monitoring-dashboard-server.py
+# Ersetze: YOUR_USER durch tatsächlichen Benutzer
+
+# 4. Service starten
 sudo systemctl daemon-reload
 sudo systemctl enable --now monitoring-dashboard.service
 
-# Verify
+# 5. Verify
 systemctl status monitoring-dashboard.service
-curl http://localhost:8080/
+curl http://localhost:8080/pcloud-tools/dashboard/index.html
 ```
 
-Der Python-Server (`dashboard/server.py`) läuft auf Port 8080 und liefert:
-- `/` → Dashboard (index.html)
-- `/monitoring/status.json` → Aggregierter Status
-- `/monitoring/reports.json` → DB-Reports
+**URLs nach dem Update:**
+- Dashboard: `http://localhost:8080/pcloud-tools/dashboard/index.html`
+- Dokumentation: `http://localhost:8080/entropy-watcher-und-clamav-scanner/docs/index.html`
+- API: `http://localhost:8080/opt/apps/monitoring/status.json` (via symlink oder mapping)
+
+**Legacy `dashboard/server.py`:**  
+Der alte `dashboard/server.py` funktioniert weiterhin für **lokale Entwicklung** im `dashboard/` Verzeichnis, aber die absoluten Links zu anderen Repos funktionieren nicht. Für Production verwende `monitoring-dashboard-server.py` im Parent-Verzeichnis.
 
 **Cache-Control Headers:**
 ```
@@ -42,12 +61,13 @@ Expires: 0
 **Option B: Nginx (für Produktivumgebung)**
 
 ```bash
-# Dashboard nach /var/www/ kopieren
+# Dashboard und Docs im Webroot verfügbar machen
 sudo mkdir -p /var/www/monitoring
-sudo cp dashboard/index.html /var/www/monitoring/
+sudo ln -s /opt/apps/pcloud-tools/dashboard /var/www/monitoring/pcloud-tools/dashboard
+sudo ln -s /opt/apps/entropy-watcher-und-clamav-scanner/docs /var/www/monitoring/entropy-watcher-und-clamav-scanner/docs
 
-# Status-JSON-Verzeichnis erstellen
-sudo mkdir -p /opt/apps/monitoring
+# Status-JSON-Verzeichnis mapping
+sudo ln -s /opt/apps/monitoring /var/www/monitoring/opt/apps/monitoring
 sudo chown www-data:www-data /opt/apps/monitoring
 ```
 
