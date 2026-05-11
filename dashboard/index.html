@@ -13,7 +13,7 @@
       --red:     #ef4444;
       --blue:    #3b82f6;
       --gray:    #6b7280;
-      --bg:      #0f172a;
+      --bg:      #0a0e1a;
       --surface: #1e293b;
       --surface2:#273549;
       --border:  #334155;
@@ -320,6 +320,45 @@
     .dcard-val.yellow { color: var(--yellow); }
     .dcard-val.red    { color: var(--red); }
     .dcard-val.blue   { color: var(--blue); }
+
+    /* Documentation Navigation */
+    .docs-nav {
+      padding: 12px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 16px;
+    }
+    .docs-nav .nav-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    .docs-nav .nav-links {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .docs-nav .nav-link {
+      font-size: 13px;
+      padding: 6px 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      text-decoration: none;
+      color: var(--text);
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .docs-nav .nav-link:hover {
+      background: rgba(16, 185, 129, 0.1);
+      border-color: var(--green);
+      color: var(--green);
+      transform: translateY(-1px);
+    }
   </style>
 </head>
 <body>
@@ -331,6 +370,57 @@
       <span id="data-timestamp">&#x2014;</span>
     </div>
   </div>
+
+  <!-- Documentation Navigation -->
+  <nav class="docs-nav">
+    <div class="nav-title">📚 Dokumentation & Ressourcen</div>
+    <div class="nav-links">
+      <a href="/entropy-watcher-und-clamav-scanner/docs/index.html" class="nav-link">
+        <span>📖</span>
+        <span>Overview</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/architecture.html" class="nav-link">
+        <span>🏗️</span>
+        <span>Architektur</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/process-flow.html" class="nav-link">
+        <span>📊</span>
+        <span>Prozess-Flow</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/pcloud.html" class="nav-link">
+        <span>☁️</span>
+        <span>pCloud System</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram.html" class="nav-link">
+        <span>⏱️</span>
+        <span>Timing Overview</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-green.html" class="nav-link">
+        <span>🟢</span>
+        <span>GREEN Szenario</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-yellow.html" class="nav-link">
+        <span>🟡</span>
+        <span>YELLOW Szenario</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-red.html" class="nav-link">
+        <span>🔴</span>
+        <span>RED Szenario</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" class="nav-link">
+        <span>🔍</span>
+        <span>Monitoring</span>
+      </a>
+      <a href="/entropy-watcher-und-clamav-scanner/docs/TESTING.html" class="nav-link">
+        <span>🧪</span>
+        <span>Testing</span>
+      </a>
+      <a href="/pcloud-tools/docs/DASHBOARD.html" class="nav-link">
+        <span>📊</span>
+        <span>Dashboard Docs</span>
+      </a>
+    </div>
+  </nav>
 
   <div class="overall-bar" id="overall-bar">
     <div class="overall-dot" id="overall-dot"></div>
@@ -390,7 +480,7 @@
       const dot = document.getElementById('overall-dot');
       dot.className = 'overall-dot ' + overallClass(overall);
       document.getElementById('overall-label').textContent = overall;
-      document.getElementById('overall-explain').textContent = buildOverallExplain(status);
+      document.getElementById('overall-explain').innerHTML = buildOverallExplain(status);
 
       const svc   = status.services || {};
       const rtb   = ((status.scripts || {}).rtb_wrapper   || {});
@@ -1085,7 +1175,10 @@
 
       if (s === 'OK')       return '\u2713 Alle Systeme funktionieren normal.';
       if (s === 'RUNNING')  return 'Backup l\xe4uft gerade \u2014 bitte nicht manuell unterbrechen.';
-      if (s === 'CRITICAL') return '\uD83D\uDEA8 Kritischer Fehler \u2014 sofortige Aktion erforderlich!';
+      if (s === 'CRITICAL') {
+        return '\uD83D\uDEA8 Kritischer Fehler \u2014 sofortige Aktion erforderlich! '
+          + '<a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" style="color: #60a5fa; text-decoration: underline;">→ Monitoring-Docs</a>';
+      }
 
       if (s === 'WARNING') {
         const parts = [];
@@ -1107,6 +1200,16 @@
           .map(([k]) => k);
         if (failed.length > 0)
           parts.push('Fehler: ' + failed.join(', ') + ' \u2014 ben\xf6tigt Aufmerksamkeit.');
+        
+        // Add contextual documentation links
+        const sgDetails = rtb.live_sg_details || '';
+        if (sgDetails.includes('YELLOW') || sgDetails.includes('RED')) {
+          parts.push('<a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" style="color: #60a5fa; text-decoration: underline;">→ Status-Details & Troubleshooting</a>');
+        }
+        if (blocked.length > 0) {
+          parts.push('<a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-yellow.html" style="color: #60a5fa; text-decoration: underline;">→ YELLOW-Szenario erklärt</a>');
+        }
+        
         return parts.join(' \u2002|\u2002 ');
       }
       return '';
