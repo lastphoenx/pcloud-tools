@@ -71,7 +71,7 @@ sudo nano /etc/systemd/system/monitoring-dashboard.service
 # - WorkingDirectory=/opt/apps
 # - ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
 # - ReadOnlyPaths=/opt/apps/pcloud-tools/main
-# - ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner/main
+# - ReadOnlyPaths=/opt/apps/entropywatcher/main
 
 # Daemon reload
 sudo systemctl daemon-reload
@@ -124,12 +124,19 @@ curl http://localhost:8080/opt/apps/monitoring/status.json
 │       │   └── server.py                   ← Legacy (nur für lokale Dev)
 │       └── systemd/
 │           └── monitoring-dashboard.service.example
-└── entropy-watcher-und-clamav-scanner/
-    └── main/                                ← Git-Repo (Branch main ausgecheckt)
-        └── docs/
-            ├── index.html                   ← Dokumentations-Hub
-            ├── MONITORING.html
-            └── ...
+├── entropywatcher/                          ← Git: entropy-watcher-und-clamav-scanner
+│   └── main/                                ← Git-Repo (Branch main ausgecheckt)
+│       └── docs/
+│           ├── index.html                   ← Dokumentations-Hub
+│           ├── MONITORING.html
+│           └── ...
+├── rtb/                                     ← Keine /main/ Struktur
+└── script-manager-ui/                       ← Keine /main/ Struktur
+```
+
+**URL Mapping:**
+- `/pcloud-tools/` → `/pcloud-tools/main/`
+- `/entropy-watcher-und-clamav-scanner/` → `/entropywatcher/main/` (Git-Repo Name ≠ Verzeichnisname)
 ```
 
 ---
