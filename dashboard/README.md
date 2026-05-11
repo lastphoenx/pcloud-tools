@@ -26,10 +26,12 @@ sudo cp main/systemd/monitoring-dashboard.service.example /etc/systemd/system/mo
 
 # 2. Service-Datei anpassen (nur User ändern)
 sudo nano /etc/systemd/system/monitoring-dashboard.service
-# Ersetze: YOUR_USER durch tatsächlichen Benutzer (z.B. pi)
+# Ersetze: YOUR_USER durch tatsächlichen Benutzer (z.B. pi, thomas)
 # Die Pfade sollten bereits korrekt sein:
 #   WorkingDirectory=/opt/apps
 #   ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
+#   ReadOnlyPaths=/opt/apps/pcloud-tools/main
+#   ReadOnlyPaths=/opt/apps/entropywatcher/main
 
 # 3. Service starten
 sudo systemctl daemon-reload

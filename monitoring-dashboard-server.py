@@ -38,12 +38,13 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         path = path.split('?', 1)[0]
         path = path.split('#', 1)[0]
         
-        # Map clean URLs to /main/ subdirectories
+        # Map clean URLs to /main/ subdirectories and correct directory names
+        # Note: URL uses full repo name, but server directory is shortened
         if path.startswith('/pcloud-tools/'):
             path = path.replace('/pcloud-tools/', '/pcloud-tools/main/', 1)
         elif path.startswith('/entropy-watcher-und-clamav-scanner/'):
-            path = path.replace('/entropy-watcher-und-clamav-scanner/', 
-                              '/entropy-watcher-und-clamav-scanner/main/', 1)
+            # Server directory is /opt/apps/entropywatcher/ not entropy-watcher-und-clamav-scanner/
+            path = path.replace('/entropy-watcher-und-clamav-scanner/', '/entropywatcher/main/', 1)
         
         # Convert URL path to filesystem path
         # The server runs from workspace root, so paths map directly
@@ -69,11 +70,11 @@ if __name__ == '__main__':
     print(f"🚀 Monitoring Dashboard Server")
     print("=" * 60)
     print(f"📁 Document Root: {workspace_root}")
-    print(f"📂 Repos: pcloud-tools/main/, entropy-watcher-und-clamav-scanner/main/")
+    print(f"📂 Repos: pcloud-tools/main/, entropywatcher/main/")
     print(f"🌐 Port: {PORT}")
     print(f"🔗 Dashboard: http://localhost:{PORT}/pcloud-tools/dashboard/index.html")
     print(f"📚 Docs: http://localhost:{PORT}/entropy-watcher-und-clamav-scanner/docs/")
-    print(f"💡 URLs auto-mapped to /main/ subdirectories")
+    print(f"💡 URL mapping: /entropy-watcher-und-clamav-scanner/ → /entropywatcher/main/")
     print("=" * 60)
     print("Press Ctrl+C to stop the server")
     print()
