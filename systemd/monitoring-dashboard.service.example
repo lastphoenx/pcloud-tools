@@ -20,13 +20,13 @@ Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Execution
 # Python HTTP server mit custom handler für cache control und multi-repo routing
 # Script liegt im pcloud-tools Repo, läuft aber mit WorkingDirectory=/opt/apps
-ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/monitoring-dashboard-server.py
+ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
 
 # Security
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/opt/apps/pcloud-tools
-ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner
+ReadOnlyPaths=/opt/apps/pcloud-tools/main
+ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner/main
 ReadOnlyPaths=/opt/apps/monitoring
 NoNewPrivileges=true
 PrivateTmp=true

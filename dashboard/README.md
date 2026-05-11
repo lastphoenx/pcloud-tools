@@ -22,14 +22,14 @@ Seit dem Dashboard-Update vom April 2026 verwendet das System **absolute Pfade**
 
 ```bash
 # 1. Systemd Service installieren
-sudo cp systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
+sudo cp main/systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
 
 # 2. Service-Datei anpassen (nur User ändern)
 sudo nano /etc/systemd/system/monitoring-dashboard.service
 # Ersetze: YOUR_USER durch tatsächlichen Benutzer (z.B. pi)
 # Die Pfade sollten bereits korrekt sein:
 #   WorkingDirectory=/opt/apps
-#   ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/monitoring-dashboard-server.py
+#   ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
 
 # 3. Service starten
 sudo systemctl daemon-reload
@@ -107,9 +107,9 @@ sudo systemctl reload nginx
 **Systemd Timer (event-getriggert + 15-min Fallback):**
 
 ```bash
-sudo cp systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
-sudo cp systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
-sudo cp systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
+sudo cp main/systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
+sudo cp main/systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
+sudo cp main/systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now monitoring-status-update.timer
 sudo systemctl enable --now monitoring-dashboard.service

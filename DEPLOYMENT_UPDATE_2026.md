@@ -10,6 +10,27 @@ Das Dashboard verwendet jetzt absolute Pfade für alle internen Links:
 
 ---
 
+## ⚙️ Repository-Struktur
+
+Wenn deine Git-Repos unter `/main/` Subdirectories ausgecheckt sind (z.B. via git worktree):
+```
+/opt/apps/pcloud-tools/main/
+/opt/apps/entropy-watcher-und-clamav-scanner/main/
+```
+
+**Erstelle Symlinks für saubere URLs:**
+```bash
+cd /opt/apps
+ln -s pcloud-tools/main pcloud-tools-main
+ln -s entropy-watcher-und-clamav-scanner/main entropy-watcher-main
+
+# Dann passe die Service-Datei an:
+# ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools-main/monitoring-dashboard-server.py
+# Oder behalte den Pfad bei: /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
+```
+
+---
+
 ## 🔄 Update auf bestehenden Systemen
 
 ### Schritt 1: Code aktualisieren
@@ -36,7 +57,7 @@ git pull origin main
 sudo systemctl stop monitoring-dashboard.service
 
 # Neue Service-Datei kopieren
-sudo cp pcloud-tools/systemd/monitoring-dashboard.service.example \
+sudo cp pcloud-tools/main/systemd/monitoring-dashboard.service.example \
         /etc/systemd/system/monitoring-dashboard.service
 
 # Service-Datei anpassen
@@ -48,9 +69,9 @@ sudo nano /etc/systemd/system/monitoring-dashboard.service
 #
 # Die Pfade sollten bereits korrekt sein:
 # - WorkingDirectory=/opt/apps
-# - ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/monitoring-dashboard-server.py
-# - ReadOnlyPaths=/opt/apps/pcloud-tools
-# - ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner
+# - ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
+# - ReadOnlyPaths=/opt/apps/pcloud-tools/main
+# - ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner/main
 
 # Daemon reload
 sudo systemctl daemon-reload
@@ -96,17 +117,19 @@ curl http://localhost:8080/opt/apps/monitoring/status.json
 │   ├── status.json
 │   └── reports.json
 ├── pcloud-tools/
-│   ├── monitoring-dashboard-server.py      ← Webserver (läuft von hier, WorkDir=/opt/apps)
-│   ├── dashboard/
-│   │   ├── index.html                      ← Dashboard UI
-│   │   └── server.py                       ← Legacy (nur für lokale Dev)
-│   └── systemd/
-│       └── monitoring-dashboard.service.example
+│   └── main/                                ← Git-Repo (Branch main ausgecheckt)
+│       ├── monitoring-dashboard-server.py  ← Webserver (WorkDir=/opt/apps)
+│       ├── dashboard/
+│       │   ├── index.html                  ← Dashboard UI
+│       │   └── server.py                   ← Legacy (nur für lokale Dev)
+│       └── systemd/
+│           └── monitoring-dashboard.service.example
 └── entropy-watcher-und-clamav-scanner/
-    └── docs/
-        ├── index.html                       ← Dokumentations-Hub
-        ├── MONITORING.html
-        └── ...
+    └── main/                                ← Git-Repo (Branch main ausgecheckt)
+        └── docs/
+            ├── index.html                   ← Dokumentations-Hub
+            ├── MONITORING.html
+            └── ...
 ```
 
 ---

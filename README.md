@@ -308,9 +308,9 @@ sudo mkdir -p /var/www/monitoring
 sudo cp dashboard/index.html /var/www/monitoring/
 
 # Status-Aggregator via systemd (event-getriggert + alle 15 min Fallback)
-sudo cp systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
-sudo cp systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
-sudo cp systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
+sudo cp main/systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
+sudo cp main/systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
+sudo cp main/systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now monitoring-status-update.timer
 sudo systemctl enable --now monitoring-dashboard.service

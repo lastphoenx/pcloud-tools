@@ -24,7 +24,11 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def translate_path(self, path):
         """
         Translate URL path to filesystem path.
-        Handles both relative and absolute paths correctly.
+        Maps URLs to the multi-repo structure with /main/ subdirectories:
+        - /pcloud-tools/dashboard/ -> pcloud-tools/main/dashboard/
+        - /entropy-watcher-und-clamav-scanner/docs/ -> entropy-watcher.../main/docs/
+        
+        This allows HTML files to use clean URLs without /main/ in the paths.
         """
         # For root or empty path, redirect to dashboard
         if path == '/' or path == '':
@@ -33,6 +37,13 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         # Remove query parameters
         path = path.split('?', 1)[0]
         path = path.split('#', 1)[0]
+        
+        # Map clean URLs to /main/ subdirectories
+        if path.startswith('/pcloud-tools/'):
+            path = path.replace('/pcloud-tools/', '/pcloud-tools/main/', 1)
+        elif path.startswith('/entropy-watcher-und-clamav-scanner/'):
+            path = path.replace('/entropy-watcher-und-clamav-scanner/', 
+                              '/entropy-watcher-und-clamav-scanner/main/', 1)
         
         # Convert URL path to filesystem path
         # The server runs from workspace root, so paths map directly
@@ -47,17 +58,22 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     PORT = 8080
     
-    # Ensure we're running from the correct directory
+    # Change to parent directory (/opt/apps) for multi-repo serving
+    # monitoring-dashboard-server.py lives in /opt/apps/pcloud-tools/main/
+    # We need to serve from /opt/apps/ to access both repos
     script_dir = Path(__file__).parent.resolve()
-    os.chdir(script_dir)
+    workspace_root = script_dir.parent.parent  # Go up from pcloud-tools/main/ to /opt/apps/
+    os.chdir(workspace_root)
     
     print("=" * 60)
     print(f"🚀 Monitoring Dashboard Server")
     print("=" * 60)
-    print(f"📁 Document Root: {script_dir}")
+    print(f"📁 Document Root: {workspace_root}")
+    print(f"📂 Repos: pcloud-tools/main/, entropy-watcher-und-clamav-scanner/main/")
     print(f"🌐 Port: {PORT}")
     print(f"🔗 Dashboard: http://localhost:{PORT}/pcloud-tools/dashboard/index.html")
     print(f"📚 Docs: http://localhost:{PORT}/entropy-watcher-und-clamav-scanner/docs/")
+    print(f"💡 URLs auto-mapped to /main/ subdirectories")
     print("=" * 60)
     print("Press Ctrl+C to stop the server")
     print()
