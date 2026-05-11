@@ -12,17 +12,20 @@ Restart=on-failure
 RestartSec=10s
 
 # Environment
-WorkingDirectory=/opt/apps/pcloud-tools/main/dashboard
+# WICHTIG: WorkingDirectory muss das gemeinsame Parent-Verzeichnis sein!
+# Dies ermöglicht absolute Pfade wie /pcloud-tools/dashboard/ und /entropy-watcher-und-clamav-scanner/docs/
+WorkingDirectory=/opt/apps
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Execution
-# Python HTTP server with custom handler for cache control
-ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/dashboard/server.py
+# Python HTTP server mit custom handler für cache control und multi-repo routing
+ExecStart=/usr/bin/python3 /opt/apps/monitoring-dashboard-server.py
 
 # Security
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/opt/apps/pcloud-tools/main/dashboard
+ReadOnlyPaths=/opt/apps/pcloud-tools
+ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner
 ReadOnlyPaths=/opt/apps/monitoring
 NoNewPrivileges=true
 PrivateTmp=true
