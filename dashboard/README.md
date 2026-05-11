@@ -21,20 +21,17 @@ Seit dem Dashboard-Update vom April 2026 verwendet das System **absolute Pfade**
 **Option A: Standalone Python-Server (empfohlen)**
 
 ```bash
-# 1. Neuen Server ins Parent-Verzeichnis kopieren
-sudo cp monitoring-dashboard-server.py /opt/apps/monitoring-dashboard-server.py
-sudo chmod +x /opt/apps/monitoring-dashboard-server.py
-
-# 2. Systemd Service installieren
+# 1. Systemd Service installieren
 sudo cp systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
 
-# 3. Service-Datei anpassen (falls Pfade abweichen)
+# 2. Service-Datei anpassen (nur User ändern)
 sudo nano /etc/systemd/system/monitoring-dashboard.service
-# Setze: WorkingDirectory=/opt/apps
-# Setze: ExecStart=/usr/bin/python3 /opt/apps/monitoring-dashboard-server.py
-# Ersetze: YOUR_USER durch tatsächlichen Benutzer
+# Ersetze: YOUR_USER durch tatsächlichen Benutzer (z.B. pi)
+# Die Pfade sollten bereits korrekt sein:
+#   WorkingDirectory=/opt/apps
+#   ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/monitoring-dashboard-server.py
 
-# 4. Service starten
+# 3. Service starten
 sudo systemctl daemon-reload
 sudo systemctl enable --now monitoring-dashboard.service
 

@@ -12,7 +12,7 @@ Das Dashboard verwendet jetzt absolute Pfade für alle internen Links:
 
 ## 🔄 Update auf bestehenden Systemen
 
-### Schritt 1: Neue Dateien deployen
+### Schritt 1: Code aktualisieren
 
 ```bash
 # Auf dem Produktions-Server
@@ -25,10 +25,8 @@ git pull origin main
 cd ../entropy-watcher-und-clamav-scanner  
 git pull origin main
 
-# Neuen Server-Script kopieren
-cd /opt/apps
-cp pcloud-tools/monitoring-dashboard-server.py monitoring-dashboard-server.py
-chmod +x monitoring-dashboard-server.py
+# Fertig! Der Server-Script liegt jetzt in pcloud-tools/monitoring-dashboard-server.py
+# Kein Kopieren nötig - der Service zeigt direkt darauf
 ```
 
 ### Schritt 2: Systemd Service aktualisieren
@@ -44,10 +42,13 @@ sudo cp pcloud-tools/systemd/monitoring-dashboard.service.example \
 # Service-Datei anpassen
 sudo nano /etc/systemd/system/monitoring-dashboard.service
 
-# Prüfe/ändere:
+# Ändere nur:
 # - User=YOUR_USER → User=pi (oder dein Benutzer)
+# - Group=YOUR_USER → Group=pi
+#
+# Die Pfade sollten bereits korrekt sein:
 # - WorkingDirectory=/opt/apps
-# - ExecStart=/usr/bin/python3 /opt/apps/monitoring-dashboard-server.py
+# - ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/monitoring-dashboard-server.py
 # - ReadOnlyPaths=/opt/apps/pcloud-tools
 # - ReadOnlyPaths=/opt/apps/entropy-watcher-und-clamav-scanner
 
@@ -91,11 +92,11 @@ curl http://localhost:8080/opt/apps/monitoring/status.json
 
 ```
 /opt/apps/
-├── monitoring-dashboard-server.py          ← Neuer Server (Root-Level)
 ├── monitoring/                              ← Status-JSON Output
 │   ├── status.json
 │   └── reports.json
 ├── pcloud-tools/
+│   ├── monitoring-dashboard-server.py      ← Webserver (läuft von hier, WorkDir=/opt/apps)
 │   ├── dashboard/
 │   │   ├── index.html                      ← Dashboard UI
 │   │   └── server.py                       ← Legacy (nur für lokale Dev)

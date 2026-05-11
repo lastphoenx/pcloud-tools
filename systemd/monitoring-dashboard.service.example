@@ -19,7 +19,8 @@ Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Execution
 # Python HTTP server mit custom handler für cache control und multi-repo routing
-ExecStart=/usr/bin/python3 /opt/apps/monitoring-dashboard-server.py
+# Script liegt im pcloud-tools Repo, läuft aber mit WorkingDirectory=/opt/apps
+ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/monitoring-dashboard-server.py
 
 # Security
 ProtectSystem=strict
