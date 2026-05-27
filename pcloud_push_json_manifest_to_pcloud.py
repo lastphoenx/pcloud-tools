@@ -114,10 +114,10 @@ def push_1to1_smart_controller(cfg, manifest, dest_root, *, dry=False, verbose=F
     
     _log(f"[smart-controller] Analysiere Strategie für {snapshot_name}...")
     
-    # Einheitliche Metriken (unified source)
-    metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
-
-    # Single Source of Truth: zentrale Klasse entscheidet deterministisch
+    # Einheitliche Metriken: binary-Checks (Index, Template) mit fast-fail cfg,
+    # damit sie bei flaky binary-Endpoint in Sekunden scheitern statt Minuten zu blockieren.
+    _metrics_cfg = {**cfg, "timeout": 2, "binary_max_attempts": 1}
+    metrics = _get_sync_metrics_unified(_metrics_cfg, manifest, dest_root, archive_dir)
     controller = SmartStrategyController()
     strategy = controller.decide(metrics)
     controller.log_decision(strategy, metrics, snapshot_name)
@@ -3395,10 +3395,13 @@ def main() -> None:
     dest_root = pc._norm_remote_path(args.dest_root)
 
     # Optional: Retention-Sync (nur sinnvoll im 1:1-Modus)
+    # Fast-fail cfg: binary-Aufrufe sollen schnell scheitern, nicht minutenlang blockieren.
+    # timeout=2 begrenzt Poll-Wartezeit; binary_max_attempts=1 verhindert Retry-Schleifen.
+    _fast_cfg = {**cfg, "timeout": 2, "binary_max_attempts": 1}
     if args.retention_sync and args.snapshot_mode == "1to1":
         local_snaps = list_local_snapshot_names(manifest["root"])
         try:
-            retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
+            retention_sync_1to1(_fast_cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
         except Exception as _ret_exc:
             _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch, Upload wird fortgesetzt): {_ret_exc}")
 
