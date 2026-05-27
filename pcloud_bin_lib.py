@@ -1165,7 +1165,15 @@ def ensure_path(cfg: Dict[str, Any], path: str, dry: bool = False) -> int:
         try:
             top = listfolder(cfg, path=cur, showpath=True)
         except Exception:
-            top = createfolder(cfg, cur)
+            try:
+                top = createfolder(cfg, cur)
+            except RuntimeError as _ce:
+                # API error 2004: Folder already exists (race or listfolder timeout fallback).
+                # Re-list the existing folder to get its folderid.
+                if "2004" in str(_ce):
+                    top = listfolder(cfg, path=cur, showpath=True)
+                else:
+                    raise
         md = top.get("metadata") or {}
         fid = int(md.get("folderid") or md.get("id") or 0)
     return fid
