@@ -3397,7 +3397,10 @@ def main() -> None:
     # Optional: Retention-Sync (nur sinnvoll im 1:1-Modus)
     if args.retention_sync and args.snapshot_mode == "1to1":
         local_snaps = list_local_snapshot_names(manifest["root"])
-        retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
+        try:
+            retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
+        except Exception as _ret_exc:
+            _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch, Upload wird fortgesetzt): {_ret_exc}")
 
     if args.snapshot_mode == "objects":
         push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
