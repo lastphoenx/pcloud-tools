@@ -2235,19 +2235,21 @@ def delete_file(cfg: Dict[str, Any], *, fileid: int | None = None, path: str | N
 def delete_folder(cfg: Dict[str, Any], *, folderid: int | None = None, path: str | None = None,
                   recursive: bool = False) -> Dict[str, Any]:
     """
-    Löscht einen Ordner (Binary-API deletefolder / deletefolderrecursive).
+    Löscht einen Ordner (REST-API deletefolder / deletefolderrecursive).
     Genau eines von folderid oder path angeben.
     """
     if (folderid is None) == (path is None):
         raise ValueError("delete_folder: genau eines von folderid oder path angeben.")
-    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    params = {}
     if folderid is not None:
         params["folderid"] = int(folderid)
     else:
         params["path"] = _norm_remote_path(path)
     method = "deletefolderrecursive" if recursive else "deletefolder"
-    top, _ = _rpc(cfg["host"], cfg["port"], cfg["timeout"], method, params)
-    _expect_ok(top)
+    # REST API statt Binary (zuverlässig, kein Socket-Blocking bei großen Ordnern)
+    top = _rest_get(cfg, method, params)
+    if int(top.get("result", -1)) != 0:
+        raise RuntimeError(f"API error {top.get('result')}: {top.get('error', 'unknown')}")
     return top
 
 # --- Rekursiv statt Einzelaufrufe ---
