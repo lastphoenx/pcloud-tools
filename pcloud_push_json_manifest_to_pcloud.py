@@ -2855,24 +2855,6 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     
     basis_path = f"{snapshots_root}/{basis_snapshot}"
     
-    # HARD-RESET: Lösche unvollständigen Zielordner (von abgebrochenem Lauf)
-    if not dry:
-        try:
-            marker_complete = f"{dest_snapshot_dir}/.upload_complete"
-            # REST-Check: Ordner existiert ABER Marker fehlt?
-            stat_res = pc._rest_get(cfg, "stat", {"path": dest_snapshot_dir})
-            if int(stat_res.get("result", -1)) == 0:
-                # Ordner existiert - prüfe Marker
-                marker_res = pc._rest_get(cfg, "stat", {"path": marker_complete})
-                if int(marker_res.get("result", -1)) != 0:
-                    # Marker fehlt → unvollständiger Upload
-                    _log(f"[delta-copy][2/6] ⚠ Unvollständiger Ordner erkannt (kein Marker) → Hard-Reset")
-                    pc.delete_folder(cfg, path=dest_snapshot_dir, recursive=True)
-                    _log(f"[delta-copy][2/6] ✓ Unvollständiger Ordner gelöscht")
-        except Exception as e_reset:
-            # Ordner existiert nicht oder API-Fehler → OK, können weitermachen
-            pass
-    
     # KRITISCH: Zielordner VORHER anlegen (copycontentonly erwartet existierenden Container)
     if not dry:
         try:
