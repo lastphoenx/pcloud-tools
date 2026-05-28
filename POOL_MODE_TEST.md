@@ -378,6 +378,121 @@ sudo /opt/apps/rtb/rtb_pool_wrapper.sh --upload-only /mnt/backup/rtb_nas/latest
 
 ---
 
+## ⚠️ SICHERHEIT: KOLLISIONS-VERMEIDUNG
+
+### Marker-basierte Sicherheit
+
+**Beide Modi (1to1 + Pool) prüfen `.upload_complete` Marker:**
+- ✅ Wenn Marker existiert → Upload wird übersprungen
+- ✅ Verhindert Doppel-Uploads für denselben Snapshot
+
+**ABER: Marker dokumentiert NICHT den Mode!**
+
+### Risiko-Szenario
+
+```
+# 1to1-Snapshot existiert
+/_snapshots/2026-05-24-200014/
+  ├─ .upload_complete      ← 1to1 Marker (ohne Mode-Info!)
+  └─ home/user/file.txt    ← Echte Datei
+
+# Wenn Marker gelöscht wird + Pool-Mode läuft:
+/_snapshots/2026-05-24-200014/
+  ├─ file.txt              ← Echte Datei (1to1)
+  └─ file.txt.meta.json    ← Stub (Pool) = CHAOS!
+```
+
+### ✅ EMPFOHLENE VORGEHENSWEISE
+
+**Option 1: Separate Dest-Roots (SICHERSTE)**
+```bash
+# 1to1-Mode (alt, läuft aus)
+--dest-root /Backup/rtb_1to1_legacy
+
+# Pool-Mode (neu, produktiv)
+--dest-root /Backup/rtb_1to1_pool
+
+# KEIN Konflikt möglich! ✓
+```
+
+**Option 2: Sequentielle Migration**
+```bash
+# Phase 1: Nur 1to1-Mode (Status Quo)
+# Phase 2: Stop 1to1-Timer
+sudo systemctl stop backup-pipeline.timer
+# Phase 3: Start Pool-Timer
+sudo systemctl start backup-pipeline-pool.timer
+# Phase 4: Alte 1to1-Snapshots löschen (nach X Tagen)
+```
+
+**Option 3: Marker mit Mode-Indikator (Code-Fix)**
+```python
+# Started-Marker bereits hat Mode-Info:
+{
+  "snapshot": "2026-05-24-200014",
+  "started_at": 1717000000.0,
+  "mode": "pool"  # ← Pool-Mode schreibt dies!
+}
+
+# TODO: Complete-Marker sollte auch Mode haben
+# TODO: Beim Prüfen auch Mode validieren
+```
+
+### 🔐 ZUSÄTZLICHE SICHERHEIT
+
+**1. Lock-Mechanismus** (bereits vorhanden)
+```bash
+# Beide Wrapper nutzen dasselbe Lock
+/run/backup_pipeline.lock
+
+# Verhindert: 1to1 + Pool gleichzeitig!
+```
+
+**2. DB-Status prüfen** (rtb_wrapper.sh macht das)
+```sql
+SELECT status FROM backup_runs 
+WHERE snapshot_name='2026-05-24-200014' 
+ORDER BY run_id DESC LIMIT 1;
+
+# Wenn SUCCESS → Skip Upload
+```
+
+**3. Snapshot-Name Convention**
+```bash
+# Optional: Mode-Prefix im Snapshot-Namen
+1to1:  2026-05-24-200014         (Status Quo)
+Pool:  pool-2026-05-24-200014    (Neue Convention)
+
+# Verhindert Name-Kollisionen!
+```
+
+### ✅ AKTUELLE EMPFEHLUNG FÜR DICH
+
+**Für ersten Test (minimales Risiko):**
+```bash
+# 1. Wähle Snapshot der NICHT auf pCloud ist
+SNAP=/mnt/backup/rtb_nas/2026-05-24-200014
+
+# 2. Prüfe ob auf pCloud existiert
+python pcloud_quick_delta.py \
+  --dest-root /Backup/rtb_1to1 \
+  --env-file .env | grep 2026-05-24-200014
+
+# 3. Wenn NICHT auf pCloud → Safe zum Testen!
+python pcloud_push_json_pool_manifest_to_pcloud.py ...
+```
+
+**Für Produktiv-Betrieb:**
+```bash
+# Nutze separaten Dest-Root (SICHERSTE Option)
+export PCLOUD_DEST=/Backup/rtb_1to1_pool
+
+# Oder: Stop 1to1-Mode komplett
+sudo systemctl stop backup-pipeline.timer
+```
+
+---
+
 ## TROUBLESHOOTING
 
 ### Problem: "pcloud_bin_lib konnte nicht importiert werden"
