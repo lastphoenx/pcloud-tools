@@ -87,8 +87,8 @@ def main():
         md = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_1"})
         fid = md["metadata"]["folderid"]
         
-        # Wir nutzen topath statt name, da copyfolder kein 'name' Argument hat
-        pc.copyfolder(cfg, from_folderid=fid, to_path=f"{test_dir}/snap_2")
+        # copyfolder: to_path = Parent-Ordner, toname = Name der Kopie
+        pc.copyfolder(cfg, from_folderid=fid, to_path=test_dir, toname="snap_2")
         q2 = get_quota(cfg)
         print(f"    Used: {format_bytes(q2['used'])} (Diff zu snap_1: {format_bytes(q2['used']-q1['used'])})")
         
@@ -96,7 +96,7 @@ def main():
         print("\n[5/7] Klon snap_2 -> snap_3 via copyfolder...")
         md2 = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_2"})
         fid2 = md2["metadata"]["folderid"]
-        pc.copyfolder(cfg, from_folderid=fid2, to_path=f"{test_dir}/snap_3")
+        pc.copyfolder(cfg, from_folderid=fid2, to_path=test_dir, toname="snap_3")
         q3 = get_quota(cfg)
         print(f"    Used: {format_bytes(q3['used'])} (Diff zu snap_2: {format_bytes(q3['used']-q2['used'])})")
         
