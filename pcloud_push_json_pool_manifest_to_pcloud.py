@@ -2210,7 +2210,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                 _log(
                     f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
                     f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
-                    f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend"
+                    f"uploaded={uploaded} resumed={resumed} stubs_queued={stubs} | {_eta_str} verbleibend"
                 )
                 _t_last_progress = _now
 
@@ -4444,7 +4444,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(
                     f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
                     f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
-                    f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend"
+                    f"uploaded={uploaded} resumed={resumed} stubs_queued={stubs} | {_eta_str} verbleibend"
                 )
                 _t_last_progress = _now
         
