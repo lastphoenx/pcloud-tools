@@ -2990,40 +2990,51 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     _log(f"[delta-copy][3/6]   Geändert:  {stats['changed_count']}")
     _log(f"[delta-copy][3/6]   Gelöscht:  {stats['deleted_count']}")
     
-    # === Schritt 4: DELETE-Loop ===
+    # === Schritt 4: DELETE-Loop (Parallel) ===
     _log(f"[delta-copy][4/6] Lösche geänderte und gelöschte Dateien...")
     t_delete_start = time.time()
     
     delete_count = 0
     delete_items = diff["deleted"] + diff["changed"]
     
-    for item in delete_items:
+    def _delete_file_and_stub(item):
+        """Helper: Löscht Datei + Stub (parallel-safe)"""
+        nonlocal delete_count
         relpath = item.get("relpath")
         if not relpath:
-            continue
+            return
         
-        # Lösche echte Datei
         file_path = f"{dest_snapshot_dir}/{relpath}"
+        stub_path = f"{file_path}.meta.json"
         
         if dry:
             _log(f"[dry] delete: {file_path}")
-        else:
-            try:
-                pc.delete_file(cfg, path=file_path)
-                delete_count += 1
-            except Exception as e:
-                if "2005" not in str(e) and "not found" not in str(e).lower():
-                    _log(f"[delta-copy][4/6][warn] Konnte {file_path} nicht löschen: {e}")
-        
-        # Lösche auch .meta.json Stub (falls vorhanden)
-        stub_path = f"{file_path}.meta.json"
-        if dry:
             _log(f"[dry] delete stub: {stub_path}")
-        else:
-            try:
-                pc.delete_file(cfg, path=stub_path)
-            except Exception:
-                pass  # Stub existiert nicht → okay
+            return
+        
+        # Datei löschen
+        try:
+            pc.delete_file(cfg, path=file_path)
+            with _metrics_lock:
+                delete_count += 1
+        except Exception as e:
+            if "2005" not in str(e) and "not found" not in str(e).lower():
+                _log(f"[delta-copy][4/6][warn] Konnte {file_path} nicht löschen: {e}")
+        
+        # Stub löschen (best effort)
+        try:
+            pc.delete_file(cfg, path=stub_path)
+        except Exception:
+            pass  # Stub existiert nicht → okay
+    
+    # Parallel-Delete (analog zu Parallel-Upload)
+    if delete_items and not dry:
+        max_workers = min(PARALLEL_UPLOAD_THREADS, 8)  # Max 8 parallel Deletes
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_delete_file_and_stub, delete_items))
+    elif dry:
+        for item in delete_items:
+            _delete_file_and_stub(item)
     
     t_delete_ms = (time.time() - t_delete_start) * 1000.0
     _log(f"[delta-copy][4/6] ✓ {delete_count} Dateien gelöscht ({t_delete_ms:.0f}ms)")
