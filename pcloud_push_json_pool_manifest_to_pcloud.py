@@ -4138,7 +4138,6 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             # 5. Fehlende Ordner anlegen (parallel mit PCLOUD_FOLDER_THREADS)
             if to_add:
                 from collections import defaultdict
-                import threading
                 _log(f"[pool-mode] Lege {len(to_add)} fehlende Ordner an...")
                 
                 folders_by_depth = defaultdict(list)
@@ -4225,7 +4224,6 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         
         if missing_folders:
             from collections import defaultdict
-            import threading
             _log(f"[pool-mode] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)")
             
             folders_by_depth = defaultdict(list)
