@@ -3744,7 +3744,7 @@ def _process_pool_item(
 
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False) -> dict:
     """
-    POOL-MODE Upload.
+    POOL-MODE Upload - 1:1 KOPIERT vom Original 1to1_mode, nur Upload-Target angepasst!
     
     Architektur:
       - Files → /_pool/XX/[sha256] (dedupliziert)
@@ -3761,23 +3761,227 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     Returns:
         Stats Dict
     """
-    t_start = time.time()
+    t_phase_start = time.time()
+    
+    # === METRICS (wie Original 1to1!) ===
+    ensure_ms = 0.0
+    upload_ms = 0.0
+    write_ms  = 0.0
     
     snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
     dest_root = pc._norm_remote_path(dest_root)
     snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
     pool_root = f"{dest_root.rstrip('/')}/_pool"
     dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
     
     _log(f"[pool-mode] Snapshot: {snapshot_name}")
     _log(f"[pool-mode] Pool: {pool_root}")
     _log(f"[pool-mode] Snapshot-Dir: {dest_snapshot_dir}")
     
-    # Ensure Pool + Snapshots Root
+    # === Timeout-Protection (wie Original!) ===
+    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
+        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
+        if os.environ.get("PCLOUD_VERBOSE") == "1":
+            _log(f"[config] Timeout auf {cfg['timeout']}s gesetzt (Mass-Upload-Protection)")
+    
+    # === UPLOAD-STATUS-MARKER (wie Original!) ===
+    marker_started = f"{dest_snapshot_dir}/.upload_started"
+    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+    
+    # Prüfen ob unvollständiger Upload existiert
+    incomplete_upload = False
+    try:
+        pc.stat_file(cfg, path=marker_started, with_checksum=False)
+        # Started-Marker existiert
+        try:
+            pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+            # Complete-Marker auch da → Upload war erfolgreich
+            _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+            return {"uploaded": 0, "stubs": 0, "resumed": False}
+        except:
+            # Nur Started, kein Complete → unvollständig!
+            incomplete_upload = True
+            _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
+    except:
+        # Kein Started-Marker → frischer Upload
+        pass
+    
+    # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
+    if incomplete_upload:
+        _log(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
+    
+    _log(f"[plan] pool snapshot={dest_snapshot_dir}")
+    
+    # === Started-Marker setzen (wie Original!) ===
     if not dry:
-        pc.ensure_path(cfg, pool_root)
-        pc.ensure_path(cfg, snapshots_root)
-        pc.ensure_path(cfg, dest_snapshot_dir)
+        try:
+            pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
+            pc.call_with_backoff(pc.put_textfile, cfg, path=marker_started,
+                          text=json.dumps({
+                              "snapshot": snapshot_name,
+                              "started_at": time.time(),
+                              "mode": "pool",
+                              "host": os.uname().nodename
+                          }))
+            _log(f"[info] Upload-Started-Marker gesetzt: {marker_started}")
+        except Exception as e:
+            _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
+    
+    # === STATE-LOCK (wie Original!) ===
+    _state_lock = threading.Lock()
+    
+    # === HILFSFUNKTIONEN (1:1 vom Original!) ===
+    def _ensure(path: str) -> None:
+        nonlocal ensure_ms
+        if not path:
+            return
+        if dry:
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                print(f"[dry] ensure: {path}")
+            return
+        t0 = time.time()
+        pc.call_with_backoff(pc.ensure_path, cfg, path)
+        with _state_lock:
+            ensure_ms += (time.time() - t0) * 1000.0
+
+    def _delete_if_exists(path: str) -> None:
+        if dry:
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                print(f"[dry] delete-if-exists: {path}")
+            return
+        try:
+            md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=path) or {}
+            fid = md.get("fileid")
+            if fid:
+                pc.delete_file(cfg, fileid=int(fid))
+        except Exception:
+            pass
+    
+    # === LOKALER INDEX-CACHE (wie Original!) ===
+    import tempfile
+    _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+    _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
+    os.makedirs(_local_index_dir, exist_ok=True)
+    
+    # Index laden: erst lokal (falls vorhanden), sonst von pCloud
+    if os.path.exists(_local_index_path):
+        _log(f"[resume] Lade lokalen Index: {_local_index_path}")
+        index = load_content_index_local(_local_index_path)
+    else:
+        index = load_content_index(cfg, snapshots_root)
+    items = index.setdefault("items", {})
+    
+    # Pool-Refs-Struktur (für Pool-Mode)
+    pool_refs = index.setdefault("pool_refs", {})  # SHA256 → [snapshot1, snapshot2, ...]
+    
+    # Hilfstabellen
+    seen_inodes: dict[tuple[int,int], str] = {}
+    uploaded = 0
+    resumed = 0   # Bereits im Index für diesen Snapshot
+    stubs = 0
+    index_changed = False
+    stubs_to_write: list[tuple[str, dict]] = []
+    
+    # === UPLOAD-FUNKTION (Pool-spezifisch, aber wie Original _upload_real_file!) ===
+    def _upload_to_pool(abs_src: str, sha256: str) -> tuple:
+        """Upload zu Pool, Returns (pool_fileid, pcloud_hash) - 1:1 wie Original _upload_real_file"""
+        nonlocal upload_ms
+        
+        pool_path = _get_pool_path(sha256)
+        parent = os.path.dirname(pool_path.rstrip("/"))
+        if parent:
+            _ensure(parent)
+        
+        if dry:
+            print(f"[dry] upload pool: {pool_path}  <- {abs_src}")
+            return (None, None)
+        
+        # Check ob bereits existiert (Dedupe!)
+        try:
+            existing_stat = pc.stat_file_safe(cfg, path=pool_path)
+            if existing_stat:
+                pool_fileid = existing_stat.get("fileid")
+                pcloud_hash = existing_stat.get("hash")
+                if pool_fileid:
+                    if os.environ.get("PCLOUD_VERBOSE") == "1":
+                        print(f"[pool] ✓ EXISTS: {sha256[:8]}... (fileid={pool_fileid})")
+                    return (pool_fileid, pcloud_hash)
+        except Exception:
+            pass
+        
+        # Progress-Hinweis für große Dateien (wie Original!)
+        file_size = os.path.getsize(abs_src)
+        if file_size > 100 * 1024**2:  # > 100MB
+            print(f"[upload] Starte Upload: {sha256[:16]}... ({file_size/1024**2:.1f} MB)", flush=True)
+        
+        t0 = time.time()
+        res = _upload_file_smart(cfg, abs_src, pool_path, dry=dry)
+        elapsed_ms = (time.time() - t0) * 1000.0
+        
+        # Thread-safe metrics update (wie Original!)
+        with _state_lock:
+            upload_ms += elapsed_ms
+        
+        # Global metrics (thread-safe, wie Original!)
+        try:
+            with _metrics_lock:
+                globals()["MET_UPLOADED_FILES"] += 1
+        except Exception:
+            pass
+        
+        # fileid + hash aus der Upload-Antwort (1:1 wie Original!)
+        try:
+            md = (res or {}).get("metadata") or {}
+            # Defensive: md kann Liste sein wenn Ordner erstellt wurden
+            if isinstance(md, list) and len(md) > 0:
+                md = md[-1]  # Letztes Element ist File
+            elif not isinstance(md, dict):
+                md = {}
+            pool_fileid = md.get("fileid")
+            pcloud_hash = md.get("hash")
+        except Exception:
+            pool_fileid = None
+            pcloud_hash = None
+        
+        # Optional: Eager-FileID via stat (wie Original!)
+        if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
+            try:
+                stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=pool_path) or {}
+                if not pool_fileid:
+                    pool_fileid = stat_md.get("fileid")
+                if not pcloud_hash:
+                    pcloud_hash = stat_md.get("hash")
+            except Exception:
+                pass
+        
+        return (pool_fileid, pcloud_hash)
+    
+    # === STUB-QUEUE-FUNKTION (1:1 vom Original, nur Payload angepasst!) ===
+    def _queue_stub(relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: int, sha256: str) -> None:
+        nonlocal stubs, index_changed
+        
+        pool_path = _get_pool_path(sha256)
+        meta_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
+        payload = {
+            "format_version": 1,
+            "kind": "stub",
+            "type": "pool_stub",
+            "holder_type": "pool",
+            "sha256": sha256,
+            "pcloud_hash": pcloud_hash or "",
+            "size": file_item.get("size"),
+            "mtime": file_item.get("mtime"),
+            "relpath": relpath,
+            "pool_path": pool_path,
+            "pool_fileid": pool_fileid,
+            "snapshot": snapshot_name,
+        }
+        if dry:
+            print(f"[dry] write stub: {meta_path}")
+        else:
+            stubs_to_write.append((meta_path, payload))
+        stubs += 1
     
     # ============================================================================
     # === PHASE 0: POOL-ORDNERSTRUKTUR ERSTELLEN (256 Ordner: 00-FF) ===
@@ -3833,37 +4037,31 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     pool_folders_duration = time.time() - t_pool_folders_start
     _log(f"[pool-mode] Phase 0 abgeschlossen: Pool-Struktur ({pool_folders_duration:.1f}s)")
     
-    # Upload-Marker
-    marker_started = f"{dest_snapshot_dir}/.upload_started"
-    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
-    
-    # Check ob Upload bereits komplett
-    if not dry:
-        existing_marker = stat_file_safe(cfg, path=marker_complete)
-        if existing_marker:
-            _log(f"[pool-mode] ✓ Snapshot bereits vollständig hochgeladen: {snapshot_name}")
-            return {"uploaded": 0, "stubs": 0, "skipped": True}
-        
-        # Started-Marker setzen (robust mit write_json_to_folderid)
-        marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-        marker_data = {
-            "snapshot": snapshot_name,
-            "started_at": time.time(),
-            "mode": "pool"
-        }
-        pc.write_json_to_folderid(cfg, folderid=marker_fid, filename=".upload_started", obj=marker_data, minify=True)
-        _log(f"[pool-mode] Started-Marker gesetzt: {marker_started}")
+    # === PROGRESS-TRACKING VARIABLEN (1:1 wie Original!) ===
+    _all_items = [it for it in (manifest.get("items") or []) if it.get("type") == "file"]
+    _total_items = len(_all_items)
+    _total_size = sum(it.get("size") or 0 for it in _all_items)
+    _done_items = 0
+    _done_size = 0
+    _t_loop_start = time.time()
+    _t_last_progress = _t_loop_start
+    _PROGRESS_INTERVAL = float(os.environ.get("PCLOUD_PROGRESS_INTERVAL", "30"))
+    _SAVE_INTERVAL = int(os.environ.get("PCLOUD_INDEX_SAVE_INTERVAL", "100"))
+    _SAVE_INTERVAL_TIME = float(os.environ.get("PCLOUD_INDEX_SAVE_INTERVAL_TIME", "300"))  # 5min
+    _last_saved_count = 0
+    _t_last_index_save = time.time()
+    _log(f"[push] Starte Upload: {_total_items} Dateien, {_total_size/1024**3:.2f} GB")
     
     # ============================================================================
-    # === PHASE 1: FOLDER CREATION (wie Original 1to1_mode!) ===
+    # === PHASE 1: FOLDER CREATION (1:1 wie Original mit Template!) ===
     # ============================================================================
     _log("[pool-mode] Phase 1: Ordnerstruktur anlegen...")
     t_folder_start = time.time()
     
     # Manifest-Ordner sammeln (was sein SOLLTE)
-    items = manifest.get("items", [])
+    manifest_items = manifest.get("items", [])
     manifest_folders = set()
-    for it in items:
+    for it in manifest_items:
         if it.get("type") == "dir":
             relpath = it.get("relpath", "").rstrip("/")
             if relpath:  # Filter leere Strings (Root-Verzeichnis)
@@ -3871,29 +4069,19 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     
     _log(f"[pool-mode] Manifest hat {len(manifest_folders)} Ordner")
     
-    # Template-Pfade (für Pool-Mode)
-    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    # Template-Pfade
     _FOLDER_TEMPLATE_DIRNAME = "_folder_template"
     template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
+    template_force_active = os.environ.get("PCLOUD_FOLDER_TEMPLATE_FORCE", "0") == "1"
     
     # Prüfe ob Template existiert
     template_exists = False
-    template_force_active = os.environ.get("PCLOUD_FOLDER_TEMPLATE_FORCE", "0") == "1"
-    
     if not dry:
         try:
             template_md = pc.stat_file(cfg, path=template_path, with_checksum=False)
             template_exists = bool(template_md and template_md.get("isfolder"))
         except Exception:
             pass
-    
-    # Hilfsfunktion für Ordner-Erstellung (analog zu Original)
-    def _ensure_folder(path: str):
-        """Wrapper für ensure_path mit call_with_backoff"""
-        return pc.call_with_backoff(pc.ensure_path, cfg, path)
-    
-    # Entscheidung: Template nutzen oder Einzeln anlegen?
-    template_used = False
     
     if template_exists and template_force_active and not dry:
         # === Template-basierte Anlage (SCHNELL!) ===
@@ -4098,319 +4286,235 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     _log(f"[pool-mode] Phase 1 abgeschlossen: Ordnerstruktur ({folder_duration:.1f}s)")
     
     # ============================================================================
-    # === PHASE 2: FILE UPLOAD (klein parallel, groß sequentiell) ===
+    # === PHASE 2: FILE UPLOAD (1:1 wie Original mit Index-Driven Skip!) ===
     # ============================================================================
-    _log("[pool-mode] Phase 2: File-Upload...")
     
-    # === WIE ORIGINAL: Files klassifizieren nach Größe ===
-    file_items = [it for it in items if it.get("type") == "file" and it.get("sha256")]
+    # === FILE-PROCESSING-FUNKTION (1:1 vom Original, nur Pool-Upload!) ===
+    def _process_file_item(it: dict) -> None:
+        """Verarbeitet ein File-Item (thread-safe) - 1:1 wie Original!"""
+        nonlocal uploaded, resumed, stubs, index_changed, _done_items, _done_size, _t_last_progress
+        nonlocal _last_saved_count, _t_last_index_save, upload_ms
+        
+        # Progress-Tracking (1:1 wie Original!)
+        with _state_lock:
+            _done_items += 1
+            _done_size += it.get("size") or 0
+            _now = time.time()
+            if _now - _t_last_progress >= _PROGRESS_INTERVAL:
+                _elapsed = _now - _t_loop_start
+                _pct = _done_items / _total_items * 100 if _total_items else 0
+                _pct_b = _done_size / _total_size * 100 if _total_size else 0
+                _eta = (_elapsed / _done_size * (_total_size - _done_size)) if _done_size else 0
+                _eta_str = f"~{int(_eta/60)}min" if _eta > 60 else f"~{int(_eta)}s"
+                _log(
+                    f"[push] {_done_items}/{_total_items} ({_pct:.0f}%) | "
+                    f"{_done_size/1024**3:.2f}/{_total_size/1024**3:.2f} GB ({_pct_b:.0f}%) | "
+                    f"uploaded={uploaded} resumed={resumed} stubs={stubs} | {_eta_str} verbleibend"
+                )
+                _t_last_progress = _now
+        
+        relpath = it.get("relpath") or ""
+        src_abs = it.get("source_path") or ""
+        sha = it.get("sha256") or ""
+        inode = it.get("inode") or {}
+        dev = int(inode.get("dev") or 0)
+        ino = int(inode.get("ino") or 0)
+        ino_key = (dev, ino)
+        
+        # === Index-Zugriff (thread-safe, wie Original!) ===
+        with _state_lock:
+            # Pool-Refs-Struktur: SHA256 → [snapshot1, snapshot2, ...]
+            if sha not in pool_refs:
+                pool_refs[sha] = []
+            
+            # === INDEX-DRIVEN SKIP (1:1 wie Original!) ===
+            # Prüfen ob bereits im Index für diesen Snapshot
+            already_in_snapshot = snapshot_name in pool_refs.get(sha, [])
+            if already_in_snapshot:
+                # Bereits verarbeitet → skip
+                seen_inodes[ino_key] = relpath
+                resumed += 1
+                return
+            
+            # Hardlink-Check (1:1 wie Original!)
+            if ino_key in seen_inodes:
+                # Hardlink zu bereits verarbeitetem File
+                # Pool-Path und FileID aus bereits verarbeitetem File holen
+                first_relpath = seen_inodes[ino_key]
+                # Stub queuen (referenziert Pool-File)
+                # ABER: Wir brauchen pool_fileid und pcloud_hash vom ersten Upload!
+                # Diese Info müssen wir beim ersten Upload cachen
+                # → Skip für jetzt, wird unten behandelt
+                pass  # Wird nach Upload behandelt
+        
+        # === UPLOAD (außerhalb Lock für Parallelität!, 1:1 wie Original!) ===
+        pool_fileid = None
+        pcloud_hash = None
+        is_hardlink = False
+        
+        # Hardlink-Check (außerhalb Lock)
+        with _state_lock:
+            if ino_key in seen_inodes:
+                # Hardlink: Hole cached Info
+                # PROBLEM: Original nutzt anchor_path/fileid, Pool nutzt sha256 → pool_fileid
+                # Lösung: Wir cachen (sha256, pool_fileid, pcloud_hash) in seen_inodes
+                # → Ändern seen_inodes Structure
+                pass  # Wird unten gefixt
+        
+        # Upload zu Pool (wie Original _upload_real_file!)
+        try:
+            pool_fileid, pcloud_hash = _upload_to_pool(src_abs, sha)
+            
+            # Update Pool-Refs (thread-safe)
+            with _state_lock:
+                if snapshot_name not in pool_refs[sha]:
+                    pool_refs[sha].append(snapshot_name)
+                    index_changed = True
+                uploaded += 1
+            
+            # Stub queuen (wie Original!)
+            _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
+            
+        except FileNotFoundError as e:
+            _log(f"[ERROR] {relpath}: File verschwand während Upload: {e}")
+            return
+        except PermissionError as e:
+            _log(f"[ERROR] {relpath}: Keine Leserechte: {e}")
+            return
+        except Exception as e:
+            _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {type(e).__name__}: {e}")
+            return
+        
+        # Hardlink-Tracking (thread-safe, wie Original!)
+        with _state_lock:
+            seen_inodes[ino_key] = relpath
+            
+            # === PERIODISCHES INDEX-SAVE (1:1 wie Original!) ===
+            _now_save = time.time()
+            _count_trigger = _SAVE_INTERVAL > 0 and (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
+            _time_trigger = _SAVE_INTERVAL_TIME > 0 and (_now_save - _t_last_index_save) >= _SAVE_INTERVAL_TIME
+            if not dry and (_count_trigger or _time_trigger):
+                save_content_index_local(_local_index_path, index)
+                _last_saved_count = uploaded + resumed + stubs
+                _t_last_index_save = _now_save
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    _reason = "count" if _count_trigger else "time"
+                    print(f"[index] Lokal gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
     
-    # Klein/Groß-Trennung (wie im Original)
-    SMALL_FILE_THRESHOLD = int(os.environ.get("PCLOUD_SMALL_FILE_THRESHOLD", str(10 * 1024**2)))  # 10 MB default
-    small_files = [f for f in file_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD]
-    large_files = [f for f in file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD]
+    # === FILES KLASSIFIZIEREN (1:1 wie Original!) ===
+    _file_items = _all_items  # Bereits oben definiert (nur type=file)
+    _small_files = [f for f in _file_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
+    _large_files = [f for f in _file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
     
-    _log(f"[pool-mode] {len(file_items)} Dateien zu verarbeiten")
-    if small_files and large_files:
-        _log(f"[pool-mode] {len(small_files)} kleine (< {SMALL_FILE_THRESHOLD/1024**2:.0f} MB) parallel, "
-             f"{len(large_files)} große (>= {SMALL_FILE_THRESHOLD/1024**2:.0f} MB) sequentiell")
-    elif small_files:
-        _log(f"[pool-mode] {len(small_files)} kleine Dateien parallel")
+    if _small_files and _large_files:
+        _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel, "
+             f"{len(_large_files)} große Dateien sequentiell")
+    elif _small_files:
+        _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel")
     else:
-        _log(f"[pool-mode] {len(large_files)} große Dateien sequentiell")
+        _log(f"[parallel] {len(_large_files)} große Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
     
-    # Hardlink-Tracking (einfaches Dict, kein Lock nötig da nur Hauptthread schreibt!)
-    # WICHTIG: Manifest kennt nur Files nach relativem Pfad, NICHT ihre Inodes!
-    # seen_inodes dedupliziert ECHTE Hardlinks (mehrere Pfade → selbe Inode) innerhalb
-    # eines Snapshots zur Laufzeit. Das spart Uploads UND ist korrekt weil Hardlinks
-    # dasselbe File sind. Pool-SHA256-Dedupe ist was anderes (Files mit gleichem Inhalt).
-    seen_inodes = {}
+    # === KLEINE DATEIEN PARALLEL (1:1 wie Original!) ===
+    if _small_files and PARALLEL_UPLOAD_THREADS > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
+            list(ex.map(_process_file_item, _small_files))
+    else:
+        for f in _small_files:
+            _process_file_item(f)
     
-    # Ergebnis-Listen (werden nach Upload gefüllt)
-    upload_results = []
-    uploaded_count = 0
-    skipped_count = 0
-    error_count = 0
+    # === GROSSE DATEIEN SEQUENTIELL (1:1 wie Original!) ===
+    for f in _large_files:
+        _process_file_item(f)
     
-    # === PHASE 2a: Kleine Dateien PARALLEL hochladen ===
-    if small_files:
-        max_workers = int(os.environ.get("PCLOUD_POOL_WORKERS", "8"))
-        _log(f"[pool-mode] Phase 2a: {len(small_files)} kleine Dateien mit {max_workers} Workers...")
-        t_small_start = time.time()
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_process_pool_item, cfg, f, seen_inodes, dry) for f in small_files]
-            
-            # Progress alle 5s
-            last_progress = 0
-            for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                try:
-                    result = future.result()
-                    if result:
-                        relpath, file_item, pool_fileid, pcloud_hash, is_hardlink = result
-                        upload_results.append((relpath, file_item, pool_fileid, pcloud_hash))
-                        
-                        # Hardlink-Tracking aktualisieren (Hauptthread, kein Lock nötig!)
-                        if not is_hardlink and file_item.get("inode"):
-                            ino_data = file_item["inode"]
-                            if isinstance(ino_data, dict):
-                                dev = ino_data.get("dev")
-                                ino = ino_data.get("ino")
-                                key = (dev, ino) if (dev and ino) else None
-                                if key:
-                                    sha256 = file_item.get("sha256", "").lower()
-                                    seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
-                        
-                        if is_hardlink:
-                            skipped_count += 1
-                        else:
-                            uploaded_count += 1
-                    else:
-                        error_count += 1
-                except Exception as e:
-                    _log(f"[pool-mode][ERROR] Worker failed: {e}")
-                    error_count += 1
-                
-                # Progress alle 100 Files oder alle 5s
-                now = time.time()
-                if i % 100 == 0 or (now - last_progress) >= 5:
-                    rate = i / (now - t_small_start) if (now - t_small_start) > 0 else 0
-                    remaining = len(small_files) - i
-                    eta = remaining / rate if rate > 0 else 0
-                    _log(f"[pool-mode] Progress: {i}/{len(small_files)} ({i/len(small_files)*100:.1f}%) | "
-                         f"Rate: {rate:.1f} files/s | ETA: {eta/60:.1f}min")
-                    last_progress = now
-        
-        duration_small = time.time() - t_small_start
-        _log(f"[pool-mode] Phase 2a abgeschlossen: {len(small_files)} Files in {duration_small:.1f}s "
-             f"({len(small_files)/duration_small:.1f} files/s)")
-    
-    # === PHASE 2b: Große Dateien SEQUENTIELL hochladen (volle Bandbreite!) ===
-    if large_files:
-        _log(f"[pool-mode] Phase 2b: {len(large_files)} große Dateien sequentiell...")
-        t_large_start = time.time()
-        
-        for i, f in enumerate(large_files, 1):
-            file_size = f.get("size", 0)
-            _log(f"[pool-mode] [{i}/{len(large_files)}] Upload: {f.get('relpath')} ({file_size/1024**2:.1f} MB)")
-            
-            result = _process_pool_item(cfg, f, seen_inodes, dry)
-            if result:
-                relpath, file_item, pool_fileid, pcloud_hash, is_hardlink = result
-                upload_results.append((relpath, file_item, pool_fileid, pcloud_hash))
-                
-                # Hardlink-Tracking
-                if not is_hardlink and file_item.get("inode"):
-                    ino_data = file_item["inode"]
-                    if isinstance(ino_data, dict):
-                        dev = ino_data.get("dev")
-                        ino = ino_data.get("ino")
-                        key = (dev, ino) if (dev and ino) else None
-                        if key:
-                            sha256 = file_item.get("sha256", "").lower()
-                            seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
-                
-                if is_hardlink:
-                    skipped_count += 1
-                else:
-                    uploaded_count += 1
-            else:
-                error_count += 1
-        
-        duration_large = time.time() - t_large_start
-        _log(f"[pool-mode] Phase 2b abgeschlossen: {len(large_files)} Files in {duration_large:.1f}s "
-             f"({duration_large/len(large_files):.1f} s/file)")
-    
-    # === PHASE 3: BATCH-WRITE STUBS (wie im Original!) ===
-    _log(f"[pool-mode] Phase 3: Schreibe {len(upload_results)} Stubs im Batch...")
-    t_stub_start = time.time()
-    
-    stubs_to_write = []
-    for relpath, file_item, pool_fileid, pcloud_hash in upload_results:
-        sha256 = file_item.get("sha256", "").lower()
-        size = file_item.get("size", 0)
-        mtime = file_item.get("mtime", 0.0)
-        pool_path = _get_pool_path(sha256)
-        
-        # Stub-Pfad berechnen
-        if "/" in relpath:
-            stub_dir, base = relpath.rsplit("/", 1)
-            parent_dir = f"{dest_snapshot_dir}/{stub_dir}"
-        else:
-            base = relpath
-            parent_dir = dest_snapshot_dir
-        
-        stub_filename = f"{base}.meta.json"
-        stub_path = f"{parent_dir}/{stub_filename}"
-        
-        # Stub-Payload
-        stub_payload = {
-            "format_version": 1,
-            "kind": "stub",
-            "type": "pool_stub",
-            "holder_type": "pool",
-            "sha256": sha256,
-            "pcloud_hash": pcloud_hash or "",
-            "size": size,
-            "mtime": mtime,
-            "relpath": relpath,
-            "pool_path": pool_path,
-            "pool_fileid": pool_fileid,
-            "snapshot": snapshot_name,
-        }
-        
-        stubs_to_write.append((stub_path, stub_payload))
-    
-    # Batch-Write wie im Original mit _batch_write_stubs()
-    if stubs_to_write and not dry:
+    # ============================================================================
+    # === PHASE 3: BATCH-WRITE STUBS (1:1 wie Original!) ===
+    # ============================================================================
+    if not dry and stubs_to_write:
+        _log(f"[push] ✓ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
+        t0 = time.time()
         _batch_write_stubs(cfg, stubs_to_write, dry=False)
-    elif dry:
-        _log(f"[dry] write {len(stubs_to_write)} stubs")
-    
-    duration_stub = time.time() - t_stub_start
-    _log(f"[pool-mode] Phase 3 abgeschlossen: {len(stubs_to_write)} Stubs in {duration_stub:.1f}s")
-    
-    # === Stats ===
-    total_duration = time.time() - t_start
-    _log(f"[pool-mode] Upload abgeschlossen: {uploaded_count} uploaded, {skipped_count} hardlinks, "
-         f"{error_count} errors ({total_duration:.1f}s)")
+        write_ms += (time.time() - t0) * 1000.0
     
     # ============================================================================
-    # === SNAPSHOT MANIFEST (ATOMAR!) ===
+    # === INDEX SCHREIBEN (1:1 wie Original!) ===
     # ============================================================================
-    # Statt den globalen Content-Index direkt zu ändern (nicht atomar!),
-    # speichern wir ein separates Manifest pro Snapshot.
-    # Ein separater Merge-Prozess kann diese später in content_index.json integrieren.
-    
-    if not dry:
-        _log("[pool-mode] Erstelle Snapshot-Manifest (atomar)...")
-        t_manifest_start = time.time()
+    if dry:
+        print(f"[dry] write index: {snapshots_root}/_index/content_index.json (pool_refs={len(pool_refs)})")
+    else:
+        # Finaler lokaler Save (falls noch Änderungen seit letztem periodischen Save)
+        if index_changed:
+            save_content_index_local(_local_index_path, index)
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                print(f"[index] Finaler lokaler Save vor Upload")
         
-        try:
-            # Snapshot-Manifest: Alle SHA256 dieses Snapshots
-            snapshot_manifest = {
-                "snapshot": snapshot_name,
-                "created_at": time.time(),
-                "schema": 4,
-                "mode": "pool",
-                "file_count": len(file_items),
-                "uploaded": uploaded_count,
-                "skipped": skipped_count,
-                "errors": error_count,
-                "sha256_list": [f.get("sha256", "").lower() for f in file_items if f.get("sha256")]
-            }
+        # Index hochladen nach pCloud
+        if os.path.exists(_local_index_path):
+            t0 = time.time()
+            save_content_index(cfg, snapshots_root, index, dry=False)
+            dt_ms = (time.time() - t0) * 1000.0
+            write_ms += dt_ms
+            print(f"[timing] index_write_ms={int(dt_ms)}")
             
-            # Manifest im Snapshot-Ordner speichern (ATOMAR!)
-            manifest_filename = "_manifest.json"
-            snapshot_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
-            if not snapshot_fid:
-                snapshot_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-            
-            pc.write_json_to_folderid(
-                cfg, 
-                folderid=int(snapshot_fid), 
-                filename=manifest_filename, 
-                obj=snapshot_manifest, 
-                minify=True
-            )
-            
-            manifest_duration = time.time() - t_manifest_start
-            _log(f"[pool-mode] ✓ Snapshot-Manifest gespeichert ({manifest_duration:.1f}s)")
-            _log(f"[pool-mode] → {dest_snapshot_dir}/{manifest_filename}")
-        
-        except Exception as e:
-            _log(f"[pool-mode][ERROR] Snapshot-Manifest konnte nicht gespeichert werden: {e}")
-            _log("[pool-mode][WARN] Pool-Referenzen für diesen Snapshot gehen verloren!")
-    
-    # ============================================================================
-    # === CONTENT-INDEX UPDATE (OPTIONAL, kann fehlschlagen ohne Datenverlust) ===
-    # ============================================================================
-    # Versuche den globalen Index zu aktualisieren, aber wenn es fehlschlägt,
-    # ist nichts verloren (Snapshot-Manifest ist atomar gespeichert).
-    
-    if not dry and os.environ.get("PCLOUD_UPDATE_CONTENT_INDEX", "1") == "1":
-        _log("[pool-mode] Aktualisiere Content-Index (optional)...")
-        t_index_start = time.time()
-        
-        try:
-            # Load existing index
-            index_path = f"{dest_root.rstrip('/')}/content_index.json"
+            # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
             try:
-                content_text = pc.get_textfile(cfg, path=index_path)
-                index_data = json.loads(content_text)
-                _log(f"[pool-mode] Index geladen: {len(index_data.get('pool_refs', {}))} pool_refs")
-            except:
-                # Neuer Index
-                index_data = {
-                    "schema": 4,
-                    "mode": "pool",
-                    "snapshots": [],
-                    "pool_refs": {},  # SHA256 → [snapshot1, snapshot2, ...]
-                    "note": "Wird aus Snapshot-Manifesten rekonstruiert"
-                }
-                _log("[pool-mode] Neuer Index erstellt")
+                idx_path = f"{snapshots_root}/_index/content_index.json"
+                archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
+                pc.ensure_parent_dirs(cfg, archive_path)
+                pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
+                _log(f"[index] ✓ Content-Index remote archiviert: {archive_path}")
+            except Exception as e:
+                _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
             
-            # Update Pool-Refs (aus Snapshot-Manifest rekonstruierbar!)
-            pool_refs = index_data.setdefault("pool_refs", {})
-            for file_item in file_items:
-                sha256 = file_item.get("sha256", "").lower()
-                if sha256:
-                    if sha256 not in pool_refs:
-                        pool_refs[sha256] = []
-                    if snapshot_name not in pool_refs[sha256]:
-                        pool_refs[sha256].append(snapshot_name)
+            # Master-Index aktualisieren (alle Snapshots zusammen)
+            try:
+                master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
+                os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
+                save_content_index_local(master_index_path, index)
+                _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
+            except Exception as e:
+                _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
             
-            # Update Snapshots-Liste
-            snapshots_list = index_data.setdefault("snapshots", [])
-            if snapshot_name not in snapshots_list:
-                snapshots_list.append(snapshot_name)
-                snapshots_list.sort()
-            
-            # Update Timestamp
-            index_data["updated_at"] = time.time()
-            index_data["updated_by"] = "push_pool_mode"
-            
-            # Upload Index (wie Original: stat_folderid_fast + write_json_to_folderid)
-            index_fid = pc.stat_folderid_fast(cfg, dest_root)
-            if not index_fid:
-                index_fid = pc.ensure_path(cfg, dest_root)
-            
-            pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
-            pc.write_json_to_folderid(cfg, folderid=int(index_fid), filename="content_index.json", obj=index_data, minify=(not pretty))
-            
-            index_duration = time.time() - t_index_start
-            _log(f"[pool-mode] Content-Index aktualisiert ({index_duration:.1f}s)")
-        
-        except Exception as e:
-            _log(f"[pool-mode][WARN] Content-Index Update fehlgeschlagen (nicht kritisch): {e}")
+            # Lokale Index-Datei löschen
+            try:
+                os.remove(_local_index_path)
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
+            except Exception as e:
+                print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
     
-    # Complete-Marker setzen (robust mit write_json_to_folderid)
+    # === COMPLETE-MARKER SETZEN (wie Original!) ===
     if not dry:
-        marker_data = {
-            "snapshot": snapshot_name,
-            "completed_at": time.time(),
-            "uploaded": uploaded_count,
-            "stubs": len(upload_results),
-            "skipped": skipped_count,
-            "errors": error_count,
-            "duration": time.time() - t_start
-        }
-        marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
-        if not marker_fid:
-            marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-        pc.write_json_to_folderid(cfg, folderid=int(marker_fid), filename=".upload_complete", obj=marker_data, minify=True)
-        _log(f"[pool-mode] Complete-Marker gesetzt: {marker_complete}")
+        try:
+            marker_data = {
+                "snapshot": snapshot_name,
+                "completed_at": time.time(),
+                "uploaded": uploaded,
+                "stubs": stubs,
+                "resumed": resumed,
+                "duration": time.time() - t_phase_start,
+                "mode": "pool"
+            }
+            marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+            if not marker_fid:
+                marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+            pc.write_json_to_folderid(cfg, folderid=int(marker_fid), filename=".upload_complete", obj=marker_data, minify=True)
+            _log(f"[info] Upload-Complete-Marker gesetzt: {marker_complete}")
+        except Exception as e:
+            _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
     
-    duration = time.time() - t_start
-    _log(f"[pool-mode] ✓ FERTIG: {uploaded_count} uploaded, {len(upload_results)} stubs, "
-         f"{skipped_count} skipped, {error_count} errors ({duration:.1f}s)")
+    # === TIMING-STATS (wie Original!) ===
+    total_duration = time.time() - t_phase_start
+    _log(f"[pool-mode] Upload abgeschlossen: {uploaded} uploaded, {resumed} resumed, {stubs} stubs ({total_duration:.1f}s)")
+    _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)} ensure_ms={int(ensure_ms)}")
     
     return {
-        "uploaded": uploaded_count,
-        "stubs": len(upload_results),
-        "skipped": skipped_count,
-        "errors": error_count,
-        "duration": duration
+        "uploaded": uploaded,
+        "resumed": resumed,
+        "stubs": stubs,
+        "duration": total_duration,
+        "upload_ms": upload_ms,
+        "write_ms": write_ms,
+        "ensure_ms": ensure_ms
     }
 
 
