@@ -4118,7 +4118,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             
             # 3. Template kopieren (1 API-Call!)
             _log(f"[pool-mode] Kopiere Template → {snapshot_name}...")
-            dest_snapshot_fid = _ensure_folder(dest_snapshot_dir)
+            dest_snapshot_fid = pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
             pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_folderid=dest_snapshot_fid, noover=True, copycontentonly=True)
             _log("[pool-mode] ✓ Template kopiert (~2-5s statt ~5min)")
             template_used = True
@@ -4155,7 +4155,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     """Erstellt Ordner mit Progress-Logging"""
                     nonlocal created
                     try:
-                        _ensure_folder(f"{dest_snapshot_dir}/{reldir}")
+                        _ensure(f"{dest_snapshot_dir}/{reldir}")
                         with created_lock:
                             created += 1
                             # Progress alle 100 oder am Ende
@@ -4185,7 +4185,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log("[pool-mode] Aktualisiere Template mit neuer Struktur...")
                 try:
                     pc.call_with_backoff(pc.delete_folder, cfg, path=template_path, recursive=True)
-                    template_fid = _ensure_folder(template_path)
+                    template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
                     pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
                     _log("[pool-mode] ✓ Template aktualisiert")
                 except Exception as e:
@@ -4233,52 +4233,46 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 folders_by_depth[reldir.count("/")].append(reldir)
             
             threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
-            folders_created = 0
-            folders_lock = threading.Lock()
+            _folders_created = 0
+            _folders_lock = threading.Lock()
+            _last_progress_pct = 0
             total_folders = len(missing_folders)
-            last_progress_pct = 0
             
-            def _create_and_log(reldir: str) -> bool:
-                """Erstellt Ordner und loggt Progress (Thread-safe)"""
-                nonlocal folders_created, last_progress_pct
+            def _create_folder(reldir: str) -> bool:
+                """1:1 vom Original - Zeile 2132-2159"""
+                nonlocal _folders_created, _last_progress_pct
                 try:
-                    _ensure_folder(f"{dest_snapshot_dir}/{reldir}")
-                    with folders_lock:
-                        folders_created += 1
-                        current_pct = int((folders_created / total_folders) * 100)
-                        
-                        # Progress alle 100 Ordner ODER alle 10% ODER am Ende
+                    _ensure(f"{dest_snapshot_dir}/{reldir}")
+                    with _folders_lock:
+                        _folders_created += 1
+                        current_pct = int((_folders_created / total_folders) * 100)
                         show_progress = (
-                            folders_created % 100 == 0 or
-                            folders_created == total_folders or
-                            (current_pct % 10 == 0 and current_pct != last_progress_pct)
+                            _folders_created % 100 == 0 or
+                            _folders_created == total_folders or
+                            (current_pct % 10 == 0 and current_pct != _last_progress_pct)
                         )
-                        
                         if show_progress:
-                            elapsed = time.time() - t_folder_start
-                            rate = folders_created / elapsed if elapsed > 0 else 0
-                            remaining = total_folders - folders_created
-                            eta = remaining / rate if rate > 0 else 0
-                            
-                            _log(f"[pool-mode] Ordner: {folders_created}/{total_folders} "
-                                 f"({current_pct}%) | Rate: {rate:.1f}/s | ETA: {eta:.0f}s")
-                            last_progress_pct = current_pct
+                            _last_progress_pct = current_pct
+                            remaining_s = (total_folders - _folders_created) * 0.05 / threads
+                            eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
+                            _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
                     return True
                 except Exception as e:
-                    _log(f"[pool-mode][warn] Ordner {reldir} konnte nicht erstellt werden: {e}")
+                    print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
                     return False
             
-            # Ordner nach Tiefe erstellen (Parents zuerst)
+            # Ordner nach Tiefe erstellen (Parents zuerst) - 1:1 Original Zeile 2160-2175
+            _log(f"[folders] {len(folders_by_depth)} Ebenen, {threads} Threads pro Ebene")
             for depth in sorted(folders_by_depth.keys()):
-                batch = folders_by_depth[depth]
-                if threads > 1 and len(batch) > 1:
+                folders_at_depth = folders_by_depth[depth]
+                if threads > 1 and len(folders_at_depth) > 1:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
-                        list(ex.map(_create_and_log, batch))
+                        list(ex.map(_create_folder, folders_at_depth))
                 else:
-                    for reldir in batch:
-                        _create_and_log(reldir)
+                    for folder in folders_at_depth:
+                        _create_folder(folder)
             
-            _log(f"[pool-mode] ✓ {folders_created} Ordner angelegt")
+            _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
         else:
             _log("[pool-mode] Alle Ordner existieren bereits")
     
