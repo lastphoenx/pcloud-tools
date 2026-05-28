@@ -3628,19 +3628,14 @@ def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict
 def _process_pool_item(
     cfg: dict,
     file_item: dict,
-    dest_snapshot_dir: str,
     seen_inodes: dict,
-    stats: _PoolStats,
     dry: bool = False
-) -> None:
+) -> Optional[tuple]:
     """
-    Verarbeitet ein einzelnes File-Item (Worker-Funktion für ThreadPool).
+    Verarbeitet ein File-Item: Upload in Pool, RETURN Stub-Info (schreibt NICHT!).
     
-    Thread-safe durch:
-    - cfg ist read-only
-    - seen_inodes hat eigenen Lock
-    - stats hat eigenen Lock
-    - pCloud API calls sind thread-safe (REST)
+    Returns:
+        (relpath, file_item, pool_fileid, pcloud_hash, is_hardlink_stub) oder None bei Fehler
     """
     relpath = file_item.get("relpath")
     sha256 = file_item.get("sha256", "").lower()
@@ -3649,8 +3644,7 @@ def _process_pool_item(
     if not relpath or not sha256 or not abs_src:
         if os.environ.get("PCLOUD_VERBOSE") == "1":
             _log(f"[pool-worker][warn] Skip {relpath} (missing data)")
-        stats.inc_errors()
-        return
+        return None
     
     # Hardlink-Check (lokale Dedupe)
     ino_data = file_item.get("inode")
@@ -3663,47 +3657,24 @@ def _process_pool_item(
         
         if key:
             # Thread-safe Lookup
-            with seen_inodes["lock"]:
-                cached_result = seen_inodes["data"].get(key)
+            cached_result = seen_inodes.get(key)
     
     if cached_result:
-        # Hardlink zu bereits verarbeitetem File → nur Stub
+        # Hardlink zu bereits verarbeitetem File → Return Cached Info
         cached_sha, cached_fileid, cached_hash = cached_result
-        try:
-            _write_pool_stub(cfg, dest_snapshot_dir, relpath, file_item, cached_fileid, cached_hash, dry=dry)
-            stats.inc_stubs()
-            stats.inc_skipped()
-        except Exception as e:
-            _log(f"[pool-worker][ERROR] Stub write failed for {relpath}: {e}")
-            stats.inc_errors()
-        return
+        return (relpath, file_item, cached_fileid, cached_hash, True)  # True = ist Hardlink-Stub
     
     # Pool-Upload (Check ob existiert oder Upload)
     try:
         pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, dry=dry)
-        stats.inc_uploaded()
     except Exception as e:
         _log(f"[pool-worker][ERROR] Upload failed for {relpath}: {e}")
-        stats.inc_errors()
-        return
+        return None
     
-    # Stub schreiben
-    try:
-        _write_pool_stub(cfg, dest_snapshot_dir, relpath, file_item, pool_fileid, pcloud_hash, dry=dry)
-        stats.inc_stubs()
-    except Exception as e:
-        _log(f"[pool-worker][ERROR] Stub write failed for {relpath}: {e}")
-        stats.inc_errors()
-        return
+    # Hardlink-Tracking (wird von Hauptthread gemacht nach Return!)
+    # seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
     
-    # Hardlink-Tracking (Thread-safe)
-    if ino_data and isinstance(ino_data, dict):
-        dev = ino_data.get("dev")
-        ino = ino_data.get("ino")
-        key = (dev, ino) if (dev and ino) else None
-        if key:
-            with seen_inodes["lock"]:
-                seen_inodes["data"][key] = (sha256, pool_fileid, pcloud_hash)
+    return (relpath, file_item, pool_fileid, pcloud_hash, False)  # False = neuer Upload
 
 
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False) -> dict:
@@ -3764,90 +3735,175 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         pc.write_json_to_folderid(cfg, folderid=marker_fid, filename=".upload_started", obj=marker_data, minify=True)
         _log(f"[pool-mode] Started-Marker gesetzt: {marker_started}")
     
-    # Stats (Thread-safe)
-    stats = _PoolStats()
-    
-    # Items filtern (nur Files mit SHA256)
+    # === WIE ORIGINAL: Files klassifizieren nach Größe ===
     items = manifest.get("items", [])
     file_items = [it for it in items if it.get("type") == "file" and it.get("sha256")]
     
+    # Klein/Groß-Trennung (wie im Original)
+    SMALL_FILE_THRESHOLD = int(os.environ.get("PCLOUD_SMALL_FILE_THRESHOLD", str(10 * 1024**2)))  # 10 MB default
+    small_files = [f for f in file_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD]
+    large_files = [f for f in file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD]
+    
     _log(f"[pool-mode] {len(file_items)} Dateien zu verarbeiten")
+    if small_files and large_files:
+        _log(f"[pool-mode] {len(small_files)} kleine (< {SMALL_FILE_THRESHOLD/1024**2:.0f} MB) parallel, "
+             f"{len(large_files)} große (>= {SMALL_FILE_THRESHOLD/1024**2:.0f} MB) sequentiell")
+    elif small_files:
+        _log(f"[pool-mode] {len(small_files)} kleine Dateien parallel")
+    else:
+        _log(f"[pool-mode] {len(large_files)} große Dateien sequentiell")
     
-    # Hardlink-Dedupe Tracking (Thread-safe Dict mit Lock)
-    seen_inodes = {
-        "data": {},
-        "lock": threading.Lock()
-    }
+    # Hardlink-Tracking (einfaches Dict, kein Lock nötig da nur Hauptthread schreibt!)
+    seen_inodes = {}
     
-    # Parallel-Verarbeitung mit ThreadPoolExecutor
-    _log("[pool-mode] Starte Parallel-Upload (8 Workers)...")
-    t_upload_start = time.time()
+    # Ergebnis-Listen (werden nach Upload gefüllt)
+    upload_results = []
+    uploaded_count = 0
+    skipped_count = 0
+    error_count = 0
     
-    max_workers = int(os.environ.get("PCLOUD_POOL_WORKERS", "8"))
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Progress-Tracking Thread
-        def progress_monitor():
-            last_report = 0
-            while True:
-                time.sleep(5)  # Report alle 5 Sekunden
-                current_stats = stats.get_stats()
-                processed = current_stats["processed"]
+    # === PHASE 1: Kleine Dateien PARALLEL hochladen ===
+    if small_files:
+        max_workers = int(os.environ.get("PCLOUD_POOL_WORKERS", "8"))
+        _log(f"[pool-mode] Phase 1: {len(small_files)} kleine Dateien mit {max_workers} Workers...")
+        t_small_start = time.time()
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_pool_item, cfg, f, seen_inodes, dry) for f in small_files]
+            
+            # Progress alle 5s
+            last_progress = 0
+            for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                try:
+                    result = future.result()
+                    if result:
+                        relpath, file_item, pool_fileid, pcloud_hash, is_hardlink = result
+                        upload_results.append((relpath, file_item, pool_fileid, pcloud_hash))
+                        
+                        # Hardlink-Tracking aktualisieren (Hauptthread, kein Lock nötig!)
+                        if not is_hardlink and file_item.get("inode"):
+                            ino_data = file_item["inode"]
+                            if isinstance(ino_data, dict):
+                                dev = ino_data.get("dev")
+                                ino = ino_data.get("ino")
+                                key = (dev, ino) if (dev and ino) else None
+                                if key:
+                                    sha256 = file_item.get("sha256", "").lower()
+                                    seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
+                        
+                        if is_hardlink:
+                            skipped_count += 1
+                        else:
+                            uploaded_count += 1
+                    else:
+                        error_count += 1
+                except Exception as e:
+                    _log(f"[pool-mode][ERROR] Worker failed: {e}")
+                    error_count += 1
                 
-                if processed > last_report:
-                    elapsed = time.time() - t_upload_start
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    remaining = len(file_items) - processed
+                # Progress alle 100 Files oder alle 5s
+                now = time.time()
+                if i % 100 == 0 or (now - last_progress) >= 5:
+                    rate = i / (now - t_small_start) if (now - t_small_start) > 0 else 0
+                    remaining = len(small_files) - i
                     eta = remaining / rate if rate > 0 else 0
-                    
-                    _log(f"[pool-mode] Progress: {processed}/{len(file_items)} "
-                         f"({processed/len(file_items)*100:.1f}%) | "
-                         f"Rate: {rate:.1f} files/s | ETA: {eta/60:.1f}min | "
-                         f"Uploaded: {current_stats['uploaded']}, Stubs: {current_stats['stubs']}, "
-                         f"Skipped: {current_stats['skipped']}, Errors: {current_stats['errors']}")
-                    last_report = processed
+                    _log(f"[pool-mode] Progress: {i}/{len(small_files)} ({i/len(small_files)*100:.1f}%) | "
+                         f"Rate: {rate:.1f} files/s | ETA: {eta/60:.1f}min")
+                    last_progress = now
+        
+        duration_small = time.time() - t_small_start
+        _log(f"[pool-mode] Phase 1 abgeschlossen: {len(small_files)} Files in {duration_small:.1f}s "
+             f"({len(small_files)/duration_small:.1f} files/s)")
+    
+    # === PHASE 2: Große Dateien SEQUENTIELL hochladen (volle Bandbreite!) ===
+    if large_files:
+        _log(f"[pool-mode] Phase 2: {len(large_files)} große Dateien sequentiell...")
+        t_large_start = time.time()
+        
+        for i, f in enumerate(large_files, 1):
+            file_size = f.get("size", 0)
+            _log(f"[pool-mode] [{i}/{len(large_files)}] Upload: {f.get('relpath')} ({file_size/1024**2:.1f} MB)")
+            
+            result = _process_pool_item(cfg, f, seen_inodes, dry)
+            if result:
+                relpath, file_item, pool_fileid, pcloud_hash, is_hardlink = result
+                upload_results.append((relpath, file_item, pool_fileid, pcloud_hash))
                 
-                # Stop wenn alle verarbeitet
-                if processed >= len(file_items):
-                    break
+                # Hardlink-Tracking
+                if not is_hardlink and file_item.get("inode"):
+                    ino_data = file_item["inode"]
+                    if isinstance(ino_data, dict):
+                        dev = ino_data.get("dev")
+                        ino = ino_data.get("ino")
+                        key = (dev, ino) if (dev and ino) else None
+                        if key:
+                            sha256 = file_item.get("sha256", "").lower()
+                            seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
+                
+                if is_hardlink:
+                    skipped_count += 1
+                else:
+                    uploaded_count += 1
+            else:
+                error_count += 1
         
-        # Starte Progress-Monitor Thread
-        monitor_thread = threading.Thread(target=progress_monitor, daemon=True)
-        monitor_thread.start()
-        
-        # Submit alle File-Items
-        futures = []
-        for file_item in file_items:
-            future = executor.submit(
-                _process_pool_item,
-                cfg,
-                file_item,
-                dest_snapshot_dir,
-                seen_inodes,
-                stats,
-                dry
-            )
-            futures.append(future)
-        
-        # Warte auf alle Worker
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()  # Exceptions propagieren
-                stats.inc_processed()
-            except Exception as e:
-                _log(f"[pool-mode][ERROR] Worker failed: {e}")
-                stats.inc_errors()
-                stats.inc_processed()
-        
-        # Progress-Monitor beenden
-        monitor_thread.join(timeout=1)
+        duration_large = time.time() - t_large_start
+        _log(f"[pool-mode] Phase 2 abgeschlossen: {len(large_files)} Files in {duration_large:.1f}s "
+             f"({duration_large/len(large_files):.1f} s/file)")
     
-    upload_duration = time.time() - t_upload_start
-    final_stats = stats.get_stats()
+    # === PHASE 3: BATCH-WRITE STUBS (wie im Original!) ===
+    _log(f"[pool-mode] Phase 3: Schreibe {len(upload_results)} Stubs im Batch...")
+    t_stub_start = time.time()
     
-    _log(f"[pool-mode] Upload-Phase abgeschlossen ({upload_duration:.1f}s)")
-    _log(f"[pool-mode] Stats: Uploaded={final_stats['uploaded']}, Stubs={final_stats['stubs']}, "
-         f"Skipped={final_stats['skipped']}, Errors={final_stats['errors']}")
+    stubs_to_write = []
+    for relpath, file_item, pool_fileid, pcloud_hash in upload_results:
+        sha256 = file_item.get("sha256", "").lower()
+        size = file_item.get("size", 0)
+        mtime = file_item.get("mtime", 0.0)
+        pool_path = _get_pool_path(sha256)
+        
+        # Stub-Pfad berechnen
+        if "/" in relpath:
+            stub_dir, base = relpath.rsplit("/", 1)
+            parent_dir = f"{dest_snapshot_dir}/{stub_dir}"
+        else:
+            base = relpath
+            parent_dir = dest_snapshot_dir
+        
+        stub_filename = f"{base}.meta.json"
+        stub_path = f"{parent_dir}/{stub_filename}"
+        
+        # Stub-Payload
+        stub_payload = {
+            "format_version": 1,
+            "kind": "stub",
+            "type": "pool_stub",
+            "holder_type": "pool",
+            "sha256": sha256,
+            "pcloud_hash": pcloud_hash or "",
+            "size": size,
+            "mtime": mtime,
+            "relpath": relpath,
+            "pool_path": pool_path,
+            "pool_fileid": pool_fileid,
+            "snapshot": snapshot_name,
+        }
+        
+        stubs_to_write.append((stub_path, stub_payload))
+    
+    # Batch-Write wie im Original mit _batch_write_stubs()
+    if stubs_to_write and not dry:
+        _batch_write_stubs(cfg, stubs_to_write, dry=False)
+    elif dry:
+        _log(f"[dry] write {len(stubs_to_write)} stubs")
+    
+    duration_stub = time.time() - t_stub_start
+    _log(f"[pool-mode] Phase 3 abgeschlossen: {len(stubs_to_write)} Stubs in {duration_stub:.1f}s")
+    
+    # === Stats ===
+    total_duration = time.time() - t_start
+    _log(f"[pool-mode] Upload abgeschlossen: {uploaded_count} uploaded, {skipped_count} hardlinks, "
+         f"{error_count} errors ({total_duration:.1f}s)")
     
     # Content-Index Update (Pool-Referenzen tracken)
     if not dry:
@@ -3858,16 +3914,15 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             # Load existing index
             index_path = f"{dest_root.rstrip('/')}/content_index.json"
             try:
-                result = pc.download_file(cfg, remote_path=index_path)
-                index_data = json.loads(result)
-                _log(f"[pool-mode] Index geladen: {len(index_data.get('nodes', {}))} nodes")
+                content_text = pc.get_textfile(cfg, path=index_path)
+                index_data = json.loads(content_text)
+                _log(f"[pool-mode] Index geladen: {len(index_data.get('pool_refs', {}))} pool_refs")
             except:
                 # Neuer Index
                 index_data = {
                     "schema": 4,
                     "mode": "pool",
                     "snapshots": [],
-                    "nodes": {},
                     "pool_refs": {}  # SHA256 → [snapshot1, snapshot2, ...]
                 }
                 _log("[pool-mode] Neuer Index erstellt")
@@ -3911,10 +3966,10 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         marker_data = {
             "snapshot": snapshot_name,
             "completed_at": time.time(),
-            "uploaded": final_stats["uploaded"],
-            "stubs": final_stats["stubs"],
-            "skipped": final_stats["skipped"],
-            "errors": final_stats["errors"],
+            "uploaded": uploaded_count,
+            "stubs": len(upload_results),
+            "skipped": skipped_count,
+            "errors": error_count,
             "duration": time.time() - t_start
         }
         marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
@@ -3924,14 +3979,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         _log(f"[pool-mode] Complete-Marker gesetzt: {marker_complete}")
     
     duration = time.time() - t_start
-    _log(f"[pool-mode] ✓ FERTIG: {final_stats['uploaded']} uploaded, {final_stats['stubs']} stubs, "
-         f"{final_stats['skipped']} skipped, {final_stats['errors']} errors ({duration:.1f}s)")
+    _log(f"[pool-mode] ✓ FERTIG: {uploaded_count} uploaded, {len(upload_results)} stubs, "
+         f"{skipped_count} skipped, {error_count} errors ({duration:.1f}s)")
     
     return {
-        "uploaded": final_stats["uploaded"],
-        "stubs": final_stats["stubs"],
-        "skipped": final_stats["skipped"],
-        "errors": final_stats["errors"],
+        "uploaded": uploaded_count,
+        "stubs": len(upload_results),
+        "skipped": skipped_count,
+        "errors": error_count,
         "duration": duration
     }
 
