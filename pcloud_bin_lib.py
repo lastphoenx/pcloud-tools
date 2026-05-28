@@ -2363,18 +2363,19 @@ def ensure_many_parent_dirs(cfg: dict, paths: list[str]) -> None:
 def write_json_to_folderid(cfg: dict, *, folderid: int, filename: str, obj: dict, minify: bool = True) -> dict:
     """
     JSON direkt in einen bekannten Zielordner (folderid) hochladen – ohne ensure().
+    REST API statt Binary für Zuverlässigkeit (kein Socket-Blocking).
     """
-    import json as _json, tempfile, os as _os
+    import json as _json
     text = (_json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
             if minify else _json.dumps(obj, ensure_ascii=False, indent=2))
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
-        tf.write(text)
-        tmp = tf.name
-    try:
-        return upload_streaming(cfg, tmp, dest_folderid=int(folderid), filename=filename)
-    finally:
-        try: _os.remove(tmp)
-        except: pass
+    
+    # REST API uploadfile mit multipart/form-data
+    # WICHTIG: Binary upload_streaming kann bei großen Files (260MB Index) 5+ Min blockieren!
+    import io
+    files = {"file": (filename, io.BytesIO(text.encode("utf-8")), "application/json")}
+    params = {"folderid": int(folderid), "filename": filename}
+    
+    return _rest_post(cfg, "uploadfile", data=params, files=files)
 
 
 def stat_folderid_fast(cfg: dict, path: str) -> int | None:
