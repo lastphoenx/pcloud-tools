@@ -2914,6 +2914,22 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     t_copy_ms = (time.time() - t_copy_start) * 1000.0
     _log(f"[delta-copy][2/6] copyfolder abgeschlossen: {t_copy_ms:.1f}ms")
     
+    # === KRITISCH: Lösche alte Marker (wurden via copyfolder mitkopiert!) ===
+    # Problem: copyfolder kopiert .upload_complete/.upload_started vom Basis-Snapshot
+    # → Würde Gap-Detection täuschen (denkt Upload komplett, obwohl Delta fehlt)
+    # → Lösung: Marker sofort nach Copy löschen, vor Delta-Upload
+    if not dry:
+        marker_paths = [
+            f"{dest_snapshot_dir}/.upload_complete",
+            f"{dest_snapshot_dir}/.upload_started",
+        ]
+        for marker in marker_paths:
+            try:
+                pc.deletefile(cfg, path=marker)
+                _log(f"[delta-copy][2/6] ✓ Gelöscht (mitkopiert): {marker}")
+            except Exception:
+                pass  # Marker existierte evtl. nicht (z.B. bei alten Snapshots ohne Marker)
+    
     # === Schritt 3: Manifest-Diff berechnen ===
     _log(f"[delta-copy][3/6] Berechne Manifest-Diff...")
     t_diff_start = time.time()
