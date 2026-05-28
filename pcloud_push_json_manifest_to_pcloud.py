@@ -114,8 +114,12 @@ def push_1to1_smart_controller(cfg, manifest, dest_root, *, dry=False, verbose=F
     
     _log(f"[smart-controller] Analysiere Strategie für {snapshot_name}...")
     
-    # Einheitliche Metriken (unified source)
-    metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
+    # Einheitliche Metriken (unified source) mit Fallback bei API-Problemen
+    try:
+        metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
+    except Exception as e:
+        _log(f"[smart-controller] WARN: Metriken konnten nicht berechnet werden ({e}). Nutze SAFE-MODE.")
+        return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="safe-mode")
 
     # Single Source of Truth: zentrale Klasse entscheidet deterministisch
     controller = SmartStrategyController()
@@ -3394,14 +3398,7 @@ def main() -> None:
 
     dest_root = pc._norm_remote_path(args.dest_root)
 
-    # Optional: Retention-Sync (nur sinnvoll im 1:1-Modus)
-    if args.retention_sync and args.snapshot_mode == "1to1":
-        local_snaps = list_local_snapshot_names(manifest["root"])
-        try:
-            retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
-        except Exception as _ret_exc:
-            _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch, Upload wird fortgesetzt): {_ret_exc}")
-
+    # Upload ZUERST (Retention kommt ans Ende, nach Upload)
     if args.snapshot_mode == "objects":
         push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
     else:
@@ -3414,6 +3411,13 @@ def main() -> None:
             # Standard: Smart-Entscheidung
             push_1to1_smart_controller(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
 
+    # Optional: Retention-Sync NACH Upload (nicht kritisch, darf Upload nicht blockieren)
+    if args.retention_sync and args.snapshot_mode == "1to1":
+        local_snaps = list_local_snapshot_names(manifest["root"])
+        try:
+            retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
+        except Exception as _ret_exc:
+            _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch): {_ret_exc}")
 
     # --- metrics summary (einheitlich, greppbar) ---
     try:

@@ -307,8 +307,25 @@ remote_has_snapshots() {
 
 remote_snapshot_exists() {
   local snapname="$1"
-  local out; out="$(load_remote_snapshots || true)"
-  grep -qx "$snapname" <<<"$out" && echo YES || echo NO
+  local marker_path="${PCLOUD_DEST}/_snapshots/${snapname}/.upload_complete"
+  
+  # Prüfe EXPLIZIT ob .upload_complete Marker existiert (nicht nur Ordner!)
+  if "${PY}" - <<PY 2>/dev/null
+import os, sys
+sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
+import pcloud_bin_lib as pc
+try:
+    cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
+    pc.stat_file(cfg, path="${marker_path}", with_checksum=False)
+    print("YES")
+except Exception:
+    print("NO")
+PY
+  then
+    echo "YES"
+  else
+    echo "NO"
+  fi
 }
 
 local_snapshot_names() {
@@ -674,6 +691,11 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
   export PCLOUD_SKIP_FINALIZE=1
   for s in "${SNAPS[@]}"; do
     build_and_push "$RTB/$s" || exit 1
+    # Harte Verifikation: Marker muss auf pCloud sein
+    if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+      _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud! Markiere als FAILED."
+      exit 1
+    fi
   done
   # einmaliges Finalize
   "${PY}" - <<'PY'
@@ -712,7 +734,9 @@ fi
 GAP_STRATEGY=${PCLOUD_GAP_STRATEGY:-optimistic}  # conservative|optimistic|aggressive
 
 for s in "${local_snaps[@]}"; do
-  if [[ -n "$TARGET_SNAPSHOT" && "$s" != "$TARGET_SNAPSHOT" ]]; then
+  # Erlaube Snapshots, die älter oder gleich dem Target sind (Gap-Backfill)
+  # Überspringe nur Snapshots, die wirklich neuer als das Target sind
+  if [[ -n "$TARGET_SNAPSHOT" && "$s" > "$TARGET_SNAPSHOT" ]]; then
     continue
   fi
 
@@ -775,11 +799,19 @@ for s in "${local_snaps[@]}"; do
             build_and_push "$RTB/$s" || {
               exit 1
             }
+            if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+              _log ERROR "Upload von $s fehlgeschlagen (Marker fehlt)"
+              exit 1
+            fi
             
             for later in "${later_snaps[@]}"; do
               build_and_push "$RTB/$later" || {
                 exit 1
               }
+              if [[ "$(remote_snapshot_exists "$later")" == "NO" ]]; then
+                _log ERROR "Upload von $later fehlgeschlagen (Marker fehlt)"
+                exit 1
+              fi
               rebuild_count=$((rebuild_count + 1))
             done
             
@@ -791,6 +823,10 @@ for s in "${local_snaps[@]}"; do
             build_and_push "$RTB/$s" || {
               exit 1
             }
+            if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+              _log ERROR "Upload von $s fehlgeschlagen (Marker fehlt)"
+              exit 1
+            fi
             uploaded_count=$((uploaded_count + 1))
           fi
           ;;
@@ -804,8 +840,17 @@ for s in "${local_snaps[@]}"; do
           done
           
           build_and_push "$RTB/$s"
+          if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+            _log ERROR "Upload von $s fehlgeschlagen (Marker fehlt)"
+            exit 1
+          fi
+          
           for later in "${later_snaps[@]}"; do
             build_and_push "$RTB/$later"
+            if [[ "$(remote_snapshot_exists "$later")" == "NO" ]]; then
+              _log ERROR "Upload von $later fehlgeschlagen (Marker fehlt)"
+              exit 1
+            fi
             rebuild_count=$((rebuild_count + 1))
           done
           
@@ -827,6 +872,10 @@ for s in "${local_snaps[@]}"; do
       build_and_push "$RTB/$s" || {
         exit 1
       }
+      if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+        _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud! Markiere als FAILED."
+        exit 1
+      fi
       uploaded_count=$((uploaded_count + 1))
     fi
   fi
