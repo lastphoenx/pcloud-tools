@@ -3714,6 +3714,60 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         pc.ensure_path(cfg, snapshots_root)
         pc.ensure_path(cfg, dest_snapshot_dir)
     
+    # ============================================================================
+    # === PHASE 0: POOL-ORDNERSTRUKTUR ERSTELLEN (256 Ordner: 00-FF) ===
+    # ============================================================================
+    _log("[pool-mode] Phase 0: Erstelle Pool-Ordnerstruktur (00-FF)...")
+    t_pool_folders_start = time.time()
+    
+    if not dry:
+        # 256 Pool-Ordner generieren (00-FF, lowercase wie _get_pool_path)
+        pool_folders_needed = [f"{pool_root}/{hex(i)[2:].zfill(2)}" for i in range(256)]
+        
+        # Prüfe welche bereits existieren (um unnötige API-Calls zu sparen)
+        existing_pool_folders = set()
+        try:
+            result = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=False, nofiles=True)
+            metadata = result.get("metadata", {})
+            contents = metadata.get("contents", [])
+            existing_pool_folders = {c["name"] for c in contents if c.get("isfolder")}
+            _log(f"[pool-mode] Pool hat bereits {len(existing_pool_folders)}/256 Ordner")
+        except Exception as e:
+            if "2005" not in str(e) and "not found" not in str(e).lower():
+                _log(f"[warn] listfolder Pool fehlgeschlagen: {e}")
+        
+        # Nur fehlende Ordner erstellen
+        missing_pool_folders = [p for p in pool_folders_needed if p.split("/")[-1] not in existing_pool_folders]
+        
+        if missing_pool_folders:
+            _log(f"[pool-mode] Erstelle {len(missing_pool_folders)} fehlende Pool-Ordner...")
+            
+            # Parallel mit Workers erstellen (wie bei Snapshot-Ordnern)
+            pool_threads = int(os.environ.get("PCLOUD_POOL_FOLDER_THREADS", "8"))
+            created_count = 0
+            
+            def _create_pool_folder(path: str) -> bool:
+                try:
+                    pc.call_with_backoff(pc.ensure_path, cfg, path)
+                    return True
+                except Exception as e:
+                    _log(f"[warn] Pool-Ordner {path} konnte nicht erstellt werden: {e}")
+                    return False
+            
+            # Batch-Erstellung mit ThreadPool
+            with concurrent.futures.ThreadPoolExecutor(max_workers=pool_threads) as ex:
+                results = list(ex.map(_create_pool_folder, missing_pool_folders))
+                created_count = sum(1 for r in results if r)
+            
+            _log(f"[pool-mode] ✓ {created_count}/{len(missing_pool_folders)} Pool-Ordner erstellt")
+        else:
+            _log("[pool-mode] ✓ Alle 256 Pool-Ordner existieren bereits")
+    elif dry:
+        _log("[dry] Pool-Ordnerstruktur würde erstellt (00-FF)")
+    
+    pool_folders_duration = time.time() - t_pool_folders_start
+    _log(f"[pool-mode] Phase 0 abgeschlossen: Pool-Struktur ({pool_folders_duration:.1f}s)")
+    
     # Upload-Marker
     marker_started = f"{dest_snapshot_dir}/.upload_started"
     marker_complete = f"{dest_snapshot_dir}/.upload_complete"
