@@ -2,13 +2,24 @@
 """
 pCloud copyfile Deduplizierungs-Test
 
-Testet ob pCloud's copyfile API Quota-aware dedupliziert.
+Testet ob pCloud's NATIVE Content-Deduplication (Storage-Level) funktioniert.
 
-KRITISCH für Pool-Modell Entscheidung:
-- Wenn copyfile dedupliziert (Quota steigt nur ~5 GB): ✓ Pool-Modell machbar!
-- Wenn copyfile NICHT dedupliziert (Quota steigt ~25-30 GB): ✗ Pool-Modell zu teuer!
+HYPOTHESIS: pCloud nutzt Content-Addressable Storage (wie Git!)
+→ Identischer Content wird NUR EINMAL physisch gespeichert
+→ Quota steigt nur um Metadata (~4-5 KB pro File), NICHT um volle File-Größe!
 
-Standard: 5 GB Test-File, 5× copyfile → Ergebnis SOFORT eindeutig!
+Test-Design:
+1. Upload original.bin (1000 MB, repetitives Pattern)
+2. copyfile() 5× → copy_0.bin bis copy_4.bin
+3. Alle haben IDENTISCHEN Content (SHA256)
+
+Erwartung bei Content-Dedup:
+- Quota-Increase: ~30 KB (nur Metadata für 6 Files)
+- ✓ Pool-Modell MACHBAR!
+
+Erwartung OHNE Content-Dedup:
+- Quota-Increase: ~6 GB (6× 1000 MB)
+- ✗ Pool-Modell zu teuer!
 
 Usage:
     python test_copyfile_deduplication.py --env-file .env
@@ -115,9 +126,23 @@ def main():
         print(f"    Geschätzte Dauer: {est_minutes_low:.0f}-{est_minutes_high:.0f} Minuten")
         print(f"    (Chunked Upload: 5 MB Chunks)")
         print()
-        print("    Upload läuft... (bitte warten, kein Fortschrittsbalken)")
         
         test_dir = "/test_dedup_experiment"
+        
+        # CLEANUP: Lösche alte Test-Daten (für sauberen Test!)
+        print(f"[CLEANUP] Lösche alte Test-Daten in {test_dir}...")
+        try:
+            pc.delete_folder(cfg, path=test_dir, recursive=True)
+            print(f"    ✓ Alte Daten gelöscht")
+        except Exception as e:
+            if "not found" not in str(e).lower():
+                print(f"    ! Cleanup fehlgeschlagen: {e}")
+            else:
+                print(f"    ✓ Keine alten Daten vorhanden")
+        
+        # Test-Ordner neu erstellen
+        print()
+        print("    Upload läuft... (bitte warten, kein Fortschrittsbalken)")
         pc.ensure_path(cfg, test_dir)
         original_path = f"{test_dir}/original.bin"
         
@@ -180,18 +205,19 @@ def main():
         print()
         
         if dedup_factor < 1.5:  # Weniger als 1.5× (mit Toleranz für Metadata)
-            print("✓✓✓ ERGEBNIS: DEDUPLIZIERUNG FUNKTIONIERT! ✓✓✓")
+            print("✓✓✓ ERGEBNIS: pCloud CONTENT-DEDUPLICATION FUNKTIONIERT! ✓✓✓")
             print()
-            print("pCloud copyfile ist quota-aware!")
+            print("pCloud speichert identischen Content NUR EINMAL (Content-Addressable Storage)!")
             print("→ Pool-Modell ist MACHBAR ohne Quota-Explosion!")
-            print("→ Empfehlung: Pool-Modell implementieren!")
+            print("→ copyfile() nutzt pCloud's native Deduplication!")
+            print("→ Empfehlung: Pool-Modell implementieren mit copyfile() statt Stubs!")
             result_code = 0
         elif dedup_factor > (args.copies * 0.8):  # Mehr als 80% der Kopien zählen voll
-            print("✗✗✗ ERGEBNIS: KEINE DEDUPLIZIERUNG! ✗✗✗")
+            print("✗✗✗ ERGEBNIS: KEINE CONTENT-DEDUPLICATION! ✗✗✗")
             print()
-            print("pCloud copyfile zählt VOLL zur Quota!")
-            print("→ Pool-Modell mit copyfile NICHT sinnvoll!")
-            print("→ Empfehlung: Stub-Pool-Hybrid oder keine Retention!")
+            print("pCloud speichert jeden copyfile() als VOLL-Kopie!")
+            print("→ Pool-Modell mit copyfile NICHT sinnvoll (Quota-Explosion)!")
+            print("→ Empfehlung: Stub-basierter Pool-Mode (aktuelle Implementierung)!")
             result_code = 1
         else:
             print("??? ERGEBNIS: UNKLAR ???")
