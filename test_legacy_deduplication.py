@@ -88,21 +88,25 @@ def main():
         fid = md["metadata"]["folderid"]
         
         # copyfolder: to_path = Parent-Ordner, toname = Name der Kopie
-        pc.copyfolder(cfg, from_folderid=fid, to_path=test_dir, toname="snap_2")
+        resp2 = pc.copyfolder(cfg, from_folderid=fid, to_path=test_dir, toname="snap_2")
+        fid2 = resp2["metadata"]["folderid"]
+        snap2_path = resp2["metadata"]["path"]
+        print(f"    ✓ snap_2 erstellt: {snap2_path} (FolderID: {fid2})")
         q2 = get_quota(cfg)
         print(f"    Used: {format_bytes(q2['used'])} (Diff zu snap_1: {format_bytes(q2['used']-q1['used'])})")
         
         # 4. Klon snap_2 -> snap_3
         print("\n[5/7] Klon snap_2 -> snap_3 via copyfolder...")
-        md2 = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_2"})
-        fid2 = md2["metadata"]["folderid"]
-        pc.copyfolder(cfg, from_folderid=fid2, to_path=test_dir, toname="snap_3")
+        resp3 = pc.copyfolder(cfg, from_folderid=fid2, to_path=test_dir, toname="snap_3")
+        fid3 = resp3["metadata"]["folderid"]
+        snap3_path = resp3["metadata"]["path"]
+        print(f"    ✓ snap_3 erstellt: {snap3_path} (FolderID: {fid3})")
         q3 = get_quota(cfg)
         print(f"    Used: {format_bytes(q3['used'])} (Diff zu snap_2: {format_bytes(q3['used']-q2['used'])})")
         
         # 5. Promotion (Move) snap_1/data.bin -> /test_legacy_experiment/promoted.bin
         print("\n[6/7] Teste Promotion (Move) snap_1/data.bin -> promoted.bin...")
-        md_file = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_1/data.bin"})
+        md_file = pc._rest_get(cfg, "stat", {"path": f"{snap2_path}/data.bin"})
         fileid = md_file["metadata"]["fileid"]
         
         pc._rest_get(cfg, "renamefile", {"fileid": fileid, "topath": f"{test_dir}/promoted.bin"})
