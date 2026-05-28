@@ -3520,6 +3520,14 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
     # Check ob File bereits im Pool existiert
     try:
         stat_result = pc.stat_file(cfg, path=pool_path, with_checksum=True)
+        
+        # API kann metadata als Dict oder Liste zurückgeben
+        if isinstance(stat_result, list):
+            if len(stat_result) > 0:
+                stat_result = stat_result[0]
+            else:
+                raise RuntimeError(f"stat_file returned empty list for {pool_path}")
+        
         pool_fileid = stat_result.get("fileid")
         pcloud_hash = stat_result.get("hash")
         
@@ -3538,7 +3546,16 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
     try:
         result = pc.upload_file(cfg, local_path=local_path, remote_path=pool_path)
         
+        # REST API kann metadata als Dict ODER als Liste zurückgeben
+        # Bei Liste: Erstes Element ist das File
         metadata = result.get("metadata", {})
+        if isinstance(metadata, list):
+            # Liste von Metadaten → nehme erstes (sollte unser File sein)
+            if len(metadata) > 0:
+                metadata = metadata[0]
+            else:
+                raise RuntimeError(f"Upload returned empty metadata list for {pool_path}")
+        
         pool_fileid = metadata.get("fileid")
         pcloud_hash = metadata.get("hash")
         
