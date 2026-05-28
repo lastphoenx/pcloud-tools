@@ -114,42 +114,12 @@ def push_1to1_smart_controller(cfg, manifest, dest_root, *, dry=False, verbose=F
     
     _log(f"[smart-controller] Analysiere Strategie für {snapshot_name}...")
     
-    # Einheitliche Metriken: binary-Checks (Index, Template) mit fast-fail cfg + hard timeout.
-    # Binary-Calls können trotz timeout=2 in socket-poll hängen → signal.alarm() als Sicherheitsnetz.
+    # Einheitliche Metriken: binary-Checks (Index, Template) mit fast-fail cfg,
+    # damit sie bei flaky binary-Endpoint in Sekunden scheitern statt Minuten zu blockieren.
     _metrics_cfg = {**cfg, "timeout": 2, "binary_max_attempts": 1}
-    import signal
-    def _metrics_timeout_handler(sig, frame):
-        raise TimeoutError("_get_sync_metrics_unified exceeded 30s hard timeout")
-    old_handler = signal.signal(signal.SIGALRM, _metrics_timeout_handler)
-    signal.alarm(30)  # Metriken dürfen max 30s dauern
-    try:
-        metrics = _get_sync_metrics_unified(_metrics_cfg, manifest, dest_root, archive_dir)
-    except TimeoutError as e:
-        _log(f"[metrics] WARNING: Metrics-Berechnung timeout, verwende safe defaults: {e}")
-        # Fallback: minimal metrics für SAFE-MODE
-        metrics = {
-            "source_snapshots": 0,
-            "match_ratio": 0.0,
-            "stub_ratio": 0.0,
-            "template_match": 0.0,
-            "template_exists": False,
-            "basis_snapshot": None,
-            "total_files": len([it for it in manifest.get("items", []) if it.get("type") == "file"]),
-            "basis_total_files": 0,
-            "match_count": 0,
-            "identical_count": 0,
-            "new_count": 0,
-            "changed_count": 0,
-            "deleted_count": 0,
-            "saved_calls": 0,
-            "cleanup_calls": 0,
-            "upload_calls": 0,
-            "upload_bytes": 0,
-        }
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-    
+    metrics = _get_sync_metrics_unified(_metrics_cfg, manifest, dest_root, archive_dir)
+    controller = SmartStrategyController()
+    strategy = controller.decide(metrics)
     controller.log_decision(strategy, metrics, snapshot_name)
 
     if strategy == SyncStrategy.TURBO_MODE:
@@ -3425,23 +3395,15 @@ def main() -> None:
     dest_root = pc._norm_remote_path(args.dest_root)
 
     # Optional: Retention-Sync (nur sinnvoll im 1:1-Modus)
-    # Fast-fail cfg + hard timeout via signal.alarm() — Binary-Calls können in socket-poll hängen.
-    # timeout=2 begrenzt Connect; binary_max_attempts=1 verhindert Retry; alarm(120) killft nach 2min.
+    # Fast-fail cfg: binary-Aufrufe sollen schnell scheitern, nicht minutenlang blockieren.
+    # timeout=2 begrenzt Poll-Wartezeit; binary_max_attempts=1 verhindert Retry-Schleifen.
     _fast_cfg = {**cfg, "timeout": 2, "binary_max_attempts": 1}
     if args.retention_sync and args.snapshot_mode == "1to1":
         local_snaps = list_local_snapshot_names(manifest["root"])
-        import signal
-        def _retention_timeout_handler(sig, frame):
-            raise TimeoutError("retention_sync_1to1 exceeded 120s hard timeout")
-        old_handler = signal.signal(signal.SIGALRM, _retention_timeout_handler)
-        signal.alarm(120)  # 2 Minuten absolutes Maximum für Retention
         try:
             retention_sync_1to1(_fast_cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
         except Exception as _ret_exc:
             _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch, Upload wird fortgesetzt): {_ret_exc}")
-        finally:
-            signal.alarm(0)  # Alarm deaktivieren
-            signal.signal(signal.SIGALRM, old_handler)
 
     if args.snapshot_mode == "objects":
         push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
