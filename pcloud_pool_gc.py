@@ -170,8 +170,8 @@ def _scan_snapshot_for_refs(
             stub_path = stub.get("path")
             
             try:
-                # Download Stub
-                stub_content = pc.download_file(cfg, remote_path=stub_path)
+                # Download Stub via get_textfile (robust, REST API)
+                stub_content = pc.get_textfile(cfg, path=stub_path)
                 stub_data = json.loads(stub_content)
                 
                 # Extrahiere SHA256
@@ -217,7 +217,8 @@ def _delete_pool_file(
         return
     
     try:
-        pc.delete_file(cfg, path=pool_file_path)
+        # Delete mit Backoff (robust gegen transiente Fehler)
+        pc.call_with_backoff(pc.delete_file, cfg, path=pool_file_path, attempts=5, max_sleep=30.0)
         stats.inc_deleted(pool_file_size)
         
         if verbose:
