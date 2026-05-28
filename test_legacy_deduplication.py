@@ -68,6 +68,19 @@ def main():
     
     cfg = pc.effective_config(env_file=args.env_file)
     test_dir = "/test_legacy_experiment"
+    
+    # CLEANUP: Lösche alte Test-Ordner (für sauberen Test!)
+    print(f"\n[CLEANUP] Lösche alte Test-Daten in {test_dir}...")
+    try:
+        pc.delete_folder(cfg, path=test_dir, recursive=True)
+        print(f"    ✓ Alte Daten gelöscht")
+    except Exception as e:
+        if "not found" not in str(e).lower():
+            print(f"    ! Cleanup fehlgeschlagen: {e}")
+        else:
+            print(f"    ✓ Keine alten Daten vorhanden")
+    
+    # Test-Ordner neu erstellen
     pc.ensure_path(cfg, test_dir)
     
     test_file_path = create_test_file(args.size, temp_dir=args.temp_dir)
@@ -79,17 +92,12 @@ def main():
         q0 = get_quota(cfg)
         print(f"    Used: {format_bytes(q0['used'])}")
         
-        # 2. Upload snap_1
+        # 2. Upload snap_1 (IMMER neu hochladen für sauberen Test!)
         print(f"\n[3/7] Erstelle snap_1 (Upload {format_bytes(test_file_size)})...")
         pc.ensure_path(cfg, f"{test_dir}/snap_1")
         
-        # Check if already uploaded
-        try:
-            pc.stat_file(cfg, path=f"{test_dir}/snap_1/data.bin")
-            print(f"    ✓ snap_1/data.bin bereits vorhanden, überspringe Upload.")
-        except Exception:
-            print(f"    Lade {format_bytes(test_file_size)} hoch...")
-            pc.upload_file(cfg, local_path=test_file_path, remote_path=f"{test_dir}/snap_1/data.bin")
+        print(f"    Lade {format_bytes(test_file_size)} hoch...")
+        pc.upload_file(cfg, local_path=test_file_path, remote_path=f"{test_dir}/snap_1/data.bin")
         
         q1 = get_quota(cfg)
         print(f"    Used: {format_bytes(q1['used'])} (Diff: {format_bytes(q1['used']-q0['used'])})")
