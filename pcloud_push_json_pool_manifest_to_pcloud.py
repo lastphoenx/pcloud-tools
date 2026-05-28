@@ -3501,6 +3501,7 @@ def _get_pool_path(sha256: str) -> str:
 def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = False) -> Tuple[Optional[int], Optional[str]]:
     """
     Upload File in Pool (dedupliziert).
+    Nutzt _upload_file_smart() für Robustheit (Retry, Resume, Timeouts).
     
     Args:
         cfg: pCloud Config
@@ -3517,61 +3518,52 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
         _log(f"[dry] upload_to_pool: {local_path} → {pool_path}")
         return (None, None)
     
-    # Check ob File bereits im Pool existiert
-    try:
-        stat_result = pc.stat_file(cfg, path=pool_path, with_checksum=True)
-        
-        # API kann metadata als Dict oder Liste zurückgeben
-        if isinstance(stat_result, list):
-            if len(stat_result) > 0:
-                stat_result = stat_result[0]
-            else:
-                raise RuntimeError(f"stat_file returned empty list for {pool_path}")
-        
-        pool_fileid = stat_result.get("fileid")
-        pcloud_hash = stat_result.get("hash")
+    # Check ob File bereits im Pool existiert (mit Safe-Wrapper)
+    existing_stat = stat_file_safe(cfg, path=pool_path)
+    if existing_stat:
+        pool_fileid = existing_stat.get("fileid")
+        pcloud_hash = existing_stat.get("hash")
         
         if os.environ.get("PCLOUD_VERBOSE") == "1":
             _log(f"[pool] ✓ EXISTS: {pool_path} (fileid={pool_fileid})")
         
         return (pool_fileid, pcloud_hash)
     
-    except Exception:
-        # File nicht im Pool → Upload
-        pass
-    
-    # Upload
+    # Upload mit _upload_file_smart (Retry + Resume für große Files)
     _log(f"[pool] upload: {local_path} → {pool_path}")
     
-    try:
-        result = pc.upload_file(cfg, local_path=local_path, remote_path=pool_path)
-        
-        # REST API kann metadata als Dict ODER als Liste zurückgeben
-        # Bei Liste: Erstes Element ist das File
-        metadata = result.get("metadata", {})
-        if isinstance(metadata, list):
-            # Liste von Metadaten → nehme erstes (sollte unser File sein)
-            if len(metadata) > 0:
-                metadata = metadata[0]
-            else:
-                raise RuntimeError(f"Upload returned empty metadata list for {pool_path}")
-        
-        pool_fileid = metadata.get("fileid")
-        pcloud_hash = metadata.get("hash")
-        
-        if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[pool] ✓ UPLOADED: {pool_path} (fileid={pool_fileid})")
-        
-        return (pool_fileid, pcloud_hash)
+    res = _upload_file_smart(cfg, local_path, pool_path, dry=dry)
     
-    except Exception as e:
-        _log(f"[pool] ERROR uploading {local_path}: {e}")
-        raise
+    # fileid + hash aus Upload-Antwort extrahieren (wie im Original)
+    try:
+        md = (res or {}).get("metadata") or {}
+        pool_fileid = md.get("fileid")
+        pcloud_hash = md.get("hash")
+    except Exception:
+        pool_fileid = None
+        pcloud_hash = None
+    
+    # EAGER FILEID FALLBACK (wie im Original)
+    if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
+        try:
+            stat_md = pc.call_with_backoff(stat_file_safe, cfg, path=pool_path) or {}
+            if not pool_fileid:
+                pool_fileid = stat_md.get("fileid")
+            if not pcloud_hash:
+                pcloud_hash = stat_md.get("hash")
+        except Exception:
+            pass
+    
+    if os.environ.get("PCLOUD_VERBOSE") == "1":
+        _log(f"[pool] ✓ UPLOADED: {pool_path} (fileid={pool_fileid})")
+    
+    return (pool_fileid, pcloud_hash)
 
 
 def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: str, *, dry: bool = False) -> None:
     """
     Schreibt Pool-Stub (.meta.json) in Snapshot-Ordner.
+    Nutzt REST API write_json_to_folderid() für Robustheit (kein Binary-Blocking).
     
     Args:
         cfg: pCloud Config
@@ -3604,9 +3596,12 @@ def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict
         _log(f"[dry] write_pool_stub: {stub_path}")
         return
     
-    # Stub-Payload
+    # Stub-Payload (wie im Original: format_version, kind, holder_type)
     stub_payload = {
+        "format_version": 1,
+        "kind": "stub",
         "type": "pool_stub",
+        "holder_type": "pool",
         "sha256": sha256,
         "pcloud_hash": pcloud_hash or "",
         "size": size,
@@ -3617,12 +3612,11 @@ def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict
         "snapshot": snapshot_name,
     }
     
-    # Parent-Ordner sicherstellen
-    pc.ensure_path(cfg, parent_dir)
+    # Parent-Ordner sicherstellen (gibt folderid zurück)
+    parent_fid = pc.ensure_path(cfg, parent_dir)
     
-    # Stub schreiben (minified JSON)
-    stub_json = json.dumps(stub_payload, separators=(',', ':'), ensure_ascii=False)
-    pc.put_textfile(cfg, path=stub_path, text=stub_json)
+    # Stub schreiben via REST (robust, kein Binary-Blocking!)
+    pc.write_json_to_folderid(cfg, folderid=parent_fid, filename=stub_filename, obj=stub_payload, minify=True)
     
     if os.environ.get("PCLOUD_VERBOSE") == "1":
         _log(f"[stub] ✓ {stub_path}")
@@ -3752,19 +3746,19 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     
     # Check ob Upload bereits komplett
     if not dry:
-        try:
-            pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+        existing_marker = stat_file_safe(cfg, path=marker_complete)
+        if existing_marker:
             _log(f"[pool-mode] ✓ Snapshot bereits vollständig hochgeladen: {snapshot_name}")
             return {"uploaded": 0, "stubs": 0, "skipped": True}
-        except:
-            pass
         
-        # Started-Marker setzen
-        pc.put_textfile(cfg, path=marker_started, text=json.dumps({
+        # Started-Marker setzen (robust mit write_json_to_folderid)
+        marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+        marker_data = {
             "snapshot": snapshot_name,
             "started_at": time.time(),
             "mode": "pool"
-        }))
+        }
+        pc.write_json_to_folderid(cfg, folderid=marker_fid, filename=".upload_started", obj=marker_data, minify=True)
         _log(f"[pool-mode] Started-Marker gesetzt: {marker_started}")
     
     # Stats (Thread-safe)
@@ -3895,8 +3889,13 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             index_data["updated_at"] = time.time()
             index_data["updated_by"] = "push_pool_mode"
             
-            # Upload Index
-            pc.write_json_to_folderid(cfg, json_obj=index_data, filename="content_index.json", folderid=None, path=dest_root)
+            # Upload Index (wie Original: stat_folderid_fast + write_json_to_folderid)
+            index_fid = pc.stat_folderid_fast(cfg, dest_root)
+            if not index_fid:
+                index_fid = pc.ensure_path(cfg, dest_root)
+            
+            pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
+            pc.write_json_to_folderid(cfg, folderid=int(index_fid), filename="content_index.json", obj=index_data, minify=(not pretty))
             
             index_duration = time.time() - t_index_start
             _log(f"[pool-mode] Content-Index aktualisiert ({index_duration:.1f}s)")
@@ -3904,7 +3903,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         except Exception as e:
             _log(f"[pool-mode][WARN] Content-Index Update fehlgeschlagen (nicht kritisch): {e}")
     
-    # Complete-Marker setzen
+    # Complete-Marker setzen (robust mit write_json_to_folderid)
     if not dry:
         marker_data = {
             "snapshot": snapshot_name,
@@ -3915,7 +3914,10 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             "errors": final_stats["errors"],
             "duration": time.time() - t_start
         }
-        pc.put_textfile(cfg, path=marker_complete, text=json.dumps(marker_data))
+        marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+        if not marker_fid:
+            marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+        pc.write_json_to_folderid(cfg, folderid=int(marker_fid), filename=".upload_complete", obj=marker_data, minify=True)
         _log(f"[pool-mode] Complete-Marker gesetzt: {marker_complete}")
     
     duration = time.time() - t_start
