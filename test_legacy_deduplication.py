@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """
-pCloud Legacy-Methoden Test (Clone & Promote)
+pCloud copyfolder Deduplizierungs-Test (copycontentonly-Methode)
 
-Testet ob der Legacy-Ansatz (copyfolder + renamefile) Quota-effizienter ist 
-als die reine Pool-Lösung.
+Testet ob der Legacy-Ansatz (copyfolder + copycontentonly) Quota-effizient ist
+und FileIDs erhält (echte Deduplizierung).
+
+STRATEGIE:
+1. Upload snap_1/data.bin (1 GB Test-File)
+2. Erstelle snap_2 (leerer Ordner)
+3. copyfolder(from=snap_1, to=snap_2, copycontentonly=True) → FileIDs bleiben!
+4. Erstelle snap_3 (leerer Ordner)
+5. copyfolder(from=snap_2, to=snap_3, copycontentonly=True) → FileIDs bleiben!
+6. FileID-Check: snap_1, snap_2, snap_3 haben IDENTISCHE FileIDs?
+7. Quota-Check: Steigt Quota nur minimal (Metadata)?
+
+ERWARTUNG:
+- FileIDs identisch → Echte Dedupe (kein physischer Speicher)
+- Quota steigt minimal → Nur Metadata (Folder-Struktur)
 
 Usage:
-    python test_legacy_deduplication.py --env-file .env
+    python test_legacy_deduplication.py --env-file .env --size 1000
 """
 
 import sys
@@ -81,52 +94,111 @@ def main():
         q1 = get_quota(cfg)
         print(f"    Used: {format_bytes(q1['used'])} (Diff: {format_bytes(q1['used']-q0['used'])})")
         
-        # 3. Klon snap_1 -> snap_2 (Die Legacy-Methode)
+        # 3. Klon snap_1 -> snap_2 (Die Legacy-Methode mit copycontentonly!)
         print("\n[4/7] Klon snap_1 -> snap_2 via copyfolder (Legacy-Sync)...")
-        # Wir brauchen die FolderID von snap_1
-        md = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_1"})
-        fid = md["metadata"]["folderid"]
         
-        # copyfolder: to_path = Parent-Ordner, toname = Name der Kopie
-        resp2 = pc.copyfolder(cfg, from_folderid=fid, to_path=test_dir, toname="snap_2")
-        fid2 = resp2["metadata"]["folderid"]
-        snap2_path = resp2["metadata"]["path"]
-        print(f"    ✓ snap_2 erstellt: {snap2_path} (FolderID: {fid2})")
+        # WICHTIG: snap_2 VORHER erstellen (Ziel-Container!)
+        pc.ensure_path(cfg, f"{test_dir}/snap_2")
+        md2_parent = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_2"})
+        fid2 = md2_parent["metadata"]["folderid"]
+        
+        # copyfolder mit copycontentonly=True → FileIDs bleiben erhalten!
+        # Kopiert NUR INHALT von snap_1 in snap_2 (kein Ordner-in-Ordner)
+        md1 = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_1"})
+        resp2 = pc.copyfolder(cfg, 
+                              from_folderid=md1["metadata"]["folderid"], 
+                              to_folderid=fid2, 
+                              copycontentonly=True)
+        
+        print(f"    ✓ snap_2 erstellt (Inhalt kopiert, FileIDs erhalten)")
+        print(f"    snap_2 FolderID: {fid2}")
+        print(f"    copyfolder result: {resp2.get('result', 'N/A')}")
         q2 = get_quota(cfg)
         print(f"    Used: {format_bytes(q2['used'])} (Diff zu snap_1: {format_bytes(q2['used']-q1['used'])})")
         
-        # 4. Klon snap_2 -> snap_3
+        # 4. Klon snap_2 -> snap_3 (ebenfalls mit copycontentonly!)
         print("\n[5/7] Klon snap_2 -> snap_3 via copyfolder...")
-        resp3 = pc.copyfolder(cfg, from_folderid=fid2, to_path=test_dir, toname="snap_3")
-        fid3 = resp3["metadata"]["folderid"]
-        snap3_path = resp3["metadata"]["path"]
-        print(f"    ✓ snap_3 erstellt: {snap3_path} (FolderID: {fid3})")
+        
+        # snap_3 vorher erstellen
+        pc.ensure_path(cfg, f"{test_dir}/snap_3")
+        md3_parent = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_3"})
+        fid3 = md3_parent["metadata"]["folderid"]
+        
+        # Inhalt von snap_2 nach snap_3 kopieren (FileIDs bleiben!)
+        resp3 = pc.copyfolder(cfg, 
+                              from_folderid=fid2, 
+                              to_folderid=fid3, 
+                              copycontentonly=True)
+        
+        print(f"    ✓ snap_3 erstellt (Inhalt kopiert, FileIDs erhalten)")
+        print(f"    snap_3 FolderID: {fid3}")
+        print(f"    copyfolder result: {resp3.get('result', 'N/A')}")
         q3 = get_quota(cfg)
         print(f"    Used: {format_bytes(q3['used'])} (Diff zu snap_2: {format_bytes(q3['used']-q2['used'])})")
         
-        # 5. Promotion (Move) snap_1/data.bin -> /test_legacy_experiment/promoted.bin
-        print("\n[6/7] Teste Promotion (Move) snap_1/data.bin -> promoted.bin...")
-        md_file = pc._rest_get(cfg, "stat", {"path": f"{snap2_path}/data.bin"})
+        # 5. FileID-Check (Beweis für Dedupe!)
+        print("\n[6/7] FileID-Check (Beweis für copycontentonly-Dedupe)...")
+        snap1_file = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_1/data.bin"})
+        snap2_file = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_2/data.bin"})
+        snap3_file = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_3/data.bin"})
+        
+        fid_snap1 = snap1_file["metadata"]["fileid"]
+        fid_snap2 = snap2_file["metadata"]["fileid"]
+        fid_snap3 = snap3_file["metadata"]["fileid"]
+        
+        print(f"    snap_1/data.bin FileID: {fid_snap1}")
+        print(f"    snap_2/data.bin FileID: {fid_snap2}")
+        print(f"    snap_3/data.bin FileID: {fid_snap3}")
+        
+        if fid_snap1 == fid_snap2 == fid_snap3:
+            print(f"    ✓✓✓ ALLE FileIDs IDENTISCH → copycontentonly dedupliziert! ✓✓✓")
+        else:
+            print(f"    ✗ FileIDs UNTERSCHIEDLICH → copycontentonly dedupliziert NICHT!")
+        
+        # 6. Promotion (Move) snap_2/data.bin -> /test_legacy_experiment/promoted.bin
+        print("\n[7/7] Teste Promotion (Move) snap_2/data.bin -> promoted.bin...")
+        md_file = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_2/data.bin"})
         fileid = md_file["metadata"]["fileid"]
         
         pc._rest_get(cfg, "renamefile", {"fileid": fileid, "topath": f"{test_dir}/promoted.bin"})
         q4 = get_quota(cfg)
         print(f"    Used: {format_bytes(q4['used'])} (Diff zu snap_3: {format_bytes(q4['used']-q3['used'])})")
         
-        # 6. Analyse
-        print("\n[7/7] ANALYSE:")
+        # 7. Finale Analyse
+        print("\nFINALE ANALYSE:")
         print("="*80)
-        print(f"Upload snap_1:      {format_bytes(q1['used']-q0['used'])} (Soll: 1x File)")
-        print(f"CopyFolder (1->2):  {format_bytes(q2['used']-q1['used'])} (Dedupe?)")
-        print(f"CopyFolder (2->3):  {format_bytes(q3['used']-q2['used'])} (Dedupe?)")
-        print(f"Promotion (Move):   {format_bytes(q4['used']-q3['used'])} (Soll: 0 B)")
+        print(f"Upload snap_1:           {format_bytes(q1['used']-q0['used'])} (Soll: 1x File)")
+        print(f"CopyFolder (1->2):       {format_bytes(q2['used']-q1['used'])} (copycontentonly=True)")
+        print(f"CopyFolder (2->3):       {format_bytes(q3['used']-q2['used'])} (copycontentonly=True)")
+        print(f"Promotion (Move):        {format_bytes(q4['used']-q3['used'])} (Soll: 0 B)")
+        print()
+        print(f"FileID snap_1/data.bin:  {fid_snap1}")
+        print(f"FileID snap_2/data.bin:  {fid_snap2}")
+        print(f"FileID snap_3/data.bin:  {fid_snap3}")
+        print(f"FileIDs identisch:       {fid_snap1 == fid_snap2 == fid_snap3}")
         print("="*80)
         
-        if (q2['used']-q1['used']) > (test_file_size * 0.9):
-            print("\nERGEBNIS: Legacy-Klon (copyfolder) verbraucht VOLL Quota!")
-            print("pCloud dedupliziert NICHT bei Server-seitigen Kopien.")
+        # Bewertung
+        fileids_match = (fid_snap1 == fid_snap2 == fid_snap3)
+        quota_increase_minimal = (q2['used']-q1['used']) < (test_file_size * 0.1)  # < 10% Quota-Anstieg
+        
+        if fileids_match and quota_increase_minimal:
+            print("\n✓✓✓ ERGEBNIS: copycontentonly DEDUPLIZIERT PERFEKT! ✓✓✓")
+            print()
+            print("- FileIDs bleiben IDENTISCH (keine Duplikate)")
+            print("- Quota steigt MINIMAL (nur Metadata)")
+            print("→ Legacy-Methode (copyfolder + copycontentonly) ist QUOTA-SAFE!")
+            print("→ Perfekt für Delta-Snapshots!")
+        elif fileids_match:
+            print("\n✓ ERGEBNIS: FileIDs bleiben, aber Quota steigt")
+            print()
+            print("- FileIDs identisch (gut!)")
+            print(f"- Quota-Anstieg: {format_bytes(q2['used']-q1['used'])} (Metadata-Overhead?)")
         else:
-            print("\nERGEBNIS: Legacy-Klon ist sparsam!")
+            print("\n✗ ERGEBNIS: copycontentonly dedupliziert NICHT wie erwartet!")
+            print()
+            print("- FileIDs UNTERSCHIEDLICH (neue Kopien!)")
+            print("- pCloud verhält sich anders als dokumentiert")
             
     finally:
         # Cleanup überspringen, um Zeit zu sparen / Ergebnisse zu prüfen
