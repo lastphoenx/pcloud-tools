@@ -288,9 +288,11 @@ for c in (js.get("metadata") or {}).get("contents", []) or []:
         # Prüfe ob Upload vollständig (.upload_complete Marker vorhanden)
         marker_path = f"{snap_root}/{snapname}/.upload_complete"
         try:
-            pc.stat_file(cfg, path=marker_path, with_checksum=False)
-            # Marker existiert → Upload war vollständig
-            names.append(snapname)
+            # REST API statt binary (zuverlässiger)
+            stat_res = pc._rest_get(cfg, "stat", {"path": marker_path})
+            if int(stat_res.get("result", -1)) == 0:
+                # Marker existiert → Upload war vollständig
+                names.append(snapname)
         except Exception:
             # Marker fehlt → Upload unvollständig oder fehlgeschlagen
             # Snapshot wird NICHT als "vorhanden" gelistet
@@ -309,23 +311,26 @@ remote_snapshot_exists() {
   local snapname="$1"
   local marker_path="${PCLOUD_DEST}/_snapshots/${snapname}/.upload_complete"
   
-  # Prüfe EXPLIZIT ob .upload_complete Marker existiert (nicht nur Ordner!)
-  if "${PY}" - <<PY 2>/dev/null
+  # Prüfe EXPLIZIT ob .upload_complete Marker existiert (REST API, zuverlässig)
+  local result
+  result=$(MARKER_PATH="$marker_path" "${PY}" - <<'PY' 2>/dev/null
 import os, sys
 sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 try:
     cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
-    pc.stat_file(cfg, path="${marker_path}", with_checksum=False)
-    print("YES")
+    marker_path = os.environ.get("MARKER_PATH")
+    # REST API statt binary (zuverlässiger)
+    stat_res = pc._rest_get(cfg, "stat", {"path": marker_path})
+    if int(stat_res.get("result", -1)) == 0:
+        print("YES")
+    else:
+        print("NO")
 except Exception:
     print("NO")
 PY
-  then
-    echo "YES"
-  else
-    echo "NO"
-  fi
+)
+  echo "$result"
 }
 
 local_snapshot_names() {
