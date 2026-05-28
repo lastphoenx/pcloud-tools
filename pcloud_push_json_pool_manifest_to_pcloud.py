@@ -3534,19 +3534,31 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
     
     res = _upload_file_smart(cfg, local_path, pool_path, dry=dry)
     
-    # fileid + hash aus Upload-Antwort extrahieren (wie im Original)
-    try:
-        md = (res or {}).get("metadata") or {}
-        # API kann metadata als Liste zurückgeben (wenn Parent-Ordner erstellt wurde)
-        if isinstance(md, list):
-            md = md[0] if len(md) > 0 else {}
-        pool_fileid = md.get("fileid")
-        pcloud_hash = md.get("hash")
-    except Exception:
-        pool_fileid = None
-        pcloud_hash = None
+    # fileid + hash aus Upload-Antwort extrahieren
+    # ROBUST: pCloud API kann verschiedene Response-Formate liefern!
+    pool_fileid = None
+    pcloud_hash = None
     
-    # EAGER FILEID FALLBACK (wie im Original)
+    if res and isinstance(res, dict):
+        # Standard-Fall: metadata ist ein Dict
+        md = res.get("metadata")
+        
+        # Fall 1: metadata ist Liste (wenn Ordner erstellt wurden)
+        if isinstance(md, list) and len(md) > 0:
+            # Letztes Element ist die hochgeladene Datei
+            md = md[-1] if isinstance(md[-1], dict) else {}
+        
+        # Fall 2: metadata ist Dict (Normalfall)
+        elif not isinstance(md, dict):
+            md = {}
+        
+        # Extrahiere fileid + hash
+        if md:
+            pool_fileid = md.get("fileid")
+            pcloud_hash = md.get("hash")
+    
+    # EAGER FILEID FALLBACK (wie im Original - aber robuster!)
+    # Wenn Upload-Response unvollständig war, hole via stat
     if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
         try:
             stat_md = pc.call_with_backoff(stat_file_safe, cfg, path=pool_path) or {}
@@ -3554,11 +3566,27 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
                 pool_fileid = stat_md.get("fileid")
             if not pcloud_hash:
                 pcloud_hash = stat_md.get("hash")
-        except Exception:
-            pass
+            
+            if pool_fileid and os.environ.get("PCLOUD_VERBOSE") == "1":
+                _log(f"[pool] ✓ FileID via EAGER fallback: {pool_fileid}")
+        except Exception as e:
+            _log(f"[pool][warn] EAGER stat failed for {pool_path}: {e}")
+    
+    # Finale Validierung
+    if not pool_fileid:
+        _log(f"[pool][ERROR] Upload lieferte keine FileID: {pool_path}")
+        # Nicht aufgeben - versuche nochmal via stat (ohne EAGER check)
+        try:
+            stat_md = stat_file_safe(cfg, path=pool_path)
+            if stat_md:
+                pool_fileid = stat_md.get("fileid")
+                pcloud_hash = stat_md.get("hash")
+                _log(f"[pool] ✓ FileID via finaler stat-check: {pool_fileid}")
+        except Exception as e:
+            _log(f"[pool][ERROR] Finale FileID-Ermittlung fehlgeschlagen: {e}")
     
     if os.environ.get("PCLOUD_VERBOSE") == "1":
-        _log(f"[pool] ✓ UPLOADED: {pool_path} (fileid={pool_fileid})")
+        _log(f"[pool] ✓ UPLOADED: {pool_path} (fileid={pool_fileid}, hash={pcloud_hash})")
     
     return (pool_fileid, pcloud_hash)
 
@@ -3640,10 +3668,27 @@ def _process_pool_item(
     relpath = file_item.get("relpath")
     sha256 = file_item.get("sha256", "").lower()
     abs_src = file_item.get("source_path")
+    file_size = file_item.get("size", 0)
     
-    if not relpath or not sha256 or not abs_src:
-        if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[pool-worker][warn] Skip {relpath} (missing data)")
+    # Validierung mit detailliertem Error-Report
+    if not relpath:
+        _log(f"[pool-worker][ERROR] File-Item fehlt 'relpath': {file_item}")
+        return None
+    
+    if not sha256:
+        _log(f"[pool-worker][ERROR] {relpath}: Fehlt SHA256 (corrupt manifest?)")
+        return None
+    
+    if not abs_src:
+        _log(f"[pool-worker][ERROR] {relpath}: Fehlt 'source_path' (manifest bug?)")
+        return None
+    
+    if not os.path.exists(abs_src):
+        _log(f"[pool-worker][ERROR] {relpath}: Source file nicht gefunden: {abs_src}")
+        return None
+    
+    if not os.path.isfile(abs_src):
+        _log(f"[pool-worker][ERROR] {relpath}: Source ist kein File: {abs_src}")
         return None
     
     # Hardlink-Check (lokale Dedupe)
@@ -3662,13 +3707,33 @@ def _process_pool_item(
     if cached_result:
         # Hardlink zu bereits verarbeitetem File → Return Cached Info
         cached_sha, cached_fileid, cached_hash = cached_result
+        if os.environ.get("PCLOUD_VERBOSE") == "1":
+            _log(f"[pool-worker] ✓ HARDLINK: {relpath} → cached fileid={cached_fileid}")
         return (relpath, file_item, cached_fileid, cached_hash, True)  # True = ist Hardlink-Stub
     
     # Pool-Upload (Check ob existiert oder Upload)
     try:
         pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, dry=dry)
+        
+        # Validiere Upload-Ergebnis
+        if not pool_fileid:
+            _log(f"[pool-worker][ERROR] {relpath}: Upload lieferte keine FileID (size={file_size}, sha256={sha256[:8]}...)")
+            _log(f"[pool-worker][ERROR] → Source: {abs_src}")
+            return None
+        
+    except FileNotFoundError as e:
+        _log(f"[pool-worker][ERROR] {relpath}: File verschwand während Upload: {e}")
+        return None
+    except PermissionError as e:
+        _log(f"[pool-worker][ERROR] {relpath}: Keine Leserechte: {e}")
+        return None
+    except IOError as e:
+        _log(f"[pool-worker][ERROR] {relpath}: I/O-Fehler beim Lesen: {e}")
+        return None
     except Exception as e:
-        _log(f"[pool-worker][ERROR] Upload failed for {relpath}: {e}")
+        _log(f"[pool-worker][ERROR] {relpath}: Upload fehlgeschlagen (size={file_size}, sha256={sha256[:8]}...)")
+        _log(f"[pool-worker][ERROR] → Exception: {type(e).__name__}: {e}")
+        _log(f"[pool-worker][ERROR] → Source: {abs_src}")
         return None
     
     # Hardlink-Tracking (wird von Hauptthread gemacht nach Return!)
@@ -4010,6 +4075,10 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         _log(f"[pool-mode] {len(large_files)} große Dateien sequentiell")
     
     # Hardlink-Tracking (einfaches Dict, kein Lock nötig da nur Hauptthread schreibt!)
+    # WICHTIG: Manifest kennt nur Files nach relativem Pfad, NICHT ihre Inodes!
+    # seen_inodes dedupliziert ECHTE Hardlinks (mehrere Pfade → selbe Inode) innerhalb
+    # eines Snapshots zur Laufzeit. Das spart Uploads UND ist korrekt weil Hardlinks
+    # dasselbe File sind. Pool-SHA256-Dedupe ist was anderes (Files mit gleichem Inhalt).
     seen_inodes = {}
     
     # Ergebnis-Listen (werden nach Upload gefüllt)
@@ -4161,9 +4230,61 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     _log(f"[pool-mode] Upload abgeschlossen: {uploaded_count} uploaded, {skipped_count} hardlinks, "
          f"{error_count} errors ({total_duration:.1f}s)")
     
-    # Content-Index Update (Pool-Referenzen tracken)
+    # ============================================================================
+    # === SNAPSHOT MANIFEST (ATOMAR!) ===
+    # ============================================================================
+    # Statt den globalen Content-Index direkt zu ändern (nicht atomar!),
+    # speichern wir ein separates Manifest pro Snapshot.
+    # Ein separater Merge-Prozess kann diese später in content_index.json integrieren.
+    
     if not dry:
-        _log("[pool-mode] Aktualisiere Content-Index...")
+        _log("[pool-mode] Erstelle Snapshot-Manifest (atomar)...")
+        t_manifest_start = time.time()
+        
+        try:
+            # Snapshot-Manifest: Alle SHA256 dieses Snapshots
+            snapshot_manifest = {
+                "snapshot": snapshot_name,
+                "created_at": time.time(),
+                "schema": 4,
+                "mode": "pool",
+                "file_count": len(file_items),
+                "uploaded": uploaded_count,
+                "skipped": skipped_count,
+                "errors": error_count,
+                "sha256_list": [f.get("sha256", "").lower() for f in file_items if f.get("sha256")]
+            }
+            
+            # Manifest im Snapshot-Ordner speichern (ATOMAR!)
+            manifest_filename = "_manifest.json"
+            snapshot_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+            if not snapshot_fid:
+                snapshot_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+            
+            pc.write_json_to_folderid(
+                cfg, 
+                folderid=int(snapshot_fid), 
+                filename=manifest_filename, 
+                obj=snapshot_manifest, 
+                minify=True
+            )
+            
+            manifest_duration = time.time() - t_manifest_start
+            _log(f"[pool-mode] ✓ Snapshot-Manifest gespeichert ({manifest_duration:.1f}s)")
+            _log(f"[pool-mode] → {dest_snapshot_dir}/{manifest_filename}")
+        
+        except Exception as e:
+            _log(f"[pool-mode][ERROR] Snapshot-Manifest konnte nicht gespeichert werden: {e}")
+            _log("[pool-mode][WARN] Pool-Referenzen für diesen Snapshot gehen verloren!")
+    
+    # ============================================================================
+    # === CONTENT-INDEX UPDATE (OPTIONAL, kann fehlschlagen ohne Datenverlust) ===
+    # ============================================================================
+    # Versuche den globalen Index zu aktualisieren, aber wenn es fehlschlägt,
+    # ist nichts verloren (Snapshot-Manifest ist atomar gespeichert).
+    
+    if not dry and os.environ.get("PCLOUD_UPDATE_CONTENT_INDEX", "1") == "1":
+        _log("[pool-mode] Aktualisiere Content-Index (optional)...")
         t_index_start = time.time()
         
         try:
@@ -4179,11 +4300,12 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     "schema": 4,
                     "mode": "pool",
                     "snapshots": [],
-                    "pool_refs": {}  # SHA256 → [snapshot1, snapshot2, ...]
+                    "pool_refs": {},  # SHA256 → [snapshot1, snapshot2, ...]
+                    "note": "Wird aus Snapshot-Manifesten rekonstruiert"
                 }
                 _log("[pool-mode] Neuer Index erstellt")
             
-            # Update Pool-Refs
+            # Update Pool-Refs (aus Snapshot-Manifest rekonstruierbar!)
             pool_refs = index_data.setdefault("pool_refs", {})
             for file_item in file_items:
                 sha256 = file_item.get("sha256", "").lower()
