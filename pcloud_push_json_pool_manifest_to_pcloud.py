@@ -3537,6 +3537,9 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
     # fileid + hash aus Upload-Antwort extrahieren (wie im Original)
     try:
         md = (res or {}).get("metadata") or {}
+        # API kann metadata als Liste zurückgeben (wenn Parent-Ordner erstellt wurde)
+        if isinstance(md, list):
+            md = md[0] if len(md) > 0 else {}
         pool_fileid = md.get("fileid")
         pcloud_hash = md.get("hash")
     except Exception:
