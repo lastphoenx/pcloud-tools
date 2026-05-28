@@ -4083,6 +4083,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         except Exception:
             pass
     
+    # Entscheidung: Template nutzen oder Einzeln anlegen? (1:1 Original Zeile 2008)
+    template_used = False
+    
     if template_exists and template_force_active and not dry:
         # === Template-basierte Anlage (SCHNELL!) ===
         _log(f"[pool-mode] Nutze Template: {template_path}")
