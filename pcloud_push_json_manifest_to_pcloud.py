@@ -2458,7 +2458,8 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
     def _list_remote_snapshots(snapshots_root: str) -> list[str]:
         try:
-            top = pc.listfolder(cfg, path=snapshots_root, recursive=False, nofiles=True, showpath=False) or {}
+            # REST API statt Binary (zuverlässig, kein Socket-Blocking)
+            top = pc._rest_get(cfg, "listfolder", {"path": snapshots_root, "nofiles": 1}) or {}
             contents = (top.get("metadata") or {}).get("contents") or []
             return sorted(c["name"] for c in contents if c.get("isfolder") and c.get("name") != "_index")
         except Exception:
@@ -2466,14 +2467,16 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
     def _stat_fileid_safe(path: str):
         try:
-            md = pc.stat_file(cfg, path=path, with_checksum=False) or {}
-            return md.get("fileid")
+            # REST API statt Binary (zuverlässig, kein Socket-Blocking)
+            md = pc._rest_get(cfg, "stat", {"path": path}) or {}
+            return (md.get("metadata") or {}).get("fileid")
         except Exception:
             return None
 
     def _load_index(snapshots_root: str) -> dict:
         idx_path = f"{snapshots_root}/_index/content_index.json"
         try:
+            # REST getfilelink statt Binary get_textfile (bereits REST in get_textfile, aber direkt ist klarer)
             txt = pc.get_textfile(cfg, path=idx_path)
             j = json.loads(txt)
             if not isinstance(j, dict):
