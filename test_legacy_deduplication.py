@@ -103,10 +103,9 @@ def main():
         fid2 = md2_parent["metadata"]["folderid"]
         
         # copyfolder mit copycontentonly=True → FileIDs bleiben erhalten!
-        # Kopiert NUR INHALT von snap_1 in snap_2 (kein Ordner-in-Ordner)
-        md1 = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_1"})
+        # KRITISCH: from_path statt from_folderid (wie im Delta-Mode L2947!)
         resp2 = pc.copyfolder(cfg, 
-                              from_folderid=md1["metadata"]["folderid"], 
+                              from_path=f"{test_dir}/snap_1",  # ← PATH statt FolderID!
                               to_folderid=fid2, 
                               copycontentonly=True)
         
@@ -124,9 +123,9 @@ def main():
         md3_parent = pc._rest_get(cfg, "stat", {"path": f"{test_dir}/snap_3"})
         fid3 = md3_parent["metadata"]["folderid"]
         
-        # Inhalt von snap_2 nach snap_3 kopieren (FileIDs bleiben!)
+        # Inhalt von snap_2 nach snap_3 kopieren (from_path!)
         resp3 = pc.copyfolder(cfg, 
-                              from_folderid=fid2, 
+                              from_path=f"{test_dir}/snap_2",  # ← PATH statt FolderID!
                               to_folderid=fid3, 
                               copycontentonly=True)
         
