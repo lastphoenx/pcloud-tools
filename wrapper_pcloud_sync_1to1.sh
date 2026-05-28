@@ -341,6 +341,13 @@ local_snapshot_names() {
 
 remote_snapshot_names() { load_remote_snapshots; }
 
+# Cached check (nutzt bereits geladenes remote_snaps Array)
+# Für Read-Operationen: Vermeidet Python-Prozess-Start
+is_remote_cached() {
+  local snapname="$1"
+  printf '%s\n' "${remote_snaps[@]}" | grep -qx "$snapname" && echo "YES" || echo "NO"
+}
+
 # --- Gap Handling: Snapshot Integrity Validation ---
 validate_snapshot_integrity() {
   local snapshot="$1"
@@ -745,13 +752,13 @@ for s in "${local_snaps[@]}"; do
     continue
   fi
 
-  if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+  if [[ "$(is_remote_cached "$s")" == "NO" ]]; then
     # Gap-Erkennung: Gibt es einen SPÄTEREN Snapshot, der remote existiert?
     is_gap=0
     later_snaps=()
     for later in "${local_snaps[@]}"; do
       if [[ "$later" > "$s" ]]; then
-        if [[ "$(remote_snapshot_exists "$later")" == "YES" ]]; then
+        if [[ "$(is_remote_cached "$later")" == "YES" ]]; then
           is_gap=1
           later_snaps+=("$later")
         fi
