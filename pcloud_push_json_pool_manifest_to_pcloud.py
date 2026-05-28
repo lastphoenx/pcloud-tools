@@ -2130,6 +2130,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             _folders_created = 0
             _folders_lock = threading.Lock()
             _last_progress_pct = 0
+            _folders_start_time = time.time()
             total_folders = len(missing_folders)
             
             def _create_folder(reldir: str) -> bool:
@@ -2146,7 +2147,13 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                         )
                         if show_progress:
                             _last_progress_pct = current_pct
-                            remaining_s = (total_folders - _folders_created) * 0.05 / threads
+                            # Dynamische ETA: Echte Geschwindigkeit statt hardcoded 0.05s!
+                            elapsed = time.time() - _folders_start_time
+                            if _folders_created > 0 and elapsed > 0:
+                                rate = _folders_created / elapsed  # Ordner pro Sekunde
+                                remaining_s = (total_folders - _folders_created) / rate if rate > 0 else 0
+                            else:
+                                remaining_s = 0
                             eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
                             _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
                     return True
@@ -2985,18 +2992,29 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     # === KRITISCH: Lösche alte Marker (wurden via copyfolder mitkopiert!) ===
     # Problem: copyfolder kopiert .upload_complete/.upload_started vom Basis-Snapshot
     # → Würde Gap-Detection täuschen (denkt Upload komplett, obwohl Delta fehlt)
-    # → Lösung: Marker sofort nach Copy löschen, vor Delta-Upload
+    # → Lösung: .upload_complete löschen, .upload_started NEU schreiben (Resume-Konsistenz!)
     if not dry:
-        marker_paths = [
-            f"{dest_snapshot_dir}/.upload_complete",
-            f"{dest_snapshot_dir}/.upload_started",
-        ]
-        for marker in marker_paths:
-            try:
-                pc.deletefile(cfg, path=marker)
-                _log(f"[delta-copy][2/6] ✓ Gelöscht (mitkopiert): {marker}")
-            except Exception:
-                pass  # Marker existierte evtl. nicht (z.B. bei alten Snapshots ohne Marker)
+        # NUR .upload_complete löschen (alter Marker vom Basis-Snapshot)
+        marker_complete_old = f"{dest_snapshot_dir}/.upload_complete"
+        try:
+            pc.deletefile(cfg, path=marker_complete_old)
+            _log(f"[delta-copy][2/6] ✓ Gelöscht (mitkopiert): {marker_complete_old}")
+        except Exception:
+            pass  # Marker existierte evtl. nicht
+        
+        # .upload_started NEU schreiben mit aktuellen Metadaten
+        marker_started_new = f"{dest_snapshot_dir}/.upload_started"
+        try:
+            pc.put_textfile(cfg, path=marker_started_new, text=json.dumps({
+                "snapshot": snapshot_name,
+                "started_at": time.time(),
+                "mode": "delta-copy",
+                "basis_snapshot": basis_snapshot,
+                "status": "delta_upload_in_progress"
+            }))
+            _log(f"[delta-copy][2/6] ✓ Started-Marker aktualisiert: {marker_started_new}")
+        except Exception as e:
+            _log(f"[delta-copy][WARN] Konnte Started-Marker nicht setzen: {e}")
     
     # === Schritt 3: Manifest-Diff berechnen ===
     _log(f"[delta-copy][3/6] Berechne Manifest-Diff...")
@@ -3389,7 +3407,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             _log(f"[delta-copy][ERROR] Konnte Complete-Marker nicht setzen: {e}")
             raise  # CRITICAL: Ohne Marker ist Upload unvollständig!
     
-    # === Manifest archivieren ===
+    # === Manifest archivieren (lokal + remote) ===
     if manifest_path and not dry:
         archive_dest = f"{archive_base}/manifests/{snapshot_name}.json"
         os.makedirs(os.path.dirname(archive_dest), exist_ok=True)
@@ -3397,9 +3415,18 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         try:
             import shutil
             shutil.copy2(manifest_path, archive_dest)
-            _log(f"[delta-copy] Manifest archiviert: {archive_dest}")
+            _log(f"[delta-copy] Manifest lokal archiviert: {archive_dest}")
         except Exception as e:
-            _log(f"[delta-copy][warn] Konnte Manifest nicht archivieren: {e}")
+            _log(f"[delta-copy][warn] Konnte Manifest lokal nicht archivieren: {e}")
+    
+    # Remote-Manifest Upload (für Restore ohne lokales Archiv!)
+    if manifest and not dry:
+        remote_manifest_path = f"{dest_snapshot_dir}/_manifest.json"
+        try:
+            pc.put_textfile(cfg, path=remote_manifest_path, text=json.dumps(manifest, indent=2))
+            _log(f"[delta-copy] ✓ Manifest remote gespeichert: {remote_manifest_path}")
+        except Exception as e:
+            _log(f"[delta-copy][WARN] Remote-Manifest Upload fehlgeschlagen: {e}")
     
     # === Summary ===
     t_total_ms = (time.time() - t_start) * 1000.0
@@ -3740,6 +3767,112 @@ def _process_pool_item(
     # seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
     
     return (relpath, file_item, pool_fileid, pcloud_hash, False)  # False = neuer Upload
+
+
+def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
+    """
+    Post-Upload Konsistenz-Check für Pool-Mode Snapshots.
+    
+    Prüft:
+    1. Alle .meta.json Stubs existieren in pCloud
+    2. Alle Pool-Dateien (SHA256) existieren
+    3. Holders-Konsistenz (Index <-> Manifest)
+    
+    Args:
+        cfg: pCloud Config
+        snapshot_dir: Remote Snapshot-Pfad (z.B. /_snapshots/2026-05-28-120014)
+        pool_root: Pool-Root (z.B. /_pool)
+        manifest: Manifest Dict
+        index: Content-Index Dict
+        dry: Dry-Run Mode
+    
+    Returns:
+        (is_valid, errors) - True wenn alles ok, sonst Liste mit Fehlern
+    """
+    _log(f"[validate] Starte Integritäts-Check für {snapshot_dir}...")
+    errors = []
+    snapshot_name = manifest.get("snapshot", "?")
+    
+    if dry:
+        _log("[validate] Überspringe Validation (dry-run)")
+        return (True, [])
+    
+    # Sample-Check (nicht alle 100k+ Dateien prüfen, sondern Stichprobe!)
+    manifest_items = [item for item in manifest.get("items", []) if item.get("type") == "file"]
+    total_files = len(manifest_items)
+    
+    # Validiere maximal 100 Dateien (repräsentativ!)
+    import random
+    sample_size = min(100, total_files)
+    sample_items = random.sample(manifest_items, sample_size) if total_files > sample_size else manifest_items
+    
+    _log(f"[validate] Prüfe {sample_size} von {total_files} Dateien (Stichprobe)")
+    
+    checked_stubs = 0
+    checked_pool = 0
+    
+    for item in sample_items:
+        relpath = item.get("relpath")
+        sha256 = item.get("sha256", "").lower()
+        
+        if not relpath or not sha256:
+            continue
+        
+        # 1. Stub-Check
+        stub_path = f"{snapshot_dir}/{relpath}.meta.json"
+        try:
+            stub_stat = stat_file_safe(cfg, path=stub_path)
+            if not stub_stat:
+                errors.append(f"Stub fehlt: {relpath}")
+            else:
+                checked_stubs += 1
+        except Exception as e:
+            errors.append(f"Stub-Check fehlgeschlagen für {relpath}: {e}")
+        
+        # 2. Pool-Check
+        pool_path = _get_pool_path(sha256)
+        try:
+            pool_stat = stat_file_safe(cfg, path=pool_path)
+            if not pool_stat:
+                errors.append(f"Pool-Datei fehlt: {sha256[:16]}...")
+            else:
+                checked_pool += 1
+        except Exception as e:
+            errors.append(f"Pool-Check fehlgeschlagen für {sha256[:16]}: {e}")
+    
+    # 3. Index-Holders-Check (für alle Dateien im Manifest)
+    holders_ok = 0
+    for item in manifest_items:
+        sha256 = (item.get("sha256") or "").lower()
+        if not sha256:
+            continue
+        
+        node = index.get("items", {}).get(sha256)
+        if node:
+            holders = node.get("holders", [])
+            has_snapshot = any(
+                isinstance(h, dict) and h.get("snapshot") == snapshot_name
+                for h in holders
+            )
+            if has_snapshot:
+                holders_ok += 1
+            else:
+                errors.append(f"Index fehlt Holder für SHA256 {sha256[:16]}... (Snapshot {snapshot_name})")
+    
+    _log(f"[validate] Stubs: {checked_stubs}/{sample_size} ok")
+    _log(f"[validate] Pool: {checked_pool}/{sample_size} ok")
+    _log(f"[validate] Holders: {holders_ok}/{total_files} ok")
+    
+    if errors:
+        _log(f"[validate] ❌ {len(errors)} Fehler gefunden!")
+        for err in errors[:10]:  # Erste 10 zeigen
+            _log(f"[validate]   {err}")
+        if len(errors) > 10:
+            _log(f"[validate]   ... und {len(errors)-10} weitere")
+        return (False, errors)
+    else:
+        _log(f"[validate] ✓ Snapshot konsistent ({sample_size} Dateien geprüft)")
+        return (True, [])
 
 
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False) -> dict:
@@ -4237,6 +4370,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _folders_created = 0
             _folders_lock = threading.Lock()
             _last_progress_pct = 0
+            _folders_start_time = time.time()
             total_folders = len(missing_folders)
             
             def _create_folder(reldir: str) -> bool:
@@ -4254,7 +4388,13 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                         )
                         if show_progress:
                             _last_progress_pct = current_pct
-                            remaining_s = (total_folders - _folders_created) * 0.05 / threads
+                            # Dynamische ETA: Echte Geschwindigkeit statt hardcoded 0.05s!
+                            elapsed = time.time() - _folders_start_time
+                            if _folders_created > 0 and elapsed > 0:
+                                rate = _folders_created / elapsed  # Ordner pro Sekunde
+                                remaining_s = (total_folders - _folders_created) / rate if rate > 0 else 0
+                            else:
+                                remaining_s = 0
                             eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
                             _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
                     return True
@@ -4476,6 +4616,25 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
             except Exception as e:
                 print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
+    
+    # === POST-UPLOAD VALIDATION (User-Request: Konsistenz-Check VOR Complete-Marker!) ===
+    validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
+    if validation_enabled and not dry:
+        _log("[pool-mode] Starte Post-Upload Validation...")
+        is_valid, validation_errors = validate_pool_snapshot(cfg, dest_snapshot_dir, pool_root, manifest, index, dry=dry)
+        
+        if not is_valid:
+            _log(f"[pool-mode][ERROR] Validation fehlgeschlagen: {len(validation_errors)} Fehler!")
+            _log("[pool-mode][ERROR] Complete-Marker wird NICHT gesetzt (inkonsistenter Snapshot)")
+            for err in validation_errors[:5]:  # Erste 5 Fehler zeigen
+                _log(f"[pool-mode][ERROR]   {err}")
+            
+            # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
+            raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
+        else:
+            _log("[pool-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
+    elif not validation_enabled:
+        _log("[pool-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
     
     # === COMPLETE-MARKER SETZEN (wie Original!) ===
     if not dry:
