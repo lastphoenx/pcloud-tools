@@ -1800,8 +1800,9 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                               "started_at": time.time(),
                               "host": os.uname().nodename
                           }))
+            _log(f"[info] Upload-Started-Marker gesetzt: {marker_started}")
         except Exception as e:
-            print(f"[warn] Konnte Started-Marker nicht setzen: {e}")
+            _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
     # === ENDE NEU ===
 
     # Lock für shared state (muss VOR Hilfsfunktionen definiert werden!)
@@ -2411,9 +2412,10 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                               "resumed": resumed,
                               "stubs": stubs
                           }))
-            _log(f"[success] Upload-Complete-Marker gesetzt")
+            _log(f"[success] Upload-Complete-Marker gesetzt: {marker_complete}")
         except Exception as e:
-            print(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
+            _log(f"[ERROR] Konnte Complete-Marker nicht setzen: {e}")
+            raise  # CRITICAL: Ohne Marker ist Upload unvollständig!
     # === ENDE NEU ===
 
     if os.environ.get("PCLOUD_TIMING") == "1":
@@ -3305,8 +3307,10 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 "mode": "delta-copy",
                 "basis_snapshot": basis_snapshot,
             }))
+            _log(f"[delta-copy] ✓ Complete-Marker gesetzt: {marker_complete}")
         except Exception as e:
-            _log(f"[delta-copy][warn] Konnte Complete-Marker nicht setzen: {e}")
+            _log(f"[delta-copy][ERROR] Konnte Complete-Marker nicht setzen: {e}")
+            raise  # CRITICAL: Ohne Marker ist Upload unvollständig!
     
     # === Manifest archivieren ===
     if manifest_path and not dry:
