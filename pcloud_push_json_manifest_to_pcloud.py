@@ -2576,36 +2576,61 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
     ensure_snapshots_layout(cfg, dest_root, dry=dry)
     snapshots_root = f"{pc._norm_remote_path(dest_root).rstrip('/')}/_snapshots"
 
+    print("[retention] === RETENTION START ===")
+    print(f"[retention] API-Call: listfolder({snapshots_root})")
+    t_list = time.time()
     remote_snaps = set(_list_remote_snapshots(snapshots_root))
+    print(f"[retention] listfolder fertig ({int((time.time()-t_list)*1000)}ms) → {len(remote_snaps)} remote Snapshots")
+    
     local_snaps = set(local_snaps or [])
     to_delete = sorted(s for s in remote_snaps if s not in local_snaps)
     keep_snaps = remote_snaps & local_snaps
 
+    print(f"[retention] Remote: {len(remote_snaps)} | Lokal: {len(local_snaps)} | Zu löschen: {len(to_delete)}")
+    if to_delete:
+        print(f"[retention] Snapshots die gelöscht werden: {', '.join(to_delete)}")
+
     if not to_delete:
-        if dry:
-            print("[dry] retention: nichts zu löschen")
+        print("[retention] Nichts zu löschen - SKIP")
         return
 
+    print(f"[retention] API-Call: Lade Content-Index (193+ MB JSON)...")
+    t_idx = time.time()
     idx = _load_index(snapshots_root)
+    print(f"[retention] Content-Index geladen ({int((time.time()-t_idx)*1000)}ms) → {len(idx.get('items', {}))} Nodes")
     items = idx.setdefault("items", {})
 
     promoted = 0
     removed_nodes = 0
     any_blockers = False
 
+    print(f"[retention] === ANALYSE START: {len(to_delete)} Snapshots werden verarbeitet ===")
+
     # --- Hauptlogik pro zu löschendem Snapshot ------------------------------
 
     for sdel in to_delete:
+        print(f"[retention] Verarbeite Snapshot: {sdel}")
         del_prefix = f"{snapshots_root}/{sdel}/"
         snapshot_blockers = False  # Pro-Snapshot Blocker-Flag
+        
+        nodes_checked = 0
+        nodes_with_anchor_in_deleted = 0
+        nodes_with_holders_in_deleted = 0
 
         for sha, node in list(items.items()):
+            nodes_checked += 1
+            if nodes_checked % 5000 == 0:
+                print(f"[retention]   Progress: {nodes_checked}/{len(items)} Nodes geprüft...")
+            
             if not isinstance(node, dict):
                 continue
 
             holders = list(node.get("holders") or [])
             anchor = node.get("anchor_path") or ""
             anchor_in_deleted = anchor.startswith(del_prefix)
+            
+            if anchor_in_deleted:
+                nodes_with_anchor_in_deleted += 1
 
             # Invariante: am Anchor-Pfad KEIN Stub (.meta.json) → best-effort Cleanup
             if anchor:
@@ -2627,6 +2652,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             if drop_holders or anchor_in_deleted:
                 node["holders"] = keep_holders
                 ret_index_changed = True
+                nodes_with_holders_in_deleted += 1
 
             # keine Keeper?
             if not keep_holders:
@@ -2645,6 +2671,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
                 # No-Op-Guard
                 if anchor == new_path:
+                    print(f"[retention]   Anchor bereits am richtigen Ort: {new_path}")
                     node["anchor_path"] = new_path
                     # am Anchor KEIN Stub: ggf. stale Stub löschen
                     _delete_file_if_exists(f"{new_path}.meta.json")
@@ -2662,6 +2689,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
                     node["anchor_path"] = new_path
                     promoted += 1
                 else:
+                    print(f"[retention]   API-Call: move fileid (Anchor-Promotion) {sha[:8]}... → {new_holder['snapshot']}/{new_holder['relpath']}")
                     fid = node.get("fileid") or _stat_fileid_safe(anchor)
                     if not fid:
                         print(f"[warn] retention: fehlende fileid für Anchor {anchor}; Snapshot {sdel} wird NICHT gelöscht.", file=sys.stderr)
@@ -2674,7 +2702,9 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
                     _delete_file_if_exists(f"{new_path}.meta.json")
 
                     try:
+                        t_move = time.time()
                         pc.move(cfg, from_fileid=int(fid), to_path=new_path)
+                        print(f"[retention]   move fertig ({int((time.time()-t_move)*1000)}ms)")
                     except Exception as e:
                         print(f"[warn] retention: move failed for fileid={fid} -> {new_path}: {e}", file=sys.stderr)
                         snapshot_blockers = True
@@ -2696,6 +2726,12 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
         # Snapshot nur löschen, wenn keine Blocker auftraten
         rmpath = f"{snapshots_root}/{sdel}"
+        
+        print(f"[retention] Snapshot {sdel} Analyse fertig:")
+        print(f"[retention]   - Nodes mit Anchor in {sdel}: {nodes_with_anchor_in_deleted}")
+        print(f"[retention]   - Nodes mit Holders in {sdel}: {nodes_with_holders_in_deleted}")
+        print(f"[retention]   - Blocker aufgetreten: {snapshot_blockers}")
+        
         if snapshot_blockers:
             print(f"[warn] retention: Snapshot {sdel} bleibt bestehen (Blocker vorhanden).")
             continue
@@ -2704,7 +2740,10 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             print(f"[dry] delete snapshot dir: {rmpath}")
             print(f"[dry] delete manifest: /srv/pcloud-archive/manifests/{sdel}.json")
         else:
+            print(f"[retention] API-Call: deletefolderrecursive({rmpath})")
+            t_del = time.time()
             pc.call_with_backoff(pc.delete_folder, cfg, path=rmpath, recursive=True)
+            print(f"[retention] Snapshot-Ordner gelöscht ({int((time.time()-t_del)*1000)}ms)")
             
             # Paritäts-Cleanup: Manifest löschen wenn Remote-Snapshot gelöscht wird
             manifest_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
@@ -2712,7 +2751,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             if os.path.exists(manifest_file):
                 try:
                     os.remove(manifest_file)
-                    print(f"[retention] Manifest gelöscht: {sdel}.json")
+                    print(f"[retention] Lokales Manifest gelöscht: {sdel}.json")
                 except Exception as e:
                     print(f"[warn] Konnte Manifest nicht löschen: {manifest_file} ({e})", file=sys.stderr)
 
@@ -2721,11 +2760,17 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
         print(f"[warn] retention: Index NICHT geschrieben wegen Blocker(n) in einem oder mehreren Snapshots")
     else:
         if ret_index_changed:
+            print(f"[retention] API-Call: Content-Index schreiben (write_json_to_folderid)...")
+            t_idx_save = time.time()
             _save_index(snapshots_root, idx, simulate=dry)
+            print(f"[retention] Content-Index geschrieben ({int((time.time()-t_idx_save)*1000)}ms)")
         else:
-            print("[retention] no index changes")
+            print("[retention] Keine Index-Änderungen - kein Schreiben notwendig")
     # === ENDE NEU ===
 
+    print(f"[retention] === RETENTION ABGESCHLOSSEN ===")
+    print(f"[retention] Statistik: promoted={promoted}, removed_nodes={removed_nodes}")
+    
     if os.environ.get("PCLOUD_TIMING") == "1":
         print(f"[timing] retention: stubs_ms={int(ret_stub_ms)} index_ms={int(ret_index_write_ms)} stubs_written={ret_stub_writes}")
 
@@ -3447,11 +3492,33 @@ def main() -> None:
 
     # Optional: Retention-Sync NACH Upload (nicht kritisch, darf Upload nicht blockieren)
     if args.retention_sync and args.snapshot_mode == "1to1":
+        print("")
+        print("="*80)
+        print("RETENTION-SYNC Phase gestartet")
+        print("="*80)
         local_snaps = list_local_snapshot_names(manifest["root"])
+        print(f"Lokale Snapshots: {len(local_snaps)}")
         try:
+            t_retention = time.time()
             retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
+            retention_duration = time.time() - t_retention
+            print("="*80)
+            print(f"RETENTION-SYNC abgeschlossen ({retention_duration:.1f}s)")
+            print("="*80)
+            print("")
         except Exception as _ret_exc:
             _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch): {_ret_exc}")
+            print("="*80)
+            print(f"RETENTION-SYNC FEHLER: {_ret_exc}")
+            print("="*80)
+            print("")
+    else:
+        if args.snapshot_mode == "1to1":
+            print("")
+            print("="*80)
+            print("RETENTION-SYNC übersprungen (--retention-sync nicht gesetzt)")
+            print("="*80)
+            print("")
 
     # --- metrics summary (einheitlich, greppbar) ---
     try:
