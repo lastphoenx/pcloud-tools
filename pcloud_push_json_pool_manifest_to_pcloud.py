@@ -3735,8 +3735,210 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         pc.write_json_to_folderid(cfg, folderid=marker_fid, filename=".upload_started", obj=marker_data, minify=True)
         _log(f"[pool-mode] Started-Marker gesetzt: {marker_started}")
     
-    # === WIE ORIGINAL: Files klassifizieren nach Größe ===
+    # ============================================================================
+    # === PHASE 1: FOLDER CREATION (wie Original 1to1_mode!) ===
+    # ============================================================================
+    _log("[pool-mode] Phase 1: Ordnerstruktur anlegen...")
+    t_folder_start = time.time()
+    
+    # Manifest-Ordner sammeln (was sein SOLLTE)
     items = manifest.get("items", [])
+    manifest_folders = set()
+    for it in items:
+        if it.get("type") == "dir":
+            relpath = it.get("relpath", "").rstrip("/")
+            if relpath:  # Filter leere Strings (Root-Verzeichnis)
+                manifest_folders.add(relpath)
+    
+    _log(f"[pool-mode] Manifest hat {len(manifest_folders)} Ordner")
+    
+    # Template-Pfade (für Pool-Mode)
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    _FOLDER_TEMPLATE_DIRNAME = "_folder_template"
+    template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
+    
+    # Prüfe ob Template existiert
+    template_exists = False
+    template_force_active = os.environ.get("PCLOUD_FOLDER_TEMPLATE_FORCE", "0") == "1"
+    
+    if not dry:
+        try:
+            template_md = pc.stat_file(cfg, path=template_path, with_checksum=False)
+            template_exists = bool(template_md and template_md.get("isfolder"))
+        except Exception:
+            pass
+    
+    # Hilfsfunktion für Ordner-Erstellung (analog zu Original)
+    def _ensure_folder(path: str):
+        """Wrapper für ensure_path mit call_with_backoff"""
+        return pc.call_with_backoff(pc.ensure_path, cfg, path)
+    
+    # Entscheidung: Template nutzen oder Einzeln anlegen?
+    template_used = False
+    
+    if template_exists and template_force_active and not dry:
+        # === Template-basierte Anlage (SCHNELL!) ===
+        _log(f"[pool-mode] Nutze Template: {template_path}")
+        try:
+            # 1. Template-Ordner laden
+            _log("[pool-mode] Lade Template-Struktur...")
+            template_folders = set()
+            try:
+                result = pc.call_with_backoff(pc.listfolder, cfg, path=template_path, recursive=True, nofiles=True)
+                def _collect_folders(obj, parent_path=""):
+                    if isinstance(obj, dict) and obj.get("isfolder"):
+                        folder_name = obj.get("name", "")
+                        folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
+                        template_folders.add(folder_path)
+                        for child in obj.get("contents") or []:
+                            _collect_folders(child, folder_path)
+                metadata = result.get("metadata") or {}
+                for child in metadata.get("contents") or []:
+                    _collect_folders(child, "")
+                _log(f"[pool-mode] Template hat {len(template_folders)} Ordner")
+            except Exception as e:
+                _log(f"[warn] Template-Laden fehlgeschlagen: {e}")
+                raise
+            
+            # 2. Diff berechnen
+            to_add = manifest_folders - template_folders
+            to_delete = template_folders - manifest_folders
+            shared = manifest_folders & template_folders
+            
+            overlap_pct = len(shared)/len(manifest_folders)*100 if manifest_folders else 0
+            _log(f"[pool-mode] Überlapp: {len(shared)}/{len(manifest_folders)} ({overlap_pct:.0f}%)")
+            _log(f"[pool-mode] Delta: +{len(to_add)} neue, -{len(to_delete)} überflüssige")
+            
+            # 3. Template kopieren (1 API-Call!)
+            _log(f"[pool-mode] Kopiere Template → {snapshot_name}...")
+            dest_snapshot_fid = _ensure_folder(dest_snapshot_dir)
+            pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_folderid=dest_snapshot_fid, noover=True, copycontentonly=True)
+            _log("[pool-mode] ✓ Template kopiert (~2-5s statt ~5min)")
+            template_used = True
+            
+            # 4. Überflüssige Ordner löschen (tiefste zuerst)
+            if to_delete:
+                _log(f"[pool-mode] Lösche {len(to_delete)} überflüssige Ordner...")
+                deleted = 0
+                for relpath in sorted(to_delete, key=lambda p: -p.count("/")):
+                    try:
+                        pc.call_with_backoff(pc.delete_folder, cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=False)
+                        deleted += 1
+                    except Exception as e:
+                        _log(f"[warn] Konnte {relpath} nicht löschen: {e}")
+                _log(f"[pool-mode] ✓ {deleted} überflüssige Ordner gelöscht")
+            
+            # 5. Fehlende Ordner anlegen (parallel mit PCLOUD_FOLDER_THREADS)
+            if to_add:
+                from collections import defaultdict
+                _log(f"[pool-mode] Lege {len(to_add)} fehlende Ordner an...")
+                
+                folders_by_depth = defaultdict(list)
+                for reldir in to_add:
+                    folders_by_depth[reldir.count("/")].append(reldir)
+                
+                threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
+                created = 0
+                for depth in sorted(folders_by_depth.keys()):
+                    batch = folders_by_depth[depth]
+                    if threads > 1 and len(batch) > 1:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                            results = list(ex.map(
+                                lambda p: _ensure_folder(f"{dest_snapshot_dir}/{p}"),
+                                batch
+                            ))
+                            created += len([r for r in results if r])
+                    else:
+                        for reldir in batch:
+                            _ensure_folder(f"{dest_snapshot_dir}/{reldir}")
+                            created += 1
+                _log(f"[pool-mode] ✓ {created} neue Ordner angelegt")
+            
+            # 6. Template aktualisieren (wenn Struktur sich änderte)
+            if to_add or to_delete:
+                _log("[pool-mode] Aktualisiere Template mit neuer Struktur...")
+                try:
+                    pc.call_with_backoff(pc.delete_folder, cfg, path=template_path, recursive=True)
+                    template_fid = _ensure_folder(template_path)
+                    pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
+                    _log("[pool-mode] ✓ Template aktualisiert")
+                except Exception as e:
+                    _log(f"[warn] Template-Update fehlgeschlagen: {e}")
+        
+        except Exception as e:
+            _log(f"[warn] Template-Nutzung fehlgeschlagen: {e} – Fallback zu Einzeln-Anlage")
+            template_used = False
+    
+    # Fallback: Ordner einzeln anlegen (wenn kein Template oder Template-Fehler)
+    if not template_used and not dry:
+        _log("[pool-mode] Lege Ordner einzeln an (kein Template)...")
+        
+        # Remote-Ordner sammeln (was IST bereits da)
+        remote_folders = set()
+        try:
+            result = pc.call_with_backoff(pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
+            def _collect_folders(obj, parent_path=""):
+                if isinstance(obj, dict) and obj.get("isfolder"):
+                    folder_name = obj.get("name", "")
+                    folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
+                    remote_folders.add(folder_path)
+                    for child in obj.get("contents") or []:
+                        _collect_folders(child, folder_path)
+            metadata = result.get("metadata") or {}
+            for child in metadata.get("contents") or []:
+                _collect_folders(child, "")
+            _log(f"[pool-mode] {len(remote_folders)} Remote-Ordner gefunden")
+        except Exception as e:
+            if "2005" in str(e) or "not found" in str(e).lower():
+                _log("[pool-mode] Snapshot-Ordner existiert noch nicht (erstes Upload)")
+            else:
+                _log(f"[warn] listfolder fehlgeschlagen: {e}")
+        
+        # Differenz berechnen
+        missing_folders = manifest_folders - remote_folders
+        
+        if missing_folders:
+            from collections import defaultdict
+            _log(f"[pool-mode] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)")
+            
+            folders_by_depth = defaultdict(list)
+            for reldir in missing_folders:
+                folders_by_depth[reldir.count("/")].append(reldir)
+            
+            threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
+            folders_created = 0
+            
+            for depth in sorted(folders_by_depth.keys()):
+                batch = folders_by_depth[depth]
+                if threads > 1 and len(batch) > 1:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                        results = list(ex.map(
+                            lambda p: _ensure_folder(f"{dest_snapshot_dir}/{p}"),
+                            batch
+                        ))
+                        folders_created += len([r for r in results if r])
+                else:
+                    for reldir in batch:
+                        _ensure_folder(f"{dest_snapshot_dir}/{reldir}")
+                        folders_created += 1
+                
+                # Progress
+                if folders_created % 100 == 0 or folders_created == len(missing_folders):
+                    _log(f"[pool-mode] Ordner: {folders_created}/{len(missing_folders)} ({folders_created/len(missing_folders)*100:.0f}%)")
+            
+            _log(f"[pool-mode] ✓ {folders_created} Ordner angelegt")
+        else:
+            _log("[pool-mode] Alle Ordner existieren bereits")
+    
+    folder_duration = time.time() - t_folder_start
+    _log(f"[pool-mode] Phase 1 abgeschlossen: Ordnerstruktur ({folder_duration:.1f}s)")
+    
+    # ============================================================================
+    # === PHASE 2: FILE UPLOAD (klein parallel, groß sequentiell) ===
+    # ============================================================================
+    _log("[pool-mode] Phase 2: File-Upload...")
+    
+    # === WIE ORIGINAL: Files klassifizieren nach Größe ===
     file_items = [it for it in items if it.get("type") == "file" and it.get("sha256")]
     
     # Klein/Groß-Trennung (wie im Original)
@@ -3762,10 +3964,10 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     skipped_count = 0
     error_count = 0
     
-    # === PHASE 1: Kleine Dateien PARALLEL hochladen ===
+    # === PHASE 2a: Kleine Dateien PARALLEL hochladen ===
     if small_files:
         max_workers = int(os.environ.get("PCLOUD_POOL_WORKERS", "8"))
-        _log(f"[pool-mode] Phase 1: {len(small_files)} kleine Dateien mit {max_workers} Workers...")
+        _log(f"[pool-mode] Phase 2a: {len(small_files)} kleine Dateien mit {max_workers} Workers...")
         t_small_start = time.time()
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -3812,12 +4014,12 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     last_progress = now
         
         duration_small = time.time() - t_small_start
-        _log(f"[pool-mode] Phase 1 abgeschlossen: {len(small_files)} Files in {duration_small:.1f}s "
+        _log(f"[pool-mode] Phase 2a abgeschlossen: {len(small_files)} Files in {duration_small:.1f}s "
              f"({len(small_files)/duration_small:.1f} files/s)")
     
-    # === PHASE 2: Große Dateien SEQUENTIELL hochladen (volle Bandbreite!) ===
+    # === PHASE 2b: Große Dateien SEQUENTIELL hochladen (volle Bandbreite!) ===
     if large_files:
-        _log(f"[pool-mode] Phase 2: {len(large_files)} große Dateien sequentiell...")
+        _log(f"[pool-mode] Phase 2b: {len(large_files)} große Dateien sequentiell...")
         t_large_start = time.time()
         
         for i, f in enumerate(large_files, 1):
@@ -3848,7 +4050,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 error_count += 1
         
         duration_large = time.time() - t_large_start
-        _log(f"[pool-mode] Phase 2 abgeschlossen: {len(large_files)} Files in {duration_large:.1f}s "
+        _log(f"[pool-mode] Phase 2b abgeschlossen: {len(large_files)} Files in {duration_large:.1f}s "
              f"({duration_large/len(large_files):.1f} s/file)")
     
     # === PHASE 3: BATCH-WRITE STUBS (wie im Original!) ===
