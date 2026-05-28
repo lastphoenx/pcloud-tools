@@ -3440,6 +3440,47 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
 # POOL-MODE FUNCTIONS (NEW)
 # ============================================================================
 
+# Thread-safe Stats für Pool-Mode
+class _PoolStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.uploaded = 0
+        self.stubs = 0
+        self.skipped = 0
+        self.errors = 0
+        self.processed = 0
+    
+    def inc_uploaded(self):
+        with self.lock:
+            self.uploaded += 1
+    
+    def inc_stubs(self):
+        with self.lock:
+            self.stubs += 1
+    
+    def inc_skipped(self):
+        with self.lock:
+            self.skipped += 1
+    
+    def inc_errors(self):
+        with self.lock:
+            self.errors += 1
+    
+    def inc_processed(self):
+        with self.lock:
+            self.processed += 1
+    
+    def get_stats(self) -> dict:
+        with self.lock:
+            return {
+                "uploaded": self.uploaded,
+                "stubs": self.stubs,
+                "skipped": self.skipped,
+                "errors": self.errors,
+                "processed": self.processed,
+            }
+
+
 def _get_pool_path(sha256: str) -> str:
     """
     Berechnet Pool-Pfad aus SHA256.
@@ -3570,6 +3611,87 @@ def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict
         _log(f"[stub] ✓ {stub_path}")
 
 
+def _process_pool_item(
+    cfg: dict,
+    file_item: dict,
+    dest_snapshot_dir: str,
+    seen_inodes: dict,
+    stats: _PoolStats,
+    dry: bool = False
+) -> None:
+    """
+    Verarbeitet ein einzelnes File-Item (Worker-Funktion für ThreadPool).
+    
+    Thread-safe durch:
+    - cfg ist read-only
+    - seen_inodes hat eigenen Lock
+    - stats hat eigenen Lock
+    - pCloud API calls sind thread-safe (REST)
+    """
+    relpath = file_item.get("relpath")
+    sha256 = file_item.get("sha256", "").lower()
+    abs_src = file_item.get("source_path")
+    
+    if not relpath or not sha256 or not abs_src:
+        if os.environ.get("PCLOUD_VERBOSE") == "1":
+            _log(f"[pool-worker][warn] Skip {relpath} (missing data)")
+        stats.inc_errors()
+        return
+    
+    # Hardlink-Check (lokale Dedupe)
+    ino_data = file_item.get("inode")
+    cached_result = None
+    
+    if ino_data and isinstance(ino_data, dict):
+        dev = ino_data.get("dev")
+        ino = ino_data.get("ino")
+        key = (dev, ino) if (dev and ino) else None
+        
+        if key:
+            # Thread-safe Lookup
+            with seen_inodes["lock"]:
+                cached_result = seen_inodes["data"].get(key)
+    
+    if cached_result:
+        # Hardlink zu bereits verarbeitetem File → nur Stub
+        cached_sha, cached_fileid, cached_hash = cached_result
+        try:
+            _write_pool_stub(cfg, dest_snapshot_dir, relpath, file_item, cached_fileid, cached_hash, dry=dry)
+            stats.inc_stubs()
+            stats.inc_skipped()
+        except Exception as e:
+            _log(f"[pool-worker][ERROR] Stub write failed for {relpath}: {e}")
+            stats.inc_errors()
+        return
+    
+    # Pool-Upload (Check ob existiert oder Upload)
+    try:
+        pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, dry=dry)
+        stats.inc_uploaded()
+    except Exception as e:
+        _log(f"[pool-worker][ERROR] Upload failed for {relpath}: {e}")
+        stats.inc_errors()
+        return
+    
+    # Stub schreiben
+    try:
+        _write_pool_stub(cfg, dest_snapshot_dir, relpath, file_item, pool_fileid, pcloud_hash, dry=dry)
+        stats.inc_stubs()
+    except Exception as e:
+        _log(f"[pool-worker][ERROR] Stub write failed for {relpath}: {e}")
+        stats.inc_errors()
+        return
+    
+    # Hardlink-Tracking (Thread-safe)
+    if ino_data and isinstance(ino_data, dict):
+        dev = ino_data.get("dev")
+        ino = ino_data.get("ino")
+        key = (dev, ino) if (dev and ino) else None
+        if key:
+            with seen_inodes["lock"]:
+                seen_inodes["data"][key] = (sha256, pool_fileid, pcloud_hash)
+
+
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False) -> dict:
     """
     POOL-MODE Upload.
@@ -3628,10 +3750,8 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         }))
         _log(f"[pool-mode] Started-Marker gesetzt: {marker_started}")
     
-    # Stats
-    uploaded = 0
-    stubs = 0
-    skipped = 0
+    # Stats (Thread-safe)
+    stats = _PoolStats()
     
     # Items filtern (nur Files mit SHA256)
     items = manifest.get("items", [])
@@ -3639,80 +3759,157 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     
     _log(f"[pool-mode] {len(file_items)} Dateien zu verarbeiten")
     
-    # Hardlink-Dedupe Tracking
-    seen_inodes = {}
+    # Hardlink-Dedupe Tracking (Thread-safe Dict mit Lock)
+    seen_inodes = {
+        "data": {},
+        "lock": threading.Lock()
+    }
     
-    # Verarbeite Files
-    for idx, file_item in enumerate(file_items, 1):
-        relpath = file_item.get("relpath")
-        sha256 = file_item.get("sha256", "").lower()
-        abs_src = file_item.get("source_path")
+    # Parallel-Verarbeitung mit ThreadPoolExecutor
+    _log("[pool-mode] Starte Parallel-Upload (8 Workers)...")
+    t_upload_start = time.time()
+    
+    max_workers = int(os.environ.get("PCLOUD_POOL_WORKERS", "8"))
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Progress-Tracking Thread
+        def progress_monitor():
+            last_report = 0
+            while True:
+                time.sleep(5)  # Report alle 5 Sekunden
+                current_stats = stats.get_stats()
+                processed = current_stats["processed"]
+                
+                if processed > last_report:
+                    elapsed = time.time() - t_upload_start
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    remaining = len(file_items) - processed
+                    eta = remaining / rate if rate > 0 else 0
+                    
+                    _log(f"[pool-mode] Progress: {processed}/{len(file_items)} "
+                         f"({processed/len(file_items)*100:.1f}%) | "
+                         f"Rate: {rate:.1f} files/s | ETA: {eta/60:.1f}min | "
+                         f"Uploaded: {current_stats['uploaded']}, Stubs: {current_stats['stubs']}, "
+                         f"Skipped: {current_stats['skipped']}, Errors: {current_stats['errors']}")
+                    last_report = processed
+                
+                # Stop wenn alle verarbeitet
+                if processed >= len(file_items):
+                    break
         
-        if not relpath or not sha256 or not abs_src:
-            _log(f"[pool-mode][warn] Skip {relpath} (missing data)")
-            continue
+        # Starte Progress-Monitor Thread
+        monitor_thread = threading.Thread(target=progress_monitor, daemon=True)
+        monitor_thread.start()
         
-        # Hardlink-Check (lokale Dedupe)
-        ino_data = file_item.get("inode")
-        if ino_data and isinstance(ino_data, dict):
-            dev = ino_data.get("dev")
-            ino = ino_data.get("ino")
-            key = (dev, ino) if (dev and ino) else None
+        # Submit alle File-Items
+        futures = []
+        for file_item in file_items:
+            future = executor.submit(
+                _process_pool_item,
+                cfg,
+                file_item,
+                dest_snapshot_dir,
+                seen_inodes,
+                stats,
+                dry
+            )
+            futures.append(future)
+        
+        # Warte auf alle Worker
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()  # Exceptions propagieren
+                stats.inc_processed()
+            except Exception as e:
+                _log(f"[pool-mode][ERROR] Worker failed: {e}")
+                stats.inc_errors()
+                stats.inc_processed()
+        
+        # Progress-Monitor beenden
+        monitor_thread.join(timeout=1)
+    
+    upload_duration = time.time() - t_upload_start
+    final_stats = stats.get_stats()
+    
+    _log(f"[pool-mode] Upload-Phase abgeschlossen ({upload_duration:.1f}s)")
+    _log(f"[pool-mode] Stats: Uploaded={final_stats['uploaded']}, Stubs={final_stats['stubs']}, "
+         f"Skipped={final_stats['skipped']}, Errors={final_stats['errors']}")
+    
+    # Content-Index Update (Pool-Referenzen tracken)
+    if not dry:
+        _log("[pool-mode] Aktualisiere Content-Index...")
+        t_index_start = time.time()
+        
+        try:
+            # Load existing index
+            index_path = f"{dest_root.rstrip('/')}/content_index.json"
+            try:
+                result = pc.download_file(cfg, remote_path=index_path)
+                index_data = json.loads(result)
+                _log(f"[pool-mode] Index geladen: {len(index_data.get('nodes', {}))} nodes")
+            except:
+                # Neuer Index
+                index_data = {
+                    "schema": 4,
+                    "mode": "pool",
+                    "snapshots": [],
+                    "nodes": {},
+                    "pool_refs": {}  # SHA256 → [snapshot1, snapshot2, ...]
+                }
+                _log("[pool-mode] Neuer Index erstellt")
             
-            if key and key in seen_inodes:
-                # Hardlink zu bereits verarbeitetem File → nur Stub
-                cached_sha, cached_fileid, cached_hash = seen_inodes[key]
-                _write_pool_stub(cfg, dest_snapshot_dir, relpath, file_item, cached_fileid, cached_hash, dry=dry)
-                stubs += 1
-                skipped += 1
-                continue
+            # Update Pool-Refs
+            pool_refs = index_data.setdefault("pool_refs", {})
+            for file_item in file_items:
+                sha256 = file_item.get("sha256", "").lower()
+                if sha256:
+                    if sha256 not in pool_refs:
+                        pool_refs[sha256] = []
+                    if snapshot_name not in pool_refs[sha256]:
+                        pool_refs[sha256].append(snapshot_name)
+            
+            # Update Snapshots-Liste
+            snapshots_list = index_data.setdefault("snapshots", [])
+            if snapshot_name not in snapshots_list:
+                snapshots_list.append(snapshot_name)
+                snapshots_list.sort()
+            
+            # Update Timestamp
+            index_data["updated_at"] = time.time()
+            index_data["updated_by"] = "push_pool_mode"
+            
+            # Upload Index
+            pc.write_json_to_folderid(cfg, json_obj=index_data, filename="content_index.json", folderid=None, path=dest_root)
+            
+            index_duration = time.time() - t_index_start
+            _log(f"[pool-mode] Content-Index aktualisiert ({index_duration:.1f}s)")
         
-        # Pool-Upload (Check ob existiert oder Upload)
-        try:
-            pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, dry=dry)
-            uploaded += 1
         except Exception as e:
-            _log(f"[pool-mode][ERROR] Upload failed for {relpath}: {e}")
-            continue
-        
-        # Stub schreiben
-        try:
-            _write_pool_stub(cfg, dest_snapshot_dir, relpath, file_item, pool_fileid, pcloud_hash, dry=dry)
-            stubs += 1
-        except Exception as e:
-            _log(f"[pool-mode][ERROR] Stub write failed for {relpath}: {e}")
-            continue
-        
-        # Hardlink-Tracking
-        if key:
-            seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
-        
-        # Progress
-        if idx % 100 == 0:
-            elapsed = time.time() - t_start
-            rate = idx / elapsed if elapsed > 0 else 0
-            eta = (len(file_items) - idx) / rate if rate > 0 else 0
-            _log(f"[pool-mode] Progress: {idx}/{len(file_items)} ({idx/len(file_items)*100:.1f}%) | "
-                 f"Rate: {rate:.1f} files/s | ETA: {eta/60:.1f}min")
+            _log(f"[pool-mode][WARN] Content-Index Update fehlgeschlagen (nicht kritisch): {e}")
     
     # Complete-Marker setzen
     if not dry:
-        pc.put_textfile(cfg, path=marker_complete, text=json.dumps({
+        marker_data = {
             "snapshot": snapshot_name,
             "completed_at": time.time(),
-            "uploaded": uploaded,
-            "stubs": stubs,
-            "skipped": skipped
-        }))
+            "uploaded": final_stats["uploaded"],
+            "stubs": final_stats["stubs"],
+            "skipped": final_stats["skipped"],
+            "errors": final_stats["errors"],
+            "duration": time.time() - t_start
+        }
+        pc.put_textfile(cfg, path=marker_complete, text=json.dumps(marker_data))
         _log(f"[pool-mode] Complete-Marker gesetzt: {marker_complete}")
     
     duration = time.time() - t_start
-    _log(f"[pool-mode] ✓ FERTIG: {uploaded} uploaded, {stubs} stubs, {skipped} skipped ({duration:.1f}s)")
+    _log(f"[pool-mode] ✓ FERTIG: {final_stats['uploaded']} uploaded, {final_stats['stubs']} stubs, "
+         f"{final_stats['skipped']} skipped, {final_stats['errors']} errors ({duration:.1f}s)")
     
     return {
-        "uploaded": uploaded,
-        "stubs": stubs,
-        "skipped": skipped,
+        "uploaded": final_stats["uploaded"],
+        "stubs": final_stats["stubs"],
+        "skipped": final_stats["skipped"],
+        "errors": final_stats["errors"],
         "duration": duration
     }
 
