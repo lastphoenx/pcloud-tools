@@ -26,13 +26,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pcloud_bin_lib as pc
 
 
-def create_test_file(size_mb=10):
+def create_test_file(size_mb=10, temp_dir="/mnt/backup"):
     """Erstellt Test-Datei mit zufälligem Content."""
     print(f"[1/6] Erstelle Test-Datei ({size_mb} MB)...")
+    print(f"    Temp-Directory: {temp_dir}")
     
-    # Temp file with random content
-    fd, path = tempfile.mkstemp(suffix=".bin", prefix="pcloud_dedup_test_")
-    with os.fdopen(fd, 'wb') as f:
+    # Test file path in temp_dir (NOT /tmp - might be too small!)
+    path = os.path.join(temp_dir, "pcloud_dedup_test.bin")
+    
+    with open(path, 'wb') as f:
         # Write random bytes (so it's compressible/dedup-testable)
         pattern = b"DEDUP_TEST_PATTERN_" * 50  # 1 KB pattern
         for _ in range(size_mb * 1024):  # size_mb × 1 MB
@@ -77,6 +79,7 @@ def main():
     ap.add_argument("--env-file", default=".env", help="Path to .env file")
     ap.add_argument("--size", type=int, default=5000, help="Test-File Größe in MB (default: 5000)")
     ap.add_argument("--copies", type=int, default=5, help="Anzahl Kopien (default: 5)")
+    ap.add_argument("--temp-dir", default="/mnt/backup", help="Temp directory for test file (default: /mnt/backup)")
     args = ap.parse_args()
     
     # Load config
@@ -88,7 +91,7 @@ def main():
     print()
     
     # Step 1: Create test file
-    test_file_path = create_test_file(args.size)
+    test_file_path = create_test_file(args.size, temp_dir=args.temp_dir)
     test_file_size = os.path.getsize(test_file_path)
     
     try:
