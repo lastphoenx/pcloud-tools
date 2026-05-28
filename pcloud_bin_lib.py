@@ -2395,12 +2395,8 @@ def call_with_backoff(func, *args, attempts: int = 5, max_sleep: float = 60.0, *
     Führt func(*args, **kwargs) mit sanftem exponentiellem Backoff aus.
     Wiederholt bei typischen temporären pCloud-Fehlern (5000/5001), Netzwerk-
     Fehlern und Rate-Limits. Bricht *nicht* bei Auth/Quota-Fehlern erneut an.
-    Wenn das erste Argument ein cfg-dict mit 'binary_max_attempts' ist,
-    wird attempts auf diesen Wert begrenzt (ermöglicht fast-fail für nicht-kritische Pfade).
     """
     import time
-    if args and isinstance(args[0], dict):
-        attempts = min(attempts, args[0].get("binary_max_attempts", attempts))
     last_exc = None
     for i in range(1, max(1, int(attempts)) + 1):
         try:
