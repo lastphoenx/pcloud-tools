@@ -106,13 +106,35 @@ def main():
         # Step 3: Upload original
         print()
         print("[3/6] Upload Original-Datei...")
+        print(f"    Größe: {format_bytes(test_file_size)}")
+        
+        # Geschätzte Upload-Dauer (basierend auf typischen pCloud Upload-Speeds)
+        # Annahme: 10-50 Mbit/s Upload-Geschwindigkeit
+        est_minutes_low = (test_file_size * 8) / (10 * 1024 * 1024) / 60  # Bei 10 Mbit/s
+        est_minutes_high = (test_file_size * 8) / (50 * 1024 * 1024) / 60  # Bei 50 Mbit/s
+        print(f"    Geschätzte Dauer: {est_minutes_low:.0f}-{est_minutes_high:.0f} Minuten")
+        print(f"    (Chunked Upload: 5 MB Chunks)")
+        print()
+        print("    Upload läuft... (bitte warten, kein Fortschrittsbalken)")
+        
         test_dir = "/test_dedup_experiment"
         pc.ensure_path(cfg, test_dir)
         original_path = f"{test_dir}/original.bin"
         
+        import time
+        start_upload = time.time()
+        
         # Upload via upload_file function
         pc.upload_file(cfg, local_path=test_file_path, remote_path=original_path)
-        print(f"    ✓ Hochgeladen: {original_path}")
+        
+        upload_duration = time.time() - start_upload
+        upload_speed_mbps = (test_file_size * 8) / upload_duration / (1024 * 1024)
+        
+        print()
+        print(f"    ✓ Upload abgeschlossen!")
+        print(f"    Dauer: {upload_duration:.1f}s ({upload_duration/60:.1f} Minuten)")
+        print(f"    Speed: {upload_speed_mbps:.1f} Mbit/s")
+        print(f"    Pfad: {original_path}")
         
         # Get fileid
         stat_result = pc._rest_get(cfg, "stat", {"path": original_path})
