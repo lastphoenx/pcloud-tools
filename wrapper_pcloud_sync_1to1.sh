@@ -746,9 +746,9 @@ fi
 GAP_STRATEGY=${PCLOUD_GAP_STRATEGY:-optimistic}  # conservative|optimistic|aggressive
 
 for s in "${local_snaps[@]}"; do
-  # Erlaube Snapshots, die älter oder gleich dem Target sind (Gap-Backfill)
-  # Überspringe nur Snapshots, die wirklich neuer als das Target sind
-  if [[ -n "$TARGET_SNAPSHOT" && "$s" > "$TARGET_SNAPSHOT" ]]; then
+  # TARGET_SNAPSHOT ist nur eine Mindestvorgabe (wo anfangen), kein Maximum (wo aufhören)!
+  # Überspringe Snapshots, die ÄLTER als das Target sind (wurden bereits verarbeitet)
+  if [[ -n "$TARGET_SNAPSHOT" && "$s" < "$TARGET_SNAPSHOT" ]]; then
     continue
   fi
 
