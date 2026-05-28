@@ -746,12 +746,13 @@ fi
 GAP_STRATEGY=${PCLOUD_GAP_STRATEGY:-optimistic}  # conservative|optimistic|aggressive
 
 for s in "${local_snaps[@]}"; do
-  # TARGET_SNAPSHOT ist nur eine Mindestvorgabe (wo anfangen), kein Maximum (wo aufhören)!
-  # Überspringe Snapshots, die ÄLTER als das Target sind (wurden bereits verarbeitet)
-  if [[ -n "$TARGET_SNAPSHOT" && "$s" < "$TARGET_SNAPSHOT" ]]; then
-    continue
-  fi
-
+  # Gap-Detection: Lade nur hoch was wirklich fehlt (remote_cached check)
+  # KEIN TARGET_SNAPSHOT Filter mehr - Gap-Detection macht alles automatisch richtig:
+  # - Alle lokalen Snapshots durchgehen
+  # - Prüfe ob remote vorhanden (via cached list)
+  # - Fehlende = Gaps → Upload
+  # - Loop läuft bis neuester Snapshot erreicht (= Gap geschlossen)
+  
   if [[ "$(is_remote_cached "$s")" == "NO" ]]; then
     # Gap-Erkennung: Gibt es einen SPÄTEREN Snapshot, der remote existiert?
     is_gap=0
