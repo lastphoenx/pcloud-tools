@@ -3934,6 +3934,168 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
 
 
 # ==============================================================================
+# LOCK-FILE MANAGEMENT (Race-Condition Protection)
+# ==============================================================================
+
+def create_gc_lock(cfg: dict, dest_root: str, snapshot_name: str, *, dry: bool = False) -> None:
+    """
+    Erstellt GC-Lock-File um parallele GC-Läufe während Backup zu verhindern.
+    
+    Lock-File: {dest_root}/.gc_lock
+    Format: JSON mit Metadaten (pid, host, started_at, snapshot)
+    
+    Dieses Lock verhindert dass GC Files löscht die gerade hochgeladen werden!
+    
+    Args:
+        cfg: pCloud Config
+        dest_root: Remote Root (z.B. /Backup/rtb_1to1)
+        snapshot_name: Snapshot-Name (für Debugging)
+        dry: Dry-run Mode
+    """
+    if dry:
+        _log("[dry] create_gc_lock: Skip (dry-run)")
+        return
+    
+    import socket
+    
+    lock_path = f"{dest_root.rstrip('/')}/.gc_lock"
+    lock_data = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "started_at": time.time(),
+        "snapshot": snapshot_name,
+        "task": "push_pool_manifest"
+    }
+    
+    try:
+        pc.write_json_at_path(cfg, lock_path, lock_data)
+        _log(f"[gc-lock] ✓ Lock erstellt: {lock_path}")
+    except Exception as e:
+        _log(f"[gc-lock][WARN] Konnte Lock nicht erstellen: {e}")
+
+
+def remove_gc_lock(cfg: dict, dest_root: str, *, dry: bool = False) -> None:
+    """
+    Entfernt GC-Lock-File nach erfolgreichem Backup.
+    
+    Args:
+        cfg: pCloud Config
+        dest_root: Remote Root
+        dry: Dry-run Mode
+    """
+    if dry:
+        _log("[dry] remove_gc_lock: Skip (dry-run)")
+        return
+    
+    lock_path = f"{dest_root.rstrip('/')}/.gc_lock"
+    
+    try:
+        # Prüfe ob Lock existiert
+        lock_stat = pc.stat_file_safe(cfg, path=lock_path)
+        
+        if lock_stat:
+            pc.delete_file(cfg, path=lock_path)
+            _log(f"[gc-lock] ✓ Lock entfernt: {lock_path}")
+        else:
+            _log(f"[gc-lock] Lock existiert nicht (bereits entfernt?)")
+    
+    except Exception as e:
+        _log(f"[gc-lock][WARN] Konnte Lock nicht entfernen: {e}")
+
+
+# ==============================================================================
+# SOURCE-INTEGRITY VALIDATION (Pre-Upload Check)
+# ==============================================================================
+
+def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tuple[bool, list]:
+    """
+    PRE-UPLOAD CHECK: Validiert dass alle Files aus Manifest in Source existieren.
+    
+    KRITISCH: Verhindert dass Manifest auf gelöschte/verschobene Source-Files zeigt!
+    
+    Checks:
+    1. File existiert noch? (os.path.exists)
+    2. Optional: Hash stimmt überein? (--deep-check, langsam!)
+    
+    Args:
+        manifest: Manifest Dict
+        deep_check: Hash-Verifikation aktivieren (langsam!)
+    
+    Returns:
+        (is_valid, errors)
+    """
+    _log("[source-integrity] Pre-Upload Source-Check...")
+    t_start = time.time()
+    errors = []
+    
+    manifest_files = [it for it in manifest.get("items", []) if it.get("type") == "file"]
+    total_files = len(manifest_files)
+    
+    if total_files == 0:
+        _log("[source-integrity] ✓ Keine Files zu prüfen")
+        return (True, [])
+    
+    _log(f"[source-integrity] Prüfe {total_files} Files...")
+    
+    checked = 0
+    missing = 0
+    hash_mismatch = 0
+    
+    for item in manifest_files:
+        source_path = item.get("source_path")
+        expected_sha256 = item.get("sha256")
+        relpath = item.get("relpath", "?")
+        
+        if not source_path:
+            errors.append(f"Manifest-Fehler: Kein source_path für {relpath}")
+            continue
+        
+        # Check 1: File existiert?
+        if not os.path.exists(source_path):
+            missing += 1
+            errors.append(f"Source-File fehlt: {relpath} ({source_path})")
+            continue
+        
+        # Check 2: Optional Deep-Check (Hash-Verifikation)
+        if deep_check and expected_sha256:
+            import hashlib
+            
+            try:
+                with open(source_path, "rb") as f:
+                    actual_sha256 = hashlib.sha256(f.read()).hexdigest().lower()
+                
+                if actual_sha256 != expected_sha256.lower():
+                    hash_mismatch += 1
+                    errors.append(f"Source-File geändert: {relpath} (Hash-Mismatch!)")
+                    errors.append(f"  Expected: {expected_sha256}")
+                    errors.append(f"  Actual:   {actual_sha256}")
+            
+            except Exception as e:
+                errors.append(f"Hash-Check fehlgeschlagen für {relpath}: {e}")
+        
+        checked += 1
+    
+    duration = time.time() - t_start
+    
+    # Result
+    if errors:
+        _log(f"[source-integrity] ❌ {len(errors)} Fehler gefunden!")
+        _log(f"[source-integrity]    Missing: {missing}, Hash-Mismatches: {hash_mismatch}")
+        
+        for err in errors[:10]:  # Erste 10 zeigen
+            _log(f"[source-integrity]   {err}")
+        if len(errors) > 10:
+            _log(f"[source-integrity]   ... und {len(errors)-10} weitere")
+        
+        return (False, errors)
+    else:
+        _log(f"[source-integrity] ✓✓✓ Alle {checked} Files vorhanden ({duration:.1f}s)")
+        if deep_check:
+            _log(f"[source-integrity] ✓ Deep-Check: Alle Hashes korrekt")
+        return (True, [])
+
+
+# ==============================================================================
 # SCOUT & TURBO-DELTA-MODE (Best Match Scout Konzept)
 # ==============================================================================
 
@@ -4421,31 +4583,75 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     _log(f"[pool-mode] Pool: {pool_root}")
     _log(f"[pool-mode] Snapshot-Dir: {dest_snapshot_dir}")
     
-    # === SCOUT: Best-Match Basis-Snapshot finden ===
-    scout_enabled = os.environ.get("PCLOUD_SCOUT_ENABLED", "1") != "0"
-    scout_threshold = float(os.environ.get("PCLOUD_SCOUT_THRESHOLD", "0.70"))
+    # ============================================================================
+    # === PRE-FLIGHT CHECKS (Source-Integrity + GC-Lock) ===
+    # ============================================================================
     
-    if scout_enabled:
-        _log("[pool-mode] Scout: Suche besten Basis-Snapshot...")
-        basis_snapshot, similarity = scout_best_pool_basis(cfg, manifest, archive_dir)
+    # === 1. SOURCE-INTEGRITY-CHECK (Pre-Upload) ===
+    deep_check = os.environ.get("PCLOUD_SOURCE_DEEP_CHECK") == "1"
+    
+    is_valid, integrity_errors = validate_source_integrity(manifest, deep_check=deep_check)
+    
+    if not is_valid:
+        _log(f"[ERROR] Source-Integrity-Check fehlgeschlagen! ({len(integrity_errors)} Fehler)")
+        _log(f"[ERROR] Backup abgebrochen (Source inkonsistent)")
+        return {
+            "error": "source_integrity_failed",
+            "errors": integrity_errors,
+            "uploaded": 0,
+            "stubs": 0
+        }
+    
+    # === 2. GC-LOCK erstellen (Race-Protection) ===
+    try:
+        create_gc_lock(cfg, dest_root, snapshot_name, dry=dry)
+    except Exception as e:
+        _log(f"[WARN] Konnte GC-Lock nicht erstellen: {e} - fahre trotzdem fort")
+    
+    # Cleanup-Helper für Lock-Removal
+    def _cleanup_lock():
+        """Entfernt Lock auch bei Fehler"""
+        try:
+            remove_gc_lock(cfg, dest_root, dry=dry)
+        except Exception as e:
+            _log(f"[WARN] Lock-Cleanup fehlgeschlagen: {e}")
+    
+    # Registriere Cleanup für Exception-Fälle
+    import atexit
+    atexit.register(_cleanup_lock)
+    
+    try:
+        # === Ab hier: Eigentlicher Upload-Code (Lock aktiv!) ===
         
-        if basis_snapshot and similarity >= scout_threshold:
-            _log(f"[pool-mode] ✓ Scout Match: {basis_snapshot} ({similarity*100:.1f}%)")
-            _log(f"[pool-mode] → Nutze Turbo-Delta-Mode!")
+        # === SCOUT: Best-Match Basis-Snapshot finden ===
+        scout_enabled = os.environ.get("PCLOUD_SCOUT_ENABLED", "1") != "0"
+        scout_threshold = float(os.environ.get("PCLOUD_SCOUT_THRESHOLD", "0.70"))
+        
+        if scout_enabled:
+            _log("[pool-mode] Scout: Suche besten Basis-Snapshot...")
+            basis_snapshot, similarity = scout_best_pool_basis(cfg, manifest, archive_dir)
             
-            # Delegation an push_pool_delta_mode
-            return push_pool_delta_mode(
-                cfg, manifest, dest_root, basis_snapshot,
-                dry=dry, verbose=verbose
-            )
-        else:
-            if basis_snapshot:
-                _log(f"[pool-mode] Scout Best: {basis_snapshot} ({similarity*100:.1f}%) - unter Schwelle ({scout_threshold*100:.0f}%)")
+            if basis_snapshot and similarity >= scout_threshold:
+                _log(f"[pool-mode] ✓ Scout Match: {basis_snapshot} ({similarity*100:.1f}%)")
+                _log(f"[pool-mode] → Nutze Turbo-Delta-Mode!")
+                
+                # Delegation an push_pool_delta_mode
+                result = push_pool_delta_mode(
+                    cfg, manifest, dest_root, basis_snapshot,
+                    dry=dry, verbose=verbose
+                )
+                
+                # Lock entfernen vor Return
+                _cleanup_lock()
+                return result
             else:
-                _log(f"[pool-mode] Scout: Kein Basis gefunden")
-            _log(f"[pool-mode] → Fallback zu Full-Pool-Mode")
-    else:
-        _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
+                if basis_snapshot:
+                    _log(f"[pool-mode] Scout Best: {basis_snapshot} ({similarity*100:.1f}%) - unter Schwelle ({scout_threshold*100:.0f}%)")
+                else:
+                    _log(f"[pool-mode] Scout: Kein Basis gefunden")
+                _log(f"[pool-mode] → Fallback zu Full-Pool-Mode")
+        else:
+            _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
     
     # === Timeout-Protection (wie Original!) ===
     if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
@@ -5310,15 +5516,19 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     _log(f"[pool-mode] Upload abgeschlossen: {uploaded} new anchors, {resumed} reused anchors, {stubs} stubs queued ({total_duration:.1f}s)")
     _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)} ensure_ms={int(ensure_ms)}")
     
-    return {
-        "uploaded": uploaded,
-        "resumed": resumed,
-        "stubs": stubs,
-        "duration": total_duration,
-        "upload_ms": upload_ms,
-        "write_ms": write_ms,
-        "ensure_ms": ensure_ms
-    }
+        return {
+            "uploaded": uploaded,
+            "resumed": resumed,
+            "stubs": stubs,
+            "duration": total_duration,
+            "upload_ms": upload_ms,
+            "write_ms": write_ms,
+            "ensure_ms": ensure_ms
+        }
+    
+    finally:
+        # === CLEANUP: GC-Lock IMMER entfernen (auch bei Fehler!) ===
+        _cleanup_lock()
 
 
 def retention_pool_mode(cfg: dict, dest_root: str, *, local_snaps: Optional[list] = None, dry: bool = False) -> None:
