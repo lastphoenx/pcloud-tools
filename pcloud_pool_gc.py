@@ -353,6 +353,47 @@ def run_pool_gc(
     _log(f"[gc] Grace Period: {grace_hours}h")
     _log(f"[gc] Dry-Run: {dry}")
     
+    # ============================================================================
+    # === GC-LOCK CHECK (Race-Protection gegen parallel laufende Backups!) ===
+    # ============================================================================
+    lock_path = f"{dest_root}/.gc_lock"
+    stale_lock_hours = int(os.environ.get("PCLOUD_GC_STALE_LOCK_HOURS", "48"))
+    
+    try:
+        lock_content = pc.get_textfile(cfg, path=lock_path)
+        lock_data = json.loads(lock_content)
+        
+        # Lock-Alter berechnen
+        lock_age_seconds = time.time() - lock_data.get("started_at", 0)
+        lock_age_hours = lock_age_seconds / 3600
+        
+        _log(f"[gc] ⚠️ GC-Lock erkannt!")
+        _log(f"[gc]    Snapshot: {lock_data.get('snapshot', '?')}")
+        _log(f"[gc]    Host: {lock_data.get('host', '?')}")
+        _log(f"[gc]    PID: {lock_data.get('pid', '?')}")
+        _log(f"[gc]    Alter: {lock_age_hours:.1f}h")
+        
+        # Stale-Lock Check
+        if lock_age_hours < stale_lock_hours:
+            # Lock ist frisch → Backup läuft!
+            _log(f"[gc] ❌ ABBRUCH: Backup läuft (Lock < {stale_lock_hours}h alt)")
+            _log(f"[gc]    Warte bis Backup abgeschlossen ist, dann versuche erneut")
+            return {
+                "error": "backup_in_progress",
+                "lock_age_hours": lock_age_hours,
+                "snapshot": lock_data.get("snapshot"),
+                "aborted": True
+            }
+        else:
+            # Lock ist stale → Backup wahrscheinlich crashed
+            _log(f"[gc] ⚠️ STALE LOCK erkannt (>{stale_lock_hours}h alt)")
+            _log(f"[gc]    Annahme: Backup-Prozess abgestürzt, fahre mit GC fort")
+            _log(f"[gc]    Lock wird ignoriert (nicht gelöscht für Debugging)")
+    
+    except Exception:
+        # Kein Lock vorhanden → alles ok!
+        _log(f"[gc] ✓ Kein GC-Lock gefunden, fahre fort")
+    
     # Stats
     stats = _GCStats()
     
