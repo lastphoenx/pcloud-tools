@@ -3771,12 +3771,17 @@ def _process_pool_item(
 
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
-    Post-Upload Konsistenz-Check für Pool-Mode Snapshots.
+    Post-Upload Konsistenz-Check für Pool-Mode Snapshots (NEUE IMPLEMENTATION).
     
-    Prüft:
-    1. Alle .meta.json Stubs existieren in pCloud
-    2. Alle Pool-Dateien (SHA256) existieren
-    3. Holders-Konsistenz (Index <-> Manifest)
+    Strategie (ULTRA-EFFIZIENT):
+    1. Pool-Full-Check: listfolder(/_pool) → ALLE SHA256s in ~2-5s (1 API-Call!)
+    2. Set-Diff: manifest_sha256s - pool_sha256s = missing_files
+    3. Pool-Refs-Check: Snapshot in index["pool_refs"] für alle SHA256s?
+    4. Optional: Stub-Stichprobe (konfigurierbar via PCLOUD_VALIDATE_STUB_SAMPLE)
+    
+    Warum besser als alte Stichproben-Methode?
+    - Alte Methode: 100× stat_file() = ~10s, nur 0.1% Coverage
+    - Neue Methode: 1× listfolder() = ~2-5s, 100% Coverage!
     
     Args:
         cfg: pCloud Config
@@ -3789,7 +3794,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     Returns:
         (is_valid, errors) - True wenn alles ok, sonst Liste mit Fehlern
     """
-    _log(f"[validate] Starte Integritäts-Check für {snapshot_dir}...")
+    _log(f"[validate] Starte Full-Integritäts-Check für {snapshot_dir}...")
     errors = []
     snapshot_name = manifest.get("snapshot", "?")
     
@@ -3797,81 +3802,134 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         _log("[validate] Überspringe Validation (dry-run)")
         return (True, [])
     
-    # Sample-Check (nicht alle 100k+ Dateien prüfen, sondern Stichprobe!)
+    # === 1. MANIFEST-SHA256s sammeln ===
     manifest_items = [item for item in manifest.get("items", []) if item.get("type") == "file"]
+    manifest_sha256s = {
+        (item.get("sha256") or "").lower()
+        for item in manifest_items
+        if item.get("sha256")
+    }
+    
     total_files = len(manifest_items)
+    total_unique_sha256s = len(manifest_sha256s)
     
-    # Validiere maximal 100 Dateien (repräsentativ!)
-    import random
-    sample_size = min(100, total_files)
-    sample_items = random.sample(manifest_items, sample_size) if total_files > sample_size else manifest_items
+    _log(f"[validate] Manifest: {total_files} Files, {total_unique_sha256s} unique SHA256s")
     
-    _log(f"[validate] Prüfe {sample_size} von {total_files} Dateien (Stichprobe)")
+    # === 2. POOL-SHA256s via listfolder (FULL-CHECK in 1 API-Call!) ===
+    _log(f"[validate] Lade Pool-Struktur via listfolder({pool_root})...")
+    t_pool_start = time.time()
     
-    checked_stubs = 0
-    checked_pool = 0
-    
-    for item in sample_items:
-        relpath = item.get("relpath")
-        sha256 = item.get("sha256", "").lower()
+    try:
+        # Rekursives listfolder über kompletten Pool
+        result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
         
-        if not relpath or not sha256:
-            continue
+        # SHA256s aus Pool-Pfaden extrahieren
+        pool_sha256s = set()
         
-        # 1. Stub-Check
-        stub_path = f"{snapshot_dir}/{relpath}.meta.json"
-        try:
-            stub_stat = stat_file_safe(cfg, path=stub_path)
-            if not stub_stat:
-                errors.append(f"Stub fehlt: {relpath}")
-            else:
-                checked_stubs += 1
-        except Exception as e:
-            errors.append(f"Stub-Check fehlgeschlagen für {relpath}: {e}")
+        def _extract_sha256s_from_tree(obj, parent_path=""):
+            """Rekursiv SHA256s aus listfolder-Tree extrahieren"""
+            if isinstance(obj, dict):
+                # File gefunden
+                if not obj.get("isfolder") and obj.get("name"):
+                    filename = obj.get("name")
+                    # Pool-Files sind benannt als: SHA256 (z.B. "abc123def456...")
+                    # Validiere: muss 64 Hex-Zeichen sein
+                    if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
+                        pool_sha256s.add(filename.lower())
+                
+                # Ordner: Rekursiv in Contents
+                for child in obj.get("contents", []):
+                    _extract_sha256s_from_tree(child, parent_path)
         
-        # 2. Pool-Check
-        pool_path = _get_pool_path(sha256)
-        try:
-            pool_stat = stat_file_safe(cfg, path=pool_path)
-            if not pool_stat:
-                errors.append(f"Pool-Datei fehlt: {sha256[:16]}...")
-            else:
-                checked_pool += 1
-        except Exception as e:
-            errors.append(f"Pool-Check fehlgeschlagen für {sha256[:16]}: {e}")
-    
-    # 3. Index-Holders-Check (für alle Dateien im Manifest)
-    holders_ok = 0
-    for item in manifest_items:
-        sha256 = (item.get("sha256") or "").lower()
-        if not sha256:
-            continue
+        metadata = result.get("metadata", {})
+        _extract_sha256s_from_tree(metadata)
         
-        node = index.get("items", {}).get(sha256)
-        if node:
-            holders = node.get("holders", [])
-            has_snapshot = any(
-                isinstance(h, dict) and h.get("snapshot") == snapshot_name
-                for h in holders
-            )
-            if has_snapshot:
-                holders_ok += 1
-            else:
-                errors.append(f"Index fehlt Holder für SHA256 {sha256[:16]}... (Snapshot {snapshot_name})")
+        pool_duration = time.time() - t_pool_start
+        _log(f"[validate] Pool: {len(pool_sha256s)} SHA256s gefunden in {pool_duration:.2f}s")
+        
+    except Exception as e:
+        errors.append(f"Pool-listfolder fehlgeschlagen: {e}")
+        _log(f"[validate][ERROR] Konnte Pool nicht laden: {e}")
+        return (False, errors)
     
-    _log(f"[validate] Stubs: {checked_stubs}/{sample_size} ok")
-    _log(f"[validate] Pool: {checked_pool}/{sample_size} ok")
-    _log(f"[validate] Holders: {holders_ok}/{total_files} ok")
+    # === 3. DELTA-CHECK: Fehlen Files im Pool? ===
+    missing_in_pool = manifest_sha256s - pool_sha256s
     
+    if missing_in_pool:
+        errors.append(f"Pool: {len(missing_in_pool)} SHA256s fehlen")
+        for sha in list(missing_in_pool)[:10]:  # Erste 10 zeigen
+            errors.append(f"  - Pool-File fehlt: {sha[:16]}...")
+        if len(missing_in_pool) > 10:
+            errors.append(f"  ... und {len(missing_in_pool)-10} weitere")
+    else:
+        _log(f"[validate] ✓ Pool: Alle {total_unique_sha256s} SHA256s vorhanden")
+    
+    # === 4. POOL-REFS-CHECK (Index-Konsistenz) ===
+    _log(f"[validate] Prüfe Index-Konsistenz (pool_refs)...")
+    pool_refs = index.get("pool_refs", {})
+    missing_in_index = 0
+    wrong_snapshot = 0
+    
+    for sha in manifest_sha256s:
+        snapshots_for_sha = pool_refs.get(sha, [])
+        
+        if not snapshots_for_sha:
+            # SHA256 fehlt komplett im Index
+            missing_in_index += 1
+            if len(errors) < 20:  # Limit error details
+                errors.append(f"Index: SHA256 {sha[:16]}... nicht in pool_refs")
+        elif snapshot_name not in snapshots_for_sha:
+            # SHA256 im Index, aber Snapshot fehlt in der Liste
+            wrong_snapshot += 1
+            if len(errors) < 20:
+                errors.append(f"Index: SHA256 {sha[:16]}... fehlt Snapshot {snapshot_name} (hat: {snapshots_for_sha})")
+    
+    if missing_in_index > 0:
+        errors.append(f"Index: {missing_in_index} SHA256s komplett fehlen in pool_refs")
+    if wrong_snapshot > 0:
+        errors.append(f"Index: {wrong_snapshot} SHA256s haben falschen Snapshot in pool_refs")
+    
+    if missing_in_index == 0 and wrong_snapshot == 0:
+        _log(f"[validate] ✓ Index: Alle {total_unique_sha256s} SHA256s korrekt in pool_refs")
+    
+    # === 5. OPTIONAL: STUB-STICHPROBE ===
+    stub_sample_size = int(os.environ.get("PCLOUD_VALIDATE_STUB_SAMPLE", "100"))
+    
+    if stub_sample_size > 0 and total_files > 0:
+        import random
+        sample_size = min(stub_sample_size, total_files)
+        sample_items = random.sample(manifest_items, sample_size) if total_files > sample_size else manifest_items
+        
+        _log(f"[validate] Prüfe {sample_size} Stub-Files (Stichprobe)...")
+        checked_stubs = 0
+        
+        for item in sample_items:
+            relpath = item.get("relpath")
+            if not relpath:
+                continue
+            
+            stub_path = f"{snapshot_dir}/{relpath}.meta.json"
+            try:
+                stub_stat = pc.stat_file_safe(cfg, path=stub_path)
+                if not stub_stat:
+                    errors.append(f"Stub fehlt: {relpath}")
+                else:
+                    checked_stubs += 1
+            except Exception as e:
+                errors.append(f"Stub-Check fehlgeschlagen für {relpath}: {e}")
+        
+        _log(f"[validate] Stubs: {checked_stubs}/{sample_size} ok")
+    
+    # === RESULT ===
     if errors:
         _log(f"[validate] ❌ {len(errors)} Fehler gefunden!")
-        for err in errors[:10]:  # Erste 10 zeigen
+        for err in errors[:15]:  # Erste 15 zeigen
             _log(f"[validate]   {err}")
-        if len(errors) > 10:
-            _log(f"[validate]   ... und {len(errors)-10} weitere")
+        if len(errors) > 15:
+            _log(f"[validate]   ... und {len(errors)-15} weitere")
         return (False, errors)
     else:
-        _log(f"[validate] ✓ Snapshot konsistent ({sample_size} Dateien geprüft)")
+        _log(f"[validate] ✓✓✓ Snapshot vollständig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
         return (True, [])
 
 
