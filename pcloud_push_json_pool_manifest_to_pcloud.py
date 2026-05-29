@@ -74,8 +74,19 @@ def _ascii_safe(text: str) -> str:
 def _log(msg: str, *, file=sys.stderr) -> None:
     """Log-Ausgabe mit Timestamp"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Im Pool-Modus wollen wir oft UTF-8 (Emojis) sehen, wenn moeglich
-    if os.environ.get("PCLOUD_ASCII_LOGS", "0") == "1":
+    # Auto-Detect: Nutze ASCII-Safe wenn Terminal kein UTF-8 unterstützt
+    # User kann via PCLOUD_ASCII_LOGS=0 UTF-8 erzwingen (für moderne Terminals)
+    use_ascii = os.environ.get("PCLOUD_ASCII_LOGS", "auto")
+    if use_ascii == "auto":
+        # Auto-Detection: Prüfe ob stdout UTF-8 unterstützt
+        try:
+            use_ascii = (file.encoding or "").lower() not in ("utf-8", "utf8")
+        except:
+            use_ascii = True  # Fallback zu ASCII bei Encoding-Detection-Fehler
+    else:
+        use_ascii = (use_ascii == "1")
+    
+    if use_ascii:
         msg = _ascii_safe(msg)
     print(f"{ts} {msg}", file=file, flush=True)
 
@@ -3806,17 +3817,17 @@ def _process_pool_item(
 
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
-    Post-Upload Konsistenz-Check fÃ¼r Pool-Mode Snapshots (NEUE IMPLEMENTATION).
+    Post-Upload Konsistenz-Check für Pool-Mode Snapshots (NEUE IMPLEMENTATION).
     
     Strategie (ULTRA-EFFIZIENT):
-    1. Pool-Full-Check: listfolder(/_pool) â†’ ALLE SHA256s in ~2-5s (1 API-Call!)
+    1. Pool-Full-Check: listfolder(/_pool) → ALLE SHA256s in ~2-5s (1 API-Call!)
     2. Set-Diff: manifest_sha256s - pool_sha256s = missing_files
-    3. Pool-Refs-Check: Snapshot in index["pool_refs"] fÃ¼r alle SHA256s?
+    3. Pool-Refs-Check: Snapshot in index["pool_refs"] für alle SHA256s?
     4. Optional: Stub-Stichprobe (konfigurierbar via PCLOUD_VALIDATE_STUB_SAMPLE)
     
     Warum besser als alte Stichproben-Methode?
-    - Alte Methode: 100Ã— stat_file() = ~10s, nur 0.1% Coverage
-    - Neue Methode: 1Ã— listfolder() = ~2-5s, 100% Coverage!
+    - Alte Methode: 100× stat_file() = ~10s, nur 0.1% Coverage
+    - Neue Methode: 1× listfolder() = ~2-5s, 100% Coverage!
     
     Args:
         cfg: pCloud Config
@@ -3829,17 +3840,17 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     Returns:
         (is_valid, errors) - True wenn alles ok, sonst Liste mit Fehlern
     """
-    _log(f"[validate] Starte Full-IntegritÃ¤ts-Check fÃ¼r {snapshot_dir}...")
+    _log(f"[validate] Starte Full-Integritäts-Check für {snapshot_dir}...")
     errors = []
     snapshot_name = manifest.get("snapshot", "?")
     
     if dry:
-        _log("[validate] (dry-run) Simuliere IntegritÃ¤ts-Check...")
+        _log("[validate] (dry-run) Simuliere Integritäts-Check...")
         # Im Dry-Run tun wir so als waere alles ok, damit die Summary am Ende stimmt
         _log(f"[validate] Manifest: {len(manifest.get('items',[]))} Files")
-        _log(f"[validate] âœ“ Pool: Alle SHA256s vorhanden (simuliert)")
-        _log(f"[validate] âœ“ Index: Alle SHA256s korrekt in pool_refs (simuliert)")
-        _log(f"[validate] âœ“âœ“âœ“ Snapshot vollstÃ¤ndig konsistent (simuliert)")
+        _log(f"[validate] ✓ Pool: Alle SHA256s vorhanden (simuliert)")
+        _log(f"[validate] ✓ Index: Alle SHA256s korrekt in pool_refs (simuliert)")
+        _log(f"[validate] ✓✓✓ Snapshot vollständig konsistent (simuliert)")
         return (True, [])
     
     # === 1. MANIFEST-SHA256s sammeln ===
@@ -5718,7 +5729,7 @@ def main() -> None:
         print("="*80)
         
         if retention_schema == 4:
-            _log("cli", "Auto-Modus Retention: POOL-Manifest erkannt.")
+            _log("[cli] Auto-Modus Retention: POOL-Manifest erkannt.")
             mode = "pool"
         else:
             mode = "1to1"
