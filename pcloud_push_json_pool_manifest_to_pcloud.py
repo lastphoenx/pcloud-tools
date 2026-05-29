@@ -74,9 +74,28 @@ def _ascii_safe(text: str) -> str:
 def _log(msg: str, *, file=sys.stderr) -> None:
     """Log-Ausgabe mit Timestamp"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if os.environ.get("PCLOUD_ASCII_LOGS", "1") != "0":
+    # Im Pool-Modus wollen wir oft UTF-8 (Emojis) sehen, wenn moeglich
+    if os.environ.get("PCLOUD_ASCII_LOGS", "0") == "1":
         msg = _ascii_safe(msg)
     print(f"{ts} {msg}", file=file, flush=True)
+
+
+class DryRunSampler:
+    """Hilfsklasse um Dry-Run Logs bei >100k Files zu drosseln"""
+    def __init__(self, limit: int = 5):
+        self.limit = limit
+        self.counts = {}
+
+    def log(self, category: str, msg: str):
+        count = self.counts.get(category, 0)
+        self.counts[category] = count + 1
+        
+        if count < self.limit:
+            print(f"[dry] {msg}")
+        elif count == self.limit:
+            print(f"[dry] ... {category}: weitere Ausgaben unterdrueckt ...")
+
+_dry_sampler = DryRunSampler(limit=5)
 
 
 # ---- Lib laden ----
@@ -1573,9 +1592,9 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             # Pretty-Print auch im Dry-Run fÃ¼r Debug
             if pretty:
                 txt = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-                print(f"[dry] stub write: {parent}/{name}\n{txt}")
+                _dry_sampler.log("stub", f"stub write: {parent}/{name}\n{txt}")
             else:
-                print(f"[dry] stub write: {parent}/{name}")
+                _dry_sampler.log("stub", f"stub write: {parent}/{name}")
             return True
         
         # Retry-Logik fÃ¼r robuste Stub-Writes (Timeout-Protection)
@@ -1676,7 +1695,7 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
                 skipped += 1
         else:
             if dry:
-                print(f"[dry] upload object: {obj_path}  <- {it.get('source_path')}")
+                _dry_sampler.log("upload", f"upload object: {obj_path}  <- {it.get('source_path')}")
             else:
                 ensure_parent_dirs(cfg, obj_path, dry=False)
                 _upload_file_smart(cfg, it["source_path"], obj_path, dry=dry)
@@ -3558,7 +3577,7 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
     pool_path = _get_pool_path(sha256)
     
     if dry:
-        _log(f"[dry] upload_to_pool: {local_path} â†’ {pool_path}")
+        _dry_sampler.log("upload", f"upload_to_pool: {local_path} -> {pool_path}")
         return (None, None)
     
     # Check ob File bereits im Pool existiert (mit Safe-Wrapper)
@@ -3787,35 +3806,19 @@ def _process_pool_item(
 
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
-    Post-Upload Konsistenz-Check fÃ¼r Pool-Mode Snapshots (NEUE IMPLEMENTATION).
-    
-    Strategie (ULTRA-EFFIZIENT):
-    1. Pool-Full-Check: listfolder(/_pool) â†’ ALLE SHA256s in ~2-5s (1 API-Call!)
-    2. Set-Diff: manifest_sha256s - pool_sha256s = missing_files
-    3. Pool-Refs-Check: Snapshot in index["pool_refs"] fÃ¼r alle SHA256s?
-    4. Optional: Stub-Stichprobe (konfigurierbar via PCLOUD_VALIDATE_STUB_SAMPLE)
-    
-    Warum besser als alte Stichproben-Methode?
-    - Alte Methode: 100Ã— stat_file() = ~10s, nur 0.1% Coverage
-    - Neue Methode: 1Ã— listfolder() = ~2-5s, 100% Coverage!
-    
-    Args:
-        cfg: pCloud Config
-        snapshot_dir: Remote Snapshot-Pfad (z.B. /_snapshots/2026-05-28-120014)
-        pool_root: Pool-Root (z.B. /_pool)
-        manifest: Manifest Dict
-        index: Content-Index Dict
-        dry: Dry-Run Mode
-    
-    Returns:
-        (is_valid, errors) - True wenn alles ok, sonst Liste mit Fehlern
+    Post-Upload Konsistenz-Check fÃ¼r Pool-Mode Snapshots.
     """
     _log(f"[validate] Starte Full-IntegritÃ¤ts-Check fÃ¼r {snapshot_dir}...")
     errors = []
     snapshot_name = manifest.get("snapshot", "?")
     
     if dry:
-        _log("[validate] Ãœberspringe Validation (dry-run)")
+        _log("[validate] (dry-run) Simuliere IntegritÃ¤ts-Check...")
+        # Im Dry-Run tun wir so als waere alles ok, damit die Summary am Ende stimmt
+        _log(f"[validate] Manifest: {len(manifest.get('items',[]))} Files")
+        _log(f"[validate] ✓ Pool: Alle SHA256s vorhanden (simuliert)")
+        _log(f"[validate] ✓ Index: Alle SHA256s korrekt in pool_refs (simuliert)")
+        _log(f"[validate] ✓✓✓ Snapshot vollstÃ¤ndig konsistent (simuliert)")
         return (True, [])
     
     # === 1. MANIFEST-SHA256s sammeln ===
@@ -3838,24 +3841,16 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     try:
         # Rekursives listfolder Ã¼ber kompletten Pool
         result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
-        
-        # SHA256s aus Pool-Pfaden extrahieren
         pool_sha256s = set()
         
-        def _extract_sha256s_from_tree(obj, parent_path=""):
-            """Rekursiv SHA256s aus listfolder-Tree extrahieren"""
+        def _extract_sha256s_from_tree(obj):
             if isinstance(obj, dict):
-                # File gefunden
                 if not obj.get("isfolder") and obj.get("name"):
                     filename = obj.get("name")
-                    # Pool-Files sind benannt als: SHA256 (z.B. "abc123def456...")
-                    # Validiere: muss 64 Hex-Zeichen sein
                     if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
                         pool_sha256s.add(filename.lower())
-                
-                # Ordner: Rekursiv in Contents
                 for child in obj.get("contents", []):
-                    _extract_sha256s_from_tree(child, parent_path)
+                    _extract_sha256s_from_tree(child)
         
         metadata = result.get("metadata", {})
         _extract_sha256s_from_tree(metadata)
@@ -3870,15 +3865,12 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     
     # === 3. DELTA-CHECK: Fehlen Files im Pool? ===
     missing_in_pool = manifest_sha256s - pool_sha256s
-    
     if missing_in_pool:
         errors.append(f"Pool: {len(missing_in_pool)} SHA256s fehlen")
-        for sha in list(missing_in_pool)[:10]:  # Erste 10 zeigen
+        for sha in list(missing_in_pool)[:5]:
             errors.append(f"  - Pool-File fehlt: {sha[:16]}...")
-        if len(missing_in_pool) > 10:
-            errors.append(f"  ... und {len(missing_in_pool)-10} weitere")
     else:
-        _log(f"[validate] âœ“ Pool: Alle {total_unique_sha256s} SHA256s vorhanden")
+        _log(f"[validate] ✓ Pool: Alle {total_unique_sha256s} SHA256s vorhanden")
     
     # === 4. POOL-REFS-CHECK (Index-Konsistenz) ===
     _log(f"[validate] PrÃ¼fe Index-Konsistenz (pool_refs)...")
@@ -3888,64 +3880,43 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     
     for sha in manifest_sha256s:
         snapshots_for_sha = pool_refs.get(sha, [])
-        
         if not snapshots_for_sha:
-            # SHA256 fehlt komplett im Index
             missing_in_index += 1
-            if len(errors) < 20:  # Limit error details
-                errors.append(f"Index: SHA256 {sha[:16]}... nicht in pool_refs")
         elif snapshot_name not in snapshots_for_sha:
-            # SHA256 im Index, aber Snapshot fehlt in der Liste
             wrong_snapshot += 1
-            if len(errors) < 20:
-                errors.append(f"Index: SHA256 {sha[:16]}... fehlt Snapshot {snapshot_name} (hat: {snapshots_for_sha})")
     
     if missing_in_index > 0:
-        errors.append(f"Index: {missing_in_index} SHA256s komplett fehlen in pool_refs")
+        errors.append(f"Index: {missing_in_index} SHA256s fehlen in pool_refs")
     if wrong_snapshot > 0:
-        errors.append(f"Index: {wrong_snapshot} SHA256s haben falschen Snapshot in pool_refs")
+        errors.append(f"Index: {wrong_snapshot} SHA256s haben falschen Snapshot")
     
     if missing_in_index == 0 and wrong_snapshot == 0:
-        _log(f"[validate] âœ“ Index: Alle {total_unique_sha256s} SHA256s korrekt in pool_refs")
+        _log(f"[validate] ✓ Index: Alle {total_unique_sha256s} SHA256s korrekt in pool_refs")
     
-    # === 5. OPTIONAL: STUB-STICHPROBE ===
+    # === 5. STUB-STICHPROBE ===
     stub_sample_size = int(os.environ.get("PCLOUD_VALIDATE_STUB_SAMPLE", "100"))
-    
     if stub_sample_size > 0 and total_files > 0:
         import random
         sample_size = min(stub_sample_size, total_files)
-        sample_items = random.sample(manifest_items, sample_size) if total_files > sample_size else manifest_items
-        
+        sample_items = random.sample(manifest_items, sample_size)
         _log(f"[validate] PrÃ¼fe {sample_size} Stub-Files (Stichprobe)...")
         checked_stubs = 0
-        
         for item in sample_items:
             relpath = item.get("relpath")
-            if not relpath:
-                continue
-            
-            stub_path = f"{snapshot_dir}/{relpath}.meta.json"
-            try:
-                stub_stat = pc.stat_file_safe(cfg, path=stub_path)
-                if not stub_stat:
-                    errors.append(f"Stub fehlt: {relpath}")
-                else:
+            if relpath:
+                stub_path = f"{snapshot_dir}/{relpath}.meta.json"
+                if pc.stat_file_safe(cfg, path=stub_path):
                     checked_stubs += 1
-            except Exception as e:
-                errors.append(f"Stub-Check fehlgeschlagen fÃ¼r {relpath}: {e}")
-        
+                else:
+                    errors.append(f"Stub fehlt: {relpath}")
         _log(f"[validate] Stubs: {checked_stubs}/{sample_size} ok")
     
     # === RESULT ===
     if errors:
-        _log(f"[validate] âŒ {len(errors)} Fehler gefunden!")
-        for err in errors[:15]:  # Erste 15 zeigen
-            _log(f"[validate]   {err}")
-        if len(errors) > 15:
-            _log(f"[validate]   ... und {len(errors)-15} weitere")
+        _log(f"[validate] ❌ {len(errors)} Fehler gefunden!")
         return (False, errors)
     else:
-        _log(f"[validate] âœ“âœ“âœ“ Snapshot vollstÃ¤ndig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
+        _log(f"[validate] ✓✓✓ Snapshot vollstÃ¤ndig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
         return (True, [])
 
 
@@ -4410,7 +4381,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pc.ensure_path(cfg, parent)
             
             if dry:
-                print(f"[dry] upload pool: {pool_path}  <- {abs_src}")
+                _dry_sampler.log("upload", f"upload pool: {pool_path}  <- {abs_src}")
                 return (None, None)
             
             # Check ob bereits existiert
@@ -4857,12 +4828,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         _log(f"[preflight] Abgeschlossen in {preflight_duration:.2f}s")
         
         # 5. File-Liste filtern: Nur noch Delta-Files verarbeiten
-        # Wichtig: Pro SHA256 kÃ¶nnen mehrere Files existieren (Hardlinks!)
         delta_items = [it for it in manifest_files if it.get("sha256") in delta_sha256s]
         reused_items = [it for it in manifest_files if it.get("sha256") in reused_sha256s]
         skipped_items = [it for it in manifest_files if it.get("sha256") in already_in_snapshot]
         
         _log(f"[preflight] Upload-Plan: {len(delta_items)} Files uploaden, {len(reused_items)} reused, {len(skipped_items)} skipped")
+
+        # --- PHASE 2: UPLOAD (nur Delta!) ---
+        _log(f"[pool-mode] Phase 2: Upload {len(delta_items)} Delta-Files...")
         
         # Hilfstabellen
         seen_inodes: dict[tuple[int,int], str] = {}
@@ -4883,7 +4856,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _ensure(parent)
             
             if dry:
-                print(f"[dry] upload pool: {pool_path}  <- {abs_src}")
+                _dry_sampler.log("upload", f"upload pool: {pool_path}  <- {abs_src}")
                 return (None, None)
             
             # Check ob bereits existiert (Dedupe!)
@@ -4967,7 +4940,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 "snapshot": snapshot_name,
             }
             if dry:
-                print(f"[dry] write stub: {meta_path}")
+                _dry_sampler.log("stub", f"write stub: {meta_path}")
             else:
                 stubs_to_write.append((meta_path, payload))
             stubs += 1
@@ -5621,6 +5594,15 @@ def retention_pool_mode(cfg: dict, dest_root: str, *, local_snaps: Optional[list
 # ----------------- CLI -----------------
 
 def main() -> None:
+    # --- Neu: Encoding rekonfigurieren ---
+    try:
+        import sys
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+    # --- Ende Neu ---
+
     ap = argparse.ArgumentParser(description="Pusht ein JSON-Manifest nach pCloud (Object-Store, 1:1-Snapshot oder POOL-Modus).")
     ap.add_argument("--manifest", required=True, help="Pfad zur Manifest-JSON (schema=2 oder schema=4 fÃ¼r Pool)")
     ap.add_argument("--dest-root", required=True, help="Remote-Wurzel, z.B. /Backup/pcloud-snapshots")
@@ -5711,7 +5693,16 @@ def main() -> None:
         print("RETENTION-SYNC Phase gestartet")
         print("="*80)
         
-        if args.snapshot_mode == "pool":
+    # Auto-Erkennung des Modus
+    is_pool_manifest = (mani_data.get("schema") == 4)
+    if is_pool_manifest:
+        _log("cli", "Auto-Modus: POOL-Manifest (Schema 4) erkannt.")
+        args.snapshot_mode = "pool"
+    else:
+        _log("cli", "Auto-Modus: Standard 1:1 Manifest erkannt.")
+        args.snapshot_mode = "1to1"
+
+    if args.snapshot_mode == "pool":
             # POOL-MODE Retention (vereinfacht)
             local_snaps = list_local_snapshot_names(manifest["root"])
             print(f"Lokale Snapshots: {len(local_snaps)}")
