@@ -5608,6 +5608,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Pusht ein JSON-Manifest nach pCloud (Object-Store, 1:1-Snapshot oder POOL-Modus).")
     ap.add_argument("--manifest", required=True, help="Pfad zur Manifest-JSON (schema=2 oder schema=4 für Pool)")
     ap.add_argument("--dest-root", required=True, help="Remote-Wurzel, z.B. /Backup/pcloud-snapshots")
+    ap.add_argument("--snapshot-name", help="Überschreibe Snapshot-Name aus Manifest (optional, für Testing)")
     ap.add_argument("--snapshot-mode", choices=["objects","1to1","pool"], default="objects",
                     help="Upload-Strategie: objects (Hash-Object-Store + Stubs), 1to1 (Materialisieren + Stubs), oder pool (Pool-basiert mit Stubs)")
     ap.add_argument("--use-delta-copy", action="store_true",
@@ -5658,6 +5659,11 @@ def main() -> None:
     if int(manifest.get("schema", 0)) < 2:
         print("Manifest schema>=2 erwartet (mit inode/ext/sha256).", file=sys.stderr)
         sys.exit(2)
+    
+    # === Snapshot-Name Override (optional für Testing) ===
+    if args.snapshot_name:
+        manifest["snapshot"] = args.snapshot_name
+        _log(f"[cli] Snapshot-Name überschrieben: {args.snapshot_name}")
 
     dest_root = pc._norm_remote_path(args.dest_root)
 
