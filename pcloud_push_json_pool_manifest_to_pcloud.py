@@ -4559,22 +4559,62 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     
     _log(f"[preflight] Manifest: {len(manifest_files)} Files, {len(manifest_sha256_to_item)} unique SHA256s")
     
-    # 2. Pool-SHA256s (bereits vorhanden, beliebiger Snapshot)
-    pool_sha256s = set(pool_refs.keys())
-    _log(f"[preflight] Pool: {len(pool_sha256s)} SHA256s bereits vorhanden")
+    # 2. PHYSISCHE Pool-SHA256s via listfolder (NEU: wie Validation-Audit!)
+    _log(f"[preflight] Scanne Pool-Struktur via listfolder({pool_root})...")
+    t_pool_scan = time.time()
     
-    # 3. Delta-Liste: SHA256s die Upload benötigen
-    delta_sha256s = set(manifest_sha256_to_item.keys()) - pool_sha256s
+    try:
+        # Rekursives listfolder über kompletten Pool (1 API-Call!)
+        result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
+        physical_pool_sha256s = set()
+        
+        def _extract_pool_sha256s(obj):
+            """Rekursiv SHA256s aus listfolder-Tree extrahieren"""
+            if isinstance(obj, dict):
+                # File gefunden
+                if not obj.get("isfolder") and obj.get("name"):
+                    filename = obj.get("name")
+                    # Pool-Files: 64 Hex-Zeichen (SHA256)
+                    if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
+                        physical_pool_sha256s.add(filename.lower())
+                
+                # Ordner: Rekursiv durchlaufen
+                for child in obj.get("contents", []):
+                    _extract_pool_sha256s(child)
+        
+        metadata = result.get("metadata", {})
+        _extract_pool_sha256s(metadata)
+        
+        pool_scan_duration = time.time() - t_pool_scan
+        _log(f"[preflight] Pool-Scan: {len(physical_pool_sha256s)} SHA256s gefunden in {pool_scan_duration:.2f}s")
+        
+    except Exception as e:
+        _log(f"[preflight][WARN] Pool-Scan fehlgeschlagen: {e}, falle zurück auf Index-basiert")
+        physical_pool_sha256s = set(pool_refs.keys())  # Fallback auf Index bei Fehler
     
-    # 4. Reused-Liste: SHA256s bereits im Pool (für diesen Snapshot aber neu)
+    # 3. Index-basierte SHA256s (für Vergleich & Index-Reparatur-Erkennung)
+    index_pool_sha256s = set(pool_refs.keys())
+    _log(f"[preflight] Index: {len(index_pool_sha256s)} SHA256s registriert")
+    
+    # 4. Delta-Liste: SHA256s die PHYSISCH Upload benötigen (nicht mehr Index-basiert!)
+    delta_sha256s = set(manifest_sha256_to_item.keys()) - physical_pool_sha256s
+    
+    # 5. Reused-Liste: SHA256s PHYSISCH im Pool (für diesen Snapshot aber neu)
     # Prüfe ob bereits für DIESEN Snapshot registriert
     already_in_snapshot = {
         sha for sha in manifest_sha256_to_item.keys()
         if snapshot_name in pool_refs.get(sha, [])
     }
     
-    # Echte Reused: Im Pool, aber nicht für diesen Snapshot
-    reused_sha256s = (set(manifest_sha256_to_item.keys()) & pool_sha256s) - already_in_snapshot
+    # Echte Reused: Physisch vorhanden, aber nicht für diesen Snapshot
+    reused_sha256s = (set(manifest_sha256_to_item.keys()) & physical_pool_sha256s) - already_in_snapshot
+    
+    # 6. Index-Reparatur-Kandidaten: Physisch vorhanden, aber nicht im Index
+    needs_index_update = reused_sha256s - index_pool_sha256s
+    
+    if needs_index_update:
+        _log(f"[preflight] ⚠️ Index-Reparatur nötig: {len(needs_index_update)} Files physisch vorhanden, aber nicht im Index")
+        _log(f"[preflight]    → Diese werden automatisch in pool_refs aufgenommen")
     
     preflight_duration = time.time() - t_preflight_start
     _log(f"[preflight] Delta: {len(delta_sha256s)} benötigen Upload ({len(delta_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
