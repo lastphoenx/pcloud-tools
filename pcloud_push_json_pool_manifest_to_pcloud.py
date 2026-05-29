@@ -4664,90 +4664,90 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[pool-mode] → Fallback zu Full-Pool-Mode")
         else:
             _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
-    
-    # === Timeout-Protection (wie Original!) ===
-    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
-        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
-        if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[config] Timeout auf {cfg['timeout']}s gesetzt (Mass-Upload-Protection)")
-    
-    # === UPLOAD-STATUS-MARKER (wie Original!) ===
-    marker_started = f"{dest_snapshot_dir}/.upload_started"
-    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
-    
-    # Prüfen ob unvollständiger Upload existiert
-    incomplete_upload = False
-    try:
-        pc.stat_file(cfg, path=marker_started, with_checksum=False)
-        # Started-Marker existiert
+        
+        # === Timeout-Protection (wie Original!) ===
+        if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
+            cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                _log(f"[config] Timeout auf {cfg['timeout']}s gesetzt (Mass-Upload-Protection)")
+        
+        # === UPLOAD-STATUS-MARKER (wie Original!) ===
+        marker_started = f"{dest_snapshot_dir}/.upload_started"
+        marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+        
+        # Prüfen ob unvollständiger Upload existiert
+        incomplete_upload = False
         try:
-            pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-            # Complete-Marker auch da → Upload war erfolgreich
-            _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
-            return {"uploaded": 0, "stubs": 0, "resumed": False}
+            pc.stat_file(cfg, path=marker_started, with_checksum=False)
+            # Started-Marker existiert
+            try:
+                pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+                # Complete-Marker auch da → Upload war erfolgreich
+                _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+                return {"uploaded": 0, "stubs": 0, "resumed": False}
+            except:
+                # Nur Started, kein Complete → unvollständig!
+                incomplete_upload = True
+                _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
         except:
-            # Nur Started, kein Complete → unvollständig!
-            incomplete_upload = True
-            _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
-    except:
-        # Kein Started-Marker → frischer Upload
-        pass
-    
-    # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
-    if incomplete_upload:
-        _log(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
-    
-    _log(f"[plan] pool snapshot={dest_snapshot_dir}")
-    
-    # === Started-Marker setzen (wie Original!) ===
-    if not dry:
-        try:
-            pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
-            pc.call_with_backoff(pc.put_textfile, cfg, path=marker_started,
-                          text=json.dumps({
-                              "snapshot": snapshot_name,
-                              "started_at": time.time(),
-                              "mode": "pool",
-                              "host": os.uname().nodename
-                          }))
-            _log(f"[info] Upload-Started-Marker gesetzt: {marker_started}")
-        except Exception as e:
-            _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
-    
-    # === STATE-LOCK (wie Original!) ===
-    _state_lock = threading.Lock()
-    
-    # === HILFSFUNKTIONEN (1:1 vom Original!) ===
-    def _ensure(path: str) -> None:
-        nonlocal ensure_ms
-        if not path:
-            return
-        if dry:
-            if os.environ.get("PCLOUD_VERBOSE") == "1":
-                print(f"[dry] ensure: {path}")
-            return
-        t0 = time.time()
-        pc.call_with_backoff(pc.ensure_path, cfg, path)
-        with _state_lock:
-            ensure_ms += (time.time() - t0) * 1000.0
-
-    def _delete_if_exists(path: str) -> None:
-        if dry:
-            if os.environ.get("PCLOUD_VERBOSE") == "1":
-                print(f"[dry] delete-if-exists: {path}")
-            return
-        try:
-            md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=path) or {}
-            fid = md.get("fileid")
-            if fid:
-                pc.delete_file(cfg, fileid=int(fid))
-        except Exception:
+            # Kein Started-Marker → frischer Upload
             pass
-    
-    # === LOKALER INDEX-CACHE (wie Original!) ===
-    import tempfile
-    _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
-    _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
+        
+        # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
+        if incomplete_upload:
+            _log(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
+        
+        _log(f"[plan] pool snapshot={dest_snapshot_dir}")
+        
+        # === Started-Marker setzen (wie Original!) ===
+        if not dry:
+            try:
+                pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
+                pc.call_with_backoff(pc.put_textfile, cfg, path=marker_started,
+                              text=json.dumps({
+                                  "snapshot": snapshot_name,
+                                  "started_at": time.time(),
+                                  "mode": "pool",
+                                  "host": os.uname().nodename
+                              }))
+                _log(f"[info] Upload-Started-Marker gesetzt: {marker_started}")
+            except Exception as e:
+                _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
+        
+        # === STATE-LOCK (wie Original!) ===
+        _state_lock = threading.Lock()
+        
+        # === HILFSFUNKTIONEN (1:1 vom Original!) ===
+        def _ensure(path: str) -> None:
+            nonlocal ensure_ms
+            if not path:
+                return
+            if dry:
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    print(f"[dry] ensure: {path}")
+                return
+            t0 = time.time()
+            pc.call_with_backoff(pc.ensure_path, cfg, path)
+            with _state_lock:
+                ensure_ms += (time.time() - t0) * 1000.0
+
+        def _delete_if_exists(path: str) -> None:
+            if dry:
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    print(f"[dry] delete-if-exists: {path}")
+                return
+            try:
+                md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=path) or {}
+                fid = md.get("fileid")
+                if fid:
+                    pc.delete_file(cfg, fileid=int(fid))
+            except Exception:
+                pass
+        
+        # === LOKALER INDEX-CACHE (wie Original!) ===
+        import tempfile
+        _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
     os.makedirs(_local_index_dir, exist_ok=True)
     
     # Index laden: erst lokal (falls vorhanden), sonst von pCloud
@@ -5522,12 +5522,12 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _log(f"[info] Upload-Complete-Marker gesetzt: {marker_complete}")
         except Exception as e:
             _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
-    
-    # === TIMING-STATS (wie Original!) ===
-    total_duration = time.time() - t_phase_start
-    _log(f"[pool-mode] Upload abgeschlossen: {uploaded} new anchors, {resumed} reused anchors, {stubs} stubs queued ({total_duration:.1f}s)")
-    _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)} ensure_ms={int(ensure_ms)}")
-    
+        
+        # === TIMING-STATS (wie Original!) ===
+        total_duration = time.time() - t_phase_start
+        _log(f"[pool-mode] Upload abgeschlossen: {uploaded} new anchors, {resumed} reused anchors, {stubs} stubs queued ({total_duration:.1f}s)")
+        _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)} ensure_ms={int(ensure_ms)}")
+        
         return {
             "uploaded": uploaded,
             "resumed": resumed,
