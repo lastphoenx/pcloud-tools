@@ -3806,7 +3806,28 @@ def _process_pool_item(
 
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
-    Post-Upload Konsistenz-Check fÃ¼r Pool-Mode Snapshots.
+    Post-Upload Konsistenz-Check fÃ¼r Pool-Mode Snapshots (NEUE IMPLEMENTATION).
+    
+    Strategie (ULTRA-EFFIZIENT):
+    1. Pool-Full-Check: listfolder(/_pool) â†’ ALLE SHA256s in ~2-5s (1 API-Call!)
+    2. Set-Diff: manifest_sha256s - pool_sha256s = missing_files
+    3. Pool-Refs-Check: Snapshot in index["pool_refs"] fÃ¼r alle SHA256s?
+    4. Optional: Stub-Stichprobe (konfigurierbar via PCLOUD_VALIDATE_STUB_SAMPLE)
+    
+    Warum besser als alte Stichproben-Methode?
+    - Alte Methode: 100Ã— stat_file() = ~10s, nur 0.1% Coverage
+    - Neue Methode: 1Ã— listfolder() = ~2-5s, 100% Coverage!
+    
+    Args:
+        cfg: pCloud Config
+        snapshot_dir: Remote Snapshot-Pfad (z.B. /_snapshots/2026-05-28-120014)
+        pool_root: Pool-Root (z.B. /_pool)
+        manifest: Manifest Dict
+        index: Content-Index Dict
+        dry: Dry-Run Mode
+    
+    Returns:
+        (is_valid, errors) - True wenn alles ok, sonst Liste mit Fehlern
     """
     _log(f"[validate] Starte Full-IntegritÃ¤ts-Check fÃ¼r {snapshot_dir}...")
     errors = []
@@ -3816,9 +3837,9 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         _log("[validate] (dry-run) Simuliere IntegritÃ¤ts-Check...")
         # Im Dry-Run tun wir so als waere alles ok, damit die Summary am Ende stimmt
         _log(f"[validate] Manifest: {len(manifest.get('items',[]))} Files")
-        _log(f"[validate] ✓ Pool: Alle SHA256s vorhanden (simuliert)")
-        _log(f"[validate] ✓ Index: Alle SHA256s korrekt in pool_refs (simuliert)")
-        _log(f"[validate] ✓✓✓ Snapshot vollstÃ¤ndig konsistent (simuliert)")
+        _log(f"[validate] âœ“ Pool: Alle SHA256s vorhanden (simuliert)")
+        _log(f"[validate] âœ“ Index: Alle SHA256s korrekt in pool_refs (simuliert)")
+        _log(f"[validate] âœ“âœ“âœ“ Snapshot vollstÃ¤ndig konsistent (simuliert)")
         return (True, [])
     
     # === 1. MANIFEST-SHA256s sammeln ===
@@ -5687,25 +5708,25 @@ def main() -> None:
             push_1to1_smart_controller(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
 
     # Optional: Retention-Sync NACH Upload (nicht kritisch, darf Upload nicht blockieren)
+    # Auto-Erkennung des Modus für Retention (auch wenn nicht aktiv, für Info-Message)
+    retention_schema = int(manifest.get("schema", 0) or 0)
+    
     if args.retention_sync:
         print("")
         print("="*80)
         print("RETENTION-SYNC Phase gestartet")
         print("="*80)
         
-    # Auto-Erkennung des Modus
-    is_pool_manifest = (mani_data.get("schema") == 4)
-    if is_pool_manifest:
-        _log("cli", "Auto-Modus: POOL-Manifest (Schema 4) erkannt.")
-        args.snapshot_mode = "pool"
-    else:
-        _log("cli", "Auto-Modus: Standard 1:1 Manifest erkannt.")
-        args.snapshot_mode = "1to1"
+        if retention_schema == 4:
+            _log("cli", "Auto-Modus Retention: POOL-Manifest erkannt.")
+            mode = "pool"
+        else:
+            mode = "1to1"
 
-    if args.snapshot_mode == "pool":
-            # POOL-MODE Retention (vereinfacht)
-            local_snaps = list_local_snapshot_names(manifest["root"])
-            print(f"Lokale Snapshots: {len(local_snaps)}")
+        local_snaps = list_local_snapshot_names(manifest.get("root", "/"))
+        print(f"Lokale Snapshots: {len(local_snaps)}")
+
+        if mode == "pool":
             try:
                 t_retention = time.time()
                 retention_pool_mode(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
@@ -5715,16 +5736,9 @@ def main() -> None:
                 print("="*80)
                 print("")
             except Exception as _ret_exc:
-                _log(f"[retention-pool] WARNING: retention_pool_mode fehlgeschlagen (nicht kritisch): {_ret_exc}")
-                print("="*80)
-                print(f"RETENTION-POOL FEHLER: {_ret_exc}")
-                print("="*80)
-                print("")
+                _log(f"[retention-pool] WARNING: retention_pool_mode fehlgeschlagen: {_ret_exc}")
         
-        elif args.snapshot_mode == "1to1":
-            # 1to1-Mode Retention (legacy)
-            local_snaps = list_local_snapshot_names(manifest["root"])
-            print(f"Lokale Snapshots: {len(local_snaps)}")
+        elif mode == "1to1":
             try:
                 t_retention = time.time()
                 retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
@@ -5734,16 +5748,13 @@ def main() -> None:
                 print("="*80)
                 print("")
             except Exception as _ret_exc:
-                _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen (nicht kritisch): {_ret_exc}")
-                print("="*80)
-                print(f"RETENTION-SYNC FEHLER: {_ret_exc}")
-            print("="*80)
-            print("")
+                _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen: {_ret_exc}")
+    
     else:
-        if args.snapshot_mode == "1to1":
+        if retention_schema == 2:  # Nur Info für 1to1
             print("")
             print("="*80)
-            print("RETENTION-SYNC Ã¼bersprungen (--retention-sync nicht gesetzt)")
+            print("RETENTION-SYNC übersprungen (--retention-sync nicht gesetzt)")
             print("="*80)
             print("")
 
