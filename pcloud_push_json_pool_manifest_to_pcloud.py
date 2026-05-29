@@ -57,9 +57,25 @@ from enum import Enum
 
 
 # ---- Logging mit Timestamp (RTB-Stil) ----
+def _ascii_safe(text: str) -> str:
+    """Normalisiert Umlaute/Sonderzeichen fuer robuste CLI-Logs auf nicht-UTF8-Terminals."""
+    if not isinstance(text, str):
+        text = str(text)
+    tr = str.maketrans({
+        "ä": "ae", "ö": "oe", "ü": "ue",
+        "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
+        "ß": "ss",
+        "→": "->", "✓": "[ok]", "⚠️": "[warn]", "❌": "[err]",
+    })
+    text = text.translate(tr)
+    return text.encode("ascii", errors="replace").decode("ascii")
+
+
 def _log(msg: str, *, file=sys.stderr) -> None:
     """Log-Ausgabe mit Timestamp"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if os.environ.get("PCLOUD_ASCII_LOGS", "1") != "0":
+        msg = _ascii_safe(msg)
     print(f"{ts} {msg}", file=file, flush=True)
 
 
@@ -4855,7 +4871,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         stubs = 0
         index_changed = False
         stubs_to_write: list[tuple[str, dict]] = []
-    
+
         # === UPLOAD-FUNKTION (Pool-spezifisch, aber wie Original _upload_real_file!) ===
         def _upload_to_pool(abs_src: str, sha256: str) -> tuple:
             """Upload zu Pool, Returns (pool_fileid, pcloud_hash) - 1:1 wie Original _upload_real_file"""
@@ -5663,9 +5679,13 @@ def main() -> None:
     # === Snapshot-Name Override (optional fÃ¼r Testing) ===
     if args.snapshot_name:
         manifest["snapshot"] = args.snapshot_name
-        _log(f"[cli] Snapshot-Name Ã¼berschrieben: {args.snapshot_name}")
+        _log(f"[cli] Snapshot-Name ueberschrieben: {args.snapshot_name}")
 
     dest_root = pc._norm_remote_path(args.dest_root)
+    schema = int(manifest.get("schema", 0) or 0)
+    _log(f"[cli] snapshot-mode={args.snapshot_mode} dry-run={bool(args.dry_run)} schema={schema}")
+    if args.snapshot_mode == "objects" and (schema >= 4 or "POOL" in dest_root.upper()):
+        _log("[cli][warn] snapshot-mode=objects aktiv. Fuer Pool-Delta/Preflight bitte --snapshot-mode pool verwenden.")
 
     # Upload ZUERST (Retention kommt ans Ende, nach Upload)
     if args.snapshot_mode == "objects":
