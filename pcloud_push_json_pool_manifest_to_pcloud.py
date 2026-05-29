@@ -4485,10 +4485,57 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     # Pool-Refs-Struktur (für Pool-Mode)
     pool_refs = index.setdefault("pool_refs", {})  # SHA256 → [snapshot1, snapshot2, ...]
     
+    # ============================================================================
+    # === PREFLIGHT: DELTA-BERECHNUNG (VOR Upload!) ===
+    # ============================================================================
+    _log("[pool-mode] Preflight: Berechne Upload-Delta...")
+    t_preflight_start = time.time()
+    
+    # 1. Manifest-SHA256s sammeln
+    manifest_files = [it for it in (manifest.get("items") or []) if it.get("type") == "file"]
+    manifest_sha256_to_item = {
+        it.get("sha256"): it 
+        for it in manifest_files 
+        if it.get("sha256")
+    }
+    
+    _log(f"[preflight] Manifest: {len(manifest_files)} Files, {len(manifest_sha256_to_item)} unique SHA256s")
+    
+    # 2. Pool-SHA256s (bereits vorhanden, beliebiger Snapshot)
+    pool_sha256s = set(pool_refs.keys())
+    _log(f"[preflight] Pool: {len(pool_sha256s)} SHA256s bereits vorhanden")
+    
+    # 3. Delta-Liste: SHA256s die Upload benötigen
+    delta_sha256s = set(manifest_sha256_to_item.keys()) - pool_sha256s
+    
+    # 4. Reused-Liste: SHA256s bereits im Pool (für diesen Snapshot aber neu)
+    # Prüfe ob bereits für DIESEN Snapshot registriert
+    already_in_snapshot = {
+        sha for sha in manifest_sha256_to_item.keys()
+        if snapshot_name in pool_refs.get(sha, [])
+    }
+    
+    # Echte Reused: Im Pool, aber nicht für diesen Snapshot
+    reused_sha256s = (set(manifest_sha256_to_item.keys()) & pool_sha256s) - already_in_snapshot
+    
+    preflight_duration = time.time() - t_preflight_start
+    _log(f"[preflight] Delta: {len(delta_sha256s)} benötigen Upload ({len(delta_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
+    _log(f"[preflight] Reused: {len(reused_sha256s)} aus Pool wiederverwendet ({len(reused_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
+    _log(f"[preflight] Skipped: {len(already_in_snapshot)} bereits für Snapshot registriert")
+    _log(f"[preflight] Abgeschlossen in {preflight_duration:.2f}s")
+    
+    # 5. File-Liste filtern: Nur noch Delta-Files verarbeiten
+    # Wichtig: Pro SHA256 können mehrere Files existieren (Hardlinks!)
+    delta_items = [it for it in manifest_files if it.get("sha256") in delta_sha256s]
+    reused_items = [it for it in manifest_files if it.get("sha256") in reused_sha256s]
+    skipped_items = [it for it in manifest_files if it.get("sha256") in already_in_snapshot]
+    
+    _log(f"[preflight] Upload-Plan: {len(delta_items)} Files uploaden, {len(reused_items)} reused, {len(skipped_items)} skipped")
+    
     # Hilfstabellen
     seen_inodes: dict[tuple[int,int], str] = {}
     uploaded = 0
-    resumed = 0   # Bereits im Index für diesen Snapshot
+    resumed = len(reused_items)  # Bereits VORAB gezählt (aus Pool wiederverwendet)
     stubs = 0
     index_changed = False
     stubs_to_write: list[tuple[str, dict]] = []
@@ -4903,11 +4950,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     
     # === FILE-PROCESSING-FUNKTION (1:1 vom Original, nur Pool-Upload!) ===
     def _process_file_item(it: dict) -> None:
-        """Verarbeitet ein File-Item (thread-safe) - 1:1 wie Original!"""
-        nonlocal uploaded, resumed, stubs, index_changed, _done_items, _done_size, _t_last_progress
+        """
+        Verarbeitet ein Delta-File (benötigt Upload).
+        Preflight hat bereits gefiltert: Nur Files die nicht im Pool sind!
+        """
+        nonlocal uploaded, stubs, index_changed, _done_items, _done_size, _t_last_progress
         nonlocal _last_saved_count, _t_last_index_save, upload_ms
         
-        # Progress-Tracking (1:1 wie Original!)
+        # Progress-Tracking
         with _state_lock:
             _done_items += 1
             _done_size += it.get("size") or 0
@@ -4933,58 +4983,29 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         ino = int(inode.get("ino") or 0)
         ino_key = (dev, ino)
         
-        # === Index-Zugriff (thread-safe, wie Original!) ===
+        # Hardlink-Check
         with _state_lock:
-            # Pool-Refs-Struktur: SHA256 → [snapshot1, snapshot2, ...]
-            if sha not in pool_refs:
-                pool_refs[sha] = []
-            
-            # === INDEX-DRIVEN SKIP (1:1 wie Original!) ===
-            # Prüfen ob bereits im Index für diesen Snapshot
-            already_in_snapshot = snapshot_name in pool_refs.get(sha, [])
-            if already_in_snapshot:
-                # Bereits verarbeitet → skip
-                seen_inodes[ino_key] = relpath
-                resumed += 1
-                return
-            
-            # Hardlink-Check (1:1 wie Original!)
             if ino_key in seen_inodes:
-                # Hardlink zu bereits verarbeitetem File
-                # Pool-Path und FileID aus bereits verarbeitetem File holen
+                # Hardlink zu bereits verarbeitetem File → nutze gecachte Info
                 first_relpath = seen_inodes[ino_key]
-                # Stub queuen (referenziert Pool-File)
-                # ABER: Wir brauchen pool_fileid und pcloud_hash vom ersten Upload!
-                # Diese Info müssen wir beim ersten Upload cachen
-                # → Skip für jetzt, wird unten behandelt
-                pass  # Wird nach Upload behandelt
+                # Pool-FileID aus erstem Upload holen (aus stubs_to_write oder Index)
+                # Für jetzt: Upload-Skip (wird unten gefixt wenn nötig)
+                pass
         
-        # === UPLOAD (außerhalb Lock für Parallelität!, 1:1 wie Original!) ===
-        pool_fileid = None
-        pcloud_hash = None
-        is_hardlink = False
-        
-        # Hardlink-Check (außerhalb Lock)
-        with _state_lock:
-            if ino_key in seen_inodes:
-                # Hardlink: Hole cached Info
-                # PROBLEM: Original nutzt anchor_path/fileid, Pool nutzt sha256 → pool_fileid
-                # Lösung: Wir cachen (sha256, pool_fileid, pcloud_hash) in seen_inodes
-                # → Ändern seen_inodes Structure
-                pass  # Wird unten gefixt
-        
-        # Upload zu Pool (wie Original _upload_real_file!)
+        # Upload zu Pool
         try:
             pool_fileid, pcloud_hash = _upload_to_pool(src_abs, sha)
             
             # Update Pool-Refs (thread-safe)
             with _state_lock:
+                if sha not in pool_refs:
+                    pool_refs[sha] = []
                 if snapshot_name not in pool_refs[sha]:
                     pool_refs[sha].append(snapshot_name)
                     index_changed = True
                 uploaded += 1
             
-            # Stub queuen (wie Original!)
+            # Stub queuen
             _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
             
         except FileNotFoundError as e:
@@ -4997,7 +5018,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {type(e).__name__}: {e}")
             return
         
-        # Hardlink-Tracking (thread-safe, wie Original!)
+        # Hardlink-Tracking
         with _state_lock:
             seen_inodes[ino_key] = relpath
             
@@ -5013,33 +5034,86 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     _reason = "count" if _count_trigger else "time"
                     print(f"[index] Lokal gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
     
-    # === FILES KLASSIFIZIEREN (1:1 wie Original!) ===
-    _file_items = _all_items  # Bereits oben definiert (nur type=file)
-    _small_files = [f for f in _file_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
-    _large_files = [f for f in _file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
+    def _process_reused_file(it: dict) -> None:
+        """
+        Verarbeitet ein Reused-File (bereits im Pool, braucht nur Stub).
+        Kein Upload, nur Pool-FileID holen und Stub erstellen.
+        """
+        nonlocal stubs, index_changed
+        
+        relpath = it.get("relpath") or ""
+        sha = it.get("sha256") or ""
+        
+        if not sha:
+            return
+        
+        # Pool-Path und FileID holen
+        pool_path = _get_pool_path(sha)
+        
+        try:
+            # FileID aus Pool holen (kein Upload!)
+            pool_md = pc.stat_file_safe(cfg, path=pool_path)
+            if not pool_md:
+                _log(f"[ERROR] Reused-File {relpath}: Pool-File nicht gefunden: {pool_path}")
+                return
+            
+            pool_fileid = pool_md.get("fileid")
+            pcloud_hash = pool_md.get("hash")
+            
+            # Update Pool-Refs
+            with _state_lock:
+                if sha not in pool_refs:
+                    pool_refs[sha] = []
+                if snapshot_name not in pool_refs[sha]:
+                    pool_refs[sha].append(snapshot_name)
+                    index_changed = True
+            
+            # Stub queuen
+            _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
+            
+        except Exception as e:
+            _log(f"[ERROR] Reused-File {relpath}: Konnte Pool-FileID nicht holen: {e}")
     
-    if _small_files and _large_files:
-        _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel, "
-             f"{len(_large_files)} große Dateien sequentiell")
-    elif _small_files:
-        _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel")
-    else:
-        _log(f"[parallel] {len(_large_files)} große Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
+    # === FILES KLASSIFIZIEREN (nur Delta-Files für Upload!) ===
+    _log(f"[pool-mode] Phase 2: Upload {len(delta_items)} Delta-Files...")
+    _small_delta = [f for f in delta_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
+    _large_delta = [f for f in delta_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
     
-    # === KLEINE DATEIEN PARALLEL (1:1 wie Original!) ===
-    if _small_files and PARALLEL_UPLOAD_THREADS > 1:
+    if _small_delta and _large_delta:
+        _log(f"[parallel] {len(_small_delta)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel, "
+             f"{len(_large_delta)} große Dateien sequentiell")
+    elif _small_delta:
+        _log(f"[parallel] {len(_small_delta)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel")
+    elif _large_delta:
+        _log(f"[parallel] {len(_large_delta)} große Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
+    
+    # === KLEINE DELTA-DATEIEN PARALLEL ===
+    if _small_delta and PARALLEL_UPLOAD_THREADS > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
-            list(ex.map(_process_file_item, _small_files))
+            list(ex.map(_process_file_item, _small_delta))
     else:
-        for f in _small_files:
+        for f in _small_delta:
             _process_file_item(f)
     
-    # === GROSSE DATEIEN SEQUENTIELL (1:1 wie Original!) ===
-    for f in _large_files:
+    # === GROSSE DELTA-DATEIEN SEQUENTIELL ===
+    for f in _large_delta:
         _process_file_item(f)
     
+    # === REUSED-FILES VERARBEITEN (nur Stubs, kein Upload!) ===
+    if reused_items:
+        _log(f"[pool-mode] Phase 2b: Erstelle {len(reused_items)} Stubs für reused Files...")
+        
+        # Reused-Files können alle parallel (kein Upload, nur stat_file)
+        reused_threads = int(os.environ.get("PCLOUD_REUSED_THREADS", "8"))
+        if reused_threads > 1 and len(reused_items) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=reused_threads) as ex:
+                list(ex.map(_process_reused_file, reused_items))
+        else:
+            for f in reused_items:
+                _process_reused_file(f)
+    
     # ============================================================================
-    # === PHASE 3: BATCH-WRITE STUBS (1:1 wie Original!) ===
+    # === PHASE 3: BATCH-WRITE STUBS ===
     # ============================================================================
     if not dry and stubs_to_write:
         _log(f"[push] ✓ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
