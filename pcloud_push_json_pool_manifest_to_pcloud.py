@@ -4,23 +4,23 @@
 pcloud_push_json_pool_manifest_to_pcloud.py
 
 === POOL-MODE VERSION ===
-LÃ¤dt ein lokales Manifest (v4) nach pCloud mit POOL-basierter Architektur.
+Lädt ein lokales Manifest (v4) nach pCloud mit POOL-basierter Architektur.
 
 POOL-ARCHITEKTUR:
-  /_pool/XX/[sha256]           â† Echte Dateien (dedupliziert nach SHA256)
-  /_snapshots/SNAPSHOT/...     â† Nur .meta.json Stubs (lesbare Ordnerstruktur)
+  /_pool/XX/[sha256]           ← Echte Dateien (dedupliziert nach SHA256)
+  /_snapshots/SNAPSHOT/...     ← Nur .meta.json Stubs (lesbare Ordnerstruktur)
 
 Vorteile:
-- âœ“ Quota-effizient: Nur 1Ã— pro SHA256 (nicht 20Ã— bei 20 Snapshots)
-- âœ“ Retention einfach: deletefolderrecursive(snapshot) - fertig!
-- âœ“ Lesbar: Jeder Snapshot behÃ¤lt Original-Ordnerstruktur
-- âœ“ Restore schnell: pool_fileid in Stub â†’ direkter Download
+- ✓ Quota-effizient: Nur 1× pro SHA256 (nicht 20× bei 20 Snapshots)
+- ✓ Retention einfach: deletefolderrecursive(snapshot) - fertig!
+- ✓ Lesbar: Jeder Snapshot behält Original-Ordnerstruktur
+- ✓ Restore schnell: pool_fileid in Stub → direkter Download
 
 STUB-FORMAT (pool_stub):
 {
   "type": "pool_stub",
   "sha256": "abc123...",
-  "pcloud_hash": "...",         # FÃ¼r API checksumfile (Speed-Verify)
+  "pcloud_hash": "...",         # Für API checksumfile (Speed-Verify)
   "size": 12345678,
   "mtime": 1717000000.0,
   "relpath": "home/user/file.txt",
@@ -30,10 +30,10 @@ STUB-FORMAT (pool_stub):
 }
 
 BETRIEBSART: --snapshot-mode pool
-- Alle Files â†’ /_pool/ (dedupliziert)
-- Alle Snapshots â†’ Stubs (lesbare Struktur)
-- Content-Index â†’ Pool-Referenzen tracken
-- Retention â†’ Ordner lÃ¶schen + Pool-GC
+- Alle Files → /_pool/ (dedupliziert)
+- Alle Snapshots → Stubs (lesbare Struktur)
+- Content-Index → Pool-Referenzen tracken
+- Retention → Ordner löschen + Pool-GC
 
 Erwartetes Manifest (schema=4):
 {
@@ -45,7 +45,7 @@ Erwartetes Manifest (schema=4):
   "items": [...]
 }
 
-BenÃ¶tigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
+Benötigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
 """
 
 from __future__ import annotations
@@ -126,12 +126,12 @@ except Exception as e:
     sys.exit(2)
 
 
-# --- Schwellenwerte fÃ¼r Smart-Strategie-Auswahl ---
-# MATCH_THRESHOLD (X): Ab welcher Ãœbereinstimmung lohnt sich Klonen/Template?
+# --- Schwellenwerte für Smart-Strategie-Auswahl ---
+# MATCH_THRESHOLD (X): Ab welcher Übereinstimmung lohnt sich Klonen/Template?
 _MATCH_THRESHOLD = float(os.environ.get("PCLOUD_SMART_MATCH_THRESHOLD", "0.85"))
-# STUB_THRESHOLD (Y): Mindest-Stub-Ratio in Basis fÃ¼r TURBO (Quota-Schutz)
+# STUB_THRESHOLD (Y): Mindest-Stub-Ratio in Basis für TURBO (Quota-Schutz)
 _STUB_THRESHOLD  = float(os.environ.get("PCLOUD_SMART_STUB_THRESHOLD", "0.50"))
-# TEMPLATE_THRESHOLD (Z): Mindest-Ãœbereinstimmung mit Template fÃ¼r TEMPLATE-DELTA-SAFE
+# TEMPLATE_THRESHOLD (Z): Mindest-Übereinstimmung mit Template für TEMPLATE-DELTA-SAFE
 _TEMPLATE_THRESHOLD = float(os.environ.get("PCLOUD_SMART_TEMPLATE_THRESHOLD", "0.70"))
 
 # Smart-Strategy 2.0 (absolute Delta-Metriken + harte Sicherheitsgates)
@@ -179,13 +179,13 @@ def _get_snapshot_paths(index: dict, snapshot_name: str) -> set[str]:
 
 def push_1to1_smart_controller(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None):
     """
-    Zentraler Strategy-Controller â€“ EINZIGER Entscheidungspunkt fÃ¼r Strategie.
+    Zentraler Strategy-Controller – EINZIGER Entscheidungspunkt für Strategie.
     Entscheidet EINMAL, ruft dann Executor mit klarem Modus auf.
     """
     snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
     archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
     
-    _log(f"[smart-controller] Analysiere Strategie fÃ¼r {snapshot_name}...")
+    _log(f"[smart-controller] Analysiere Strategie für {snapshot_name}...")
     
     # Einheitliche Metriken (unified source) mit Fallback bei API-Problemen
     try:
@@ -249,7 +249,7 @@ MET_RESUMED_FILES  = 0
 MET_STUBS_WRITTEN  = 0
 MET_PROMOTED       = 0
 MET_REMOVED_NODES  = 0
-MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional ZÃ¤hler aus Lib/Wrapper
+MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional Zähler aus Lib/Wrapper
 
 # --- Chunked Upload Configuration ---
 RESUME_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_RESUME_THRESHOLD_GB", "5")) * 1024**3  # Default: 5 GB
@@ -266,8 +266,8 @@ _metrics_lock = threading.Lock()
 
 def _ensure_parent(cfg, remote_path: str, *, dry: bool = False) -> None:
     """
-    Stellt sicher, dass alle Elternordner fÃ¼r `remote_path` existieren.
-    Delegiert vollstÃ¤ndig an pcloud_bin_lib.ensure_parent_dirs(...).
+    Stellt sicher, dass alle Elternordner für `remote_path` existieren.
+    Delegiert vollständig an pcloud_bin_lib.ensure_parent_dirs(...).
     """
     if dry:
         return
@@ -276,9 +276,9 @@ def _ensure_parent(cfg, remote_path: str, *, dry: bool = False) -> None:
 
 def _get_resume_state_dir() -> str:
     """
-    Ermittelt State-Verzeichnis fÃ¼r Resume-Uploads (analog zu poc_chunked_resume.py).
+    Ermittelt State-Verzeichnis für Resume-Uploads (analog zu poc_chunked_resume.py).
     
-    PrioritÃ¤t:
+    Priorität:
     1. ENV: PCLOUD_RESUME_DIR
     2. /srv/pcloud-archive/resume/ (production)
     3. ~/.pcloud_resume/ (user home)
@@ -320,13 +320,13 @@ def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, ve
     """
     Bereinigt verwaiste/alte Resume-State-Files.
     
-    LÃ¶scht:
-    - Files Ã¤lter als max_age_days (Standard: 7 Tage)
-    - Error-Status Files Ã¤lter als 24 Stunden
+    Löscht:
+    - Files älter als max_age_days (Standard: 7 Tage)
+    - Error-Status Files älter als 24 Stunden
     - Files mit korruptem JSON
     
     Returns:
-        Anzahl gelÃ¶schter Files
+        Anzahl gelöschter Files
     """
     if not os.path.exists(state_dir):
         return 0
@@ -344,35 +344,35 @@ def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, ve
             filepath = os.path.join(state_dir, filename)
             
             try:
-                # File-Age prÃ¼fen
+                # File-Age prüfen
                 mtime = os.path.getmtime(filepath)
                 age = now - mtime
                 
-                # Alte Files lÃ¶schen
+                # Alte Files löschen
                 if age > max_age_seconds:
                     if verbose:
-                        _log(f"[cleanup] LÃ¶sche altes State-File ({age/86400:.1f} Tage alt): {filename}")
+                        _log(f"[cleanup] Lösche altes State-File ({age/86400:.1f} Tage alt): {filename}")
                     os.remove(filepath)
                     deleted += 1
                     continue
                 
-                # State laden und prÃ¼fen
+                # State laden und prüfen
                 try:
                     with open(filepath, "r") as f:
                         state = json.load(f)
                     
-                    # Error-Status Files nach 24h lÃ¶schen
+                    # Error-Status Files nach 24h löschen
                     if state.get("status") == "error" and age > error_max_age:
                         if verbose:
-                            _log(f"[cleanup] LÃ¶sche Error-State ({age/3600:.1f}h alt): {filename}")
+                            _log(f"[cleanup] Lösche Error-State ({age/3600:.1f}h alt): {filename}")
                         os.remove(filepath)
                         deleted += 1
                         continue
                     
                 except json.JSONDecodeError:
-                    # Korruptes JSON lÃ¶schen
+                    # Korruptes JSON löschen
                     if verbose:
-                        _log(f"[cleanup] LÃ¶sche korruptes State-File: {filename}")
+                        _log(f"[cleanup] Lösche korruptes State-File: {filename}")
                     os.remove(filepath)
                     deleted += 1
                     continue
@@ -386,7 +386,7 @@ def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, ve
         _log(f"[cleanup] Cleanup-Fehler: {e}")
     
     if deleted > 0 and verbose:
-        _log(f"[cleanup] {deleted} verwaiste State-Files gelÃ¶scht")
+        _log(f"[cleanup] {deleted} verwaiste State-Files gelöscht")
     
     return deleted
 
@@ -401,8 +401,8 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     - upload_info() Server-Sync vor Resume
     - Automatische Offset-Korrektur
     - SHA256-Verifikation nach Upload
-    - Snapshot-Validierung (State gehÃ¶rt zu aktuellem Snapshot)
-    - Automatisches Cleanup ungÃ¼ltiger/alter State-Files
+    - Snapshot-Validierung (State gehört zu aktuellem Snapshot)
+    - Automatisches Cleanup ungültiger/alter State-Files
     
     Returns:
         Dict mit 'metadata' (kompatibel mit pc.upload_file)
@@ -430,7 +430,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
         _cleanup_orphaned_resume_states(state_dir, max_age_days=max_age, verbose=verbose)
         _resume_cleanup_done = True
     
-    # Snapshot-Name aus remote_path extrahieren (wichtig fÃ¼r Validierung!)
+    # Snapshot-Name aus remote_path extrahieren (wichtig für Validierung!)
     # Format: /_snapshots/<snapshot_name>/...
     snapshot_name = None
     match = re.search(r'/_snapshots/([^/]+)/', remote_path)
@@ -455,21 +455,21 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
             with open(state_file, "r") as f:
                 state = json.load(f)
             
-            # Hash aus State Ã¼bernehmen (falls vorhanden)
+            # Hash aus State übernehmen (falls vorhanden)
             file_hash = state.get("file_hash")
             
-            # Validierung 1: Pfad & GrÃ¶ÃŸe mÃ¼ssen matchen
+            # Validierung 1: Pfad & Größe müssen matchen
             if state.get("remote_path") != remote_path:
-                _log(f"[chunked] State ungÃ¼ltig (remote_path geÃ¤ndert) - lÃ¶sche State")
+                _log(f"[chunked] State ungültig (remote_path geändert) - lösche State")
                 os.remove(state_file)
                 file_hash = None
             elif state.get("file_size") != file_size:
-                _log(f"[chunked] State ungÃ¼ltig (file_size geÃ¤ndert) - lÃ¶sche State")
+                _log(f"[chunked] State ungültig (file_size geändert) - lösche State")
                 os.remove(state_file)
                 file_hash = None
             # Validierung 2: Snapshot-Name muss matchen (wenn vorhanden)
             elif snapshot_name and state.get("snapshot_name") != snapshot_name:
-                _log(f"[chunked] State ungÃ¼ltig (Snapshot geÃ¤ndert: {state.get('snapshot_name')} -> {snapshot_name}) - lÃ¶sche State")
+                _log(f"[chunked] State ungültig (Snapshot geändert: {state.get('snapshot_name')} -> {snapshot_name}) - lösche State")
                 os.remove(state_file)
                 file_hash = None
             else:
@@ -482,7 +482,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                 _log(f"[chunked] Lade State: {os.path.basename(state_file)}")
                 _log(f"[chunked] Resume @ {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
                 
-                # Metrik hochzÃ¤hlen
+                # Metrik hochzählen
                 try:
                     with _metrics_lock:
                         globals()["MET_RESUMED_FILES"] += 1
@@ -499,8 +499,8 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                         upload_offset = server_offset
                         chunks_uploaded = server_offset // RESUME_CHUNK_SIZE
                 except Exception as e:
-                    _log(f"[chunked] upload_info fehlgeschlagen: {e} - lÃ¶sche State und starte neu")
-                    # Wichtig: State-File lÃ¶schen, nicht Ã¼berschreiben!
+                    _log(f"[chunked] upload_info fehlgeschlagen: {e} - lösche State und starte neu")
+                    # Wichtig: State-File löschen, nicht überschreiben!
                     try:
                         os.remove(state_file)
                     except Exception:
@@ -521,14 +521,14 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     
     # FIX 3: SHA256 nur berechnen wenn nicht aus State geladen
     if not file_hash:
-        _log(f"[chunked] Berechne SHA256 fÃ¼r {filename_base} ({file_size/1024**3:.2f} GB)...")
+        _log(f"[chunked] Berechne SHA256 für {filename_base} ({file_size/1024**3:.2f} GB)...")
         h = hashlib.sha256()
         with open(local_path, "rb") as f:
             for chunk in iter(lambda: f.read(1024**2), b""):
                 h.update(chunk)
         file_hash = h.hexdigest()
     
-    # Upload-Session erstellen (falls nÃ¶tig)
+    # Upload-Session erstellen (falls nötig)
     if not uploadid:
         _log(f"[chunked] Erstelle Upload-Session...")
         resp = pc.upload_create(cfg)
@@ -549,7 +549,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
             
             chunk_number += 1
             
-            # FIX 2: Retry-Logik fÃ¼r Chunk-Upload (transiente Netzwerkfehler)
+            # FIX 2: Retry-Logik für Chunk-Upload (transiente Netzwerkfehler)
             chunk_uploaded = False
             for retry in range(1, 6):  # 5 Versuche pro Chunk
                 try:
@@ -609,9 +609,9 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
     dest_filename = os.path.basename(remote_path)
     dest_folderid = pc.ensure_path(cfg, dest_dir)
     
-    # FIX 2: Retry-Logik auch fÃ¼r upload_save (kritisch!)
+    # FIX 2: Retry-Logik auch für upload_save (kritisch!)
     result = None
-    for retry in range(1, 6):  # 5 Versuche fÃ¼r Finalisierung
+    for retry in range(1, 6):  # 5 Versuche für Finalisierung
         try:
             result = pc.upload_save(cfg, uploadid, folderid=dest_folderid, name=dest_filename)
             break
@@ -641,13 +641,13 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
             remote_sha256 = checksum_data.get("sha256", "").lower()
             
             if file_hash.lower() == remote_sha256:
-                _log(f"[chunked] âœ“ SHA256 verifiziert")
+                _log(f"[chunked] ✓ SHA256 verifiziert")
             else:
-                _log(f"[chunked] âœ— SHA256 MISMATCH! Lokal={file_hash[:16]}... Remote={remote_sha256[:16]}...")
+                _log(f"[chunked] ✗ SHA256 MISMATCH! Lokal={file_hash[:16]}... Remote={remote_sha256[:16]}...")
         except Exception as e:
             _log(f"[chunked] SHA256-Verifikation fehlgeschlagen: {e}")
     
-    # State aufrÃ¤umen
+    # State aufräumen
     try:
         os.remove(state_file)
     except Exception:
@@ -659,7 +659,7 @@ def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
 def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
                       *, dry: bool = False) -> dict:
     """
-    Smart Upload: Standard-Upload fÃ¼r kleine Files, Chunked-Resume fÃ¼r groÃŸe Files.
+    Smart Upload: Standard-Upload für kleine Files, Chunked-Resume für große Files.
     
     Args:
         cfg: pCloud Config
@@ -672,7 +672,7 @@ def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
     """
     file_size = os.path.getsize(local_path)
     
-    # GroÃŸe Dateien: Chunked Upload mit Resume
+    # Große Dateien: Chunked Upload mit Resume
     if file_size > RESUME_THRESHOLD_BYTES:
         return _upload_file_resumable(cfg, local_path, remote_path, dry=dry)
     
@@ -684,7 +684,7 @@ def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
 
 
 def stat_file_safe(cfg: dict, *, path: Optional[str]=None, fileid: Optional[int]=None) -> Optional[dict]:
-    """Stat-Datei; gibt None bei 'not found' zurÃ¼ck (anstatt Exception)."""
+    """Stat-Datei; gibt None bei 'not found' zurück (anstatt Exception)."""
     try:
         if path is not None:
             md = pc.stat_file(cfg, path=pc._norm_remote_path(path), with_checksum=False, enrich_path=True)
@@ -696,7 +696,7 @@ def stat_file_safe(cfg: dict, *, path: Optional[str]=None, fileid: Optional[int]
     except Exception:
         return None
 def ensure_parent_dirs(cfg: dict, remote_path: str, *, dry: bool=False) -> None:
-    """Sorgt dafÃ¼r, dass alle Ordner bis zum parent von remote_path existieren."""
+    """Sorgt dafür, dass alle Ordner bis zum parent von remote_path existieren."""
     p = pc._norm_remote_path(remote_path)
     parent = p.rsplit("/", 1)[0] or "/"
     if dry:
@@ -736,7 +736,7 @@ def stub_path_for(snapshots_root: str, snapshot: str, relpath: str) -> str:
     return f"{snapshots_root.rstrip('/')}/{snapshot}/{relpath}.meta.json".replace("//", "/")
 
 def key_from_inode(item: dict) -> Optional[str]:
-    """Erzeugt einen Key fÃ¼r Hardlink-Gruppierung; None wenn kein inode."""
+    """Erzeugt einen Key für Hardlink-Gruppierung; None wenn kein inode."""
     ino = (item.get("inode") or {})
     dev = ino.get("dev"); n = ino.get("ino")
     if dev is None or n is None:
@@ -746,11 +746,11 @@ def key_from_inode(item: dict) -> Optional[str]:
 def _compute_snapshot_stub_ratio(index: dict, snapshot_name: str) -> tuple:
     """
     Analysiert den lokalen Master-Index und berechnet die Stub-Ratio
-    fÃ¼r einen gegebenen Snapshot â€“ OHNE API-Calls, rein lokal, O(n).
+    für einen gegebenen Snapshot – OHNE API-Calls, rein lokal, O(n).
 
-    Ein Node "gehÃ¶rt" zu snapshot_name wenn:
-      a) anchor_path den Snapshot-Namen enthÃ¤lt (â†’ echte Datei / Anchor)
-      b) Ein Holder-Eintrag mit snapshot == snapshot_name existiert (â†’ Stub)
+    Ein Node "gehört" zu snapshot_name wenn:
+      a) anchor_path den Snapshot-Namen enthält (→ echte Datei / Anchor)
+      b) Ein Holder-Eintrag mit snapshot == snapshot_name existiert (→ Stub)
 
     Returns: (total, stubs, stub_ratio)
       total      = Anzahl Dateien, die in diesem Snapshot existieren
@@ -766,7 +766,7 @@ def _compute_snapshot_stub_ratio(index: dict, snapshot_name: str) -> tuple:
 
         # Snapshot-Name aus anchor_path extrahieren:
         # Format: /.../_snapshots/YYYY-MM-DD-HHMMSS/relpath
-        # â†’ Segment nach "_snapshots/" ist der Snapshot-Name
+        # → Segment nach "_snapshots/" ist der Snapshot-Name
         anchor_snap = ""
         if "/_snapshots/" in anchor_path:
             try:
@@ -774,7 +774,7 @@ def _compute_snapshot_stub_ratio(index: dict, snapshot_name: str) -> tuple:
             except (IndexError, AttributeError):
                 anchor_snap = ""
 
-        # PrÃ¼fe ob Node in diesem Snapshot vorkommt (als Anchor ODER Holder)
+        # Prüfe ob Node in diesem Snapshot vorkommt (als Anchor ODER Holder)
         is_anchor = (anchor_snap == snapshot_name)
         is_holder = any(
             isinstance(h, dict) and h.get("snapshot") == snapshot_name
@@ -783,7 +783,7 @@ def _compute_snapshot_stub_ratio(index: dict, snapshot_name: str) -> tuple:
 
         if is_anchor or is_holder:
             total += 1
-            if not is_anchor:  # Holder aber kein Anchor â†’ Stub
+            if not is_anchor:  # Holder aber kein Anchor → Stub
                 stub_count += 1
 
     ratio = stub_count / total if total > 0 else 0.0
@@ -804,7 +804,7 @@ def save_content_index_local(local_path: str, index: dict) -> None:
     os.chmod(local_path, 0o644)
 
 def load_content_index_local(local_path: str) -> dict:
-    """LÃ¤dt den Index lokal, falls vorhanden."""
+    """Lädt den Index lokal, falls vorhanden."""
     try:
         with open(local_path, 'r') as f:
             j = json.load(f)
@@ -820,10 +820,10 @@ def load_content_index_local(local_path: str) -> dict:
 
 def load_content_index(cfg: dict, snapshots_root: str) -> dict:
     """
-    LÃ¤dt _snapshots/_index/content_index.json robust.
-    - Wenn Datei fehlt/kaputt: leeren Index zurÃ¼ckgeben.
-    - Ein 'result'â‰ 0 im JSON gilt als API-Fehler (dann leerer Index).
-    - Fehlt 'result' vÃ¶llig (Normalfall bei echter Index-Datei) â†’ OK.
+    Lädt _snapshots/_index/content_index.json robust.
+    - Wenn Datei fehlt/kaputt: leeren Index zurückgeben.
+    - Ein 'result'≠0 im JSON gilt als API-Fehler (dann leerer Index).
+    - Fehlt 'result' völlig (Normalfall bei echter Index-Datei) → OK.
     """
     idx_path = f"{snapshots_root.rstrip('/')}/_index/content_index.json"
     try:
@@ -866,7 +866,7 @@ def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool
     pc.write_json_to_folderid(cfg, folderid=int(fid), filename=idx_name, obj=index, minify=(not pretty))
 
 def list_remote_snapshot_names(cfg: dict, snapshots_root: str) -> set[str]:
-    """Liest die Ordnernamen unter <snapshots_root> (auÃŸer '_index')."""
+    """Liest die Ordnernamen unter <snapshots_root> (außer '_index')."""
     out: set[str] = set()
     try:
         top = pc.listfolder(cfg, path=snapshots_root, recursive=False, nofiles=True, showpath=False)
@@ -908,7 +908,7 @@ class SmartStrategyController:
     """
 
     def __init__(self):
-        # Default Schwellenwerte (Ã¼ber ENV steuerbar)
+        # Default Schwellenwerte (über ENV steuerbar)
         self.x_match_ratio = _MATCH_THRESHOLD
         self.y_stub_ratio = _STUB_THRESHOLD
         self.z_template_match = _TEMPLATE_THRESHOLD
@@ -919,10 +919,10 @@ class SmartStrategyController:
 
     def decide(self, metrics: dict) -> SyncStrategy:
         """
-        Entscheidungslogik gemÃ¤ÃŸ Fachspezifikation:
-        1. Quota-Schutz (Stub-Ratio) ist Bedingung fÃ¼r Turbo.
+        Entscheidungslogik gemäß Fachspezifikation:
+        1. Quota-Schutz (Stub-Ratio) ist Bedingung für Turbo.
         2. Template ist kontrollierte mittlere Stufe.
-        3. Safe-Mode ist immer verfÃ¼gbarer Fallback.
+        3. Safe-Mode ist immer verfügbarer Fallback.
         """
         source_count = metrics.get("source_snapshots", 0)
         stub_ratio = metrics.get("stub_ratio", 0.0)
@@ -956,7 +956,7 @@ class SmartStrategyController:
         return SyncStrategy.SAFE_MODE
 
     def log_decision(self, strategy: SyncStrategy, metrics: dict, snapshot_name: str):
-        """Schreibt eine maschinenlesbare Log-Zeile fÃ¼r Auditing."""
+        """Schreibt eine maschinenlesbare Log-Zeile für Auditing."""
         m = metrics
         log_line = (
             f"[decision] mode={strategy.value} | "
@@ -987,8 +987,8 @@ class SmartStrategyController:
 
 def _load_template_manifest(archive_dir: str) -> Optional[dict]:
     """
-    LÃ¤dt das lokale Template-Manifest (gespeichert nach Upload).
-    Gibt None zurÃ¼ck wenn nicht vorhanden oder ungÃ¼ltig.
+    Lädt das lokale Template-Manifest (gespeichert nach Upload).
+    Gibt None zurück wenn nicht vorhanden oder ungültig.
     
     Returns:
         dict mit {"folders": [...], "template_path": "...", ...} oder None
@@ -1040,7 +1040,7 @@ def _save_template_manifest(archive_dir: str, template_path: str, folders: set, 
 
 
 def _get_sync_metrics(cfg: dict, manifest: dict, dest_root: str, archive_dir: str) -> dict:
-    """Berechnet Kennzahlen fÃ¼r die Strategiewahl."""
+    """Berechnet Kennzahlen für die Strategiewahl."""
     metrics = {
         "source_snapshots": 0,
         "match_ratio": 0.0,
@@ -1050,7 +1050,7 @@ def _get_sync_metrics(cfg: dict, manifest: dict, dest_root: str, archive_dir: st
         "basis_snapshot": None
     }
 
-    # 1. Source Snapshots zÃ¤hlen (Lokal im Archiv)
+    # 1. Source Snapshots zählen (Lokal im Archiv)
     if os.path.exists(archive_dir):
         manifests = [f for f in os.listdir(archive_dir) if f.endswith(".json")]
         metrics["source_snapshots"] = len(manifests)
@@ -1067,7 +1067,7 @@ def _get_sync_metrics(cfg: dict, manifest: dict, dest_root: str, archive_dir: st
                 with open(f"{archive_dir}/{basis_name}.json", "r") as f:
                     basis_manifest = json.load(f)
                 
-                # Sets von (relpath, size, mtime) fÃ¼r Match-Check
+                # Sets von (relpath, size, mtime) für Match-Check
                 curr_items = { (it.get("relpath"), it.get("size"), it.get("mtime")) 
                               for it in manifest.get("items", []) if it.get("type") == "file" }
                 basis_items = { (it.get("relpath"), it.get("size"), it.get("mtime")) 
@@ -1109,7 +1109,7 @@ def _get_sync_metrics(cfg: dict, manifest: dict, dest_root: str, archive_dir: st
 
 def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive_dir: str) -> dict:
     """
-    Einheitliche Kennzahlenberechnung fÃ¼r alle Entscheidungen.
+    Einheitliche Kennzahlenberechnung für alle Entscheidungen.
     IMMER aus derselben Quelle (Index + Manifest-Archive).
     """
     metrics = {
@@ -1143,7 +1143,7 @@ def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive
     # 1. Source-Snapshots aus dem RICHTIGEN Pfad
     manifests_dir = os.path.join(archive_dir, "manifests")
     if os.path.exists(manifests_dir):
-        # ZÃ¤hle nur Snapshots mit abgelautenem .json
+        # Zähle nur Snapshots mit abgelautenem .json
         manifests = [f for f in os.listdir(manifests_dir) if f.endswith(".json")]
         metrics["source_snapshots"] = len(manifests)
         
@@ -1260,7 +1260,7 @@ def _get_sync_metrics_unified(cfg: dict, manifest: dict, dest_root: str, archive
 
 def _list_remote_folders_from_template(cfg: dict, template_path: str) -> set:
     """
-    LÃ¤dt AKTUELLEN Ordner-Zustand des Templates von pCloud (IST-Zustand).
+    Lädt AKTUELLEN Ordner-Zustand des Templates von pCloud (IST-Zustand).
     
     WICHTIG: pCloud ist Single Source of Truth - nicht das lokale Manifest!
     Das lokale Manifest wird nur zum Speichern verwendet, nicht zum Diff.
@@ -1302,9 +1302,9 @@ def _list_remote_folders_from_template(cfg: dict, template_path: str) -> set:
 
 def finalize_index_fileids(cfg, snapshots_root):
     """
-    LÃ¤dt <snapshots_root>/_index/content_index.json und fÃ¼llt fehlende fileids
-    (fÃ¼r Nodes mit anchor_path) via REST /stat nach. Schreibt nur bei Ã„nderungen.
-    Return: Anzahl reparierter EintrÃ¤ge.
+    Lädt <snapshots_root>/_index/content_index.json und füllt fehlende fileids
+    (für Nodes mit anchor_path) via REST /stat nach. Schreibt nur bei Änderungen.
+    Return: Anzahl reparierter Einträge.
     """
     start = time.time()
 
@@ -1350,7 +1350,7 @@ def finalize_index_fileids(cfg, snapshots_root):
 
 def _batch_ensure_paths(cfg: dict, paths: list[str], *, dry: bool = False) -> None:
     """
-    Batch-Version von ensure_parent_dirs fÃ¼r mehrere Pfade.
+    Batch-Version von ensure_parent_dirs für mehrere Pfade.
     Nutzt createfolderrecursive (ein Call pro Parent-Kette).
     """
     if not paths:
@@ -1365,17 +1365,17 @@ def _batch_ensure_paths(cfg: dict, paths: list[str], *, dry: bool = False) -> No
         try:
             pc.ensure_path(cfg, parent, dry=dry)
         except Exception:
-            # nicht hart abbrechen â€“ idempotent, nÃ¤chste versuchen
+            # nicht hart abbrechen – idempotent, nächste versuchen
             continue
 
 def _build_folder_cache_from_tree(cfg: dict, root_path: str) -> dict[str, int]:
     """
-    LÃ¤dt Ordner-Struktur via listfolder (recursive=True, nofiles=True)
+    Lädt Ordner-Struktur via listfolder (recursive=True, nofiles=True)
     und baut eine Map: {normalized_path: folderid}
     
     Performance:
-      - 1Ã— listfolder (recursive) API-Call
-      - Statt NÃ— ensure_path/stat fÃ¼r Parent-FolderID-Lookups
+      - 1× listfolder (recursive) API-Call
+      - Statt N× ensure_path/stat für Parent-FolderID-Lookups
       - Typisch: 1 Call statt 1,000+ Calls (999x Reduktion)
     
     Returns:
@@ -1389,12 +1389,12 @@ def _build_folder_cache_from_tree(cfg: dict, root_path: str) -> dict[str, int]:
     try:
         result = pc.listfolder(cfg, path=root_path, recursive=True, nofiles=True)
     except Exception as e:
-        # Root existiert noch nicht (erstes Upload) oder Fehler â†’ leere Map
+        # Root existiert noch nicht (erstes Upload) oder Fehler → leere Map
         if "2005" in str(e) or "not found" in str(e).lower():
             return {}
         # Bei anderen Fehlern auch leere Map (defensiv, kein Abbruch)
         if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[warn] listfolder fÃ¼r Folder-Cache fehlgeschlagen: {e}")
+            _log(f"[warn] listfolder für Folder-Cache fehlgeschlagen: {e}")
         return {}
     
     cache = {}
@@ -1415,10 +1415,10 @@ def _build_folder_cache_from_tree(cfg: dict, root_path: str) -> dict[str, int]:
         if parent_path:
             full_path = f"{parent_path}/{folder_name}"
         else:
-            # Root-Node: verwende den Ã¼bergebenen Pfad
+            # Root-Node: verwende den übergebenen Pfad
             full_path = root_path
         
-        # Normalisieren (wichtig fÃ¼r Map-Lookup!)
+        # Normalisieren (wichtig für Map-Lookup!)
         normalized = pc._norm_remote_path(full_path)
         
         if folderid:
@@ -1449,7 +1449,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
 
     pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
     
-    # Progress-Tracking fÃ¼r Stub-Writing (thread-safe)
+    # Progress-Tracking für Stub-Writing (thread-safe)
     _stubs_written = 0
     _stubs_failed = 0
     _stubs_lock = threading.Lock()
@@ -1463,7 +1463,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         name = os.path.basename(stub_path)
         by_parent.setdefault(parent, []).append((name, payload))
 
-    # 2) parent-fids auflÃ¶sen (optimiert: listfolder + selective ensure)
+    # 2) parent-fids auflösen (optimiert: listfolder + selective ensure)
     parent_fids: dict[str, int] = {}
     _total_parents = len(by_parent)
     _cache_hits = 0
@@ -1475,13 +1475,13 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     if not dry and by_parent:
         # Snapshot-Root ermitteln (z.B. /My Cloud/_snapshots/2026-04-17-120000)
         first_parent = next(iter(by_parent.keys()))
-        # Format: /.../snapshots_root/snapshot_name/... â†’ extrahiere bis snapshot_name
+        # Format: /.../snapshots_root/snapshot_name/... → extrahiere bis snapshot_name
         parts = first_parent.split("/")
         snapshot_root = None
         # Finde _snapshots Index
         try:
             snapshots_idx = parts.index("_snapshots")
-            # snapshot_root = alles bis einschlieÃŸlich snapshot_name (snapshots_idx + 2)
+            # snapshot_root = alles bis einschließlich snapshot_name (snapshots_idx + 2)
             if len(parts) > snapshots_idx + 1:
                 snapshot_root = "/".join(parts[:snapshots_idx + 2])
             else:
@@ -1501,29 +1501,29 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             t_cache_ms = (time.time() - t_cache_start) * 1000.0
             _api_calls += 1  # Ein listfolder-Call
             if folder_cache:
-                _log(f"[stubs] âœ“ Folder-Cache geladen: {len(folder_cache)} Ordner in {t_cache_ms:.0f}ms")
+                _log(f"[stubs] ✓ Folder-Cache geladen: {len(folder_cache)} Ordner in {t_cache_ms:.0f}ms")
             else:
                 _log(f"[stubs][WARN] Folder-Cache leer nach listfolder (Snapshot existiert noch nicht?)")
         else:
-            # Snapshot-Root ungÃ¼ltig â†’ Skip Cache-Build (Legacy-Mode wird unten aktiviert)
-            _log(f"[stubs][WARN] Ãœberspringe Cache-Build (ungÃ¼ltige snapshot_root)")
+            # Snapshot-Root ungültig → Skip Cache-Build (Legacy-Mode wird unten aktiviert)
+            _log(f"[stubs][WARN] Überspringe Cache-Build (ungültige snapshot_root)")
             folder_cache = {}
     else:
         folder_cache = {}
     
-    # 2b) Fallback-Detection: Wenn Cache leer ABER viele Parents â†’ Legacy-Mode
+    # 2b) Fallback-Detection: Wenn Cache leer ABER viele Parents → Legacy-Mode
     _use_legacy_mode = False
     if not dry and not folder_cache and _total_parents > 10:
-        _log(f"[stubs][WARN] Folder-Cache leer ({len(folder_cache)} EintrÃ¤ge) trotz {_total_parents} Parents")
-        _log(f"[stubs][WARN] â†’ Fallback zu Legacy-Mode (sequential ensure_path)")
-        _log(f"[stubs][WARN] â†’ Erwartet: ~{int(_total_parents * 0.5 / 60)}min statt <5s")
+        _log(f"[stubs][WARN] Folder-Cache leer ({len(folder_cache)} Einträge) trotz {_total_parents} Parents")
+        _log(f"[stubs][WARN] → Fallback zu Legacy-Mode (sequential ensure_path)")
+        _log(f"[stubs][WARN] → Erwartet: ~{int(_total_parents * 0.5 / 60)}min statt <5s")
         _use_legacy_mode = True
     
     # 2c) Parent-FIDs: Cache-Lookup (optimiert) oder Legacy-Mode (sequential)
     if _use_legacy_mode:
-        _log(f"[stubs] LÃ¶se {_total_parents} Parent-FolderIDs auf (Legacy-Modus: sequential ensure_path)...")
+        _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Legacy-Modus: sequential ensure_path)...")
     else:
-        _log(f"[stubs] LÃ¶se {_total_parents} Parent-FolderIDs auf (Cache-Optimiert: {len(folder_cache)} gecacht)...")
+        _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Cache-Optimiert: {len(folder_cache)} gecacht)...")
     
     for parent in by_parent.keys():
         if dry:
@@ -1531,7 +1531,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             parent_fids[parent] = 0
             continue
         
-        # Normalisieren fÃ¼r Cache-Lookup
+        # Normalisieren für Cache-Lookup
         normalized_parent = pc._norm_remote_path(parent)
         
         # Cache-Lookup (O(1))
@@ -1539,13 +1539,13 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             parent_fids[parent] = folder_cache[normalized_parent]
             _cache_hits += 1
         else:
-            # Cache-Miss: Ordner existiert noch nicht â†’ anlegen
+            # Cache-Miss: Ordner existiert noch nicht → anlegen
             try:
                 fid = pc.ensure_path(cfg, path=parent)
                 parent_fids[parent] = int(fid)
                 folder_cache[normalized_parent] = int(fid)  # Cache updaten
                 _cache_misses += 1
-                _api_calls += 1  # ZÃ¤hle ensure_path als API-Call
+                _api_calls += 1  # Zähle ensure_path als API-Call
             except Exception as e:
                 # Bei 2004 (Already exists): FolderID via stat nachziehen
                 if "2004" in str(e):
@@ -1559,7 +1559,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                             if os.environ.get("PCLOUD_VERBOSE") == "1":
                                 _log(f"[info] Folder {parent} existiert bereits (2004) - FolderID via stat geholt: {fid}")
                         else:
-                            _log(f"[warn] Folder {parent} existiert (2004), aber FolderID nicht auflÃ¶sbar - Stubs werden Ã¼bersprungen")
+                            _log(f"[warn] Folder {parent} existiert (2004), aber FolderID nicht auflösbar - Stubs werden übersprungen")
                     except Exception as e2:
                         _log(f"[warn] cannot resolve folderid for {parent}: {e} (fallback failed: {e2})")
                 else:
@@ -1568,8 +1568,8 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     # Performance-Report
     if not dry:
         _speedup = (_total_parents / _api_calls) if _api_calls > 0 else 0
-        _log(f"[stubs] âœ“ Parent-FIDs aufgelÃ¶st: {_cache_hits} Cache-Hits, {_cache_misses} neu angelegt")
-        _log(f"[stubs] âœ“ API-Calls: {_api_calls} (statt {_total_parents}) â†’ {_speedup:.0f}x Reduktion")
+        _log(f"[stubs] ✓ Parent-FIDs aufgelöst: {_cache_hits} Cache-Hits, {_cache_misses} neu angelegt")
+        _log(f"[stubs] ✓ API-Calls: {_api_calls} (statt {_total_parents}) → {_speedup:.0f}x Reduktion")
 
     # 3) Schreibjobs bauen (nur Parents mit bekannter fid) + Payload anreichern
     tasks: list[tuple[str, str, dict]] = []
@@ -1585,7 +1585,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             if "holder_type" not in payload and payload.get("type") == "hardlink":
                 payload["holder_type"] = "hardlink"
             
-            # mtime_iso hinzufÃ¼gen falls mtime vorhanden
+            # mtime_iso hinzufügen falls mtime vorhanden
             mtime = payload.get("mtime")
             if mtime and "mtime_iso" not in payload:
                 try:
@@ -1609,7 +1609,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         parent, name, payload = args
         
         if dry:
-            # Pretty-Print auch im Dry-Run fÃ¼r Debug
+            # Pretty-Print auch im Dry-Run für Debug
             if pretty:
                 txt = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
                 _dry_sampler.log("stub", f"stub write: {parent}/{name}\n{txt}")
@@ -1617,7 +1617,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 _dry_sampler.log("stub", f"stub write: {parent}/{name}")
             return True
         
-        # Retry-Logik fÃ¼r robuste Stub-Writes (Timeout-Protection)
+        # Retry-Logik für robuste Stub-Writes (Timeout-Protection)
         try:
             ret = pc.call_with_backoff(
                 pc.write_json_to_folderid,
@@ -1648,7 +1648,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             _stubs_written += 1
             current_pct = int((_stubs_written / total_tasks) * 100)
             
-            # Alle _progress_interval Stubs ODER bei Prozent-Ã„nderung (10%, 20%, ...)
+            # Alle _progress_interval Stubs ODER bei Prozent-Änderung (10%, 20%, ...)
             show_progress = (
                 _stubs_written % _progress_interval == 0 or 
                 _stubs_written == total_tasks or
@@ -1657,7 +1657,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
             
             if show_progress:
                 _last_progress_pct = current_pct
-                eta_per_stub = 0.5  # SchÃ¤tzung: ~0.5s pro Stub
+                eta_per_stub = 0.5  # Schätzung: ~0.5s pro Stub
                 remaining = (total_tasks - _stubs_written) * eta_per_stub / threads
                 eta_str = f"~{int(remaining/60)}min" if remaining > 60 else f"~{int(remaining)}s"
                 _log(f"[stubs] {_stubs_written}/{total_tasks} ({current_pct}%) | {eta_str} verbleibend")
@@ -1674,7 +1674,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     # Abschluss-Meldung mit Fehler-Statistik
     if _stubs_failed > 0:
         _log(f"[warn] {_stubs_failed} Stubs fehlgeschlagen (von {total_tasks})")
-    _log(f"[stubs] âœ“ {_stubs_written}/{total_tasks} Stubs erfolgreich ({(_stubs_written/total_tasks*100):.1f}%)")
+    _log(f"[stubs] ✓ {_stubs_written}/{total_tasks} Stubs erfolgreich ({(_stubs_written/total_tasks*100):.1f}%)")
 
 # ----------------- Haupt-Logik -----------------
 
@@ -1689,7 +1689,7 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
 
     _log(f"[plan] objects={objects_root} snapshot={snapshots_root}/{snapshot}")
 
-    # === Parallel Upload fÃ¼r Objects-Mode ===
+    # === Parallel Upload für Objects-Mode ===
     _state_lock = threading.Lock()
     
     # 1) echte Objekte sicherstellen (mit Parallelisierung)
@@ -1728,11 +1728,11 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
     _large_objects = [f for f in _file_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
     
     if _small_objects and _large_objects:
-        _log(f"[objects] {len(_small_objects)} kleine Objekte parallel, {len(_large_objects)} groÃŸe sequentiell")
+        _log(f"[objects] {len(_small_objects)} kleine Objekte parallel, {len(_large_objects)} große sequentiell")
     elif _small_objects:
         _log(f"[objects] {len(_small_objects)} kleine Objekte parallel")
     else:
-        _log(f"[objects] {len(_large_objects)} groÃŸe Objekte sequentiell")
+        _log(f"[objects] {len(_large_objects)} große Objekte sequentiell")
     
     # Kleine Objekte parallel
     if _small_objects and PARALLEL_UPLOAD_THREADS > 1:
@@ -1742,7 +1742,7 @@ def push_objects_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool, o
         for obj in _small_objects:
             _upload_object(obj)
     
-    # GroÃŸe Objekte sequentiell
+    # Große Objekte sequentiell
     for obj in _large_objects:
         _upload_object(obj)
     # === Ende Parallel Upload (Objects-Mode) ===
@@ -1804,7 +1804,7 @@ def ensure_snapshots_layout(cfg: dict, dest_root: str, *, dry: bool = False) -> 
 def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manifest_path=None, 
                    strategy_mode="SAFE-MODE"):
     """
-    1:1-Modus mit Resume-UnterstÃ¼tzung.
+    1:1-Modus mit Resume-Unterstützung.
     Entscheidung zwischen TURBO/TEMPLATE/SAFE erfolgt EXTERN in push_1to1_smart_controller.
     
     Args:
@@ -1826,7 +1826,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     force_safe = (strategy_mode == "SAFE-MODE")
     template_force_active = (strategy_mode == "TEMPLATE-DELTA-SAFE")
     
-    # === Timeout-Protection fÃ¼r Mass-Uploads ===
+    # === Timeout-Protection für Mass-Uploads ===
     # Ensure minimum timeout (kritisch bei 19k+ Stub-Writes)
     if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
         cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
@@ -1838,27 +1838,27 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     marker_started = f"{dest_snapshot_dir}/.upload_started"
     marker_complete = f"{dest_snapshot_dir}/.upload_complete"
     
-    # PrÃ¼fen ob unvollstÃ¤ndiger Upload existiert
+    # Prüfen ob unvollständiger Upload existiert
     incomplete_upload = False
     try:
         pc.stat_file(cfg, path=marker_started, with_checksum=False)
         # Started-Marker existiert
         try:
             pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-            # Complete-Marker auch da â†’ Upload war erfolgreich
-            _log(f"[info] Snapshot {snapshot_name} bereits vollstÃ¤ndig hochgeladen")
+            # Complete-Marker auch da → Upload war erfolgreich
+            _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
             return {"uploaded": 0, "stubs": 0, "resumed": False}
         except:
-            # Nur Started, kein Complete â†’ unvollstÃ¤ndig!
+            # Nur Started, kein Complete → unvollständig!
             incomplete_upload = True
-            _log(f"[warn] UnvollstÃ¤ndiger Upload erkannt fÃ¼r {snapshot_name} - starte neu")
+            _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
     except:
-        # Kein Started-Marker â†’ frischer Upload
+        # Kein Started-Marker → frischer Upload
         pass
     
-    # Bei unvollstÃ¤ndigem Upload: Index-Driven Skip (keine LÃ¶schung)
+    # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
     if incomplete_upload:
-        _log(f"[resume] Setze Upload fort fÃ¼r {snapshot_name} (bereits verarbeitete Dateien werden Ã¼bersprungen)")
+        _log(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
     # === ENDE NEU ===
 
     _log(f"[plan] 1to1 snapshot={dest_snapshot_dir}")
@@ -1878,7 +1878,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
     # === ENDE NEU ===
 
-    # Lock fÃ¼r shared state (muss VOR Hilfsfunktionen definiert werden!)
+    # Lock für shared state (muss VOR Hilfsfunktionen definiert werden!)
     _state_lock = threading.Lock()
 
     # --- kleine Helfer ---
@@ -1908,7 +1908,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         except Exception:
             pass
 
-    # Lokaler Index-Cache-Pfad (nur wÃ¤hrend Upload, wird am Ende hochgeladen)
+    # Lokaler Index-Cache-Pfad (nur während Upload, wird am Ende hochgeladen)
     import tempfile
     _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
     _local_index_path = os.path.join(_local_index_dir, f"pcloud_index_{snapshot_name}.json")
@@ -1936,7 +1936,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     # Hilfstabellen
     seen_inodes: dict[tuple[int,int], str] = {}
     uploaded = 0
-    resumed = 0   # Bereits im Index fÃ¼r diesen Snapshot
+    resumed = 0   # Bereits im Index für diesen Snapshot
     stubs = 0
     index_changed = False
     stubs_to_write: list[tuple[str, dict]] = []
@@ -1952,7 +1952,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             print(f"[dry] upload 1to1: {dst_path}  <- {abs_src}")
             return (None, None)
 
-        # Progress-Hinweis fÃ¼r groÃŸe Dateien
+        # Progress-Hinweis für große Dateien
         file_size = os.path.getsize(abs_src)
         if file_size > 100 * 1024**2:  # > 100MB
             print(f"[upload] Starte Upload: {os.path.basename(dst_path)} ({file_size/1024**2:.1f} MB)", flush=True)
@@ -2051,7 +2051,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
     template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
     
-    # PrÃ¼fe ob Template existiert (via stat)
+    # Prüfe ob Template existiert (via stat)
     template_exists = False
     try:
         template_md = pc.stat_file(cfg, path=template_path, with_checksum=False)
@@ -2073,24 +2073,24 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         if template_folders:
             # 2. Diff berechnen (lokal, OHNE API-Call!)
             to_add = manifest_folders - template_folders       # Neue Ordner
-            to_delete = template_folders - manifest_folders    # ÃœberflÃ¼ssige
+            to_delete = template_folders - manifest_folders    # Überflüssige
             shared = manifest_folders & template_folders       # Identisch
             
-            _log(f"[template] Ãœberlapp: {len(shared)}/{len(manifest_folders)} ({len(shared)/len(manifest_folders)*100:.0f}%)")
-            _log(f"[template] Delta: +{len(to_add)} neue, -{len(to_delete)} Ã¼berflÃ¼ssige")
+            _log(f"[template] Überlapp: {len(shared)}/{len(manifest_folders)} ({len(shared)/len(manifest_folders)*100:.0f}%)")
+            _log(f"[template] Delta: +{len(to_add)} neue, -{len(to_delete)} überflüssige")
             
             # 3. Template kopieren (1 API-Call statt N!)
-            _log(f"[template] Kopiere Template â†’ {snapshot_name} ...")
+            _log(f"[template] Kopiere Template → {snapshot_name} ...")
             try:
                 if not dry:
                     dest_snapshot_fid = pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
                     pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_folderid=dest_snapshot_fid, noover=True, copycontentonly=True)
-                _log(f"[template] âœ“ Template kopiert (~2-5s statt ~5min)")
+                _log(f"[template] ✓ Template kopiert (~2-5s statt ~5min)")
                 template_used = True
                 
-                # 4. ÃœberflÃ¼ssige Ordner lÃ¶schen (tiefste zuerst)
+                # 4. Überflüssige Ordner löschen (tiefste zuerst)
                 if to_delete:
-                    _log(f"[template] LÃ¶sche {len(to_delete)} Ã¼berflÃ¼ssige Ordner...")
+                    _log(f"[template] Lösche {len(to_delete)} überflüssige Ordner...")
                     deleted = 0
                     for relpath in sorted(to_delete, key=lambda p: -p.count("/")):
                         try:
@@ -2098,8 +2098,8 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                                 pc.call_with_backoff(pc.delete_folder, cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=False)
                             deleted += 1
                         except Exception as e:
-                            _log(f"[warn] Konnte {relpath} nicht lÃ¶schen: {e}")
-                    _log(f"[template] âœ“ {deleted} Ã¼berflÃ¼ssige Ordner gelÃ¶scht")
+                            _log(f"[warn] Konnte {relpath} nicht löschen: {e}")
+                    _log(f"[template] ✓ {deleted} überflüssige Ordner gelöscht")
                 
                 # 5. Fehlende Ordner anlegen (parallel)
                 if to_add:
@@ -2126,9 +2126,9 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                                 if not dry:
                                     pc.call_with_backoff(pc.ensure_path, cfg, f"{dest_snapshot_dir}/{reldir}")
                                 created += 1
-                    _log(f"[template] âœ“ {created} neue Ordner angelegt")
+                    _log(f"[template] ✓ {created} neue Ordner angelegt")
                 
-                # 6. Template aktualisieren (wenn Struktur sich Ã¤nderte)
+                # 6. Template aktualisieren (wenn Struktur sich änderte)
                 if (to_add or to_delete) and not dry:
                     _log("[template] Aktualisiere Template mit neuer Struktur...")
                     try:
@@ -2136,12 +2136,12 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                         template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
                         pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
                         _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
-                        _log("[template] âœ“ Template aktualisiert")
+                        _log("[template] ✓ Template aktualisiert")
                     except Exception as e:
                         _log(f"[warn] Template-Update fehlgeschlagen: {e}")
                 
             except Exception as e:
-                _log(f"[warn] Template-Nutzung fehlgeschlagen: {e} â€“ Fallback zu Einzeln-Anlage")
+                _log(f"[warn] Template-Nutzung fehlgeschlagen: {e} – Fallback zu Einzeln-Anlage")
                 template_used = False
     
     # Fallback: Ordner einzeln anlegen (wenn kein Template oder Template-Fehler)
@@ -2213,7 +2213,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                             _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
                     return True
                 except Exception as e:
-                    print(f"[warn] Ordner-Anlage fehlgeschlagen fÃ¼r {reldir}: {e}", file=sys.stderr)
+                    print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
                     return False
             
             _log(f"[folders] {max_depth + 1} Ebenen, {threads} Threads pro Ebene")
@@ -2226,7 +2226,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                     for folder in folders_at_depth:
                         _create_folder(folder)
             
-            _log(f"[folders] âœ“ {total_folders} Ordner erfolgreich angelegt")
+            _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
             
             # Initial-Template erstellen (Ordner sind noch leer!)
             if not template_exists and len(manifest_folders) > 50 and not dry:
@@ -2235,23 +2235,23 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                     template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
                     pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
                     _save_template_manifest(archive_dir, template_path, manifest_folders, snapshot_name)
-                    _log("[template] âœ“ Template erstellt fÃ¼r zukÃ¼nftige Snapshots")
+                    _log("[template] ✓ Template erstellt für zukünftige Snapshots")
                 except Exception as e:
                     _log(f"[warn] Template-Erstellung fehlgeschlagen: {e}")
         else:
             _log(f"[plan] Alle {len(manifest_folders)} Ordner existieren bereits")
     # === Ende Folder-Template-basierte Ordner-Anlage ===
 
-    # === Parallel Upload fÃ¼r kleine Dateien ===
+    # === Parallel Upload für kleine Dateien ===
     # (_state_lock bereits oben definiert - wird hier wiederverwendet)
     
     # File-Processing-Funktion (thread-safe)
     def _process_file_item(it: dict) -> None:
-        """Verarbeitet ein File-Item (thread-safe fÃ¼r parallele AusfÃ¼hrung)"""
+        """Verarbeitet ein File-Item (thread-safe für parallele Ausführung)"""
         nonlocal uploaded, resumed, stubs, index_changed, _done_items, _done_size, _t_last_progress
         nonlocal _last_saved_count, _t_last_index_save, upload_ms
 
-        # Progress-Tracking (ohne Lock fÃ¼r Performance, nicht kritisch)
+        # Progress-Tracking (ohne Lock für Performance, nicht kritisch)
         with _state_lock:
             _done_items += 1
             _done_size += it.get("size") or 0
@@ -2283,18 +2283,18 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         with _state_lock:
             node = items.setdefault(sha, {"holders": []})
             
-            # === Index-Driven Skip: PrÃ¼fen ob bereits im Index fÃ¼r diesen Snapshot ===
+            # === Index-Driven Skip: Prüfen ob bereits im Index für diesen Snapshot ===
             already_in_snapshot = any(
                 h.get("snapshot") == snapshot_name and h.get("relpath") == relpath
                 for h in node.get("holders", [])
             )
             if already_in_snapshot:
-                # Bereits verarbeitet â†’ skip
+                # Bereits verarbeitet → skip
                 seen_inodes[ino_key] = relpath
                 resumed += 1
                 return
             
-            # Content-SHA auch als Feld im Node mitfÃ¼hren
+            # Content-SHA auch als Feld im Node mitführen
             if sha and node.get("sha256") != sha:
                 node["sha256"] = sha
                 index_changed = True
@@ -2319,7 +2319,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                     _delete_if_exists(f"{dst_path}.meta.json")
                 return
 
-        # Upload (auÃŸerhalb Lock fÃ¼r ParallelitÃ¤t!)
+        # Upload (außerhalb Lock für Parallelität!)
         fid = None
         pcloud_hash = None
         if not anchor_path:
@@ -2374,11 +2374,11 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
     
     if _small_files and _large_files:
         _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel, "
-             f"{len(_large_files)} groÃŸe Dateien sequentiell")
+             f"{len(_large_files)} große Dateien sequentiell")
     elif _small_files:
         _log(f"[parallel] {len(_small_files)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel")
     else:
-        _log(f"[parallel] {len(_large_files)} groÃŸe Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
+        _log(f"[parallel] {len(_large_files)} große Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
 
     # Kleine Dateien parallel hochladen
     if _small_files and PARALLEL_UPLOAD_THREADS > 1:
@@ -2388,7 +2388,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
         for f in _small_files:
             _process_file_item(f)
 
-    # GroÃŸe Dateien sequentiell (volle Bandbreite pro File)
+    # Große Dateien sequentiell (volle Bandbreite pro File)
     for f in _large_files:
         _process_file_item(f)
     # === Ende Parallel Upload ===
@@ -2396,17 +2396,17 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
 
     # --- Batch: Stubs & Index schreiben (einmaliges Ensure + Writes) ---
     if not dry and stubs_to_write:
-        _log(f"[push] âœ“ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
+        _log(f"[push] ✓ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
         t0 = time.time()
-        _batch_write_stubs(cfg, stubs_to_write, dry=False)  # sorgt intern fÃ¼r 1x Parent-Ensure
+        _batch_write_stubs(cfg, stubs_to_write, dry=False)  # sorgt intern für 1x Parent-Ensure
         write_ms += (time.time() - t0) * 1000.0
 
 
-    # Index schreiben (lokal â†’ pCloud â†’ lokal lÃ¶schen)
+    # Index schreiben (lokal → pCloud → lokal löschen)
     if dry:
         print(f"[dry] write index: {snapshots_root}/_index/content_index.json (items={len(items)})")
     else:
-        # Finaler lokaler Save (falls noch Ã„nderungen seit letztem periodischen Save)
+        # Finaler lokaler Save (falls noch Änderungen seit letztem periodischen Save)
         if index_changed:
             save_content_index_local(_local_index_path, index)
             if os.environ.get("PCLOUD_VERBOSE") == "1":
@@ -2420,13 +2420,13 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             write_ms += dt_ms 
             print(f"[timing] index_write_ms={int(dt_ms)}")
             
-            # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index fÃ¼r Recovery)
+            # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
             try:
                 idx_path = f"{snapshots_root}/_index/content_index.json"
                 archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
                 pc.ensure_parent_dirs(cfg, archive_path)
                 pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-                _log(f"[index] âœ“ Content-Index remote archiviert: {archive_path}")
+                _log(f"[index] ✓ Content-Index remote archiviert: {archive_path}")
             except Exception as e:
                 _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
             
@@ -2435,17 +2435,17 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
                 master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
                 os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
                 save_content_index_local(master_index_path, index)
-                _log(f"[index] âœ“ Master-Index aktualisiert: {master_index_path}")
+                _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
             except Exception as e:
                 _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
             
-            # Lokale Index-Datei lÃ¶schen
+            # Lokale Index-Datei löschen
             try:
                 os.remove(_local_index_path)
                 if os.environ.get("PCLOUD_VERBOSE") == "1":
-                    print(f"[index] Lokale Kopie gelÃ¶scht: {_local_index_path}")
+                    print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
             except Exception as e:
-                print(f"[warn] Konnte lokale Index-Datei nicht lÃ¶schen: {e}")
+                print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
             
             # Manifest archivieren (falls Pfad gegeben und Upload erfolgreich)
             if manifest_path and not dry:
@@ -2495,7 +2495,7 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
             _log(f"[success] Upload-Complete-Marker gesetzt: {marker_complete}")
         except Exception as e:
             _log(f"[ERROR] Konnte Complete-Marker nicht setzen: {e}")
-            raise  # CRITICAL: Ohne Marker ist Upload unvollstÃ¤ndig!
+            raise  # CRITICAL: Ohne Marker ist Upload unvollständig!
     # === ENDE NEU ===
 
     if os.environ.get("PCLOUD_TIMING") == "1":
@@ -2514,21 +2514,21 @@ def push_1to1_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, manife
 
 def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_stubs=True):
     """
-    Retention/Prune fÃ¼r den 1:1-Modus, index-zentriert.
+    Retention/Prune für den 1:1-Modus, index-zentriert.
 
     Ablauf:
       - Remote-Snapshots unter <dest>/_snapshots mit lokalen (local_snaps) vergleichen.
-      - FÃ¼r jeden entfernten Remote-Snapshot:
-          â€¢ Holders fÃ¼r gelÃ¶schte Snaps entfernen.
-          â€¢ Liegt Anchor im gelÃ¶schten Snap:
-              - Gibt es verbleibende Holder -> Anchor serverseitig in Pfad des jÃ¼ngsten Holders moven,
-                Index aktualisieren, Ziel-Stub entfernen, Ã¼brige Holder -> Stub (optional).
+      - Für jeden entfernten Remote-Snapshot:
+          • Holders für gelöschte Snaps entfernen.
+          • Liegt Anchor im gelöschten Snap:
+              - Gibt es verbleibende Holder -> Anchor serverseitig in Pfad des jüngsten Holders moven,
+                Index aktualisieren, Ziel-Stub entfernen, übrige Holder -> Stub (optional).
               - Keine Holder mehr -> Node entfernen.
-          â€¢ Snapshot-Ordner lÃ¶schen nur, wenn keine Blocker (z. B. fehlende fileid / Move-Fehler).
+          • Snapshot-Ordner löschen nur, wenn keine Blocker (z. B. fehlende fileid / Move-Fehler).
       - Index zuletzt schreiben (write-last), aber NUR wenn keine Blocker auftraten.
-      - WICHTIG: am Anchor-Pfad gibt es KEINEN Stub; stale Stubs dort werden gelÃ¶scht.
+      - WICHTIG: am Anchor-Pfad gibt es KEINEN Stub; stale Stubs dort werden gelöscht.
     """
-    # Timing / Metriken fÃ¼r Stub- und Index-Writes
+    # Timing / Metriken für Stub- und Index-Writes
     ret_stub_ms = 0.0
     ret_index_write_ms = 0.0
     ret_stub_writes = 0
@@ -2538,7 +2538,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
     def _list_remote_snapshots(snapshots_root: str) -> list[str]:
         try:
-            # REST API statt Binary (zuverlÃ¤ssig, kein Socket-Blocking)
+            # REST API statt Binary (zuverlässig, kein Socket-Blocking)
             top = pc._rest_get(cfg, "listfolder", {"path": snapshots_root, "nofiles": 1}) or {}
             contents = (top.get("metadata") or {}).get("contents") or []
             return sorted(c["name"] for c in contents if c.get("isfolder") and c.get("name") != "_index")
@@ -2547,7 +2547,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
     def _stat_fileid_safe(path: str):
         try:
-            # REST API statt Binary (zuverlÃ¤ssig, kein Socket-Blocking)
+            # REST API statt Binary (zuverlässig, kein Socket-Blocking)
             md = pc._rest_get(cfg, "stat", {"path": path}) or {}
             return (md.get("metadata") or {}).get("fileid")
         except Exception:
@@ -2586,7 +2586,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
         Stub-JSON effizient neu schreiben:
           - Parent-Folder per folderid (stat_folderid_fast/ensure_path)
           - Schreiben via write_json_to_folderid(..., minify=True)
-          - Vorhandenes Stub-JSON (falls vorhanden) Ã¼bernehmen/aktualisieren
+          - Vorhandenes Stub-JSON (falls vorhanden) übernehmen/aktualisieren
         """
         nonlocal ret_stub_ms, ret_stub_writes
         
@@ -2640,7 +2640,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             print(f"[timing] retention_stub_write_ms={int(dt)} file={meta_path}")
 
     def _delete_file_if_exists(path: str) -> None:
-        "Best-effort: lÃ¶scht Datei (z. B. stale Stub) am Pfad, wenn vorhanden."
+        "Best-effort: löscht Datei (z. B. stale Stub) am Pfad, wenn vorhanden."
         if dry:
             print(f"[dry] delete-if-exists: {path}")
             return
@@ -2660,24 +2660,24 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
     print(f"[retention] API-Call: listfolder({snapshots_root})")
     t_list = time.time()
     remote_snaps = set(_list_remote_snapshots(snapshots_root))
-    print(f"[retention] listfolder fertig ({int((time.time()-t_list)*1000)}ms) â†’ {len(remote_snaps)} remote Snapshots")
+    print(f"[retention] listfolder fertig ({int((time.time()-t_list)*1000)}ms) → {len(remote_snaps)} remote Snapshots")
     
     local_snaps = set(local_snaps or [])
     to_delete = sorted(s for s in remote_snaps if s not in local_snaps)
     keep_snaps = remote_snaps & local_snaps
 
-    print(f"[retention] Remote: {len(remote_snaps)} | Lokal: {len(local_snaps)} | Zu lÃ¶schen: {len(to_delete)}")
+    print(f"[retention] Remote: {len(remote_snaps)} | Lokal: {len(local_snaps)} | Zu löschen: {len(to_delete)}")
     if to_delete:
-        print(f"[retention] Snapshots die gelÃ¶scht werden: {', '.join(to_delete)}")
+        print(f"[retention] Snapshots die gelöscht werden: {', '.join(to_delete)}")
 
     if not to_delete:
-        print("[retention] Nichts zu lÃ¶schen - SKIP")
+        print("[retention] Nichts zu löschen - SKIP")
         return
 
     print(f"[retention] API-Call: Lade Content-Index (193+ MB JSON)...")
     t_idx = time.time()
     idx = _load_index(snapshots_root)
-    print(f"[retention] Content-Index geladen ({int((time.time()-t_idx)*1000)}ms) â†’ {len(idx.get('items', {}))} Nodes")
+    print(f"[retention] Content-Index geladen ({int((time.time()-t_idx)*1000)}ms) → {len(idx.get('items', {}))} Nodes")
     items = idx.setdefault("items", {})
 
     promoted = 0
@@ -2686,7 +2686,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
 
     print(f"[retention] === ANALYSE START: {len(to_delete)} Snapshots werden verarbeitet ===")
 
-    # --- Hauptlogik pro zu lÃ¶schendem Snapshot ------------------------------
+    # --- Hauptlogik pro zu löschendem Snapshot ------------------------------
 
     for sdel in to_delete:
         print(f"[retention] Verarbeite Snapshot: {sdel}")
@@ -2700,7 +2700,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
         for sha, node in list(items.items()):
             nodes_checked += 1
             if nodes_checked % 5000 == 0:
-                print(f"[retention]   Progress: {nodes_checked}/{len(items)} Nodes geprÃ¼ft...")
+                print(f"[retention]   Progress: {nodes_checked}/{len(items)} Nodes geprüft...")
             
             if not isinstance(node, dict):
                 continue
@@ -2712,14 +2712,14 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             if anchor_in_deleted:
                 nodes_with_anchor_in_deleted += 1
 
-            # Invariante: am Anchor-Pfad KEIN Stub (.meta.json) â†’ best-effort Cleanup
+            # Invariante: am Anchor-Pfad KEIN Stub (.meta.json) → best-effort Cleanup
             if anchor:
                 _delete_file_if_exists(f"{anchor}.meta.json")
 
-            # (A) Node ohne Holder, Anchor im gelÃ¶schten Snapshot -> Node weg
+            # (A) Node ohne Holder, Anchor im gelöschten Snapshot -> Node weg
             if not holders and anchor_in_deleted:
                 if dry:
-                    print(f"[dry] drop node (no holders, anchor in {sdel}): {sha[:8]}â€¦")
+                    print(f"[dry] drop node (no holders, anchor in {sdel}): {sha[:8]}…")
                 else:
                     del items[sha]
                     removed_nodes += 1
@@ -2738,13 +2738,13 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             if not keep_holders:
                 if anchor_in_deleted:
                     if dry:
-                        print(f"[dry] drop node (no keepers, anchor in {sdel}): {sha[:8]}â€¦")
+                        print(f"[dry] drop node (no keepers, anchor in {sdel}): {sha[:8]}…")
                     else:
                         del items[sha]
                         removed_nodes += 1
                 continue
 
-            # (C) Anchor liegt im gelÃ¶schten Snapshot -> Promotion (MOVE)
+            # (C) Anchor liegt im gelöschten Snapshot -> Promotion (MOVE)
             if anchor_in_deleted:
                 new_holder = max(keep_holders, key=lambda h: h.get("snapshot") or "")
                 new_path = f"{snapshots_root}/{new_holder['snapshot']}/{new_holder['relpath']}"
@@ -2753,9 +2753,9 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
                 if anchor == new_path:
                     print(f"[retention]   Anchor bereits am richtigen Ort: {new_path}")
                     node["anchor_path"] = new_path
-                    # am Anchor KEIN Stub: ggf. stale Stub lÃ¶schen
+                    # am Anchor KEIN Stub: ggf. stale Stub löschen
                     _delete_file_if_exists(f"{new_path}.meta.json")
-                    # optional: Stubs der Ã¼brigen Holder neu schreiben
+                    # optional: Stubs der übrigen Holder neu schreiben
                     if rewrite_stubs:
                         for h in keep_holders:
                             if h is new_holder or (h["snapshot"] == new_holder["snapshot"] and h["relpath"] == new_holder["relpath"]):
@@ -2765,14 +2765,14 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
                     continue
 
                 if dry:
-                    print(f"[dry] promote (move) {sha[:8]}â€¦ {anchor} -> {new_path}")
+                    print(f"[dry] promote (move) {sha[:8]}… {anchor} -> {new_path}")
                     node["anchor_path"] = new_path
                     promoted += 1
                 else:
-                    print(f"[retention]   API-Call: move fileid (Anchor-Promotion) {sha[:8]}... â†’ {new_holder['snapshot']}/{new_holder['relpath']}")
+                    print(f"[retention]   API-Call: move fileid (Anchor-Promotion) {sha[:8]}... → {new_holder['snapshot']}/{new_holder['relpath']}")
                     fid = node.get("fileid") or _stat_fileid_safe(anchor)
                     if not fid:
-                        print(f"[warn] retention: fehlende fileid fÃ¼r Anchor {anchor}; Snapshot {sdel} wird NICHT gelÃ¶scht.", file=sys.stderr)
+                        print(f"[warn] retention: fehlende fileid für Anchor {anchor}; Snapshot {sdel} wird NICHT gelöscht.", file=sys.stderr)
                         snapshot_blockers = True
                         any_blockers = True  # === NEU ===
                         continue
@@ -2796,7 +2796,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
                     promoted += 1
                     ret_index_changed = True
 
-                # Ã¼brige Holder: Stubs neu schreiben (Ziel-Holder auslassen)
+                # übrige Holder: Stubs neu schreiben (Ziel-Holder auslassen)
                 if rewrite_stubs:
                     for h in keep_holders:
                         if h is new_holder or (h["snapshot"] == new_holder["snapshot"] and h["relpath"] == new_holder["relpath"]):
@@ -2804,7 +2804,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
                             continue
                         _rewrite_stub(snapshots_root, h["snapshot"], h["relpath"], sha, node["anchor_path"], node.get("fileid"))
 
-        # Snapshot nur lÃ¶schen, wenn keine Blocker auftraten
+        # Snapshot nur löschen, wenn keine Blocker auftraten
         rmpath = f"{snapshots_root}/{sdel}"
         
         print(f"[retention] Snapshot {sdel} Analyse fertig:")
@@ -2823,17 +2823,17 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             print(f"[retention] API-Call: deletefolderrecursive({rmpath})")
             t_del = time.time()
             pc.call_with_backoff(pc.delete_folder, cfg, path=rmpath, recursive=True)
-            print(f"[retention] Snapshot-Ordner gelÃ¶scht ({int((time.time()-t_del)*1000)}ms)")
+            print(f"[retention] Snapshot-Ordner gelöscht ({int((time.time()-t_del)*1000)}ms)")
             
-            # ParitÃ¤ts-Cleanup: Manifest lÃ¶schen wenn Remote-Snapshot gelÃ¶scht wird
+            # Paritäts-Cleanup: Manifest löschen wenn Remote-Snapshot gelöscht wird
             manifest_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
             manifest_file = os.path.join(manifest_dir, f"{sdel}.json")
             if os.path.exists(manifest_file):
                 try:
                     os.remove(manifest_file)
-                    print(f"[retention] Lokales Manifest gelÃ¶scht: {sdel}.json")
+                    print(f"[retention] Lokales Manifest gelöscht: {sdel}.json")
                 except Exception as e:
-                    print(f"[warn] Konnte Manifest nicht lÃ¶schen: {manifest_file} ({e})", file=sys.stderr)
+                    print(f"[warn] Konnte Manifest nicht löschen: {manifest_file} ({e})", file=sys.stderr)
 
     # === NEU: Index nur schreiben wenn KEINE Blocker ===
     if any_blockers:
@@ -2845,7 +2845,7 @@ def retention_sync_1to1(cfg, dest_root, *, local_snaps=None, dry=False, rewrite_
             _save_index(snapshots_root, idx, simulate=dry)
             print(f"[retention] Content-Index geschrieben ({int((time.time()-t_idx_save)*1000)}ms)")
         else:
-            print("[retention] Keine Index-Ã„nderungen - kein Schreiben notwendig")
+            print("[retention] Keine Index-Änderungen - kein Schreiben notwendig")
     # === ENDE NEU ===
 
     print(f"[retention] === RETENTION ABGESCHLOSSEN ===")
@@ -2872,16 +2872,16 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     Delta-Copy Mode: Server-seitiges Klonen + Selective Update
     
     Workflow:
-      1. Finde letzten vollstÃ¤ndigen Snapshot (via content_index.json)
+      1. Finde letzten vollständigen Snapshot (via content_index.json)
       2. copyfolder() - Server-seitiges Klonen (2-5s statt 3.5h)
       3. Manifest-Diff berechnen (10s)
-      4. DELETE-Loop: deleted + changed Dateien lÃ¶schen
+      4. DELETE-Loop: deleted + changed Dateien löschen
       5. WRITE-Loop: new + changed Dateien hochladen/stubben
       6. Content-Index aktualisieren
       
     Performance:
-      - Typisch: 60x-210x schneller bei minimalen Ã„nderungen
-      - 100k Dateien, 1 Ã„nderung: 3.5h â†’ <2min
+      - Typisch: 60x-210x schneller bei minimalen Änderungen
+      - 100k Dateien, 1 Änderung: 3.5h → <2min
       
     Fallback:
       - Falls kein Basis-Snapshot existiert: Wechsel zu push_1to1_mode()
@@ -2899,24 +2899,24 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     # === Config: Timeout Protection (copyfolder kann bei 20k+ Dateien lange dauern) ===
     # Delta-Copy Meta-Operationen brauchen ~60-120s, Standard-Timeout (30s) ist zu kurz
     current_timeout = int(cfg.get("timeout", 30))
-    if current_timeout <= 60:  # ErhÃ¶he nur bei Standard/niedrigen Werten
+    if current_timeout <= 60:  # Erhöhe nur bei Standard/niedrigen Werten
         cfg["timeout"] = 300  # 5 Minuten Puffer (Test: 67s bei ~20k Dateien)
-        _log(f"[delta-copy] Timeout erhÃ¶ht: {current_timeout}s â†’ {cfg['timeout']}s (Meta-Operationen)")
+        _log(f"[delta-copy] Timeout erhöht: {current_timeout}s → {cfg['timeout']}s (Meta-Operationen)")
     else:
         _log(f"[delta-copy] Timeout beibehalten: {current_timeout}s")
     
     # === Schritt 1: Finde Basis-Snapshot ===
-    _log(f"[delta-copy][1/6] Suche letzten vollstÃ¤ndigen Snapshot...")
+    _log(f"[delta-copy][1/6] Suche letzten vollständigen Snapshot...")
     t_find_start = time.time()
     
     try:
         index = load_content_index(cfg, snapshots_root)
     except Exception as e:
         _log(f"[delta-copy][FALLBACK] Konnte content_index.json nicht laden: {e}")
-        _log(f"[delta-copy][FALLBACK] Wechsle zu vollstÃ¤ndigem Upload...")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
         return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
-    # Finde letzten Snapshot mit .upload_complete Marker (falls nicht Ã¼bergeben)
+    # Finde letzten Snapshot mit .upload_complete Marker (falls nicht übergeben)
     if basis_snapshot is None:
         remote_snapshots = list_remote_snapshot_names(cfg, snapshots_root)
         
@@ -2925,9 +2925,9 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         
         for candidate in sorted_snapshots:
             if candidate == snapshot_name:
-                continue  # Ãœberspringe den neuen Snapshot selbst
+                continue  # Überspringe den neuen Snapshot selbst
             
-            # PrÃ¼fe ob .upload_complete existiert
+            # Prüfe ob .upload_complete existiert
             marker_complete = f"{snapshots_root}/{candidate}/.upload_complete"
             try:
                 pc.stat_file(cfg, path=marker_complete, with_checksum=False)
@@ -2935,28 +2935,28 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 _log(f"[delta-copy][1/6] Basis gefunden: {basis_snapshot}")
                 break
             except Exception:
-                # Kein Complete-Marker â†’ Ã¼berspringe
+                # Kein Complete-Marker → überspringe
                 if verbose:
-                    _log(f"[delta-copy][1/6] Ãœberspringe {candidate} (kein Complete-Marker)")
+                    _log(f"[delta-copy][1/6] Überspringe {candidate} (kein Complete-Marker)")
                 continue
     else:
-        _log(f"[delta-copy][1/6] Basis via Controller Ã¼bergeben: {basis_snapshot}")
+        _log(f"[delta-copy][1/6] Basis via Controller übergeben: {basis_snapshot}")
     
     if not basis_snapshot:
-        _log(f"[delta-copy][FALLBACK] Kein vollstÃ¤ndiger Basis-Snapshot gefunden")
-        _log(f"[delta-copy][FALLBACK] Wechsle zu vollstÃ¤ndigem Upload...")
+        _log(f"[delta-copy][FALLBACK] Kein vollständiger Basis-Snapshot gefunden")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
         return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
     t_find_ms = (time.time() - t_find_start) * 1000.0
-    _log(f"[delta-copy][1/6] âœ“ Basis: {basis_snapshot} ({t_find_ms:.0f}ms)")
+    _log(f"[delta-copy][1/6] ✓ Basis: {basis_snapshot} ({t_find_ms:.0f}ms)")
 
     # === Schritt 1.5: Stub-Ratio-Check ===
-    # copyfolder lohnt sich nur, wenn der Basis-Snapshot bereits Ã¼berwiegend
-    # aus Stubs besteht. Andernfalls wÃ¼rde copyfolder echte Dateien duplizieren
+    # copyfolder lohnt sich nur, wenn der Basis-Snapshot bereits überwiegend
+    # aus Stubs besteht. Andernfalls würde copyfolder echte Dateien duplizieren
     # (doppelte Quota), statt nur leichte Stubs zu klonen.
     #
     # Threshold via ENV konfigurierbar:
-    #   PCLOUD_COPYFOLDER_MIN_STUB_RATIO  (default 0.5 = 50% Stubs nÃ¶tig)
+    #   PCLOUD_COPYFOLDER_MIN_STUB_RATIO  (default 0.5 = 50% Stubs nötig)
     #   PCLOUD_COPYFOLDER_MIN_FILES       (default 100, vermeidet False-Positives bei kleinen Snapshots)
     _min_stub_ratio = float(os.environ.get("PCLOUD_COPYFOLDER_MIN_STUB_RATIO", "0.5"))
     _min_files      = int(os.environ.get("PCLOUD_COPYFOLDER_MIN_FILES", "100"))
@@ -2975,10 +2975,10 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         return push_1to1_mode(cfg, manifest, dest_root,
                               dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
 
-    _log(f"[delta-copy][TURBO-MODE] Stub-Ratio OK ({_basis_ratio:.1%}) â€“ nutze copyfolder + Delta")
+    _log(f"[delta-copy][TURBO-MODE] Stub-Ratio OK ({_basis_ratio:.1%}) – nutze copyfolder + Delta")
 
     # === Schritt 2: copyfolder() - Server-seitiges Klonen ===
-    _log(f"[delta-copy][2/6] Starte Server-Side Copy: {basis_snapshot} â†’ {snapshot_name}")
+    _log(f"[delta-copy][2/6] Starte Server-Side Copy: {basis_snapshot} → {snapshot_name}")
     t_copy_start = time.time()
     
     basis_path = f"{snapshots_root}/{basis_snapshot}"
@@ -2988,13 +2988,13 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         try:
             pc.ensure_path(cfg, snapshots_root)  # Parent sicherstellen
             dest_snapshot_fid = pc.ensure_path(cfg, dest_snapshot_dir)  # Zielordner anlegen!
-            _log(f"[delta-copy][2/6] âœ“ Zielordner angelegt: {dest_snapshot_dir}")
+            _log(f"[delta-copy][2/6] ✓ Zielordner angelegt: {dest_snapshot_dir}")
         except Exception as e:
             _log(f"[delta-copy][ERROR] Konnte Zielordner nicht anlegen: {e}")
             return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
     if dry:
-        _log(f"[dry] copyfolder (contentonly): {basis_path} â†’ {dest_snapshot_dir}")
+        _log(f"[dry] copyfolder (contentonly): {basis_path} → {dest_snapshot_dir}")
     else:
         try:
             # copyfolder mit copycontentonly=True
@@ -3017,10 +3017,10 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             
             while elapsed < max_wait_sec:
                 try:
-                    # PrÃ¼fe ob Ordner existiert
+                    # Prüfe ob Ordner existiert
                     pc.stat_file(cfg, path=dest_snapshot_dir, with_checksum=False)
                     folder_exists = True
-                    _log(f"[delta-copy][2/6] âœ“ Ordner sichtbar nach {elapsed:.1f}s")
+                    _log(f"[delta-copy][2/6] ✓ Ordner sichtbar nach {elapsed:.1f}s")
                     break
                 except Exception:
                     # Noch nicht sichtbar, warte
@@ -3032,28 +3032,28 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         
         except Exception as e:
             _log(f"[delta-copy][ERROR] copyfolder fehlgeschlagen: {e}")
-            _log(f"[delta-copy][FALLBACK] Wechsle zu vollstÃ¤ndigem Upload...")
-            # Cleanup: Versuche geklonten Snapshot zu lÃ¶schen
+            _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
+            # Cleanup: Versuche geklonten Snapshot zu löschen
             try:
                 pc.call_with_backoff(pc.delete_folder, cfg, path=dest_snapshot_dir, recursive=True)
             except Exception:
                 pass
                 return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
-    # Timing fÃ¼r copyfolder-Operation
+    # Timing für copyfolder-Operation
     t_copy_ms = (time.time() - t_copy_start) * 1000.0
     _log(f"[delta-copy][2/6] copyfolder abgeschlossen: {t_copy_ms:.1f}ms")
     
-    # === KRITISCH: LÃ¶sche alte Marker (wurden via copyfolder mitkopiert!) ===
+    # === KRITISCH: Lösche alte Marker (wurden via copyfolder mitkopiert!) ===
     # Problem: copyfolder kopiert .upload_complete/.upload_started vom Basis-Snapshot
-    # â†’ WÃ¼rde Gap-Detection tÃ¤uschen (denkt Upload komplett, obwohl Delta fehlt)
-    # â†’ LÃ¶sung: .upload_complete lÃ¶schen, .upload_started NEU schreiben (Resume-Konsistenz!)
+    # → Würde Gap-Detection täuschen (denkt Upload komplett, obwohl Delta fehlt)
+    # → Lösung: .upload_complete löschen, .upload_started NEU schreiben (Resume-Konsistenz!)
     if not dry:
-        # NUR .upload_complete lÃ¶schen (alter Marker vom Basis-Snapshot)
+        # NUR .upload_complete löschen (alter Marker vom Basis-Snapshot)
         marker_complete_old = f"{dest_snapshot_dir}/.upload_complete"
         try:
             pc.deletefile(cfg, path=marker_complete_old)
-            _log(f"[delta-copy][2/6] âœ“ GelÃ¶scht (mitkopiert): {marker_complete_old}")
+            _log(f"[delta-copy][2/6] ✓ Gelöscht (mitkopiert): {marker_complete_old}")
         except Exception:
             pass  # Marker existierte evtl. nicht
         
@@ -3067,7 +3067,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 "basis_snapshot": basis_snapshot,
                 "status": "delta_upload_in_progress"
             }))
-            _log(f"[delta-copy][2/6] âœ“ Started-Marker aktualisiert: {marker_started_new}")
+            _log(f"[delta-copy][2/6] ✓ Started-Marker aktualisiert: {marker_started_new}")
         except Exception as e:
             _log(f"[delta-copy][WARN] Konnte Started-Marker nicht setzen: {e}")
     
@@ -3081,7 +3081,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     
     if not os.path.exists(basis_manifest_path):
         _log(f"[delta-copy][ERROR] Basis-Manifest nicht gefunden: {basis_manifest_path}")
-        _log(f"[delta-copy][FALLBACK] Wechsle zu vollstÃ¤ndigem Upload...")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
         # Cleanup
         if not dry:
             try:
@@ -3095,10 +3095,10 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         import pcloud_manifest_diff
     except Exception as e:
         _log(f"[delta-copy][ERROR] Konnte pcloud_manifest_diff nicht importieren: {e}")
-        _log(f"[delta-copy][FALLBACK] Wechsle zu vollstÃ¤ndigem Upload...")
+        _log(f"[delta-copy][FALLBACK] Wechsle zu vollständigem Upload...")
         return push_1to1_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, manifest_path=manifest_path, strategy_mode="SAFE-MODE")
     
-    # Schreibe current manifest temporÃ¤r (falls noch nicht gespeichert)
+    # Schreibe current manifest temporär (falls noch nicht gespeichert)
     import tempfile
     temp_current = None
     if not manifest_path or not os.path.exists(manifest_path):
@@ -3123,21 +3123,21 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     t_diff_ms = (time.time() - t_diff_start) * 1000.0
     
     stats = diff["stats"]
-    _log(f"[delta-copy][3/6] âœ“ Manifest-Diff berechnet ({t_diff_ms:.0f}ms)")
+    _log(f"[delta-copy][3/6] ✓ Manifest-Diff berechnet ({t_diff_ms:.0f}ms)")
     _log(f"[delta-copy][3/6]   Identisch: {stats['identical_count']}")
     _log(f"[delta-copy][3/6]   Neu:       {stats['new_count']}")
-    _log(f"[delta-copy][3/6]   GeÃ¤ndert:  {stats['changed_count']}")
-    _log(f"[delta-copy][3/6]   GelÃ¶scht:  {stats['deleted_count']}")
+    _log(f"[delta-copy][3/6]   Geändert:  {stats['changed_count']}")
+    _log(f"[delta-copy][3/6]   Gelöscht:  {stats['deleted_count']}")
     
     # === Schritt 4: DELETE-Loop (Parallel) ===
-    _log(f"[delta-copy][4/6] LÃ¶sche geÃ¤nderte und gelÃ¶schte Dateien...")
+    _log(f"[delta-copy][4/6] Lösche geänderte und gelöschte Dateien...")
     t_delete_start = time.time()
     
     delete_count = 0
     delete_items = diff["deleted"] + diff["changed"]
     
     def _delete_file_and_stub(item):
-        """Helper: LÃ¶scht Datei + Stub (parallel-safe)"""
+        """Helper: Löscht Datei + Stub (parallel-safe)"""
         nonlocal delete_count
         relpath = item.get("relpath")
         if not relpath:
@@ -3151,20 +3151,20 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             _log(f"[dry] delete stub: {stub_path}")
             return
         
-        # Datei lÃ¶schen
+        # Datei löschen
         try:
             pc.delete_file(cfg, path=file_path)
             with _metrics_lock:
                 delete_count += 1
         except Exception as e:
             if "2005" not in str(e) and "not found" not in str(e).lower():
-                _log(f"[delta-copy][4/6][warn] Konnte {file_path} nicht lÃ¶schen: {e}")
+                _log(f"[delta-copy][4/6][warn] Konnte {file_path} nicht löschen: {e}")
         
-        # Stub lÃ¶schen (best effort)
+        # Stub löschen (best effort)
         try:
             pc.delete_file(cfg, path=stub_path)
         except Exception:
-            pass  # Stub existiert nicht â†’ okay
+            pass  # Stub existiert nicht → okay
     
     # Parallel-Delete (analog zu Parallel-Upload)
     if delete_items and not dry:
@@ -3176,17 +3176,17 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             _delete_file_and_stub(item)
     
     t_delete_ms = (time.time() - t_delete_start) * 1000.0
-    _log(f"[delta-copy][4/6] âœ“ {delete_count} Dateien gelÃ¶scht ({t_delete_ms:.0f}ms)")
+    _log(f"[delta-copy][4/6] ✓ {delete_count} Dateien gelöscht ({t_delete_ms:.0f}ms)")
     
     # === Schritt 5: WRITE-Loop (new + changed) ===
-    _log(f"[delta-copy][5/6] Schreibe neue und geÃ¤nderte Dateien...")
+    _log(f"[delta-copy][5/6] Schreibe neue und geänderte Dateien...")
     t_write_start = time.time()
     
     write_items = diff["new"] + diff["changed"]
     uploaded = 0
     stubs = 0
     
-    # Hilfstabellen (Ã¤hnlich wie push_1to1_mode)
+    # Hilfstabellen (ähnlich wie push_1to1_mode)
     seen_inodes: dict[tuple[int,int], str] = {}
     items_dict = index.setdefault("items", {})
     known_anchors = {}
@@ -3197,7 +3197,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         if ap and fid:
             known_anchors[sha] = (ap, fid)
     
-    # Sortiere nach Extension fÃ¼r bessere Fehlerdiagnose
+    # Sortiere nach Extension für bessere Fehlerdiagnose
     write_items.sort(key=lambda x: (x.get("ext") or "", x.get("relpath") or ""))
     
     index_changed = False
@@ -3268,7 +3268,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
             stubs_to_write.append((meta_path, payload))
         stubs += 1
     
-    # === Parallel Upload fÃ¼r kleine Dateien (Delta-Mode) ===
+    # === Parallel Upload für kleine Dateien (Delta-Mode) ===
     _state_lock = threading.Lock()
     
     def _process_write_item(file_item: dict) -> None:
@@ -3284,7 +3284,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         ext = file_item.get("ext", "")
         
         if not sha or not abs_src:
-            _log(f"[delta-copy][5/6][warn] Ãœberspringe {relpath} (kein SHA256 oder source_path)")
+            _log(f"[delta-copy][5/6][warn] Überspringe {relpath} (kein SHA256 oder source_path)")
             return
         
         # Hardlink-Dedupe (thread-safe)
@@ -3302,17 +3302,17 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 _queue_stub(relpath, file_item, items_dict.get(sha, {}))
                 return
             
-            # PrÃ¼fe ob SHA256 bereits im Index existiert
+            # Prüfe ob SHA256 bereits im Index existiert
             node = items_dict.get(sha)
         
         if node:
-            # Hash existiert bereits â†’ Stub schreiben
+            # Hash existiert bereits → Stub schreiben
             with _state_lock:
                 _queue_stub(relpath, file_item, node)
                 if key:
                     seen_inodes[key] = sha
         else:
-            # Neue Datei â†’ Upload + Anchor registrieren (auÃŸerhalb Lock!)
+            # Neue Datei → Upload + Anchor registrieren (außerhalb Lock!)
             dst_path = f"{dest_snapshot_dir}/{relpath}"
             fileid, pcloud_hash = _upload_real_file(abs_src, dst_path)
             
@@ -3343,11 +3343,11 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     _large_writes = [f for f in write_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
     
     if _small_writes and _large_writes:
-        _log(f"[delta-copy][5/6] {len(_small_writes)} kleine Dateien parallel, {len(_large_writes)} groÃŸe sequentiell")
+        _log(f"[delta-copy][5/6] {len(_small_writes)} kleine Dateien parallel, {len(_large_writes)} große sequentiell")
     elif _small_writes:
         _log(f"[delta-copy][5/6] {len(_small_writes)} kleine Dateien parallel")
     else:
-        _log(f"[delta-copy][5/6] {len(_large_writes)} groÃŸe Dateien sequentiell")
+        _log(f"[delta-copy][5/6] {len(_large_writes)} große Dateien sequentiell")
     
     # Kleine Dateien parallel
     if _small_writes and PARALLEL_UPLOAD_THREADS > 1:
@@ -3357,26 +3357,26 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         for f in _small_writes:
             _process_write_item(f)
     
-    # GroÃŸe Dateien sequentiell
+    # Große Dateien sequentiell
     for f in _large_writes:
         _process_write_item(f)
     # === Ende Parallel Upload (Delta-Mode) ===
     
     # Stubs schreiben (Batch)
-    # Note: MET_STUBS_WRITTEN wird in _batch_write_stubs() hochgezÃ¤hlt
+    # Note: MET_STUBS_WRITTEN wird in _batch_write_stubs() hochgezählt
     if stubs_to_write and not dry:
         _log(f"[delta-copy][5/6] Schreibe {len(stubs_to_write)} Stubs...")
         _batch_write_stubs(cfg, stubs_to_write, dry=dry)
     
     t_write_ms = (time.time() - t_write_start) * 1000.0
-    _log(f"[delta-copy][5/6] âœ“ WRITE abgeschlossen: {uploaded} uploads, {stubs} stubs ({t_write_ms:.0f}ms)")
+    _log(f"[delta-copy][5/6] ✓ WRITE abgeschlossen: {uploaded} uploads, {stubs} stubs ({t_write_ms:.0f}ms)")
     
     # === Schritt 6: Content-Index aktualisieren ===
     _log(f"[delta-copy][6/6] Aktualisiere Content-Index...")
     t_index_start = time.time()
     
-    # Holders aktualisieren: Snapshot zu allen verwendeten Hashes hinzufÃ¼gen
-    # WICHTIG: Iteriere Ã¼ber items_dict (enthÃ¤lt auch neue Nodes aus Phase 5!)
+    # Holders aktualisieren: Snapshot zu allen verwendeten Hashes hinzufügen
+    # WICHTIG: Iteriere über items_dict (enthält auch neue Nodes aus Phase 5!)
     for file_item in (manifest.get("items") or []):
         if file_item.get("type") != "file":
             continue
@@ -3387,14 +3387,14 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         
         node = items_dict.get(sha)
         if not node:
-            # Sollte nicht vorkommen (Phase 5 hÃ¤tte Node erstellt)
+            # Sollte nicht vorkommen (Phase 5 hätte Node erstellt)
             _log(f"[delta-copy][6/6][ERROR] SHA256 {sha[:16]}... nicht im Index!")
             continue
         
         holders = node.setdefault("holders", [])
         relpath = file_item.get("relpath") or ""
         
-        # Holder mit vollstÃ¤ndigen Metadaten (wie in Manifesten)
+        # Holder mit vollständigen Metadaten (wie in Manifesten)
         holder_entry = {
             "snapshot": snapshot_name,
             "relpath": relpath,
@@ -3417,33 +3417,33 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
     # Index speichern (remote + lokal)
     if index_changed:
         save_content_index(cfg, snapshots_root, index, dry=dry)
-        _log(f"[delta-copy][6/6] âœ“ Content-Index remote gespeichert")
+        _log(f"[delta-copy][6/6] ✓ Content-Index remote gespeichert")
         
         # Lokal archivieren (Snapshot-spezifisch)
         if not dry:
             archive_index_path = f"{archive_base}/indexes/content_index_{snapshot_name}.json"
             os.makedirs(os.path.dirname(archive_index_path), exist_ok=True)
             save_content_index_local(archive_index_path, index)
-            _log(f"[delta-copy][6/6] âœ“ Content-Index lokal archiviert: {archive_index_path}")
+            _log(f"[delta-copy][6/6] ✓ Content-Index lokal archiviert: {archive_index_path}")
         
         # Master-Index aktualisieren (alle Snapshots zusammen)
         if not dry:
             master_index_path = f"{archive_base}/indexes/content_index_master.json"
             save_content_index_local(master_index_path, index)
-            _log(f"[delta-copy][6/6] âœ“ Master-Index aktualisiert: {master_index_path}")
+            _log(f"[delta-copy][6/6] ✓ Master-Index aktualisiert: {master_index_path}")
         
-        # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index fÃ¼r Recovery)
+        # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
         if not dry:
             idx_path = f"{snapshots_root}/_index/content_index.json"
             archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
             try:
                 pc.ensure_parent_dirs(cfg, archive_path)
                 pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-                _log(f"[delta-copy][6/6] âœ“ Content-Index remote archiviert: {archive_path}")
+                _log(f"[delta-copy][6/6] ✓ Content-Index remote archiviert: {archive_path}")
             except Exception as e:
                 _log(f"[delta-copy][6/6][warn] Remote-Archivierung fehlgeschlagen: {e}")
     else:
-        _log(f"[delta-copy][6/6] Content-Index unverÃ¤ndert")
+        _log(f"[delta-copy][6/6] Content-Index unverändert")
     
     t_index_ms = (time.time() - t_index_start) * 1000.0
     
@@ -3457,10 +3457,10 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
                 "mode": "delta-copy",
                 "basis_snapshot": basis_snapshot,
             }))
-            _log(f"[delta-copy] âœ“ Complete-Marker gesetzt: {marker_complete}")
+            _log(f"[delta-copy] ✓ Complete-Marker gesetzt: {marker_complete}")
         except Exception as e:
             _log(f"[delta-copy][ERROR] Konnte Complete-Marker nicht setzen: {e}")
-            raise  # CRITICAL: Ohne Marker ist Upload unvollstÃ¤ndig!
+            raise  # CRITICAL: Ohne Marker ist Upload unvollständig!
     
     # === Manifest archivieren (lokal + remote) ===
     if manifest_path and not dry:
@@ -3474,19 +3474,19 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
         except Exception as e:
             _log(f"[delta-copy][warn] Konnte Manifest lokal nicht archivieren: {e}")
     
-    # Remote-Manifest Upload (fÃ¼r Restore ohne lokales Archiv!)
+    # Remote-Manifest Upload (für Restore ohne lokales Archiv!)
     if manifest and not dry:
         remote_manifest_path = f"{dest_snapshot_dir}/_manifest.json"
         try:
             pc.put_textfile(cfg, path=remote_manifest_path, text=json.dumps(manifest, indent=2))
-            _log(f"[delta-copy] âœ“ Manifest remote gespeichert: {remote_manifest_path}")
+            _log(f"[delta-copy] ✓ Manifest remote gespeichert: {remote_manifest_path}")
         except Exception as e:
             _log(f"[delta-copy][WARN] Remote-Manifest Upload fehlgeschlagen: {e}")
     
     # === Summary ===
     t_total_ms = (time.time() - t_start) * 1000.0
     
-    _log(f"[delta-copy] âœ“ ABGESCHLOSSEN ({t_total_ms/1000:.1f}s total)")
+    _log(f"[delta-copy] ✓ ABGESCHLOSSEN ({t_total_ms/1000:.1f}s total)")
     _log(f"[delta-copy]   Server-Copy: {t_copy_ms:.0f}ms")
     _log(f"[delta-copy]   Manifest-Diff: {t_diff_ms:.0f}ms")
     _log(f"[delta-copy]   DELETE: {delete_count} Dateien, {t_delete_ms:.0f}ms")
@@ -3522,7 +3522,7 @@ def push_1to1_delta_mode(cfg, manifest, dest_root, *, dry=False, verbose=False, 
 # POOL-MODE FUNCTIONS (NEW)
 # ============================================================================
 
-# Thread-safe Stats fÃ¼r Pool-Mode
+# Thread-safe Stats für Pool-Mode
 class _PoolStats:
     def __init__(self):
         self.lock = threading.Lock()
@@ -3642,7 +3642,7 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, pool_root: str, *, 
             pcloud_hash = md.get("hash")
     
     # EAGER FILEID FALLBACK (wie im Original - aber robuster!)
-    # Wenn Upload-Response unvollstÃ¤ndig war, hole via stat
+    # Wenn Upload-Response unvollständig war, hole via stat
     if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
         try:
             stat_md = pc.call_with_backoff(stat_file_safe, cfg, path=pool_path) or {}
@@ -3652,7 +3652,7 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, pool_root: str, *, 
                 pcloud_hash = stat_md.get("hash")
             
             if pool_fileid and os.environ.get("PCLOUD_VERBOSE") == "1":
-                _log(f"[pool] âœ“ FileID via EAGER fallback: {pool_fileid}")
+                _log(f"[pool] ✓ FileID via EAGER fallback: {pool_fileid}")
         except Exception as e:
             _log(f"[pool][warn] EAGER stat failed for {pool_path}: {e}")
     
@@ -3665,12 +3665,12 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, pool_root: str, *, 
             if stat_md:
                 pool_fileid = stat_md.get("fileid")
                 pcloud_hash = stat_md.get("hash")
-                _log(f"[pool] âœ“ FileID via finaler stat-check: {pool_fileid}")
+                _log(f"[pool] ✓ FileID via finaler stat-check: {pool_fileid}")
         except Exception as e:
             _log(f"[pool][ERROR] Finale FileID-Ermittlung fehlgeschlagen: {e}")
     
     if os.environ.get("PCLOUD_VERBOSE") == "1":
-        _log(f"[pool] âœ“ UPLOADED: {pool_path} (fileid={pool_fileid}, hash={pcloud_hash})")
+        _log(f"[pool] ✓ UPLOADED: {pool_path} (fileid={pool_fileid}, hash={pcloud_hash})")
     
     return (pool_fileid, pcloud_hash)
 
@@ -3678,7 +3678,7 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, pool_root: str, *, 
 def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: str, *, dry: bool = False) -> None:
     """
     Schreibt Pool-Stub (.meta.json) in Snapshot-Ordner.
-    Nutzt REST API write_json_to_folderid() fÃ¼r Robustheit (kein Binary-Blocking).
+    Nutzt REST API write_json_to_folderid() für Robustheit (kein Binary-Blocking).
     
     Args:
         cfg: pCloud Config
@@ -3727,14 +3727,14 @@ def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict
         "snapshot": snapshot_name,
     }
     
-    # Parent-Ordner sicherstellen (gibt folderid zurÃ¼ck)
+    # Parent-Ordner sicherstellen (gibt folderid zurück)
     parent_fid = pc.ensure_path(cfg, parent_dir)
     
     # Stub schreiben via REST (robust, kein Binary-Blocking!)
     pc.write_json_to_folderid(cfg, folderid=parent_fid, filename=stub_filename, obj=stub_payload, minify=True)
     
     if os.environ.get("PCLOUD_VERBOSE") == "1":
-        _log(f"[stub] âœ“ {stub_path}")
+        _log(f"[stub] ✓ {stub_path}")
 
 
 def _process_pool_item(
@@ -3790,10 +3790,10 @@ def _process_pool_item(
             cached_result = seen_inodes.get(key)
     
     if cached_result:
-        # Hardlink zu bereits verarbeitetem File â†’ Return Cached Info
+        # Hardlink zu bereits verarbeitetem File → Return Cached Info
         cached_sha, cached_fileid, cached_hash = cached_result
         if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[pool-worker] âœ“ HARDLINK: {relpath} â†’ cached fileid={cached_fileid}")
+            _log(f"[pool-worker] ✓ HARDLINK: {relpath} → cached fileid={cached_fileid}")
         return (relpath, file_item, cached_fileid, cached_hash, True)  # True = ist Hardlink-Stub
     
     # Pool-Upload (Check ob existiert oder Upload)
@@ -3803,11 +3803,11 @@ def _process_pool_item(
         # Validiere Upload-Ergebnis
         if not pool_fileid:
             _log(f"[pool-worker][ERROR] {relpath}: Upload lieferte keine FileID (size={file_size}, sha256={sha256[:8]}...)")
-            _log(f"[pool-worker][ERROR] â†’ Source: {abs_src}")
+            _log(f"[pool-worker][ERROR] → Source: {abs_src}")
             return None
         
     except FileNotFoundError as e:
-        _log(f"[pool-worker][ERROR] {relpath}: File verschwand wÃ¤hrend Upload: {e}")
+        _log(f"[pool-worker][ERROR] {relpath}: File verschwand während Upload: {e}")
         return None
     except PermissionError as e:
         _log(f"[pool-worker][ERROR] {relpath}: Keine Leserechte: {e}")
@@ -3817,8 +3817,8 @@ def _process_pool_item(
         return None
     except Exception as e:
         _log(f"[pool-worker][ERROR] {relpath}: Upload fehlgeschlagen (size={file_size}, sha256={sha256[:8]}...)")
-        _log(f"[pool-worker][ERROR] â†’ Exception: {type(e).__name__}: {e}")
-        _log(f"[pool-worker][ERROR] â†’ Source: {abs_src}")
+        _log(f"[pool-worker][ERROR] → Exception: {type(e).__name__}: {e}")
+        _log(f"[pool-worker][ERROR] → Source: {abs_src}")
         return None
     
     # Hardlink-Tracking (wird von Hauptthread gemacht nach Return!)
@@ -3883,7 +3883,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     t_pool_start = time.time()
     
     try:
-        # Rekursives listfolder Ã¼ber kompletten Pool
+        # Rekursives listfolder über kompletten Pool
         result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
         pool_sha256s = set()
         
@@ -3917,7 +3917,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         _log(f"[validate] ✓ Pool: Alle {total_unique_sha256s} SHA256s vorhanden")
     
     # === 4. POOL-REFS-CHECK (Index-Konsistenz) ===
-    _log(f"[validate] PrÃ¼fe Index-Konsistenz (pool_refs)...")
+    _log(f"[validate] Prüfe Index-Konsistenz (pool_refs)...")
     pool_refs = index.get("pool_refs", {})
     missing_in_index = 0
     wrong_snapshot = 0
@@ -3943,7 +3943,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         import random
         sample_size = min(stub_sample_size, total_files)
         sample_items = random.sample(manifest_items, sample_size)
-        _log(f"[validate] PrÃ¼fe {sample_size} Stub-Files (Stichprobe)...")
+        _log(f"[validate] Prüfe {sample_size} Stub-Files (Stichprobe)...")
         checked_stubs = 0
         for item in sample_items:
             relpath = item.get("relpath")
@@ -3960,7 +3960,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         _log(f"[validate] ❌ {len(errors)} Fehler gefunden!")
         return (False, errors)
     else:
-        _log(f"[validate] ✓✓✓ Snapshot vollstÃ¤ndig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
+        _log(f"[validate] ✓✓✓ Snapshot vollständig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
         return (True, [])
 
 
@@ -3970,17 +3970,17 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
 
 def create_gc_lock(cfg: dict, dest_root: str, snapshot_name: str, *, dry: bool = False) -> None:
     """
-    Erstellt GC-Lock-File um parallele GC-LÃ¤ufe wÃ¤hrend Backup zu verhindern.
+    Erstellt GC-Lock-File um parallele GC-Läufe während Backup zu verhindern.
     
     Lock-File: {dest_root}/.gc_lock
     Format: JSON mit Metadaten (pid, host, started_at, snapshot)
     
-    Dieses Lock verhindert dass GC Files lÃ¶scht die gerade hochgeladen werden!
+    Dieses Lock verhindert dass GC Files löscht die gerade hochgeladen werden!
     
     Args:
         cfg: pCloud Config
         dest_root: Remote Root (z.B. /Backup/rtb_1to1)
-        snapshot_name: Snapshot-Name (fÃ¼r Debugging)
+        snapshot_name: Snapshot-Name (für Debugging)
         dry: Dry-run Mode
     """
     if dry:
@@ -4000,7 +4000,7 @@ def create_gc_lock(cfg: dict, dest_root: str, snapshot_name: str, *, dry: bool =
     
     try:
         pc.write_json_at_path(cfg, lock_path, lock_data)
-        _log(f"[gc-lock] âœ“ Lock erstellt: {lock_path}")
+        _log(f"[gc-lock] ✓ Lock erstellt: {lock_path}")
     except Exception as e:
         _log(f"[gc-lock][WARN] Konnte Lock nicht erstellen: {e}")
 
@@ -4021,12 +4021,12 @@ def remove_gc_lock(cfg: dict, dest_root: str, *, dry: bool = False) -> None:
     lock_path = f"{dest_root.rstrip('/')}/.gc_lock"
     
     try:
-        # PrÃ¼fe ob Lock existiert
+        # Prüfe ob Lock existiert
         lock_stat = pc.stat_file_safe(cfg, path=lock_path)
         
         if lock_stat:
             pc.delete_file(cfg, path=lock_path)
-            _log(f"[gc-lock] âœ“ Lock entfernt: {lock_path}")
+            _log(f"[gc-lock] ✓ Lock entfernt: {lock_path}")
         else:
             _log(f"[gc-lock] Lock existiert nicht (bereits entfernt?)")
     
@@ -4042,11 +4042,11 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
     """
     PRE-UPLOAD CHECK: Validiert dass alle Files aus Manifest in Source existieren.
     
-    KRITISCH: Verhindert dass Manifest auf gelÃ¶schte/verschobene Source-Files zeigt!
+    KRITISCH: Verhindert dass Manifest auf gelöschte/verschobene Source-Files zeigt!
     
     Checks:
     1. File existiert noch? (os.path.exists)
-    2. Optional: Hash stimmt Ã¼berein? (--deep-check, langsam!)
+    2. Optional: Hash stimmt überein? (--deep-check, langsam!)
     
     Args:
         manifest: Manifest Dict
@@ -4063,10 +4063,10 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
     total_files = len(manifest_files)
     
     if total_files == 0:
-        _log("[source-integrity] âœ“ Keine Files zu prÃ¼fen")
+        _log("[source-integrity] ✓ Keine Files zu prüfen")
         return (True, [])
     
-    _log(f"[source-integrity] PrÃ¼fe {total_files} Files...")
+    _log(f"[source-integrity] Prüfe {total_files} Files...")
     
     checked = 0
     missing = 0
@@ -4078,7 +4078,7 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
         relpath = item.get("relpath", "?")
         
         if not source_path:
-            errors.append(f"Manifest-Fehler: Kein source_path fÃ¼r {relpath}")
+            errors.append(f"Manifest-Fehler: Kein source_path für {relpath}")
             continue
         
         # Check 1: File existiert?
@@ -4097,12 +4097,12 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
                 
                 if actual_sha256 != expected_sha256.lower():
                     hash_mismatch += 1
-                    errors.append(f"Source-File geÃ¤ndert: {relpath} (Hash-Mismatch!)")
+                    errors.append(f"Source-File geändert: {relpath} (Hash-Mismatch!)")
                     errors.append(f"  Expected: {expected_sha256}")
                     errors.append(f"  Actual:   {actual_sha256}")
             
             except Exception as e:
-                errors.append(f"Hash-Check fehlgeschlagen fÃ¼r {relpath}: {e}")
+                errors.append(f"Hash-Check fehlgeschlagen für {relpath}: {e}")
         
         checked += 1
     
@@ -4110,7 +4110,7 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
     
     # Result
     if errors:
-        _log(f"[source-integrity] âŒ {len(errors)} Fehler gefunden!")
+        _log(f"[source-integrity] ❌ {len(errors)} Fehler gefunden!")
         _log(f"[source-integrity]    Missing: {missing}, Hash-Mismatches: {hash_mismatch}")
         
         for err in errors[:10]:  # Erste 10 zeigen
@@ -4120,9 +4120,9 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
         
         return (False, errors)
     else:
-        _log(f"[source-integrity] âœ“âœ“âœ“ Alle {checked} Files vorhanden ({duration:.1f}s)")
+        _log(f"[source-integrity] ✓✓✓ Alle {checked} Files vorhanden ({duration:.1f}s)")
         if deep_check:
-            _log(f"[source-integrity] âœ“ Deep-Check: Alle Hashes korrekt")
+            _log(f"[source-integrity] ✓ Deep-Check: Alle Hashes korrekt")
         return (True, [])
 
 
@@ -4132,15 +4132,15 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
 
 def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[str | None, float]:
     """
-    Findet den effizientesten Basis-Snapshot via Jaccard-Ã„hnlichkeit.
+    Findet den effizientesten Basis-Snapshot via Jaccard-Ähnlichkeit.
     
     Strategie:
     - Vergleiche relpath-Mengen der Manifeste.
     - Performance-Limit: Scanne nur die letzten 10 Snapshots.
-    - Early Exit: Bei >95% Match sofort wÃ¤hlen.
+    - Early Exit: Bei >95% Match sofort wählen.
     
     Args:
-        cfg: pCloud Config (wird nicht verwendet, fÃ¼r Signatur-KompatibilitÃ¤t)
+        cfg: pCloud Config (wird nicht verwendet, für Signatur-Kompatibilität)
         manifest: Aktuelles Manifest
         archive_dir: Pfad zum Manifest-Archiv
     
@@ -4154,7 +4154,7 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[
         _log("[scout] Kein Manifest-Archiv gefunden")
         return None, 0.0
     
-    # Aktuelle Dateimenge (relpath â†’ sha256)
+    # Aktuelle Dateimenge (relpath → sha256)
     current_files = {
         it.get("relpath"): it.get("sha256")
         for it in manifest.get("items", [])
@@ -4169,13 +4169,13 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[
     best_snap = None
     best_score = 0.0
     
-    # Neueste zuerst prÃ¼fen
+    # Neueste zuerst prüfen
     archived_files = sorted(
         [f for f in os.listdir(manifests_path) if f.endswith(".json")],
         reverse=True
     )
     
-    _log(f"[scout] PrÃ¼fe {min(len(archived_files), 10)} Snapshots...")
+    _log(f"[scout] Prüfe {min(len(archived_files), 10)} Snapshots...")
     
     for filename in archived_files[:10]:
         snap_name = filename.replace(".json", "")
@@ -4186,7 +4186,7 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[
             with open(os.path.join(manifests_path, filename), "r", encoding="utf-8") as f:
                 arch_manifest = json.load(f)
             
-            # Basis-Dateien (relpath â†’ sha256)
+            # Basis-Dateien (relpath → sha256)
             basis_files = {
                 it.get("relpath"): it.get("sha256")
                 for it in arch_manifest.get("items", [])
@@ -4223,7 +4223,7 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[
     elapsed = time.time() - t_start
     
     if best_snap:
-        _log(f"[scout] âœ“ Best Match: {best_snap} (Similarity: {best_score*100:.1f}%) in {elapsed:.1f}s")
+        _log(f"[scout] ✓ Best Match: {best_snap} (Similarity: {best_score*100:.1f}%) in {elapsed:.1f}s")
     else:
         _log(f"[scout] Kein geeigneter Basis-Snapshot gefunden in {elapsed:.1f}s")
     
@@ -4236,10 +4236,10 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     Turbo-Delta-Mode: Synchronisiert neuen Snapshot basierend auf Klon eines alten.
     
     Workflow:
-    1. copyfolder(basis_snapshot) â†’ neuer Snapshot (5 Sek statt 73 Min!)
+    1. copyfolder(basis_snapshot) → neuer Snapshot (5 Sek statt 73 Min!)
     2. Diff berechnen (Added, Changed, Removed)
     3. Bereinigung: Veraltete Stubs entfernen
-    4. Update: Neue/GeÃ¤nderte Stubs parallel verarbeiten
+    4. Update: Neue/Geänderte Stubs parallel verarbeiten
     5. Marker & Manifest finalisieren
     
     Args:
@@ -4275,10 +4275,10 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     marker_started = f"{dest_snapshot_dir}/.upload_started"
     marker_complete = f"{dest_snapshot_dir}/.upload_complete"
     
-    # PrÃ¼fen ob bereits vollstÃ¤ndig
+    # Prüfen ob bereits vollständig
     try:
         pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-        _log(f"[info] Snapshot {snapshot_name} bereits vollstÃ¤ndig hochgeladen")
+        _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
         return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
     except:
         pass
@@ -4294,13 +4294,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=snapshots_fid, 
                          toname=snapshot_name, copycontentonly=True)
             copy_duration = time.time() - t_copy_start
-            _log(f"[delta-mode] âœ“ Struktur geklont in {copy_duration:.1f}s")
+            _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")
         except Exception as e:
             _log(f"[delta-mode][ERROR] copyfolder fehlgeschlagen: {e}")
             _log("[delta-mode] Fallback zu Full-Pool-Mode...")
             return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose)
     else:
-        _log(f"[dry] copyfolder({basis_snapshot_dir} â†’ {snapshot_name})")
+        _log(f"[dry] copyfolder({basis_snapshot_dir} → {snapshot_name})")
     
     # Started-Marker setzen
     if not dry:
@@ -4361,18 +4361,18 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             changed_paths.add(relpath)
     
     diff_duration = time.time() - t_diff_start
-    _log(f"[delta-mode] Diff: +{len(added_paths)} -{len(deleted_paths)} Î”{len(changed_paths)} (={len(common_paths)-len(changed_paths)} unverÃ¤ndert) in {diff_duration:.1f}s")
+    _log(f"[delta-mode] Diff: +{len(added_paths)} -{len(deleted_paths)} Δ{len(changed_paths)} (={len(common_paths)-len(changed_paths)} unverändert) in {diff_duration:.1f}s")
     
-    # === PHASE 3: BEREINIGUNG (Veraltete Stubs lÃ¶schen) ===
+    # === PHASE 3: BEREINIGUNG (Veraltete Stubs löschen) ===
     if deleted_paths and not dry:
-        _log(f"[delta-mode] Phase 3: LÃ¶sche {len(deleted_paths)} veraltete Stubs...")
+        _log(f"[delta-mode] Phase 3: Lösche {len(deleted_paths)} veraltete Stubs...")
         t_cleanup_start = time.time()
         deleted_count = 0
         
         for relpath in deleted_paths:
             stub_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
             try:
-                # Stub-File-ID holen und lÃ¶schen
+                # Stub-File-ID holen und löschen
                 stub_md = pc.stat_file_safe(cfg, path=stub_path)
                 if stub_md:
                     fid = stub_md.get("fileid")
@@ -4381,18 +4381,18 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                         deleted_count += 1
             except Exception as e:
                 if os.environ.get("PCLOUD_VERBOSE") == "1":
-                    _log(f"[warn] Konnte Stub nicht lÃ¶schen: {stub_path}: {e}")
+                    _log(f"[warn] Konnte Stub nicht löschen: {stub_path}: {e}")
         
         cleanup_duration = time.time() - t_cleanup_start
-        _log(f"[delta-mode] âœ“ {deleted_count} Stubs gelÃ¶scht in {cleanup_duration:.1f}s")
+        _log(f"[delta-mode] ✓ {deleted_count} Stubs gelöscht in {cleanup_duration:.1f}s")
     elif deleted_paths:
-        _log(f"[dry] WÃ¼rde {len(deleted_paths)} Stubs lÃ¶schen")
+        _log(f"[dry] Würde {len(deleted_paths)} Stubs löschen")
     
-    # === PHASE 4: UPDATE (Neue/GeÃ¤nderte Files verarbeiten) ===
+    # === PHASE 4: UPDATE (Neue/Geänderte Files verarbeiten) ===
     tasks = list(added_paths | changed_paths)
     
     if tasks:
-        _log(f"[delta-mode] Phase 4: Verarbeite {len(tasks)} neue/geÃ¤nderte Files...")
+        _log(f"[delta-mode] Phase 4: Verarbeite {len(tasks)} neue/geänderte Files...")
         
         # Index laden
         import tempfile
@@ -4493,7 +4493,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             if not abs_src or not sha256:
                 return
             
-            # PrÃ¼fen ob bereits im Pool (anderer Snapshot)
+            # Prüfen ob bereits im Pool (anderer Snapshot)
             with _state_lock:
                 if sha256 not in pool_refs:
                     pool_refs[sha256] = []
@@ -4522,7 +4522,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
             list(ex.map(_process_file, tasks))
         
-        _log(f"[delta-mode] âœ“ Files verarbeitet: {uploaded} neue, {reused} wiederverwendet")
+        _log(f"[delta-mode] ✓ Files verarbeitet: {uploaded} neue, {reused} wiederverwendet")
         
         # Stubs schreiben
         if stubs_to_write and not dry:
@@ -4536,7 +4536,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             save_content_index_local(_local_index_path, index)
             save_content_index(cfg, snapshots_root, index, dry=False)
     else:
-        _log("[delta-mode] Keine Ã„nderungen - Snapshot identisch mit Basis")
+        _log("[delta-mode] Keine Änderungen - Snapshot identisch mit Basis")
         uploaded = 0
         reused = 0
         stubs = 0
@@ -4558,9 +4558,9 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
             raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
         else:
-            _log("[delta-mode] âœ“ Validation erfolgreich - Snapshot ist konsistent")
+            _log("[delta-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
     elif not validation_enabled:
-        _log("[delta-mode] Validation Ã¼bersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
+        _log("[delta-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
     
     # === COMPLETE-MARKER SETZEN ===
     if not dry:
@@ -4584,7 +4584,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
     
     total_duration = time.time() - t_start
-    _log(f"[delta-mode] âœ“ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
+    _log(f"[delta-mode] ✓ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
     _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)}")
     
     return {
@@ -4604,9 +4604,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     POOL-MODE Upload - 1:1 KOPIERT vom Original 1to1_mode, nur Upload-Target angepasst!
     
     Architektur:
-      - Files â†’ /_pool/XX/[sha256] (dedupliziert)
-      - Snapshots â†’ Nur .meta.json Stubs (lesbare Ordnerstruktur)
-      - Content-Index â†’ Pool-Referenzen tracken
+      - Files → /_pool/XX/[sha256] (dedupliziert)
+      - Snapshots → Nur .meta.json Stubs (lesbare Ordnerstruktur)
+      - Content-Index → Pool-Referenzen tracken
     
     Args:
         cfg: pCloud Config
@@ -4661,7 +4661,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     except Exception as e:
         _log(f"[WARN] Konnte GC-Lock nicht erstellen: {e} - fahre trotzdem fort")
     
-    # Cleanup-Helper fÃ¼r Lock-Removal
+    # Cleanup-Helper für Lock-Removal
     def _cleanup_lock():
         """Entfernt Lock auch bei Fehler"""
         try:
@@ -4681,8 +4681,8 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             basis_snapshot, similarity = scout_best_pool_basis(cfg, manifest, archive_dir)
             
             if basis_snapshot and similarity >= scout_threshold:
-                _log(f"[pool-mode] âœ“ Scout Match: {basis_snapshot} ({similarity*100:.1f}%)")
-                _log(f"[pool-mode] â†’ Nutze Turbo-Delta-Mode!")
+                _log(f"[pool-mode] ✓ Scout Match: {basis_snapshot} ({similarity*100:.1f}%)")
+                _log(f"[pool-mode] → Nutze Turbo-Delta-Mode!")
                 
                 # Delegation an push_pool_delta_mode
                 # (Lock wird vom finally-Block entfernt)
@@ -4695,7 +4695,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     _log(f"[pool-mode] Scout Best: {basis_snapshot} ({similarity*100:.1f}%) - unter Schwelle ({scout_threshold*100:.0f}%)")
                 else:
                     _log(f"[pool-mode] Scout: Kein Basis gefunden")
-                _log(f"[pool-mode] â†’ Fallback zu Full-Pool-Mode")
+                _log(f"[pool-mode] → Fallback zu Full-Pool-Mode")
         else:
             _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
         
@@ -4709,27 +4709,27 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         marker_started = f"{dest_snapshot_dir}/.upload_started"
         marker_complete = f"{dest_snapshot_dir}/.upload_complete"
         
-        # PrÃ¼fen ob unvollstÃ¤ndiger Upload existiert
+        # Prüfen ob unvollständiger Upload existiert
         incomplete_upload = False
         try:
             pc.stat_file(cfg, path=marker_started, with_checksum=False)
             # Started-Marker existiert
             try:
                 pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-                # Complete-Marker auch da â†’ Upload war erfolgreich
-                _log(f"[info] Snapshot {snapshot_name} bereits vollstÃ¤ndig hochgeladen")
+                # Complete-Marker auch da → Upload war erfolgreich
+                _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
                 return {"uploaded": 0, "stubs": 0, "resumed": False}
             except:
-                # Nur Started, kein Complete â†’ unvollstÃ¤ndig!
+                # Nur Started, kein Complete → unvollständig!
                 incomplete_upload = True
-                _log(f"[warn] UnvollstÃ¤ndiger Upload erkannt fÃ¼r {snapshot_name} - starte neu")
+                _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
         except:
-            # Kein Started-Marker â†’ frischer Upload
+            # Kein Started-Marker → frischer Upload
             pass
         
-        # Bei unvollstÃ¤ndigem Upload: Index-Driven Skip (keine LÃ¶schung)
+        # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
         if incomplete_upload:
-            _log(f"[resume] Setze Upload fort fÃ¼r {snapshot_name} (bereits verarbeitete Dateien werden Ã¼bersprungen)")
+            _log(f"[resume] Setze Upload fort für {snapshot_name} (bereits verarbeitete Dateien werden übersprungen)")
         
         _log(f"[plan] pool snapshot={dest_snapshot_dir}")
         
@@ -4792,8 +4792,8 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             index = load_content_index(cfg, snapshots_root)
         items = index.setdefault("items", {})
         
-        # Pool-Refs-Struktur (fÃ¼r Pool-Mode)
-        pool_refs = index.setdefault("pool_refs", {})  # SHA256 â†’ [snapshot1, snapshot2, ...]
+        # Pool-Refs-Struktur (für Pool-Mode)
+        pool_refs = index.setdefault("pool_refs", {})  # SHA256 → [snapshot1, snapshot2, ...]
         
         # ============================================================================
         # === PREFLIGHT: DELTA-BERECHNUNG (VOR Upload!) ===
@@ -4816,7 +4816,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         t_pool_scan = time.time()
         
         try:
-            # Rekursives listfolder Ã¼ber kompletten Pool (1 API-Call!)
+            # Rekursives listfolder über kompletten Pool (1 API-Call!)
             result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
             physical_pool_sha256s = set()
             
@@ -4841,37 +4841,37 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _log(f"[preflight] Pool-Scan: {len(physical_pool_sha256s)} SHA256s gefunden in {pool_scan_duration:.2f}s")
             
         except Exception as e:
-            _log(f"[preflight][WARN] Pool-Scan fehlgeschlagen: {e}, falle zurÃ¼ck auf Index-basiert")
+            _log(f"[preflight][WARN] Pool-Scan fehlgeschlagen: {e}, falle zurück auf Index-basiert")
             physical_pool_sha256s = set(pool_refs.keys())  # Fallback auf Index bei Fehler
         
-        # 3. Index-basierte SHA256s (fÃ¼r Vergleich & Index-Reparatur-Erkennung)
+        # 3. Index-basierte SHA256s (für Vergleich & Index-Reparatur-Erkennung)
         index_pool_sha256s = set(pool_refs.keys())
         _log(f"[preflight] Index: {len(index_pool_sha256s)} SHA256s registriert")
         
-        # 4. Delta-Liste: SHA256s die PHYSISCH Upload benÃ¶tigen (nicht mehr Index-basiert!)
+        # 4. Delta-Liste: SHA256s die PHYSISCH Upload benötigen (nicht mehr Index-basiert!)
         delta_sha256s = set(manifest_sha256_to_item.keys()) - physical_pool_sha256s
         
-        # 5. Reused-Liste: SHA256s PHYSISCH im Pool (fÃ¼r diesen Snapshot aber neu)
-        # PrÃ¼fe ob bereits fÃ¼r DIESEN Snapshot registriert
+        # 5. Reused-Liste: SHA256s PHYSISCH im Pool (für diesen Snapshot aber neu)
+        # Prüfe ob bereits für DIESEN Snapshot registriert
         already_in_snapshot = {
             sha for sha in manifest_sha256_to_item.keys()
             if snapshot_name in pool_refs.get(sha, [])
         }
         
-        # Echte Reused: Physisch vorhanden, aber nicht fÃ¼r diesen Snapshot
+        # Echte Reused: Physisch vorhanden, aber nicht für diesen Snapshot
         reused_sha256s = (set(manifest_sha256_to_item.keys()) & physical_pool_sha256s) - already_in_snapshot
         
         # 6. Index-Reparatur-Kandidaten: Physisch vorhanden, aber nicht im Index
         needs_index_update = reused_sha256s - index_pool_sha256s
         
         if needs_index_update:
-            _log(f"[preflight] âš ï¸ Index-Reparatur nÃ¶tig: {len(needs_index_update)} Files physisch vorhanden, aber nicht im Index")
-            _log(f"[preflight]    â†’ Diese werden automatisch in pool_refs aufgenommen")
+            _log(f"[preflight] ⚠️ Index-Reparatur nötig: {len(needs_index_update)} Files physisch vorhanden, aber nicht im Index")
+            _log(f"[preflight]    → Diese werden automatisch in pool_refs aufgenommen")
         
         preflight_duration = time.time() - t_preflight_start
-        _log(f"[preflight] Delta: {len(delta_sha256s)} benÃ¶tigen Upload ({len(delta_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
+        _log(f"[preflight] Delta: {len(delta_sha256s)} benötigen Upload ({len(delta_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
         _log(f"[preflight] Reused: {len(reused_sha256s)} aus Pool wiederverwendet ({len(reused_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
-        _log(f"[preflight] Skipped: {len(already_in_snapshot)} bereits fÃ¼r Snapshot registriert")
+        _log(f"[preflight] Skipped: {len(already_in_snapshot)} bereits für Snapshot registriert")
         _log(f"[preflight] Abgeschlossen in {preflight_duration:.2f}s")
         
         # 5. File-Liste filtern: Nur noch Delta-Files verarbeiten
@@ -4887,7 +4887,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         # Hilfstabellen
         seen_inodes: dict[tuple[int,int], str] = {}
         uploaded = 0
-        resumed = len(reused_items)  # Bereits VORAB gezÃ¤hlt (aus Pool wiederverwendet)
+        resumed = len(reused_items)  # Bereits VORAB gezählt (aus Pool wiederverwendet)
         stubs = 0
         index_changed = False
         stubs_to_write: list[tuple[str, dict]] = []
@@ -5007,7 +5007,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             # 256 Pool-Ordner generieren (00-FF, lowercase wie _get_pool_path)
             pool_folders_needed = [f"{pool_root}/{hex(i)[2:].zfill(2)}" for i in range(256)]
             
-            # PrÃ¼fe welche bereits existieren (um unnÃ¶tige API-Calls zu sparen)
+            # Prüfe welche bereits existieren (um unnötige API-Calls zu sparen)
             existing_pool_folders = set()
             try:
                 result = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=False, nofiles=True)
@@ -5042,11 +5042,11 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     results = list(ex.map(_create_pool_folder, missing_pool_folders))
                     created_count = sum(1 for r in results if r)
                 
-                _log(f"[pool-mode] âœ“ {created_count}/{len(missing_pool_folders)} Pool-Ordner erstellt")
+                _log(f"[pool-mode] ✓ {created_count}/{len(missing_pool_folders)} Pool-Ordner erstellt")
             else:
-                _log("[pool-mode] âœ“ Alle 256 Pool-Ordner existieren bereits")
+                _log("[pool-mode] ✓ Alle 256 Pool-Ordner existieren bereits")
         elif dry:
-            _log("[dry] Pool-Ordnerstruktur wÃ¼rde erstellt (00-FF)")
+            _log("[dry] Pool-Ordnerstruktur würde erstellt (00-FF)")
         
         pool_folders_duration = time.time() - t_pool_folders_start
         _log(f"[pool-mode] Phase 0 abgeschlossen: Pool-Struktur ({pool_folders_duration:.1f}s)")
@@ -5088,7 +5088,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
         template_force_active = os.environ.get("PCLOUD_FOLDER_TEMPLATE_FORCE", "0") == "1"
         
-        # PrÃ¼fe ob Template existiert
+        # Prüfe ob Template existiert
         template_exists = False
         if not dry:
             try:
@@ -5130,27 +5130,27 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 shared = manifest_folders & template_folders
                 
                 overlap_pct = len(shared)/len(manifest_folders)*100 if manifest_folders else 0
-                _log(f"[pool-mode] Ãœberlapp: {len(shared)}/{len(manifest_folders)} ({overlap_pct:.0f}%)")
-                _log(f"[pool-mode] Delta: +{len(to_add)} neue, -{len(to_delete)} Ã¼berflÃ¼ssige")
+                _log(f"[pool-mode] Überlapp: {len(shared)}/{len(manifest_folders)} ({overlap_pct:.0f}%)")
+                _log(f"[pool-mode] Delta: +{len(to_add)} neue, -{len(to_delete)} überflüssige")
                 
                 # 3. Template kopieren (1 API-Call!)
-                _log(f"[pool-mode] Kopiere Template â†’ {snapshot_name}...")
+                _log(f"[pool-mode] Kopiere Template → {snapshot_name}...")
                 dest_snapshot_fid = pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
                 pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_folderid=dest_snapshot_fid, noover=True, copycontentonly=True)
-                _log("[pool-mode] âœ“ Template kopiert (~2-5s statt ~5min)")
+                _log("[pool-mode] ✓ Template kopiert (~2-5s statt ~5min)")
                 template_used = True
                 
-                # 4. ÃœberflÃ¼ssige Ordner lÃ¶schen (tiefste zuerst)
+                # 4. Überflüssige Ordner löschen (tiefste zuerst)
                 if to_delete:
-                    _log(f"[pool-mode] LÃ¶sche {len(to_delete)} Ã¼berflÃ¼ssige Ordner...")
+                    _log(f"[pool-mode] Lösche {len(to_delete)} überflüssige Ordner...")
                     deleted = 0
                     for relpath in sorted(to_delete, key=lambda p: -p.count("/")):
                         try:
                             pc.call_with_backoff(pc.delete_folder, cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=False)
                             deleted += 1
                         except Exception as e:
-                            _log(f"[warn] Konnte {relpath} nicht lÃ¶schen: {e}")
-                    _log(f"[pool-mode] âœ“ {deleted} Ã¼berflÃ¼ssige Ordner gelÃ¶scht")
+                            _log(f"[warn] Konnte {relpath} nicht löschen: {e}")
+                    _log(f"[pool-mode] ✓ {deleted} überflüssige Ordner gelöscht")
                 
                 # 5. Fehlende Ordner anlegen (parallel mit PCLOUD_FOLDER_THREADS)
                 if to_add:
@@ -5194,21 +5194,21 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                             for reldir in batch:
                                 _create_template_folder(reldir)
                     
-                    _log(f"[pool-mode] âœ“ {created} neue Ordner angelegt")
+                    _log(f"[pool-mode] ✓ {created} neue Ordner angelegt")
                 
-                # 6. Template aktualisieren (wenn Struktur sich Ã¤nderte)
+                # 6. Template aktualisieren (wenn Struktur sich änderte)
                 if to_add or to_delete:
                     _log("[pool-mode] Aktualisiere Template mit neuer Struktur...")
                     try:
                         pc.call_with_backoff(pc.delete_folder, cfg, path=template_path, recursive=True)
                         template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
                         pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
-                        _log("[pool-mode] âœ“ Template aktualisiert")
+                        _log("[pool-mode] ✓ Template aktualisiert")
                     except Exception as e:
                         _log(f"[warn] Template-Update fehlgeschlagen: {e}")
             
             except Exception as e:
-                _log(f"[warn] Template-Nutzung fehlgeschlagen: {e} â€“ Fallback zu Einzeln-Anlage")
+                _log(f"[warn] Template-Nutzung fehlgeschlagen: {e} – Fallback zu Einzeln-Anlage")
                 template_used = False
         
         # Fallback: Ordner einzeln anlegen (wenn kein Template oder Template-Fehler)
@@ -5280,7 +5280,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                                 _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
                         return True
                     except Exception as e:
-                        print(f"[warn] Ordner-Anlage fehlgeschlagen fÃ¼r {reldir}: {e}", file=sys.stderr)
+                        print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
                         return False
                 
                 # Ordner nach Tiefe erstellen (Parents zuerst) - 1:1 Original Zeile 2160-2175
@@ -5294,7 +5294,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                         for folder in folders_at_depth:
                             _create_folder(folder)
                 
-                _log(f"[folders] âœ“ {total_folders} Ordner erfolgreich angelegt")
+                _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
             else:
                 _log("[pool-mode] Alle Ordner existieren bereits")
         
@@ -5308,7 +5308,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         # === FILE-PROCESSING-FUNKTION (1:1 vom Original, nur Pool-Upload!) ===
         def _process_file_item(it: dict) -> None:
             """
-            Verarbeitet ein Delta-File (benÃ¶tigt Upload).
+            Verarbeitet ein Delta-File (benötigt Upload).
             Preflight hat bereits gefiltert: Nur Files die nicht im Pool sind!
             """
             nonlocal uploaded, stubs, index_changed, _done_items, _done_size, _t_last_progress
@@ -5343,10 +5343,10 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             # Hardlink-Check
             with _state_lock:
                 if ino_key in seen_inodes:
-                    # Hardlink zu bereits verarbeitetem File â†’ nutze gecachte Info
+                    # Hardlink zu bereits verarbeitetem File → nutze gecachte Info
                     first_relpath = seen_inodes[ino_key]
                     # Pool-FileID aus erstem Upload holen (aus stubs_to_write oder Index)
-                    # FÃ¼r jetzt: Upload-Skip (wird unten gefixt wenn nÃ¶tig)
+                    # Für jetzt: Upload-Skip (wird unten gefixt wenn nötig)
                     pass
             
             # Upload zu Pool
@@ -5366,7 +5366,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
                 
             except FileNotFoundError as e:
-                _log(f"[ERROR] {relpath}: File verschwand wÃ¤hrend Upload: {e}")
+                _log(f"[ERROR] {relpath}: File verschwand während Upload: {e}")
                 return
             except PermissionError as e:
                 _log(f"[ERROR] {relpath}: Keine Leserechte: {e}")
@@ -5432,18 +5432,18 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             except Exception as e:
                 _log(f"[ERROR] Reused-File {relpath}: Konnte Pool-FileID nicht holen: {e}")
         
-        # === FILES KLASSIFIZIEREN (nur Delta-Files fÃ¼r Upload!) ===
+        # === FILES KLASSIFIZIEREN (nur Delta-Files für Upload!) ===
         _log(f"[pool-mode] Phase 2: Upload {len(delta_items)} Delta-Files...")
         _small_delta = [f for f in delta_items if (f.get("size") or 0) < SMALL_FILE_THRESHOLD_BYTES]
         _large_delta = [f for f in delta_items if (f.get("size") or 0) >= SMALL_FILE_THRESHOLD_BYTES]
         
         if _small_delta and _large_delta:
             _log(f"[parallel] {len(_small_delta)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel, "
-                 f"{len(_large_delta)} groÃŸe Dateien sequentiell")
+                 f"{len(_large_delta)} große Dateien sequentiell")
         elif _small_delta:
             _log(f"[parallel] {len(_small_delta)} kleine Dateien (< {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) parallel")
         elif _large_delta:
-            _log(f"[parallel] {len(_large_delta)} groÃŸe Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
+            _log(f"[parallel] {len(_large_delta)} große Dateien (>= {SMALL_FILE_THRESHOLD_BYTES/1024**2:.0f} MB) sequentiell")
         
         # === KLEINE DELTA-DATEIEN PARALLEL ===
         if _small_delta and PARALLEL_UPLOAD_THREADS > 1:
@@ -5459,9 +5459,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         
         # === REUSED-FILES VERARBEITEN (nur Stubs, kein Upload!) ===
         if reused_items:
-            _log(f"[pool-mode] Phase 2b: Erstelle {len(reused_items)} Stubs fÃ¼r reused Files...")
+            _log(f"[pool-mode] Phase 2b: Erstelle {len(reused_items)} Stubs für reused Files...")
             
-            # Reused-Files kÃ¶nnen alle parallel (kein Upload, nur stat_file)
+            # Reused-Files können alle parallel (kein Upload, nur stat_file)
             reused_threads = int(os.environ.get("PCLOUD_REUSED_THREADS", "8"))
             if reused_threads > 1 and len(reused_items) > 1:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=reused_threads) as ex:
@@ -5474,7 +5474,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         # === PHASE 3: BATCH-WRITE STUBS ===
         # ============================================================================
         if not dry and stubs_to_write:
-            _log(f"[push] âœ“ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
+            _log(f"[push] ✓ Loop abgeschlossen. Bereite Stub-Batch vor ({len(stubs_to_write)} Stubs)...")
             t0 = time.time()
             _batch_write_stubs(cfg, stubs_to_write, dry=False)
             write_ms += (time.time() - t0) * 1000.0
@@ -5485,7 +5485,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         if dry:
             print(f"[dry] write index: {snapshots_root}/_index/content_index.json (pool_refs={len(pool_refs)})")
         else:
-            # Finaler lokaler Save (falls noch Ã„nderungen seit letztem periodischen Save)
+            # Finaler lokaler Save (falls noch Änderungen seit letztem periodischen Save)
             if index_changed:
                 save_content_index_local(_local_index_path, index)
                 if os.environ.get("PCLOUD_VERBOSE") == "1":
@@ -5499,13 +5499,13 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 write_ms += dt_ms
                 print(f"[timing] index_write_ms={int(dt_ms)}")
                 
-                # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index fÃ¼r Recovery)
+                # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
                 try:
                     idx_path = f"{snapshots_root}/_index/content_index.json"
                     archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
                     pc.ensure_parent_dirs(cfg, archive_path)
                     pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-                    _log(f"[index] âœ“ Content-Index remote archiviert: {archive_path}")
+                    _log(f"[index] ✓ Content-Index remote archiviert: {archive_path}")
                 except Exception as e:
                     _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
                 
@@ -5514,17 +5514,17 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
                     os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
                     save_content_index_local(master_index_path, index)
-                    _log(f"[index] âœ“ Master-Index aktualisiert: {master_index_path}")
+                    _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
                 except Exception as e:
                     _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
                 
-                # Lokale Index-Datei lÃ¶schen
+                # Lokale Index-Datei löschen
                 try:
                     os.remove(_local_index_path)
                     if os.environ.get("PCLOUD_VERBOSE") == "1":
-                        print(f"[index] Lokale Kopie gelÃ¶scht: {_local_index_path}")
+                        print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
                 except Exception as e:
-                    print(f"[warn] Konnte lokale Index-Datei nicht lÃ¶schen: {e}")
+                    print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
         
         # === POST-UPLOAD VALIDATION (User-Request: Konsistenz-Check VOR Complete-Marker!) ===
         validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
@@ -5541,9 +5541,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
                 raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
             else:
-                _log("[pool-mode] âœ“ Validation erfolgreich - Snapshot ist konsistent")
+                _log("[pool-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
         elif not validation_enabled:
-            _log("[pool-mode] Validation Ã¼bersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
+            _log("[pool-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
         
         # === COMPLETE-MARKER SETZEN (wie Original!) ===
         if not dry:
@@ -5589,7 +5589,7 @@ def retention_pool_mode(cfg: dict, dest_root: str, *, local_snaps: Optional[list
     """
     POOL-MODE Retention (vereinfacht!).
     
-    LÃ¶scht Snapshot-Ordner die nicht mehr lokal existieren.
+    Löscht Snapshot-Ordner die nicht mehr lokal existieren.
     Pool-Garbage-Collection erfolgt separat (async).
     
     Args:
@@ -5615,17 +5615,17 @@ def retention_pool_mode(cfg: dict, dest_root: str, *, local_snaps: Optional[list
         _log(f"[retention-pool] ERROR listing remote snapshots: {e}")
         return
     
-    # Welche lÃ¶schen?
+    # Welche löschen?
     local_set = set(local_snaps or [])
     to_delete = remote_snaps - local_set
     
-    _log(f"[retention-pool] Lokal: {len(local_set)} | Zu lÃ¶schen: {len(to_delete)}")
+    _log(f"[retention-pool] Lokal: {len(local_set)} | Zu löschen: {len(to_delete)}")
     
     if not to_delete:
-        _log("[retention-pool] Nichts zu lÃ¶schen")
+        _log("[retention-pool] Nichts zu löschen")
         return
     
-    # Snapshots lÃ¶schen
+    # Snapshots löschen
     for snap in sorted(to_delete):
         snap_path = f"{snapshots_root}/{snap}"
         
@@ -5634,14 +5634,14 @@ def retention_pool_mode(cfg: dict, dest_root: str, *, local_snaps: Optional[list
             continue
         
         try:
-            _log(f"[retention-pool] LÃ¶sche: {snap_path}")
+            _log(f"[retention-pool] Lösche: {snap_path}")
             pc.delete_folder(cfg, path=snap_path, recursive=True)
-            _log(f"[retention-pool] âœ“ GelÃ¶scht: {snap}")
+            _log(f"[retention-pool] ✓ Gelöscht: {snap}")
         except Exception as e:
             _log(f"[retention-pool] ERROR deleting {snap}: {e}")
     
-    _log(f"[retention-pool] âœ“ FERTIG: {len(to_delete)} Snapshots gelÃ¶scht")
-    _log("[retention-pool] HINWEIS: Pool-Garbage-Collection separat ausfÃ¼hren!")
+    _log(f"[retention-pool] ✓ FERTIG: {len(to_delete)} Snapshots gelöscht")
+    _log("[retention-pool] HINWEIS: Pool-Garbage-Collection separat ausführen!")
 
 
 # ----------------- CLI -----------------
@@ -5657,18 +5657,18 @@ def main() -> None:
     # --- Ende Neu ---
 
     ap = argparse.ArgumentParser(description="Pusht ein JSON-Manifest nach pCloud (Object-Store, 1:1-Snapshot oder POOL-Modus).")
-    ap.add_argument("--manifest", required=True, help="Pfad zur Manifest-JSON (schema=2 oder schema=4 fÃ¼r Pool)")
+    ap.add_argument("--manifest", required=True, help="Pfad zur Manifest-JSON (schema=2 oder schema=4 für Pool)")
     ap.add_argument("--dest-root", required=True, help="Remote-Wurzel, z.B. /Backup/pcloud-snapshots")
-    ap.add_argument("--snapshot-name", help="Ãœberschreibe Snapshot-Name aus Manifest (optional, fÃ¼r Testing)")
+    ap.add_argument("--snapshot-name", help="Überschreibe Snapshot-Name aus Manifest (optional, für Testing)")
     ap.add_argument("--snapshot-mode", choices=["objects","1to1","pool"], default="objects",
                     help="Upload-Strategie: objects (Hash-Object-Store + Stubs), 1to1 (Materialisieren + Stubs), oder pool (Pool-basiert mit Stubs)")
     ap.add_argument("--use-delta-copy", action="store_true",
                     help="Delta-Copy-Modus: Server-seitiges Klonen + selective Updates (nur mit --snapshot-mode 1to1). "
-                         "Erfordert vorherigen vollstÃ¤ndigen Snapshot. Fallback zu Full-Mode wenn kein Basis existiert.")
+                         "Erfordert vorherigen vollständigen Snapshot. Fallback zu Full-Mode wenn kein Basis existiert.")
     ap.add_argument("--objects-layout", choices=["two-level"], default="two-level",
-                    help="Layout fÃ¼r Object-Store (aktuell nur two-level).")
+                    help="Layout für Object-Store (aktuell nur two-level).")
     ap.add_argument("--retention-sync", action="store_true",
-                    help="Nach dem Upload: entfernte Snapshots, die lokal fehlen, sauber promoten/lÃ¶schen (relevant fÃ¼r --snapshot-mode 1to1 oder pool).")
+                    help="Nach dem Upload: entfernte Snapshots, die lokal fehlen, sauber promoten/löschen (relevant für --snapshot-mode 1to1 oder pool).")
     ap.add_argument("--dry-run", action="store_true")
 
 
@@ -5694,11 +5694,11 @@ def main() -> None:
     )
 
     # --- Neu: Plausibilisierung & Preflight ---
-    # Zielpfad normieren (fÃ¼hrt fÃ¼hrenden "/")
+    # Zielpfad normieren (führt führenden "/")
     args.dest_root = pc._norm_remote_path(args.dest_root)
-    # ENV-File rein informativ: effective_config hat bereits geprÃ¼ft, ob Token existiert
+    # ENV-File rein informativ: effective_config hat bereits geprüft, ob Token existiert
     try:
-        pc.preflight_or_raise(cfg)   # â†’ raise bei Auth/Quota/API down
+        pc.preflight_or_raise(cfg)   # → raise bei Auth/Quota/API down
     except Exception as e:
         print(f"[preflight][FAIL] {e}", file=sys.stderr)
         sys.exit(12)
@@ -5711,7 +5711,7 @@ def main() -> None:
         print("Manifest schema>=2 erwartet (mit inode/ext/sha256).", file=sys.stderr)
         sys.exit(2)
     
-    # === Snapshot-Name Override (optional fÃ¼r Testing) ===
+    # === Snapshot-Name Override (optional für Testing) ===
     if args.snapshot_name:
         manifest["snapshot"] = args.snapshot_name
         _log(f"[cli] Snapshot-Name ueberschrieben: {args.snapshot_name}")
@@ -5730,10 +5730,10 @@ def main() -> None:
         push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
     else:
         # 1to1-Mode
-        # Smart Strategy Selection, aber mit Legacy-KompatibilitÃ¤t fÃ¼r --use-delta-copy
+        # Smart Strategy Selection, aber mit Legacy-Kompatibilität für --use-delta-copy
         if args.use_delta_copy:
             _log("[legacy] --use-delta-copy Flag erkannt; erzwinge TURBO-MODE (deprecated, nutze Smart-Controller stattdessen)")
-            # Direkt zu Delta-Mode, ohne Metriken zu prÃ¼fen
+            # Direkt zu Delta-Mode, ohne Metriken zu prüfen
             push_1to1_delta_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
         else:
             # Standard: Smart-Entscheidung
