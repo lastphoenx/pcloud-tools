@@ -4509,6 +4509,25 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         upload_ms = 0.0
         write_ms = 0.0
     
+    # === POST-UPLOAD VALIDATION (wie Full-Pool-Mode!) ===
+    validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
+    if validation_enabled and not dry:
+        _log("[delta-mode] Starte Post-Upload Validation...")
+        is_valid, validation_errors = validate_pool_snapshot(cfg, dest_snapshot_dir, pool_root, manifest, index, dry=dry)
+        
+        if not is_valid:
+            _log(f"[delta-mode][ERROR] Validation fehlgeschlagen: {len(validation_errors)} Fehler!")
+            _log("[delta-mode][ERROR] Complete-Marker wird NICHT gesetzt (inkonsistenter Snapshot)")
+            for err in validation_errors[:5]:  # Erste 5 Fehler zeigen
+                _log(f"[delta-mode][ERROR]   {err}")
+            
+            # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
+            raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
+        else:
+            _log("[delta-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
+    elif not validation_enabled:
+        _log("[delta-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
+    
     # === COMPLETE-MARKER SETZEN ===
     if not dry:
         try:
@@ -4616,10 +4635,6 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         except Exception as e:
             _log(f"[WARN] Lock-Cleanup fehlgeschlagen: {e}")
     
-    # Registriere Cleanup für Exception-Fälle
-    import atexit
-    atexit.register(_cleanup_lock)
-    
     try:
         # === Ab hier: Eigentlicher Upload-Code (Lock aktiv!) ===
         
@@ -4636,14 +4651,11 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[pool-mode] → Nutze Turbo-Delta-Mode!")
                 
                 # Delegation an push_pool_delta_mode
-                result = push_pool_delta_mode(
+                # (Lock wird vom finally-Block entfernt)
+                return push_pool_delta_mode(
                     cfg, manifest, dest_root, basis_snapshot,
                     dry=dry, verbose=verbose
                 )
-                
-                # Lock entfernen vor Return
-                _cleanup_lock()
-                return result
             else:
                 if basis_snapshot:
                     _log(f"[pool-mode] Scout Best: {basis_snapshot} ({similarity*100:.1f}%) - unter Schwelle ({scout_threshold*100:.0f}%)")
