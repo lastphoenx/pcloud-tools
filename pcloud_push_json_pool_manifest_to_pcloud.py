@@ -3565,266 +3565,19 @@ class _PoolStats:
 
 def _get_pool_path(sha256: str) -> str:
     """
-    Berechnet Pool-Pfad aus SHA256.
+    Berechnet Pool-Pfad aus SHA256 (RELATIV zu dest_root, ohne führenden Slash!).
     
     Args:
         sha256: SHA256-Hash (64 chars hex)
     
     Returns:
-        Pool-Pfad: /_pool/XX/[full_sha256]
+        Pool-Pfad: _pool/XX/[full_sha256]
     """
     if not sha256 or len(sha256) < 2:
         raise ValueError(f"Invalid SHA256: {sha256}")
     
     prefix = sha256[:2].lower()
-    return f"/_pool/{prefix}/{sha256.lower()}"
-
-
-def _upload_to_pool(cfg: dict, local_path: str, sha256: str, pool_root: str, *, dry: bool = False) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Upload File in Pool (dedupliziert).
-    Nutzt _upload_file_smart() für Robustheit (Retry, Resume, Timeouts).
-    
-    Args:
-        cfg: pCloud Config
-        local_path: Lokaler File-Pfad
-        sha256: SHA256 Hash des Files
-        pool_root: Pool-Root-Pfad (z.B. /Backup/rtb_1to1_POOL/_pool)
-        dry: Dry-run Mode
-    
-    Returns:
-        (pool_fileid, pcloud_hash) oder (None, None) bei dry-run
-    """
-    pool_path_rel = _get_pool_path(sha256)
-    pool_path = f"{pool_root.rstrip('/')}{pool_path_rel}"
-    
-    if dry:
-        _dry_sampler.log("upload", f"upload pool: {pool_path}  <- {local_path}")
-        return (None, None)
-    
-    # Check ob File bereits im Pool existiert (mit Safe-Wrapper)
-    existing_stat = stat_file_safe(cfg, path=pool_path)
-    if existing_stat:
-        pool_fileid = existing_stat.get("fileid")
-        pcloud_hash = existing_stat.get("hash")
-        
-        if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[pool] ✓ EXISTS: {pool_path} (fileid={pool_fileid})")
-        
-        return (pool_fileid, pcloud_hash)
-    
-    # Upload mit _upload_file_smart (Retry + Resume für große Files)
-    _log(f"[pool] upload: {local_path} → {pool_path}")
-    
-    res = _upload_file_smart(cfg, local_path, pool_path, dry=dry)
-    
-    # fileid + hash aus Upload-Antwort extrahieren
-    # ROBUST: pCloud API kann verschiedene Response-Formate liefern!
-    pool_fileid = None
-    pcloud_hash = None
-    
-    if res and isinstance(res, dict):
-        # Standard-Fall: metadata ist ein Dict
-        md = res.get("metadata")
-        
-        # Fall 1: metadata ist Liste (wenn Ordner erstellt wurden)
-        if isinstance(md, list) and len(md) > 0:
-            # Letztes Element ist die hochgeladene Datei
-            md = md[-1] if isinstance(md[-1], dict) else {}
-        
-        # Fall 2: metadata ist Dict (Normalfall)
-        elif not isinstance(md, dict):
-            md = {}
-        
-        # Extrahiere fileid + hash
-        if md:
-            pool_fileid = md.get("fileid")
-            pcloud_hash = md.get("hash")
-    
-    # EAGER FILEID FALLBACK (wie im Original - aber robuster!)
-    # Wenn Upload-Response unvollständig war, hole via stat
-    if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
-        try:
-            stat_md = pc.call_with_backoff(stat_file_safe, cfg, path=pool_path) or {}
-            if not pool_fileid:
-                pool_fileid = stat_md.get("fileid")
-            if not pcloud_hash:
-                pcloud_hash = stat_md.get("hash")
-            
-            if pool_fileid and os.environ.get("PCLOUD_VERBOSE") == "1":
-                _log(f"[pool] ✓ FileID via EAGER fallback: {pool_fileid}")
-        except Exception as e:
-            _log(f"[pool][warn] EAGER stat failed for {pool_path}: {e}")
-    
-    # Finale Validierung
-    if not pool_fileid:
-        _log(f"[pool][ERROR] Upload lieferte keine FileID: {pool_path}")
-        # Nicht aufgeben - versuche nochmal via stat (ohne EAGER check)
-        try:
-            stat_md = stat_file_safe(cfg, path=pool_path)
-            if stat_md:
-                pool_fileid = stat_md.get("fileid")
-                pcloud_hash = stat_md.get("hash")
-                _log(f"[pool] ✓ FileID via finaler stat-check: {pool_fileid}")
-        except Exception as e:
-            _log(f"[pool][ERROR] Finale FileID-Ermittlung fehlgeschlagen: {e}")
-    
-    if os.environ.get("PCLOUD_VERBOSE") == "1":
-        _log(f"[pool] ✓ UPLOADED: {pool_path} (fileid={pool_fileid}, hash={pcloud_hash})")
-    
-    return (pool_fileid, pcloud_hash)
-
-
-def _write_pool_stub(cfg: dict, snapshot_dir: str, relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: str, *, dry: bool = False) -> None:
-    """
-    Schreibt Pool-Stub (.meta.json) in Snapshot-Ordner.
-    Nutzt REST API write_json_to_folderid() für Robustheit (kein Binary-Blocking).
-    
-    Args:
-        cfg: pCloud Config
-        snapshot_dir: Remote Snapshot-Ordner (z.B. /_snapshots/2026-05-28-120014)
-        relpath: Relative Pfad im Snapshot (z.B. home/user/file.txt)
-        file_item: Manifest File-Item mit sha256, size, mtime, etc.
-        pool_fileid: Pool-File ID
-        pcloud_hash: pCloud Hash
-        dry: Dry-run Mode
-    """
-    sha256 = file_item.get("sha256", "").lower()
-    size = file_item.get("size", 0)
-    mtime = file_item.get("mtime", 0.0)
-    snapshot_name = file_item.get("snapshot", "?")
-    
-    pool_path = _get_pool_path(sha256)
-    
-    # Stub-Pfad: snapshot_dir/relpath.meta.json
-    if "/" in relpath:
-        stub_dir, base = relpath.rsplit("/", 1)
-        parent_dir = f"{snapshot_dir}/{stub_dir}"
-    else:
-        base = relpath
-        parent_dir = snapshot_dir
-    
-    stub_filename = f"{base}.meta.json"
-    stub_path = f"{parent_dir}/{stub_filename}"
-    
-    if dry:
-        _log(f"[dry] write_pool_stub: {stub_path}")
-        return
-    
-    # Stub-Payload (wie im Original: format_version, kind, holder_type)
-    stub_payload = {
-        "format_version": 1,
-        "kind": "stub",
-        "type": "pool_stub",
-        "holder_type": "pool",
-        "sha256": sha256,
-        "pcloud_hash": pcloud_hash or "",
-        "size": size,
-        "mtime": mtime,
-        "relpath": relpath,
-        "pool_path": pool_path,
-        "pool_fileid": pool_fileid,
-        "snapshot": snapshot_name,
-    }
-    
-    # Parent-Ordner sicherstellen (gibt folderid zurück)
-    parent_fid = pc.ensure_path(cfg, parent_dir)
-    
-    # Stub schreiben via REST (robust, kein Binary-Blocking!)
-    pc.write_json_to_folderid(cfg, folderid=parent_fid, filename=stub_filename, obj=stub_payload, minify=True)
-    
-    if os.environ.get("PCLOUD_VERBOSE") == "1":
-        _log(f"[stub] ✓ {stub_path}")
-
-
-def _process_pool_item(
-    cfg: dict,
-    file_item: dict,
-    seen_inodes: dict,
-    pool_root: str,
-    dry: bool = False
-) -> Optional[tuple]:
-    """
-    Verarbeitet ein File-Item: Upload in Pool, RETURN Stub-Info (schreibt NICHT!).
-    
-    Returns:
-        (relpath, file_item, pool_fileid, pcloud_hash, is_hardlink_stub) oder None bei Fehler
-    """
-    relpath = file_item.get("relpath")
-    sha256 = file_item.get("sha256", "").lower()
-    abs_src = file_item.get("source_path")
-    file_size = file_item.get("size", 0)
-    
-    # Validierung mit detailliertem Error-Report
-    if not relpath:
-        _log(f"[pool-worker][ERROR] File-Item fehlt 'relpath': {file_item}")
-        return None
-    
-    if not sha256:
-        _log(f"[pool-worker][ERROR] {relpath}: Fehlt SHA256 (corrupt manifest?)")
-        return None
-    
-    if not abs_src:
-        _log(f"[pool-worker][ERROR] {relpath}: Fehlt 'source_path' (manifest bug?)")
-        return None
-    
-    if not os.path.exists(abs_src):
-        _log(f"[pool-worker][ERROR] {relpath}: Source file nicht gefunden: {abs_src}")
-        return None
-    
-    if not os.path.isfile(abs_src):
-        _log(f"[pool-worker][ERROR] {relpath}: Source ist kein File: {abs_src}")
-        return None
-    
-    # Hardlink-Check (lokale Dedupe)
-    ino_data = file_item.get("inode")
-    cached_result = None
-    
-    if ino_data and isinstance(ino_data, dict):
-        dev = ino_data.get("dev")
-        ino = ino_data.get("ino")
-        key = (dev, ino) if (dev and ino) else None
-        
-        if key:
-            # Thread-safe Lookup
-            cached_result = seen_inodes.get(key)
-    
-    if cached_result:
-        # Hardlink zu bereits verarbeitetem File → Return Cached Info
-        cached_sha, cached_fileid, cached_hash = cached_result
-        if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[pool-worker] ✓ HARDLINK: {relpath} → cached fileid={cached_fileid}")
-        return (relpath, file_item, cached_fileid, cached_hash, True)  # True = ist Hardlink-Stub
-    
-    # Pool-Upload (Check ob existiert oder Upload)
-    try:
-        pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, pool_root, dry=dry)
-        
-        # Validiere Upload-Ergebnis
-        if not pool_fileid:
-            _log(f"[pool-worker][ERROR] {relpath}: Upload lieferte keine FileID (size={file_size}, sha256={sha256[:8]}...)")
-            _log(f"[pool-worker][ERROR] → Source: {abs_src}")
-            return None
-        
-    except FileNotFoundError as e:
-        _log(f"[pool-worker][ERROR] {relpath}: File verschwand während Upload: {e}")
-        return None
-    except PermissionError as e:
-        _log(f"[pool-worker][ERROR] {relpath}: Keine Leserechte: {e}")
-        return None
-    except IOError as e:
-        _log(f"[pool-worker][ERROR] {relpath}: I/O-Fehler beim Lesen: {e}")
-        return None
-    except Exception as e:
-        _log(f"[pool-worker][ERROR] {relpath}: Upload fehlgeschlagen (size={file_size}, sha256={sha256[:8]}...)")
-        _log(f"[pool-worker][ERROR] → Exception: {type(e).__name__}: {e}")
-        _log(f"[pool-worker][ERROR] → Source: {abs_src}")
-        return None
-    
-    # Hardlink-Tracking (wird von Hauptthread gemacht nach Return!)
-    # seen_inodes[key] = (sha256, pool_fileid, pcloud_hash)
-    
-    return (relpath, file_item, pool_fileid, pcloud_hash, False)  # False = neuer Upload
+    return f"_pool/{prefix}/{sha256.lower()}"
 
 
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
@@ -3923,7 +3676,8 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     wrong_snapshot = 0
     
     for sha in manifest_sha256s:
-        snapshots_for_sha = pool_refs.get(sha, [])
+        entry = pool_refs.get(sha)
+        snapshots_for_sha = entry.get("snapshots", []) if isinstance(entry, dict) else (entry or [])
         if not snapshots_for_sha:
             missing_in_index += 1
         elif snapshot_name not in snapshots_for_sha:
@@ -4269,10 +4023,17 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     _log(f"[delta-mode] Basis: {basis_snapshot_name}")
     _log(f"[delta-mode] Pool: {pool_root}")
     
-    # Timeout-Protection
-    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
-        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
-    
+    # Timeout-Protection: copyfolder ist eine Meta-Operation, die bei 100k Dateien
+    # 60-120s+ dauert. Default 30s ist viel zu kurz und war die Ursache der
+    # Fallback-Kaskade. Analog zum 1to1-Delta-Mode auf 300s anheben (override:
+    # PCLOUD_COPYFOLDER_TIMEOUT).
+    current_timeout = int(cfg.get("timeout", 30))
+    if current_timeout <= 60:
+        cfg["timeout"] = int(os.environ.get("PCLOUD_COPYFOLDER_TIMEOUT", "300"))
+        _log(f"[delta-mode] Timeout erhöht: {current_timeout}s → {cfg['timeout']}s (Meta-Operationen)")
+    else:
+        _log(f"[delta-mode] Timeout beibehalten: {current_timeout}s")
+
     # Marker
     marker_started = f"{dest_snapshot_dir}/.upload_started"
     marker_complete = f"{dest_snapshot_dir}/.upload_complete"
@@ -4492,7 +4253,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             nonlocal upload_ms
             pool_path_rel = _get_pool_path(sha256)
             # Absolute Pfadangabe für Log-Ausgabe und pCloud-Operationen
-            pool_path_abs = dest_root.rstrip("/") + pool_path_rel
+            pool_path_abs = f"{dest_root.rstrip('/')}/{pool_path_rel}"
             
             parent_abs = os.path.dirname(pool_path_abs.rstrip("/"))
             if parent_abs:
@@ -4534,7 +4295,8 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         
         def _queue_stub(relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: int, sha256: str) -> None:
             nonlocal stubs
-            pool_path = _get_pool_path(sha256)
+            pool_path_rel = _get_pool_path(sha256)
+            pool_path_abs = f"{dest_root.rstrip('/')}/{pool_path_rel}"
             meta_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
             payload = {
                 "format_version": 1,
@@ -4546,7 +4308,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 "size": file_item.get("size"),
                 "mtime": file_item.get("mtime"),
                 "relpath": relpath,
-                "pool_path": pool_path,
+                "pool_path": pool_path_abs,
                 "pool_fileid": pool_fileid,
                 "snapshot": snapshot_name,
             }
@@ -4566,11 +4328,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             
             # Prüfen ob bereits im Pool (anderer Snapshot)
             with _state_lock:
-                if sha256 not in pool_refs:
-                    pool_refs[sha256] = []
+                entry = pool_refs.get(sha256)
+                if isinstance(entry, dict):
+                    snaps = entry.get("snapshots", [])
+                else:
+                    snaps = entry if entry is not None else []
                 
-                already_in_snapshot = snapshot_name in pool_refs.get(sha256, [])
-                if already_in_snapshot:
+                if snapshot_name in snaps:
                     reused += 1
                     return
             
@@ -4579,8 +4343,28 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
                 
                 with _state_lock:
-                    if snapshot_name not in pool_refs[sha256]:
-                        pool_refs[sha256].append(snapshot_name)
+                    if sha256 not in pool_refs:
+                        pool_refs[sha256] = {
+                            "fileid": pool_fileid,
+                            "hash": pcloud_hash,
+                            "size": file_item.get("size"),
+                            "snapshots": [snapshot_name]
+                        }
+                    else:
+                        entry = pool_refs[sha256]
+                        if isinstance(entry, list):
+                            pool_refs[sha256] = {
+                                "fileid": pool_fileid,
+                                "hash": pcloud_hash,
+                                "size": file_item.get("size"),
+                                "snapshots": list(set(entry + [snapshot_name]))
+                            }
+                        else:
+                            if snapshot_name not in entry.get("snapshots", []):
+                                entry.setdefault("snapshots", []).append(snapshot_name)
+                            if not entry.get("fileid"): entry["fileid"] = pool_fileid
+                            if not entry.get("hash"): entry["hash"] = pcloud_hash
+                    
                     uploaded += 1
                 
                 _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
@@ -4926,20 +4710,53 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         
         # 5. Reused-Liste: SHA256s PHYSISCH im Pool (für diesen Snapshot aber neu)
         # Prüfe ob bereits für DIESEN Snapshot registriert
-        already_in_snapshot = {
-            sha for sha in manifest_sha256_to_item.keys()
-            if snapshot_name in pool_refs.get(sha, [])
-        }
+        already_in_snapshot = set()
+        for sha in manifest_sha256_to_item.keys():
+            entry = pool_refs.get(sha)
+            if entry:
+                snaps = entry.get("snapshots", []) if isinstance(entry, dict) else entry
+                if snapshot_name in snaps:
+                    already_in_snapshot.add(sha)
         
         # Echte Reused: Physisch vorhanden, aber nicht für diesen Snapshot
         reused_sha256s = (set(manifest_sha256_to_item.keys()) & physical_pool_sha256s) - already_in_snapshot
         
-        # 6. Index-Reparatur-Kandidaten: Physisch vorhanden, aber nicht im Index
-        needs_index_update = reused_sha256s - index_pool_sha256s
+        # 6. Index-Reparatur-Kandidaten: Physisch vorhanden, aber nicht im Index (oder unvollständig)
+        # Wir betrachten auch Files als reparaturbedürftig, die zwar im Index sind, aber keine fileid haben.
+        needs_index_update = set()
+        for sha in reused_sha256s:
+            entry = pool_refs.get(sha)
+            if not entry or (isinstance(entry, dict) and not entry.get("fileid")):
+                needs_index_update.add(sha)
         
         if needs_index_update:
-            _log(f"[preflight] ⚠️ Index-Reparatur nötig: {len(needs_index_update)} Files physisch vorhanden, aber nicht im Index")
-            _log(f"[preflight]    → Diese werden automatisch in pool_refs aufgenommen")
+            _log(f"[preflight] ⚠️ Index-Reparatur nötig: {len(needs_index_update)} Files im Pool benötigen Metadaten-Erfassung")
+            _log(f"[preflight]    → Erfasse fileids via stat_file...")
+            for sha in needs_index_update:
+                if dry: continue
+                try:
+                    p_path = f"{dest_root.rstrip('/')}/{_get_pool_path(sha)}"
+                    md = pc.stat_file_safe(cfg, path=p_path)
+                    if md and md.get("fileid"):
+                        fid = md["fileid"]
+                        phash = md.get("hash")
+                        size = md.get("size")
+                        
+                        # In Index schreiben (Upgrade zu Objekt-Format)
+                        old_snaps = []
+                        if sha in pool_refs:
+                            old_entry = pool_refs[sha]
+                            old_snaps = old_entry.get("snapshots", []) if isinstance(old_entry, dict) else old_entry
+                        
+                        pool_refs[sha] = {
+                            "fileid": fid,
+                            "hash": phash,
+                            "size": size,
+                            "snapshots": list(set(old_snaps))
+                        }
+                        index_changed = True
+                except Exception:
+                    pass
         
         preflight_duration = time.time() - t_preflight_start
         _log(f"[preflight] Delta: {len(delta_sha256s)} benötigen Upload ({len(delta_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
@@ -4972,7 +4789,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             
             pool_path_rel = _get_pool_path(sha256)
             # Absolute Pfadangabe für Log-Ausgabe und pCloud-Operationen
-            pool_path_abs = dest_root.rstrip("/") + pool_path_rel
+            pool_path_abs = f"{dest_root.rstrip('/')}/{pool_path_rel}"
             
             parent_abs = os.path.dirname(pool_path_abs.rstrip("/"))
             if parent_abs:
@@ -5048,7 +4865,8 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         def _queue_stub(relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: int, sha256: str) -> None:
             nonlocal stubs, index_changed
             
-            pool_path = _get_pool_path(sha256)
+            pool_path_rel = _get_pool_path(sha256)
+            pool_path_abs = f"{dest_root.rstrip('/')}/{pool_path_rel}"
             meta_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
             payload = {
                 "format_version": 1,
@@ -5060,7 +4878,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 "size": file_item.get("size"),
                 "mtime": file_item.get("mtime"),
                 "relpath": relpath,
-                "pool_path": pool_path,
+                "pool_path": pool_path_abs,
                 "pool_fileid": pool_fileid,
                 "snapshot": snapshot_name,
             }
@@ -5426,13 +5244,38 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             try:
                 pool_fileid, pcloud_hash = _upload_to_pool(src_abs, sha)
                 
-                # Update Pool-Refs (thread-safe)
+                # Update Pool-Refs (thread-safe) - NEU: Enriched Index Format!
                 with _state_lock:
                     if sha not in pool_refs:
-                        pool_refs[sha] = []
-                    if snapshot_name not in pool_refs[sha]:
-                        pool_refs[sha].append(snapshot_name)
+                        # Initialer Eintrag für neue Datei
+                        pool_refs[sha] = {
+                            "fileid": pool_fileid,
+                            "hash": pcloud_hash,
+                            "size": it.get("size"),
+                            "snapshots": [snapshot_name]
+                        }
                         index_changed = True
+                    else:
+                        # Bestehender SHA256 (aus Preflight oder anderem File im selben Lauf)
+                        entry = pool_refs[sha]
+                        if isinstance(entry, list):
+                            # Auto-Migration von altem Listen-Format
+                            pool_refs[sha] = {
+                                "fileid": pool_fileid,
+                                "hash": pcloud_hash,
+                                "size": it.get("size"),
+                                "snapshots": list(set(entry + [snapshot_name]))
+                            }
+                            index_changed = True
+                        else:
+                            # Update bestehendes Objekt
+                            if snapshot_name not in entry.get("snapshots", []):
+                                entry.setdefault("snapshots", []).append(snapshot_name)
+                                index_changed = True
+                            # Eagerly update metadata if missing (z.B. nach Migration)
+                            if not entry.get("fileid"): entry["fileid"] = pool_fileid
+                            if not entry.get("hash"): entry["hash"] = pcloud_hash
+                    
                     uploaded += 1
                 
                 # Stub queuen
@@ -5477,33 +5320,61 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             if not sha:
                 return
             
-            # Pool-Path und FileID holen
-            pool_path_rel = _get_pool_path(sha)
-            pool_path_abs = dest_root.rstrip("/") + pool_path_rel
+            # Pool-Path und FileID holen - NEU: Erst Index, dann API
+            pool_fileid = None
+            pcloud_hash = None
             
-            try:
-                # FileID aus Pool holen (kein Upload!)
-                pool_md = pc.stat_file_safe(cfg, path=pool_path_abs)
-                if not pool_md:
-                    _log(f"[ERROR] Reused-File {relpath}: Pool-File nicht gefunden: {pool_path_abs}")
-                    return
+            entry = pool_refs.get(sha)
+            if isinstance(entry, dict):
+                pool_fileid = entry.get("fileid")
+                pcloud_hash = entry.get("hash")
+            
+            if not pool_fileid:
+                # Fallback: API fragen (und Index reparieren)
+                pool_path_rel = _get_pool_path(sha)
+                pool_path_abs = f"{dest_root.rstrip('/')}/{pool_path_rel}"
                 
-                pool_fileid = pool_md.get("fileid")
-                pcloud_hash = pool_md.get("hash")
-                
-                # Update Pool-Refs
-                with _state_lock:
-                    if sha not in pool_refs:
-                        pool_refs[sha] = []
-                    if snapshot_name not in pool_refs[sha]:
-                        pool_refs[sha].append(snapshot_name)
+                try:
+                    pool_md = pc.stat_file_safe(cfg, path=pool_path_abs)
+                    if pool_md:
+                        pool_fileid = pool_md.get("fileid")
+                        pcloud_hash = pool_md.get("hash")
+                except Exception:
+                    pass
+            
+            if not pool_fileid:
+                _log(f"[ERROR] Reused-File {relpath}: Pool-Metadaten nicht findbar (SHA={sha[:16]}...)")
+                return
+
+            # Update Pool-Refs (Snapshots registrieren)
+            with _state_lock:
+                if sha not in pool_refs:
+                    pool_refs[sha] = {
+                        "fileid": pool_fileid,
+                        "hash": pcloud_hash,
+                        "size": it.get("size"),
+                        "snapshots": [snapshot_name]
+                    }
+                    index_changed = True
+                else:
+                    entry = pool_refs[sha]
+                    if isinstance(entry, list):
+                        pool_refs[sha] = {
+                            "fileid": pool_fileid,
+                            "hash": pcloud_hash,
+                            "size": it.get("size"),
+                            "snapshots": list(set(entry + [snapshot_name]))
+                        }
                         index_changed = True
-                
-                # Stub queuen
-                _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
-                
-            except Exception as e:
-                _log(f"[ERROR] Reused-File {relpath}: Konnte Pool-FileID nicht holen: {e}")
+                    else:
+                        if snapshot_name not in entry.get("snapshots", []):
+                            entry.setdefault("snapshots", []).append(snapshot_name)
+                            index_changed = True
+                        if not entry.get("fileid"): entry["fileid"] = pool_fileid
+                        if not entry.get("hash"): entry["hash"] = pcloud_hash
+            
+            # Stub queuen
+            _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
         
         # === FILES KLASSIFIZIEREN (nur Delta-Files für Upload!) ===
         _log(f"[pool-mode] Phase 2: Upload {len(delta_items)} Delta-Files...")

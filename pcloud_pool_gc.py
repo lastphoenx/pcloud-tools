@@ -201,7 +201,10 @@ def _load_refs_from_index(
         referenced_sha256s = set(pool_refs.keys())
         
         # Optional: Zähle Snapshot-Zuordnungen
-        total_refs = sum(len(snapshots) for snapshots in pool_refs.values())
+        total_refs = sum(
+            len(v.get("snapshots", [])) if isinstance(v, dict) else len(v)
+            for v in pool_refs.values()
+        )
         
         duration = time.time() - t_start
         _log(f"[gc] PHASE 1 DONE: {len(referenced_sha256s)} unique SHA256s, "
