@@ -72,23 +72,32 @@ def _ascii_safe(text: str) -> str:
 
 
 def _log(msg: str, *, file=sys.stderr) -> None:
-    """Log-Ausgabe mit Timestamp"""
+    """Log-Ausgabe mit Timestamp (robust gegen Encoding-Probleme)"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Auto-Detect: Nutze ASCII-Safe wenn Terminal kein UTF-8 unterstützt
-    # User kann via PCLOUD_ASCII_LOGS=0 UTF-8 erzwingen (für moderne Terminals)
+    
+    # Auto-Detection: Prüfe ob Terminal UTF-8 unterstützt
     use_ascii = os.environ.get("PCLOUD_ASCII_LOGS", "auto")
     if use_ascii == "auto":
-        # Auto-Detection: Prüfe ob stdout UTF-8 unterstützt
         try:
-            use_ascii = (file.encoding or "").lower() not in ("utf-8", "utf8")
+            # Prüfe Encoding des Ziel-Streams (case-insensitive)
+            encoding = (getattr(file, 'encoding', '') or '').upper().replace('-', '').replace('_', '')
+            use_ascii = encoding not in ('UTF8', 'UTF')
         except:
-            use_ascii = True  # Fallback zu ASCII bei Encoding-Detection-Fehler
+            use_ascii = True  # Safe Fallback
     else:
         use_ascii = (use_ascii == "1")
     
+    # ASCII-Safe Transformation wenn nötig
     if use_ascii:
         msg = _ascii_safe(msg)
-    print(f"{ts} {msg}", file=file, flush=True)
+    
+    # Robuste Ausgabe mit Fallback
+    try:
+        print(f"{ts} {msg}", file=file, flush=True)
+    except UnicodeEncodeError:
+        # Fallback: Ersetze problematische Zeichen
+        safe_msg = _ascii_safe(msg)
+        print(f"{ts} {safe_msg}", file=file, flush=True)
 
 
 class DryRunSampler:
@@ -3571,24 +3580,26 @@ def _get_pool_path(sha256: str) -> str:
     return f"/_pool/{prefix}/{sha256.lower()}"
 
 
-def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = False) -> Tuple[Optional[int], Optional[str]]:
+def _upload_to_pool(cfg: dict, local_path: str, sha256: str, pool_root: str, *, dry: bool = False) -> Tuple[Optional[int], Optional[str]]:
     """
     Upload File in Pool (dedupliziert).
-    Nutzt _upload_file_smart() fÃ¼r Robustheit (Retry, Resume, Timeouts).
+    Nutzt _upload_file_smart() für Robustheit (Retry, Resume, Timeouts).
     
     Args:
         cfg: pCloud Config
         local_path: Lokaler File-Pfad
         sha256: SHA256 Hash des Files
+        pool_root: Pool-Root-Pfad (z.B. /Backup/rtb_1to1_POOL/_pool)
         dry: Dry-run Mode
     
     Returns:
         (pool_fileid, pcloud_hash) oder (None, None) bei dry-run
     """
-    pool_path = _get_pool_path(sha256)
+    pool_path_rel = _get_pool_path(sha256)
+    pool_path = f"{pool_root.rstrip('/')}{pool_path_rel}"
     
     if dry:
-        _dry_sampler.log("upload", f"upload_to_pool: {local_path} -> {pool_path}")
+        _dry_sampler.log("upload", f"upload pool: {pool_path}  <- {local_path}")
         return (None, None)
     
     # Check ob File bereits im Pool existiert (mit Safe-Wrapper)
@@ -3598,12 +3609,12 @@ def _upload_to_pool(cfg: dict, local_path: str, sha256: str, *, dry: bool = Fals
         pcloud_hash = existing_stat.get("hash")
         
         if os.environ.get("PCLOUD_VERBOSE") == "1":
-            _log(f"[pool] âœ“ EXISTS: {pool_path} (fileid={pool_fileid})")
+            _log(f"[pool] ✓ EXISTS: {pool_path} (fileid={pool_fileid})")
         
         return (pool_fileid, pcloud_hash)
     
-    # Upload mit _upload_file_smart (Retry + Resume fÃ¼r groÃŸe Files)
-    _log(f"[pool] upload: {local_path} â†’ {pool_path}")
+    # Upload mit _upload_file_smart (Retry + Resume für große Files)
+    _log(f"[pool] upload: {local_path} → {pool_path}")
     
     res = _upload_file_smart(cfg, local_path, pool_path, dry=dry)
     
@@ -3730,6 +3741,7 @@ def _process_pool_item(
     cfg: dict,
     file_item: dict,
     seen_inodes: dict,
+    pool_root: str,
     dry: bool = False
 ) -> Optional[tuple]:
     """
@@ -3786,7 +3798,7 @@ def _process_pool_item(
     
     # Pool-Upload (Check ob existiert oder Upload)
     try:
-        pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, dry=dry)
+        pool_fileid, pcloud_hash = _upload_to_pool(cfg, abs_src, sha256, pool_root, dry=dry)
         
         # Validiere Upload-Ergebnis
         if not pool_fileid:
@@ -4407,18 +4419,21 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         # Upload-Funktion (wie in push_pool_mode)
         def _upload_to_pool(abs_src: str, sha256: str) -> tuple:
             nonlocal upload_ms
-            pool_path = _get_pool_path(sha256)
-            parent = os.path.dirname(pool_path.rstrip("/"))
-            if parent:
-                pc.ensure_path(cfg, parent)
+            pool_path_rel = _get_pool_path(sha256)
+            # Absolute Pfadangabe für Log-Ausgabe und pCloud-Operationen
+            pool_path_abs = dest_root.rstrip("/") + pool_path_rel
+            
+            parent_abs = os.path.dirname(pool_path_abs.rstrip("/"))
+            if parent_abs:
+                pc.ensure_path(cfg, parent_abs)
             
             if dry:
-                _dry_sampler.log("upload", f"upload pool: {pool_path}  <- {abs_src}")
+                _dry_sampler.log("upload", f"upload pool: {pool_path_abs}  <- {abs_src}")
                 return (None, None)
             
             # Check ob bereits existiert
             try:
-                existing_stat = pc.stat_file_safe(cfg, path=pool_path)
+                existing_stat = pc.stat_file_safe(cfg, path=pool_path_abs)
                 if existing_stat:
                     pool_fileid = existing_stat.get("fileid")
                     pcloud_hash = existing_stat.get("hash")
@@ -4428,7 +4443,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pass
             
             t0 = time.time()
-            res = _upload_file_smart(cfg, abs_src, pool_path, dry=dry)
+            res = _upload_file_smart(cfg, abs_src, pool_path_abs, dry=dry)
             with _state_lock:
                 upload_ms += (time.time() - t0) * 1000.0
             
@@ -4882,36 +4897,41 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             """Upload zu Pool, Returns (pool_fileid, pcloud_hash) - 1:1 wie Original _upload_real_file"""
             nonlocal upload_ms
             
-            pool_path = _get_pool_path(sha256)
-            parent = os.path.dirname(pool_path.rstrip("/"))
-            if parent:
-                _ensure(parent)
+            pool_path_rel = _get_pool_path(sha256)
+            # Absolute Pfadangabe für Log-Ausgabe und pCloud-Operationen
+            pool_path_abs = dest_root.rstrip("/") + pool_path_rel
+            
+            parent_abs = os.path.dirname(pool_path_abs.rstrip("/"))
+            if parent_abs:
+                _ensure(parent_abs)
             
             if dry:
-                _dry_sampler.log("upload", f"upload pool: {pool_path}  <- {abs_src}")
+                _dry_sampler.log("upload", f"upload pool: {pool_path_abs}  <- {abs_src}")
                 return (None, None)
             
             # Check ob bereits existiert (Dedupe!)
             try:
-                existing_stat = pc.stat_file_safe(cfg, path=pool_path)
+                existing_stat = pc.stat_file_safe(cfg, path=pool_path_abs)
                 if existing_stat:
                     pool_fileid = existing_stat.get("fileid")
                     pcloud_hash = existing_stat.get("hash")
                     if pool_fileid:
                         if os.environ.get("PCLOUD_VERBOSE") == "1":
-                            print(f"[pool] âœ“ EXISTS: {sha256[:8]}... (fileid={pool_fileid})")
+                            _log(f"[pool] ✓ EXISTS: {pool_path_abs} (fileid={pool_fileid})")
                         return (pool_fileid, pcloud_hash)
             except Exception:
                 pass
             
-            # Progress-Hinweis fÃ¼r groÃŸe Dateien (wie Original!)
+            # Progress-Hinweis für große Dateien
             file_size = os.path.getsize(abs_src)
             if file_size > 100 * 1024**2:  # > 100MB
-                print(f"[upload] Starte Upload: {sha256[:16]}... ({file_size/1024**2:.1f} MB)", flush=True)
+                _log(f"[upload] Starte Upload: {sha256[:16]}... ({file_size/1024**2:.1f} MB)")
             
             t0 = time.time()
-            res = _upload_file_smart(cfg, abs_src, pool_path, dry=dry)
+            res = _upload_file_smart(cfg, abs_src, pool_path_abs, dry=dry)
             elapsed_ms = (time.time() - t0) * 1000.0
+            
+            _log(f"[pool] upload: {abs_src} → {pool_path_abs}")
             
             # Thread-safe metrics update (wie Original!)
             with _state_lock:
@@ -5385,13 +5405,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 return
             
             # Pool-Path und FileID holen
-            pool_path = _get_pool_path(sha)
+            pool_path_rel = _get_pool_path(sha)
+            pool_path_abs = dest_root.rstrip("/") + pool_path_rel
             
             try:
                 # FileID aus Pool holen (kein Upload!)
-                pool_md = pc.stat_file_safe(cfg, path=pool_path)
+                pool_md = pc.stat_file_safe(cfg, path=pool_path_abs)
                 if not pool_md:
-                    _log(f"[ERROR] Reused-File {relpath}: Pool-File nicht gefunden: {pool_path}")
+                    _log(f"[ERROR] Reused-File {relpath}: Pool-File nicht gefunden: {pool_path_abs}")
                     return
                 
                 pool_fileid = pool_md.get("fileid")
