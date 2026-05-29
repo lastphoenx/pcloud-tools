@@ -4130,107 +4130,109 @@ def validate_source_integrity(manifest: dict, *, deep_check: bool = False) -> tu
 # SCOUT & TURBO-DELTA-MODE (Best Match Scout Konzept)
 # ==============================================================================
 
-def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[str | None, float]:
+def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots_root: str) -> tuple[str | None, float]:
     """
-    Findet den effizientesten Basis-Snapshot via Jaccard-Ähnlichkeit.
-    
+    Findet den effizientesten REMOTE vorhandenen Basis-Snapshot via Jaccard-Ähnlichkeit.
+
+    WICHTIG: Kandidaten sind ausschliesslich Snapshots, die REMOTE unter
+    <snapshots_root> tatsaechlich existieren UND fuer die lokal ein Manifest
+    vorliegt (Letzteres wird fuer den Diff zwingend benoetigt). Dadurch ist der
+    gewaehlte Basis-Snapshot garantiert remote klonbar (copyfolder) UND lokal
+    diffbar - der frueher moegliche Fall "Scout waehlt lokal, remote nicht
+    vorhanden -> copyfolder API 2005 -> Endlos-Fallback" kann nicht mehr auftreten.
+
     Strategie:
-    - Vergleiche relpath-Mengen der Manifeste.
-    - Performance-Limit: Scanne nur die letzten 10 Snapshots.
-    - Early Exit: Bei >95% Match sofort wählen.
-    
-    Args:
-        cfg: pCloud Config (wird nicht verwendet, für Signatur-Kompatibilität)
-        manifest: Aktuelles Manifest
-        archive_dir: Pfad zum Manifest-Archiv
-    
+    - Kandidaten = remote_snapshots ∩ lokale Manifeste (ohne aktuellen, ohne _index).
+    - Vergleiche relpath+sha256-Mengen (Jaccard).
+    - Early Exit: Bei >95% Match sofort waehlen.
+
     Returns:
         (snapshot_name, similarity) oder (None, 0.0)
     """
     t_start = time.time()
-    manifests_path = os.path.join(archive_dir, "manifests")
-    
-    if not os.path.isdir(manifests_path):
-        _log("[scout] Kein Manifest-Archiv gefunden")
+    verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
+
+    # 1. Welche Snapshots existieren REMOTE? (DAS ist die massgebliche Quelle!)
+    remote_snaps = list_remote_snapshot_names(cfg, snapshots_root)
+    current_name = manifest.get("snapshot")
+    remote_snaps.discard(current_name)
+
+    if not remote_snaps:
+        _log(f"[scout] Keine Remote-Snapshots unter {snapshots_root} vorhanden")
         return None, 0.0
-    
-    # Aktuelle Dateimenge (relpath → sha256)
+
+    # 2. Aktuelle Dateimenge (relpath → sha256)
     current_files = {
         it.get("relpath"): it.get("sha256")
         for it in manifest.get("items", [])
         if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
     }
-    
     if not current_files:
-        _log("[scout] Kein Files im aktuellen Manifest")
+        _log("[scout] Keine Files im aktuellen Manifest")
         return None, 0.0
-    
-    current_name = manifest.get("snapshot")
+
+    manifests_path = os.path.join(archive_dir, "manifests")
     best_snap = None
     best_score = 0.0
-    
-    # Neueste zuerst prüfen
-    archived_files = sorted(
-        [f for f in os.listdir(manifests_path) if f.endswith(".json")],
-        reverse=True
-    )
-    
-    _log(f"[scout] Prüfe {min(len(archived_files), 10)} Snapshots...")
-    
-    for filename in archived_files[:10]:
-        snap_name = filename.replace(".json", "")
-        if snap_name == current_name:
+
+    # Neueste zuerst (Namensformat YYYY-mm-dd-HHMMSS sortiert chronologisch)
+    candidates = sorted(remote_snaps, reverse=True)
+    _log(f"[scout] Prüfe {len(candidates)} Remote-Snapshots...")
+
+    for snap_name in candidates:
+        # Diff braucht ein lokales Manifest des Kandidaten - sonst nicht nutzbar
+        basis_manifest_path = os.path.join(manifests_path, f"{snap_name}.json")
+        if not os.path.exists(basis_manifest_path):
+            if verbose:
+                _log(f"[scout]   {snap_name}: remote vorhanden, aber kein lokales Manifest → übersprungen")
             continue
-        
+
         try:
-            with open(os.path.join(manifests_path, filename), "r", encoding="utf-8") as f:
+            with open(basis_manifest_path, "r", encoding="utf-8") as f:
                 arch_manifest = json.load(f)
-            
+
             # Basis-Dateien (relpath → sha256)
             basis_files = {
                 it.get("relpath"): it.get("sha256")
                 for it in arch_manifest.get("items", [])
                 if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
             }
-            
             if not basis_files:
                 continue
-            
+
             # Jaccard-Similarity (relpath + sha256 match)
             matches = sum(
                 1 for relpath, sha in current_files.items()
                 if basis_files.get(relpath) == sha
             )
-            
             score = matches / len(current_files)
-            
-            if os.environ.get("PCLOUD_VERBOSE") == "1":
+
+            if verbose:
                 _log(f"[scout]   {snap_name}: {matches}/{len(current_files)} ({score*100:.1f}%)")
-            
+
             if score > best_score:
                 best_score = score
                 best_snap = snap_name
-            
+
             # Early Exit bei >95%
             if best_score > 0.95:
                 break
-                
+
         except Exception as e:
-            if os.environ.get("PCLOUD_VERBOSE") == "1":
+            if verbose:
                 _log(f"[scout]   {snap_name}: Fehler beim Laden: {e}")
             continue
-    
+
     elapsed = time.time() - t_start
-    
     if best_snap:
-        _log(f"[scout] ✓ Best Match: {best_snap} (Similarity: {best_score*100:.1f}%) in {elapsed:.1f}s")
+        _log(f"[scout] ✓ Best Match (remote): {best_snap} (Similarity: {best_score*100:.1f}%) in {elapsed:.1f}s")
     else:
-        _log(f"[scout] Kein geeigneter Basis-Snapshot gefunden in {elapsed:.1f}s")
-    
+        _log(f"[scout] Kein geeigneter Remote-Basis-Snapshot gefunden in {elapsed:.1f}s")
+
     return best_snap, best_score
 
 
-def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapshot_name: str, 
+def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapshot_name: str,
                          *, dry: bool = False, verbose: bool = False) -> dict:
     """
     Turbo-Delta-Mode: Synchronisiert neuen Snapshot basierend auf Klon eines alten.
@@ -4275,14 +4277,34 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     marker_started = f"{dest_snapshot_dir}/.upload_started"
     marker_complete = f"{dest_snapshot_dir}/.upload_complete"
     
-    # Prüfen ob bereits vollständig
-    try:
-        pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-        _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
-        return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
-    except:
-        pass
-    
+    # Ziel-Status prüfen.
+    # - vollständig (.upload_complete vorhanden) -> nichts zu tun
+    # - existiert, aber unvollständig            -> abgebrochener Lauf: komplett
+    #   verwerfen und sauber neu aufsetzen. Resume/Reconcile ist NICHT zuverlässig:
+    #   der content_index wird erst am Ende (aus dem RAM) geschrieben, und listfolder
+    #   liefert noch keine SHA256 zum Abgleich. Daher: fresh start via copyfolder.
+    if not dry:
+        existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+        if existing_fid:
+            if pc.stat_file_safe(cfg, path=marker_complete):
+                _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+                return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
+            _log(f"[delta-mode] Ziel existiert, aber unvollständig (kein .upload_complete) → verwerfe und starte sauber neu")
+            try:
+                pc.deletefolder_recursive(cfg, folderid=int(existing_fid))
+            except Exception as e:
+                _log(f"[delta-mode][warn] Konnte unvollständigen Ziel-Ordner nicht entfernen: {e}")
+            # Lokalen Index-Checkpoint dieses Snapshots verwerfen: sonst würde Phase 4
+            # Files als 'bereits erledigt' überspringen, deren Stubs gerade weg sind.
+            try:
+                import tempfile as _tf
+                _idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
+                _idx_path = os.path.join(_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
+                if os.path.exists(_idx_path):
+                    os.remove(_idx_path)
+            except Exception:
+                pass
+
     # === PHASE 1: SERVER-SIDE COPY (INSTANT STRUKTUR!) ===
     _log(f"[delta-mode] Phase 1: Klone Basis-Snapshot...")
     t_copy_start = time.time()
@@ -4291,14 +4313,27 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         try:
             # copyfolder mit toname (Ordner wird umbenannt beim Kopieren)
             snapshots_fid = pc.ensure_path(cfg, snapshots_root)
-            pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=snapshots_fid, 
+            pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=snapshots_fid,
                          toname=snapshot_name, copycontentonly=True)
             copy_duration = time.time() - t_copy_start
             _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")
+
+            # Vom Basis mitkopierte Status-Marker entfernen. Sonst gilt der frisch
+            # geklonte Snapshot faelschlich als 'bereits vollstaendig' (Complete-Marker
+            # des Basis) bzw. traegt einen fremden Started-Marker. Der frische
+            # Started-Marker wird unmittelbar danach neu geschrieben.
+            for _marker in (marker_complete, marker_started):
+                try:
+                    _mmd = pc.stat_file_safe(cfg, path=_marker)
+                    if _mmd and _mmd.get("fileid"):
+                        pc.delete_file(cfg, fileid=int(_mmd["fileid"]))
+                except Exception as _me:
+                    if verbose:
+                        _log(f"[delta-mode][warn] Marker-Cleanup ({_marker}): {_me}")
         except Exception as e:
             _log(f"[delta-mode][ERROR] copyfolder fehlgeschlagen: {e}")
             _log("[delta-mode] Fallback zu Full-Pool-Mode...")
-            return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose)
+            return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, use_scout=False)
     else:
         _log(f"[dry] copyfolder({basis_snapshot_dir} → {snapshot_name})")
     
@@ -4329,7 +4364,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     except Exception as e:
         _log(f"[delta-mode][ERROR] Basis-Manifest nicht gefunden: {e}")
         _log("[delta-mode] Fallback zu Full-Pool-Mode...")
-        return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose)
+        return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, use_scout=False)
     
     # File-Maps erstellen
     current_files = {
@@ -4363,30 +4398,66 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     diff_duration = time.time() - t_diff_start
     _log(f"[delta-mode] Diff: +{len(added_paths)} -{len(deleted_paths)} Δ{len(changed_paths)} (={len(common_paths)-len(changed_paths)} unverändert) in {diff_duration:.1f}s")
     
-    # === PHASE 3: BEREINIGUNG (Veraltete Stubs löschen) ===
+    # === PHASE 3: BEREINIGUNG (Veraltete Stubs/Ordner löschen) ===
     if deleted_paths and not dry:
-        _log(f"[delta-mode] Phase 3: Lösche {len(deleted_paths)} veraltete Stubs...")
+        _log(f"[delta-mode] Phase 3: Entferne {len(deleted_paths)} veraltete Einträge...")
         t_cleanup_start = time.time()
-        deleted_count = 0
-        
-        for relpath in deleted_paths:
-            stub_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
+
+        # Lebende Ordner: jeder Ordner, unter dem noch ein aktueller File liegt.
+        kept_dirs = set()
+        for rp in current_paths:
+            d = os.path.dirname(rp)
+            while d:
+                kept_dirs.add(d)
+                d = os.path.dirname(d)
+
+        # Komplett tote Teilbäume (höchster toter Ancestor) → 1 deletefolderrecursive
+        # statt N Einzel-Deletes; Stubs in noch lebenden Ordnern → einzeln per deletefile.
+        # pCloud kennt keinen Multi-File-Delete - deletefolderrecursive ist das einzige
+        # Batch-Primitiv, daher diese Gruppierung.
+        dead_top_dirs = set()
+        single_stubs = []
+        for rp in deleted_paths:
+            parent = os.path.dirname(rp)
+            if parent and parent not in kept_dirs:
+                # Ordner ist tot → höchsten toten Ancestor finden
+                top = parent
+                while True:
+                    gp = os.path.dirname(top)
+                    if gp and gp not in kept_dirs:
+                        top = gp
+                    else:
+                        break
+                dead_top_dirs.add(top)
+            else:
+                # Ordner lebt (kept Siblings) oder Datei liegt im Snapshot-Root
+                single_stubs.append(rp)
+
+        folders_removed = 0
+        for rel_dir in dead_top_dirs:
             try:
-                # Stub-File-ID holen und löschen
+                pc.deletefolder_recursive(cfg, path=f"{dest_snapshot_dir}/{rel_dir}")
+                folders_removed += 1
+            except Exception as e:
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    _log(f"[warn] Konnte toten Ordner nicht löschen: {rel_dir}: {e}")
+
+        deleted_count = 0
+        for rp in single_stubs:
+            stub_path = f"{dest_snapshot_dir}/{rp}.meta.json"
+            try:
                 stub_md = pc.stat_file_safe(cfg, path=stub_path)
-                if stub_md:
-                    fid = stub_md.get("fileid")
-                    if fid:
-                        pc.delete_file(cfg, fileid=int(fid))
-                        deleted_count += 1
+                if stub_md and stub_md.get("fileid"):
+                    pc.delete_file(cfg, fileid=int(stub_md["fileid"]))
+                    deleted_count += 1
             except Exception as e:
                 if os.environ.get("PCLOUD_VERBOSE") == "1":
                     _log(f"[warn] Konnte Stub nicht löschen: {stub_path}: {e}")
-        
+
         cleanup_duration = time.time() - t_cleanup_start
-        _log(f"[delta-mode] ✓ {deleted_count} Stubs gelöscht in {cleanup_duration:.1f}s")
+        _log(f"[delta-mode] ✓ Bereinigt: {folders_removed} tote Ordner rekursiv, {deleted_count} Einzel-Stubs in {cleanup_duration:.1f}s")
     elif deleted_paths:
-        _log(f"[dry] Würde {len(deleted_paths)} Stubs löschen")
+        _log(f"[dry] Würde {len(deleted_paths)} veraltete Einträge entfernen (tote Ordner rekursiv + Einzel-Stubs)")
     
     # === PHASE 4: UPDATE (Neue/Geänderte Files verarbeiten) ===
     tasks = list(added_paths | changed_paths)
@@ -4599,7 +4670,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     }
 
 
-def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False) -> dict:
+def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False, use_scout: bool = True) -> dict:
     """
     POOL-MODE Upload - 1:1 KOPIERT vom Original 1to1_mode, nur Upload-Target angepasst!
     
@@ -4676,14 +4747,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         scout_enabled = os.environ.get("PCLOUD_SCOUT_ENABLED", "1") != "0"
         scout_threshold = float(os.environ.get("PCLOUD_SCOUT_THRESHOLD", "0.70"))
         
-        if scout_enabled:
-            _log("[pool-mode] Scout: Suche besten Basis-Snapshot...")
-            basis_snapshot, similarity = scout_best_pool_basis(cfg, manifest, archive_dir)
-            
+        if scout_enabled and use_scout:
+            _log("[pool-mode] Scout: Suche besten Basis-Snapshot (remote)...")
+            basis_snapshot, similarity = scout_best_pool_basis(cfg, manifest, archive_dir, snapshots_root)
+
             if basis_snapshot and similarity >= scout_threshold:
                 _log(f"[pool-mode] ✓ Scout Match: {basis_snapshot} ({similarity*100:.1f}%)")
                 _log(f"[pool-mode] → Nutze Turbo-Delta-Mode!")
-                
+
                 # Delegation an push_pool_delta_mode
                 # (Lock wird vom finally-Block entfernt)
                 return push_pool_delta_mode(
@@ -4694,8 +4765,10 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 if basis_snapshot:
                     _log(f"[pool-mode] Scout Best: {basis_snapshot} ({similarity*100:.1f}%) - unter Schwelle ({scout_threshold*100:.0f}%)")
                 else:
-                    _log(f"[pool-mode] Scout: Kein Basis gefunden")
-                _log(f"[pool-mode] → Fallback zu Full-Pool-Mode")
+                    _log(f"[pool-mode] Scout: Kein geeigneter Remote-Basis gefunden")
+                _log(f"[pool-mode] → Full-Pool-Mode")
+        elif scout_enabled and not use_scout:
+            _log("[pool-mode] Scout übersprungen (Fallback nach Delta-Fehler) → Full-Pool-Mode")
         else:
             _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
         
