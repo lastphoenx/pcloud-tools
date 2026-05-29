@@ -3875,6 +3875,457 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         return (True, [])
 
 
+# ==============================================================================
+# SCOUT & TURBO-DELTA-MODE (Best Match Scout Konzept)
+# ==============================================================================
+
+def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str) -> tuple[str | None, float]:
+    """
+    Findet den effizientesten Basis-Snapshot via Jaccard-Ähnlichkeit.
+    
+    Strategie:
+    - Vergleiche relpath-Mengen der Manifeste.
+    - Performance-Limit: Scanne nur die letzten 10 Snapshots.
+    - Early Exit: Bei >95% Match sofort wählen.
+    
+    Args:
+        cfg: pCloud Config (wird nicht verwendet, für Signatur-Kompatibilität)
+        manifest: Aktuelles Manifest
+        archive_dir: Pfad zum Manifest-Archiv
+    
+    Returns:
+        (snapshot_name, similarity) oder (None, 0.0)
+    """
+    t_start = time.time()
+    manifests_path = os.path.join(archive_dir, "manifests")
+    
+    if not os.path.isdir(manifests_path):
+        _log("[scout] Kein Manifest-Archiv gefunden")
+        return None, 0.0
+    
+    # Aktuelle Dateimenge (relpath → sha256)
+    current_files = {
+        it.get("relpath"): it.get("sha256")
+        for it in manifest.get("items", [])
+        if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
+    }
+    
+    if not current_files:
+        _log("[scout] Kein Files im aktuellen Manifest")
+        return None, 0.0
+    
+    current_name = manifest.get("snapshot")
+    best_snap = None
+    best_score = 0.0
+    
+    # Neueste zuerst prüfen
+    archived_files = sorted(
+        [f for f in os.listdir(manifests_path) if f.endswith(".json")],
+        reverse=True
+    )
+    
+    _log(f"[scout] Prüfe {min(len(archived_files), 10)} Snapshots...")
+    
+    for filename in archived_files[:10]:
+        snap_name = filename.replace(".json", "")
+        if snap_name == current_name:
+            continue
+        
+        try:
+            with open(os.path.join(manifests_path, filename), "r", encoding="utf-8") as f:
+                arch_manifest = json.load(f)
+            
+            # Basis-Dateien (relpath → sha256)
+            basis_files = {
+                it.get("relpath"): it.get("sha256")
+                for it in arch_manifest.get("items", [])
+                if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
+            }
+            
+            if not basis_files:
+                continue
+            
+            # Jaccard-Similarity (relpath + sha256 match)
+            matches = sum(
+                1 for relpath, sha in current_files.items()
+                if basis_files.get(relpath) == sha
+            )
+            
+            score = matches / len(current_files)
+            
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                _log(f"[scout]   {snap_name}: {matches}/{len(current_files)} ({score*100:.1f}%)")
+            
+            if score > best_score:
+                best_score = score
+                best_snap = snap_name
+            
+            # Early Exit bei >95%
+            if best_score > 0.95:
+                break
+                
+        except Exception as e:
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                _log(f"[scout]   {snap_name}: Fehler beim Laden: {e}")
+            continue
+    
+    elapsed = time.time() - t_start
+    
+    if best_snap:
+        _log(f"[scout] ✓ Best Match: {best_snap} (Similarity: {best_score*100:.1f}%) in {elapsed:.1f}s")
+    else:
+        _log(f"[scout] Kein geeigneter Basis-Snapshot gefunden in {elapsed:.1f}s")
+    
+    return best_snap, best_score
+
+
+def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapshot_name: str, 
+                         *, dry: bool = False, verbose: bool = False) -> dict:
+    """
+    Turbo-Delta-Mode: Synchronisiert neuen Snapshot basierend auf Klon eines alten.
+    
+    Workflow:
+    1. copyfolder(basis_snapshot) → neuer Snapshot (5 Sek statt 73 Min!)
+    2. Diff berechnen (Added, Changed, Removed)
+    3. Bereinigung: Veraltete Stubs entfernen
+    4. Update: Neue/Geänderte Stubs parallel verarbeiten
+    5. Marker & Manifest finalisieren
+    
+    Args:
+        cfg: pCloud Config
+        manifest: Aktuelles Manifest
+        dest_root: Remote Root
+        basis_snapshot_name: Name des Basis-Snapshots (wird geklont)
+        dry: Dry-run Mode
+        verbose: Verbose Logging
+    
+    Returns:
+        Stats Dict
+    """
+    t_start = time.time()
+    
+    snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
+    dest_root = pc._norm_remote_path(dest_root)
+    snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
+    pool_root = f"{dest_root.rstrip('/')}/_pool"
+    dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+    basis_snapshot_dir = f"{snapshots_root}/{basis_snapshot_name}"
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    
+    _log(f"[delta-mode] Snapshot: {snapshot_name}")
+    _log(f"[delta-mode] Basis: {basis_snapshot_name}")
+    _log(f"[delta-mode] Pool: {pool_root}")
+    
+    # Timeout-Protection
+    if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
+        cfg["timeout"] = int(os.environ.get("PCLOUD_TIMEOUT", "60"))
+    
+    # Marker
+    marker_started = f"{dest_snapshot_dir}/.upload_started"
+    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+    
+    # Prüfen ob bereits vollständig
+    try:
+        pc.stat_file(cfg, path=marker_complete, with_checksum=False)
+        _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+        return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
+    except:
+        pass
+    
+    # === PHASE 1: SERVER-SIDE COPY (INSTANT STRUKTUR!) ===
+    _log(f"[delta-mode] Phase 1: Klone Basis-Snapshot...")
+    t_copy_start = time.time()
+    
+    if not dry:
+        try:
+            # copyfolder mit toname (Ordner wird umbenannt beim Kopieren)
+            snapshots_fid = pc.ensure_path(cfg, snapshots_root)
+            pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=snapshots_fid, 
+                         toname=snapshot_name, copycontentonly=True)
+            copy_duration = time.time() - t_copy_start
+            _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")
+        except Exception as e:
+            _log(f"[delta-mode][ERROR] copyfolder fehlgeschlagen: {e}")
+            _log("[delta-mode] Fallback zu Full-Pool-Mode...")
+            return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose)
+    else:
+        _log(f"[dry] copyfolder({basis_snapshot_dir} → {snapshot_name})")
+    
+    # Started-Marker setzen
+    if not dry:
+        try:
+            pc.put_textfile(cfg, path=marker_started, text=json.dumps({
+                "snapshot": snapshot_name,
+                "started_at": time.time(),
+                "mode": "delta",
+                "basis": basis_snapshot_name,
+                "host": os.uname().nodename
+            }))
+        except Exception as e:
+            _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
+    
+    # === PHASE 2: MANIFEST-DIFF BERECHNEN ===
+    _log("[delta-mode] Phase 2: Berechne Manifest-Diff...")
+    t_diff_start = time.time()
+    
+    # Basis-Manifest laden
+    manifests_path = os.path.join(archive_dir, "manifests")
+    basis_manifest_path = os.path.join(manifests_path, f"{basis_snapshot_name}.json")
+    
+    try:
+        with open(basis_manifest_path, "r", encoding="utf-8") as f:
+            basis_manifest = json.load(f)
+    except Exception as e:
+        _log(f"[delta-mode][ERROR] Basis-Manifest nicht gefunden: {e}")
+        _log("[delta-mode] Fallback zu Full-Pool-Mode...")
+        return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose)
+    
+    # File-Maps erstellen
+    current_files = {
+        it.get("relpath"): it
+        for it in manifest.get("items", [])
+        if it.get("type") == "file" and it.get("relpath")
+    }
+    
+    basis_files = {
+        it.get("relpath"): it
+        for it in basis_manifest.get("items", [])
+        if it.get("type") == "file" and it.get("relpath")
+    }
+    
+    # Diff berechnen
+    current_paths = set(current_files.keys())
+    basis_paths = set(basis_files.keys())
+    
+    added_paths = current_paths - basis_paths
+    deleted_paths = basis_paths - current_paths
+    common_paths = current_paths & basis_paths
+    
+    # Changed Files (gleicher Pfad, aber andere SHA256)
+    changed_paths = set()
+    for relpath in common_paths:
+        curr_sha = current_files[relpath].get("sha256", "")
+        base_sha = basis_files[relpath].get("sha256", "")
+        if curr_sha != base_sha:
+            changed_paths.add(relpath)
+    
+    diff_duration = time.time() - t_diff_start
+    _log(f"[delta-mode] Diff: +{len(added_paths)} -{len(deleted_paths)} Δ{len(changed_paths)} (={len(common_paths)-len(changed_paths)} unverändert) in {diff_duration:.1f}s")
+    
+    # === PHASE 3: BEREINIGUNG (Veraltete Stubs löschen) ===
+    if deleted_paths and not dry:
+        _log(f"[delta-mode] Phase 3: Lösche {len(deleted_paths)} veraltete Stubs...")
+        t_cleanup_start = time.time()
+        deleted_count = 0
+        
+        for relpath in deleted_paths:
+            stub_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
+            try:
+                # Stub-File-ID holen und löschen
+                stub_md = pc.stat_file_safe(cfg, path=stub_path)
+                if stub_md:
+                    fid = stub_md.get("fileid")
+                    if fid:
+                        pc.delete_file(cfg, fileid=int(fid))
+                        deleted_count += 1
+            except Exception as e:
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    _log(f"[warn] Konnte Stub nicht löschen: {stub_path}: {e}")
+        
+        cleanup_duration = time.time() - t_cleanup_start
+        _log(f"[delta-mode] ✓ {deleted_count} Stubs gelöscht in {cleanup_duration:.1f}s")
+    elif deleted_paths:
+        _log(f"[dry] Würde {len(deleted_paths)} Stubs löschen")
+    
+    # === PHASE 4: UPDATE (Neue/Geänderte Files verarbeiten) ===
+    tasks = list(added_paths | changed_paths)
+    
+    if tasks:
+        _log(f"[delta-mode] Phase 4: Verarbeite {len(tasks)} neue/geänderte Files...")
+        
+        # Index laden
+        import tempfile
+        _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
+        os.makedirs(_local_index_dir, exist_ok=True)
+        
+        if os.path.exists(_local_index_path):
+            index = load_content_index_local(_local_index_path)
+        else:
+            index = load_content_index(cfg, snapshots_root)
+        
+        pool_refs = index.setdefault("pool_refs", {})
+        
+        # Stats
+        uploaded = 0
+        reused = 0
+        stubs = 0
+        upload_ms = 0.0
+        write_ms = 0.0
+        stubs_to_write = []
+        _state_lock = threading.Lock()
+        
+        # Upload-Funktion (wie in push_pool_mode)
+        def _upload_to_pool(abs_src: str, sha256: str) -> tuple:
+            nonlocal upload_ms
+            pool_path = _get_pool_path(sha256)
+            parent = os.path.dirname(pool_path.rstrip("/"))
+            if parent:
+                pc.ensure_path(cfg, parent)
+            
+            if dry:
+                print(f"[dry] upload pool: {pool_path}  <- {abs_src}")
+                return (None, None)
+            
+            # Check ob bereits existiert
+            try:
+                existing_stat = pc.stat_file_safe(cfg, path=pool_path)
+                if existing_stat:
+                    pool_fileid = existing_stat.get("fileid")
+                    pcloud_hash = existing_stat.get("hash")
+                    if pool_fileid:
+                        return (pool_fileid, pcloud_hash)
+            except Exception:
+                pass
+            
+            t0 = time.time()
+            res = _upload_file_smart(cfg, abs_src, pool_path, dry=dry)
+            with _state_lock:
+                upload_ms += (time.time() - t0) * 1000.0
+            
+            try:
+                md = (res or {}).get("metadata") or {}
+                if isinstance(md, list) and len(md) > 0:
+                    md = md[-1]
+                elif not isinstance(md, dict):
+                    md = {}
+                pool_fileid = md.get("fileid")
+                pcloud_hash = md.get("hash")
+            except Exception:
+                pool_fileid = None
+                pcloud_hash = None
+            
+            return (pool_fileid, pcloud_hash)
+        
+        def _queue_stub(relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: int, sha256: str) -> None:
+            nonlocal stubs
+            pool_path = _get_pool_path(sha256)
+            meta_path = f"{dest_snapshot_dir}/{relpath}.meta.json"
+            payload = {
+                "format_version": 1,
+                "kind": "stub",
+                "type": "pool_stub",
+                "holder_type": "pool",
+                "sha256": sha256,
+                "pcloud_hash": pcloud_hash or "",
+                "size": file_item.get("size"),
+                "mtime": file_item.get("mtime"),
+                "relpath": relpath,
+                "pool_path": pool_path,
+                "pool_fileid": pool_fileid,
+                "snapshot": snapshot_name,
+            }
+            if not dry:
+                stubs_to_write.append((meta_path, payload))
+            stubs += 1
+        
+        def _process_file(relpath: str) -> None:
+            nonlocal uploaded, reused
+            
+            file_item = current_files[relpath]
+            abs_src = file_item.get("source_path", "")
+            sha256 = file_item.get("sha256", "")
+            
+            if not abs_src or not sha256:
+                return
+            
+            # Prüfen ob bereits im Pool (anderer Snapshot)
+            with _state_lock:
+                if sha256 not in pool_refs:
+                    pool_refs[sha256] = []
+                
+                already_in_snapshot = snapshot_name in pool_refs.get(sha256, [])
+                if already_in_snapshot:
+                    reused += 1
+                    return
+            
+            # Upload zu Pool
+            try:
+                pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
+                
+                with _state_lock:
+                    if snapshot_name not in pool_refs[sha256]:
+                        pool_refs[sha256].append(snapshot_name)
+                    uploaded += 1
+                
+                _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
+                
+            except Exception as e:
+                _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {e}")
+        
+        # Parallel verarbeiten
+        threads = int(os.environ.get("PCLOUD_PARALLEL_UPLOAD_THREADS", "4"))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            list(ex.map(_process_file, tasks))
+        
+        _log(f"[delta-mode] ✓ Files verarbeitet: {uploaded} neue, {reused} wiederverwendet")
+        
+        # Stubs schreiben
+        if stubs_to_write and not dry:
+            _log(f"[delta-mode] Schreibe {len(stubs_to_write)} Stubs...")
+            t0 = time.time()
+            _batch_write_stubs(cfg, stubs_to_write, dry=False)
+            write_ms = (time.time() - t0) * 1000.0
+        
+        # Index speichern
+        if not dry:
+            save_content_index_local(_local_index_path, index)
+            save_content_index(cfg, snapshots_root, index, dry=False)
+    else:
+        _log("[delta-mode] Keine Änderungen - Snapshot identisch mit Basis")
+        uploaded = 0
+        reused = 0
+        stubs = 0
+        upload_ms = 0.0
+        write_ms = 0.0
+    
+    # === COMPLETE-MARKER SETZEN ===
+    if not dry:
+        try:
+            marker_data = {
+                "snapshot": snapshot_name,
+                "completed_at": time.time(),
+                "uploaded": uploaded,
+                "stubs": stubs,
+                "reused": reused,
+                "duration": time.time() - t_start,
+                "mode": "delta",
+                "basis": basis_snapshot_name
+            }
+            marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+            if not marker_fid:
+                marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+            pc.write_json_to_folderid(cfg, folderid=int(marker_fid), 
+                                     filename=".upload_complete", obj=marker_data, minify=True)
+        except Exception as e:
+            _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
+    
+    total_duration = time.time() - t_start
+    _log(f"[delta-mode] ✓ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
+    _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)}")
+    
+    return {
+        "uploaded": uploaded,
+        "reused": reused,
+        "stubs": stubs,
+        "duration": total_duration,
+        "upload_ms": upload_ms,
+        "write_ms": write_ms,
+        "mode": "delta",
+        "basis": basis_snapshot_name
+    }
+
+
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False) -> dict:
     """
     POOL-MODE Upload - 1:1 KOPIERT vom Original 1to1_mode, nur Upload-Target angepasst!
@@ -3911,6 +4362,32 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
     _log(f"[pool-mode] Snapshot: {snapshot_name}")
     _log(f"[pool-mode] Pool: {pool_root}")
     _log(f"[pool-mode] Snapshot-Dir: {dest_snapshot_dir}")
+    
+    # === SCOUT: Best-Match Basis-Snapshot finden ===
+    scout_enabled = os.environ.get("PCLOUD_SCOUT_ENABLED", "1") != "0"
+    scout_threshold = float(os.environ.get("PCLOUD_SCOUT_THRESHOLD", "0.70"))
+    
+    if scout_enabled:
+        _log("[pool-mode] Scout: Suche besten Basis-Snapshot...")
+        basis_snapshot, similarity = scout_best_pool_basis(cfg, manifest, archive_dir)
+        
+        if basis_snapshot and similarity >= scout_threshold:
+            _log(f"[pool-mode] ✓ Scout Match: {basis_snapshot} ({similarity*100:.1f}%)")
+            _log(f"[pool-mode] → Nutze Turbo-Delta-Mode!")
+            
+            # Delegation an push_pool_delta_mode
+            return push_pool_delta_mode(
+                cfg, manifest, dest_root, basis_snapshot,
+                dry=dry, verbose=verbose
+            )
+        else:
+            if basis_snapshot:
+                _log(f"[pool-mode] Scout Best: {basis_snapshot} ({similarity*100:.1f}%) - unter Schwelle ({scout_threshold*100:.0f}%)")
+            else:
+                _log(f"[pool-mode] Scout: Kein Basis gefunden")
+            _log(f"[pool-mode] → Fallback zu Full-Pool-Mode")
+    else:
+        _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
     
     # === Timeout-Protection (wie Original!) ===
     if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
