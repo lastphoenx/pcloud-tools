@@ -246,6 +246,7 @@ _fid_cache_shared: dict = {}
 # --- Metrics (Prometheus-freundlich) ---
 MET_UPLOADED_FILES = 0
 MET_RESUMED_FILES  = 0
+MET_POOL_REUSED    = 0   # SHA256 bereits physisch im Pool -> kein Upload (Dedup)
 MET_STUBS_WRITTEN  = 0
 MET_PROMOTED       = 0
 MET_REMOVED_NODES  = 0
@@ -4257,12 +4258,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             
             parent_abs = os.path.dirname(pool_path_abs.rstrip("/"))
             if parent_abs:
-                pc.ensure_path(cfg, parent_abs)
-            
+                # cached: Pool ist zweistufig (_pool/XX), 256 feste Ordner aus Phase 0
+                # -> nach dem 1. Mal pro Prefix kein API-Call mehr (statt 1x pro File)
+                pc.ensure_path_cached(cfg, parent_abs)
+
             if dry:
                 _dry_sampler.log("upload", f"upload pool: {pool_path_abs}  <- {abs_src}")
                 return (None, None)
-            
+
             # Check ob bereits existiert
             try:
                 existing_stat = pc.stat_file_safe(cfg, path=pool_path_abs)
@@ -4270,6 +4273,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                     pool_fileid = existing_stat.get("fileid")
                     pcloud_hash = existing_stat.get("hash")
                     if pool_fileid:
+                        try:
+                            with _metrics_lock:
+                                globals()["MET_POOL_REUSED"] += 1
+                        except Exception:
+                            pass
                         return (pool_fileid, pcloud_hash)
             except Exception:
                 pass
@@ -4618,7 +4626,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     print(f"[dry] ensure: {path}")
                 return
             t0 = time.time()
-            pc.call_with_backoff(pc.ensure_path, cfg, path)
+            # cached: spart bei der grossen Mehrheit der Aufrufe (Pool-Parent _pool/XX,
+            # bereits angelegte Snapshot-Ordner) den API-Roundtrip nach dem 1. Mal.
+            pc.call_with_backoff(pc.ensure_path_cached, cfg, path)
             with _state_lock:
                 ensure_ms += (time.time() - t0) * 1000.0
 
@@ -4808,6 +4818,11 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     if pool_fileid:
                         if os.environ.get("PCLOUD_VERBOSE") == "1":
                             _log(f"[pool] ✓ EXISTS: {pool_path_abs} (fileid={pool_fileid})")
+                        try:
+                            with _metrics_lock:
+                                globals()["MET_POOL_REUSED"] += 1
+                        except Exception:
+                            pass
                         return (pool_fileid, pcloud_hash)
             except Exception:
                 pass
@@ -5736,7 +5751,8 @@ def main() -> None:
 
     # --- metrics summary (einheitlich, greppbar) ---
     try:
-        print(f"[metrics] uploaded_files={MET_UPLOADED_FILES} resumed_files={MET_RESUMED_FILES} "
+        print(f"[metrics] uploaded_files={MET_UPLOADED_FILES} pool_reused={MET_POOL_REUSED} "
+              f"resumed_files={MET_RESUMED_FILES} "
               f"stubs_written={MET_STUBS_WRITTEN} promoted={MET_PROMOTED} removed_nodes={MET_REMOVED_NODES} "
               f"fid_cache_hits={fid_cache_hits} fid_lookups={fid_lookups} fid_rest_ms={int(fid_rest_ms)} "
               f"api_retries={MET_API_RETRIES}")
