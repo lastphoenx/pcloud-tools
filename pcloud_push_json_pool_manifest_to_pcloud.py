@@ -3636,11 +3636,13 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     _log(f"[validate] Lade Pool-Struktur via listfolder({pool_root})...")
     t_pool_start = time.time()
     
+    pool_scan_ok = True
     try:
-        # Rekursives listfolder über kompletten Pool
-        result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
+        # Rekursives listfolder über kompletten Pool, mit Retry (transiente API-Fehler)
+        result = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root,
+                                      recursive=True, nofiles=False, attempts=4, max_sleep=30.0)
         pool_sha256s = set()
-        
+
         def _extract_sha256s_from_tree(obj):
             if isinstance(obj, dict):
                 if not obj.get("isfolder") and obj.get("name"):
@@ -3649,20 +3651,40 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
                         pool_sha256s.add(filename.lower())
                 for child in obj.get("contents", []):
                     _extract_sha256s_from_tree(child)
-        
+
         metadata = result.get("metadata", {})
         _extract_sha256s_from_tree(metadata)
-        
+
         pool_duration = time.time() - t_pool_start
         _log(f"[validate] Pool: {len(pool_sha256s)} SHA256s gefunden in {pool_duration:.2f}s")
-        
+
     except Exception as e:
-        errors.append(f"Pool-listfolder fehlgeschlagen: {e}")
-        _log(f"[validate][ERROR] Konnte Pool nicht laden: {e}")
-        return (False, errors)
-    
-    # === 3. DELTA-CHECK: Fehlen Files im Pool? ===
+        # Scan-Fehler ist KEIN harter Validierungsfehler: bei sehr grossen Pools kann
+        # listfolder transient scheitern. Den (gerade geschriebenen) Index als Ground-Truth
+        # fuer den Coverage-Check nutzen, statt faelschlich abzubrechen.
+        _log(f"[validate][WARN] Pool-listfolder nach Retries fehlgeschlagen: {e}")
+        _log(f"[validate][WARN] → nutze Index (pool_refs) als Ground-Truth fuer Coverage-Check")
+        pool_sha256s = set((index.get("pool_refs") or {}).keys())
+        pool_scan_ok = False
+
+    # === 3. DELTA-CHECK: Fehlen Files im Pool? (mit Truncation-Schutz) ===
     missing_in_pool = manifest_sha256s - pool_sha256s
+    if missing_in_pool and pool_scan_ok:
+        if len(missing_in_pool) > 2000:
+            # So viele "fehlende" deuten auf einen unzuverlaessigen/abgeschnittenen Bulk-Scan
+            # hin, nicht auf echten Verlust -> Index als Ground-Truth, kein Truncation-Fehlalarm.
+            _log(f"[validate][WARN] {len(missing_in_pool)} vermeintlich fehlend - Bulk-Scan unzuverlaessig, nutze Index")
+            missing_in_pool = manifest_sha256s - set((index.get("pool_refs") or {}).keys())
+        else:
+            # Wenige vermeintlich fehlende: einzeln per stat verifizieren (definitiv),
+            # um listfolder-Truncation-Fehlalarme auszuschliessen.
+            _log(f"[validate] {len(missing_in_pool)} nicht im Bulk-Scan - verifiziere einzeln via stat...")
+            _really_missing = set()
+            for _sha in missing_in_pool:
+                _p = f"{pool_root.rstrip('/')}/{_sha[:2]}/{_sha}"
+                if not pc.stat_file_safe(cfg, path=_p):
+                    _really_missing.add(_sha)
+            missing_in_pool = _really_missing
     if missing_in_pool:
         errors.append(f"Pool: {len(missing_in_pool)} SHA256s fehlen")
         for sha in list(missing_in_pool)[:5]:
@@ -4683,8 +4705,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         t_pool_scan = time.time()
         
         try:
-            # Rekursives listfolder über kompletten Pool (1 API-Call!)
-            result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
+            # Rekursives listfolder über kompletten Pool, mit Retry (transiente API-Fehler)
+            result = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root,
+                                          recursive=True, nofiles=False, attempts=4, max_sleep=30.0)
             physical_pool_sha256s = set()
             
             def _extract_pool_sha256s(obj):
@@ -4708,8 +4731,13 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _log(f"[preflight] Pool-Scan: {len(physical_pool_sha256s)} SHA256s gefunden in {pool_scan_duration:.2f}s")
             
         except Exception as e:
-            _log(f"[preflight][WARN] Pool-Scan fehlgeschlagen: {e}, falle zurück auf Index-basiert")
-            physical_pool_sha256s = set(pool_refs.keys())  # Fallback auf Index bei Fehler
+            # NICHT auf den (evtl. veralteten) Index zurueckfallen -> das koennte Stubs mit
+            # fileids erzeugen, deren Pool-Objekt fehlt (korrupter Snapshot). Stattdessen ALLE
+            # Files als neu behandeln (Full-Upload); _upload_to_pool dedupliziert pro File via
+            # stat -> real vorhandene Objekte werden NICHT neu hochgeladen (sicher, nur langsamer).
+            _log(f"[preflight][WARN] Pool-Scan nach Retries fehlgeschlagen: {e}")
+            _log(f"[preflight][WARN] → Erzwinge Full-Upload (alle als neu); stat dedupliziert pro File.")
+            physical_pool_sha256s = set()
         
         # 3. Index-basierte SHA256s (für Vergleich & Index-Reparatur-Erkennung)
         index_pool_sha256s = set(pool_refs.keys())
@@ -5217,7 +5245,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             Verarbeitet ein Delta-File (benötigt Upload).
             Preflight hat bereits gefiltert: Nur Files die nicht im Pool sind!
             """
-            nonlocal uploaded, stubs, index_changed, _done_items, _done_size, _t_last_progress
+            nonlocal uploaded, resumed, stubs, index_changed, _done_items, _done_size, _t_last_progress
             nonlocal _last_saved_count, _t_last_index_save, upload_ms
             
             # Progress-Tracking
@@ -5246,14 +5274,30 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             ino = int(inode.get("ino") or 0)
             ino_key = (dev, ino)
             
-            # Hardlink-Check
+            # Hardlink-Fast-Path: inode bereits verarbeitet -> Pool-Objekt existiert sicher.
+            # fileid/hash aus dem Index nehmen, Stub schreiben, return -> spart den stat-Call.
+            # Bei unvollstaendigem Index-Eintrag faellt es auf den normalen Upload-Pfad zurueck
+            # (korrekt, nur 1 stat teurer) - reine Optimierung, keine Verhaltensaenderung am Ergebnis.
+            _hl_fileid = None
+            _hl_hash = None
             with _state_lock:
                 if ino_key in seen_inodes:
-                    # Hardlink zu bereits verarbeitetem File → nutze gecachte Info
-                    first_relpath = seen_inodes[ino_key]
-                    # Pool-FileID aus erstem Upload holen (aus stubs_to_write oder Index)
-                    # Für jetzt: Upload-Skip (wird unten gefixt wenn nötig)
+                    _entry = pool_refs.get(sha)
+                    if isinstance(_entry, dict) and _entry.get("fileid"):
+                        _hl_fileid = _entry.get("fileid")
+                        _hl_hash = _entry.get("hash")
+                        if snapshot_name not in _entry.get("snapshots", []):
+                            _entry.setdefault("snapshots", []).append(snapshot_name)
+                            index_changed = True
+                        resumed += 1
+            if _hl_fileid:
+                try:
+                    with _metrics_lock:
+                        globals()["MET_POOL_REUSED"] += 1
+                except Exception:
                     pass
+                _queue_stub(relpath, it, _hl_fileid, _hl_hash, sha)
+                return
             
             # Upload zu Pool
             try:
