@@ -4866,7 +4866,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             # Optional: Eager-FileID via stat (wie Original!)
             if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
                 try:
-                    stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=pool_path) or {}
+                    stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=pool_path_abs) or {}
                     if not pool_fileid:
                         pool_fileid = stat_md.get("fileid")
                     if not pcloud_hash:
