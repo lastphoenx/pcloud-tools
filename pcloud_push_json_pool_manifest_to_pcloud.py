@@ -1291,23 +1291,49 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     if missing_in_index == 0 and wrong_snapshot == 0:
         _log(f"[validate] ✓ Index: Alle {total_unique_sha256s} SHA256s korrekt in pool_refs")
     
-    # === 5. STUB-STICHPROBE ===
-    stub_sample_size = int(os.environ.get("PCLOUD_VALIDATE_STUB_SAMPLE", "100"))
-    if stub_sample_size > 0 and total_files > 0:
-        import random
-        sample_size = min(stub_sample_size, total_files)
-        sample_items = random.sample(manifest_items, sample_size)
-        _log(f"[validate] Prüfe {sample_size} Stub-Files (Stichprobe)...")
-        checked_stubs = 0
-        for item in sample_items:
-            relpath = item.get("relpath")
-            if relpath:
-                stub_path = f"{snapshot_dir}/{relpath}.meta.json"
-                if pc.stat_file_safe(cfg, path=stub_path):
-                    checked_stubs += 1
+    # === 5. STUB-VOLLCHECK via listfolder (100% Coverage, 1 API-Call) ===
+    # Frueherer Ansatz: N × stat_file_safe (Stichprobe 100/20107 = 0.5% → fehlende Stubs
+    # wurden nicht gefunden). Neuer Ansatz: 1 × listfolder(snapshot_dir) → Set aller
+    # vorhandenen Stubs → Manifest-Pfade dagegen in O(1). Gleiche Kosten wie der
+    # listfolder der bereits in _batch_write_stubs lauft.
+    if total_files > 0:
+        try:
+            _log(f"[validate] Lade Snapshot-Dateiliste (Stub-Vollcheck)...")
+            _snap_result = pc.call_with_backoff(
+                pc.listfolder, cfg, path=snapshot_dir, recursive=True, nofiles=False)
+
+            # Alle Stub-Pfade aus dem Baum rekonstruieren (rekursiv, O(n))
+            _remote_stub_paths: set = set()
+            def _walk_stubs(node, cur_path):
+                name = node.get("name", "")
+                path = f"{cur_path}/{name}" if name and cur_path else (name or cur_path)
+                if node.get("isfolder"):
+                    for child in node.get("contents", []) or []:
+                        _walk_stubs(child, path)
                 else:
-                    errors.append(f"Stub fehlt: {relpath}")
-        _log(f"[validate] Stubs: {checked_stubs}/{sample_size} ok")
+                    if name.endswith(".meta.json"):
+                        _remote_stub_paths.add(path)
+            _walk_stubs(
+                _snap_result.get("metadata", {}), cur_path=snapshot_dir.rstrip("/"))
+            _log(f"[validate] Remote-Stubs vorhanden: {len(_remote_stub_paths)}")
+
+            missing_stubs = []
+            for item in manifest_items:
+                relpath = item.get("relpath")
+                if relpath:
+                    stub_path = f"{snapshot_dir}/{relpath}.meta.json"
+                    if stub_path not in _remote_stub_paths:
+                        missing_stubs.append(relpath)
+            if missing_stubs:
+                errors.append(f"Stubs fehlen: {len(missing_stubs)}")
+                for rp in missing_stubs[:10]:
+                    errors.append(f"  - Stub fehlt: {rp}")
+                if len(missing_stubs) > 10:
+                    errors.append(f"  ... und {len(missing_stubs)-10} weitere")
+            else:
+                _log(f"[validate] ✓ Stubs: Alle {total_files} vorhanden (100% Coverage)")
+        except Exception as e:
+            _log(f"[validate][WARN] Stub-Vollcheck fehlgeschlagen: {e} - uebersprungen")
     
     # === RESULT ===
     if errors:
