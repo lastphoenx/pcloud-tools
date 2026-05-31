@@ -1999,13 +1999,19 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
                 return
 
-            # Prüfen ob dieser Snapshot fuer dieses File bereits abgeschlossen ist
-            # (Resume-Optimierung: kein erneuter stat auf das Pool-Objekt noetig).
-            # pool_refs ist hier konsistent: beim Wipe wird snapshot_name bereinigt.
+            # Resume-Optimierung: (sha, relpath, snapshot) bereits vollstaendig
+            # abgeschlossen -> kein Re-Upload, kein Stub-Overwrite noetig.
+            # WICHTIG: Pruefung auf (sha, relpath) NICHT nur auf sha, denn dieselbe
+            # sha kann in einem Snapshot an mehreren Relpaths liegen (Dedup: z.B.
+            # leere Placeholder-Dateien). sha-only wuerde alle doppelten ueberspringen
+            # und deren Stubs nicht schreiben.
             with _state_lock:
-                if snapshot_name in _snap_names(pool_refs.get(sha256)):
-                    reused += 1
-                    return
+                _e = pool_refs.get(sha256)
+                if isinstance(_e, dict):
+                    _snap_map = _e.get("snapshots")
+                    if isinstance(_snap_map, dict) and relpath in _snap_map.get(snapshot_name, []):
+                        reused += 1
+                        return
             
             # Upload zu Pool
             try:
