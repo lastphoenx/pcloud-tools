@@ -31,7 +31,41 @@ Legacy-Referenzen (im Repo, NICHT loeschen bis Pool stabil):
 - pcloud-tools 3290d38: UnboundLocalError `index` im Delta-0-Changes-Pfad + alle (auch
   geklonten) SHAs in pool_refs des neuen Snapshots registrieren.
 
-## OFFENER BUG (Hauptaufgabe naechster Chat): Delta meldet faelschlich "+0 -0 Δ0"
+## STAND 2026-05-31 (frueh): Catch-up komplett, Upload-Pfad funktioniert
+Alle 4 Snapshots SUCCESS hochgeladen: 2026-04-27 (Backfill), 2026-05-01 (identisch,
+73s), 2026-05-14 (+1 Datei, 74s), 2026-05-15 (+299 Dateien, 233s). Pool waechst
+korrekt, Validation prueft physisch (listfolder _pool) + pool_refs, Fail-fast greift.
+Gefixt+gepusht in dieser Session:
+- Klon-Pfad (copycontentonly ins Snapshot-Dir statt _snapshots-Root)
+- 4 Upload-Konstanten (RESUME_THRESHOLD_BYTES etc.) + 11 Metrics-Globals (vom Ausbau)
+- Fail-fast bei fehlgeschlagenem Pool-Upload (kein halbfertiger Snapshot mehr)
+- Dry-Run schreibt nicht mehr in die DB
+- Delta loggt jetzt jeden Pool-Upload sichtbar + archiviert Index + synct Metriken
+- Stdlib-Checker scripts/utilities/check_undefined_names.py (Ersatz fuer pyflakes)
+
+OFFENE PUNKTE fuer naechste Session:
+1. tamper-detect (pcloud_quick_delta.py) ist POOL-BLIND: liest index["items"]/anchor_path
+   (1to1), Pool nutzt pool_refs -> "0 Nodes" -> leeres "KEINE ABWEICHUNGEN". GEFAEHRLICH
+   (haette kaputten Snapshot durchgewunken). Umbau: pro pool_refs[sha] das _pool/XX/<sha>
+   remote gegen fileid/hash/size pruefen + verwaiste Pool-Objekte/Stubs finden.
+2. Per-Snapshot Index-Archive (_index/archive/<snap>_index.json): aktuell kopiert sowohl
+   das Push-Tool ALS AUCH pool_archive_index.py den KUMULIERTEN Master -> enthaelt mehr
+   als der Snapshot real hat. Entscheidung: (A) Archive-Schritt verwerfen (Master+Stubs+
+   per-Snapshot-Manifeste sind autoritativ) ODER (B) gefilterten per-Snapshot-Index bauen
+   (nur shas mit snapshots∋snap) und Push-Tool-Schritt gleich mit umstellen. Tendenz: A.
+   pool_archive_index.py NICHT als-ist nutzen.
+3. DB: 2 FAILED-Zeilen (05-14 Crash, 05-15 Frueh-Abbruch) - optional wegraeumen.
+4. _snapshots/-Root-Muell (Folge des alten Klon-Bugs) per Web-UI loeschen, falls noch da.
+5. Service-Cutover backup-pipeline.service -> rtb_pool_wrapper.sh, dann Timer wieder an.
+6. Legacy-Dateien loeschen NUR auf explizites "Legacy-Dateien loeschen".
+
+## ERLEDIGTER BUG (war Hauptaufgabe): Delta "+0 -0 Δ0" war KORREKT, kein Bug
+Bewiesen per Inode-Vergleich: 2026-04-27 und 2026-05-01 sind byte-identisch (NEU=0,
+rsnapshot-Hardlink-Klon). Spaetere Snapshots unterscheiden sich (05-14 +1, 05-15 +299)
+und wurden korrekt als Delta erkannt+hochgeladen. Smart-Manifest (mtime/size+inode-Reuse)
+arbeitet korrekt.
+
+## (historisch) urspruenglich vermuteter BUG: Delta meldet faelschlich "+0 -0 Δ0"
 Beweis dass es ein Bug ist: rtb erstellt einen Snapshot NUR bei changes_detected
 (rtb_wrapper.sh:85-129). Also hat ein neuer Snapshot IMMER echte Aenderungen. Der
 Pool-Delta meldete trotzdem 0. -> echter Bug.
