@@ -1837,6 +1837,9 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             res = _upload_file_smart(cfg, abs_src, pool_path_abs, dry=dry)
             with _state_lock:
                 upload_ms += (time.time() - t0) * 1000.0
+            # Sichtbar machen, dass die Originaldatei real in den Pool geschrieben wurde
+            # (nur echte Uploads; Dedup-Treffer kehren oben frueher zurueck).
+            _log(f"[pool] ✓ Original in Pool geladen: {pool_path_rel}  <- {abs_src}")
             
             try:
                 md = (res or {}).get("metadata") or {}
@@ -2061,7 +2064,39 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                                      filename=".upload_complete", obj=marker_data, minify=True)
         except Exception as e:
             _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
-    
+
+    # === REMOTE INDEX-ARCHIVE + MASTER (wie Full-Pool-Mode) ===
+    # Der Delta-Pfad kehrt frueher zurueck als der Full-Pool-Pfad und erreichte dessen
+    # Archive-Schritt nie -> fuer Delta-Snapshots fehlte die Snapshot-isolierte
+    # Index-Kopie unter _index/archive/. Hier 1:1 nachgezogen.
+    if not dry:
+        try:
+            idx_path = f"{snapshots_root}/_index/content_index.json"
+            archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
+            pc.ensure_parent_dirs(cfg, archive_path)
+            pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
+            _log(f"[index] ✓ Content-Index remote archiviert: {archive_path}")
+        except Exception as e:
+            _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
+        try:
+            master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
+            os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
+            save_content_index_local(master_index_path, index)
+            _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
+        except Exception as e:
+            _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
+
+    # === METRIK-GLOBALS synchronisieren ===
+    # Der Delta-Pfad fuehrt eigene lokale Zaehler; ohne diesen Sync zeigte die globale
+    # [metrics]-Summary uploaded_files=0 trotz erfolgtem Pool-Upload. (MET_POOL_REUSED
+    # wird bereits am Dedup-Treffer in _upload_to_pool hochgezaehlt.)
+    try:
+        with _metrics_lock:
+            globals()["MET_UPLOADED_FILES"] += uploaded
+            globals()["MET_STUBS_WRITTEN"] += stubs
+    except Exception:
+        pass
+
     total_duration = time.time() - t_start
     _log(f"[delta-mode] ✓ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
     _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)}")
