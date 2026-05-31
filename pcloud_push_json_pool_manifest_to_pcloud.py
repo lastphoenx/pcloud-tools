@@ -141,6 +141,14 @@ _SMART_TEMPLATE_STRONG_THRESHOLD = float(os.environ.get("PCLOUD_SMART_TEMPLATE_S
 
 _FOLDER_TEMPLATE_DIRNAME = "_folder_template"
 
+# --- Chunked Upload Configuration --- (1:1 aus Legacy, beim Ausbau verloren gegangen)
+RESUME_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_RESUME_THRESHOLD_GB", "5")) * 1024**3  # Default: 5 GB
+RESUME_CHUNK_SIZE = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128")) * 1024**2  # Default: 128 MB
+
+# --- Parallel Upload Configuration ---
+SMALL_FILE_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_SMALL_FILE_THRESHOLD_MB", "50")) * 1024**2  # Default: 50 MB
+PARALLEL_UPLOAD_THREADS = int(os.environ.get("PCLOUD_UPLOAD_THREADS", "4"))  # Default: 4 threads
+
 
 def _get_resume_state_dir() -> str:
     """
