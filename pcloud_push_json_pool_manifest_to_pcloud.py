@@ -1780,6 +1780,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         upload_ms = 0.0
         write_ms = 0.0
         stubs_to_write = []
+        failed = []  # relpaths, deren Originaldatei NICHT in den Pool geladen werden konnte
         _state_lock = threading.Lock()
         
         # Upload-Funktion (wie in push_pool_mode)
@@ -1865,8 +1866,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             sha256 = file_item.get("sha256", "")
             
             if not abs_src or not sha256:
+                # Manifest-Defekt: ohne Quelle/SHA kann die Datei nicht in den Pool ->
+                # als Fehler werten, damit der Snapshot nicht still unvollstaendig wird.
+                with _state_lock:
+                    failed.append(relpath)
+                _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
                 return
-            
+
             # Prüfen ob bereits im Pool (anderer Snapshot)
             with _state_lock:
                 entry = pool_refs.get(sha256)
@@ -1912,12 +1918,28 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 
             except Exception as e:
                 _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {e}")
+                with _state_lock:
+                    failed.append(relpath)
         
         # Parallel verarbeiten
         threads = int(os.environ.get("PCLOUD_PARALLEL_UPLOAD_THREADS", "4"))
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
             list(ex.map(_process_file, tasks))
-        
+
+        # Fail-fast (Reihenfolge!): konnte eine benoetigte Originaldatei NICHT in den
+        # Pool geladen werden, darf der Snapshot NICHT finalisiert werden - KEINE Stubs
+        # schreiben, KEINEN Index speichern, KEINEN Complete-Marker setzen. Sonst
+        # entstuende ein Stub/Index-Eintrag ohne zugehoeriges Pool-Objekt (genau der
+        # inkonsistente Zustand, den sonst erst die End-Validation faengt). Das gc-lock
+        # raeumt der aeussere finally-Block beim Propagieren der Exception.
+        if not dry and failed:
+            _log(f"[delta-mode][ERROR] {len(failed)} Datei(en) konnten NICHT in den Pool geladen werden - Snapshot wird NICHT finalisiert:")
+            for _fp in failed[:10]:
+                _log(f"[delta-mode][ERROR]   - {_fp}")
+            if len(failed) > 10:
+                _log(f"[delta-mode][ERROR]   ... und {len(failed)-10} weitere")
+            raise RuntimeError(f"Pool-Upload fehlgeschlagen fuer {len(failed)} Datei(en) - Snapshot nicht finalisiert")
+
         _log(f"[delta-mode] ✓ Files verarbeitet: {uploaded} neue, {reused} wiederverwendet")
         
         # Stubs schreiben
