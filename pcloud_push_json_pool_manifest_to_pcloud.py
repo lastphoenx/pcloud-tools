@@ -149,6 +149,23 @@ RESUME_CHUNK_SIZE = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128")) * 1024*
 SMALL_FILE_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_SMALL_FILE_THRESHOLD_MB", "50")) * 1024**2  # Default: 50 MB
 PARALLEL_UPLOAD_THREADS = int(os.environ.get("PCLOUD_UPLOAD_THREADS", "4"))  # Default: 4 threads
 
+# --- fileid-Cache Telemetrie (1:1 aus Legacy, beim Ausbau verloren gegangen) ---
+fid_lookups = 0          # Anzahl _fid_for Aufrufe
+fid_cache_hits = 0       # Treffer im Cache
+fid_rest_ms = 0.0        # aufsummierte Zeit in pc.resolve_fileid_cached
+
+# --- Globale Metrik-Zaehler (1:1 aus Legacy; MET_POOL_REUSED ist pool-spezifisch) ---
+MET_UPLOADED_FILES = 0
+MET_POOL_REUSED    = 0   # Pool-spezifisch: Datei lag bereits im _pool (Dedup-Treffer)
+MET_RESUMED_FILES  = 0
+MET_STUBS_WRITTEN  = 0
+MET_PROMOTED       = 0
+MET_REMOVED_NODES  = 0
+MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional Zaehler aus Lib/Wrapper
+
+# --- Global Metrics Lock (Thread-Safety) ---
+_metrics_lock = threading.Lock()
+
 
 def _get_resume_state_dir() -> str:
     """
