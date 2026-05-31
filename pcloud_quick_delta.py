@@ -69,18 +69,18 @@ def _flatten_tree(metadata: dict, parent_path: str = "", is_root: bool = True) -
 def _load_index(cfg: dict, snaps_root: str, index_file: str = "content_index.json") -> dict:
     """
     Lädt Index-Datei (Master oder Archive).
-    
+
     Args:
         index_file: Dateiname (z.B. 'content_index.json' oder '2026-04-10-075334_index.json')
     """
     idx_path = f"{snaps_root.rstrip('/')}/_index/{index_file}"
-    
+
     # Prüfe ob Archive-Index
     is_archive = index_file != "content_index.json"
     if is_archive:
         # Archive-Indexes liegen unter _index/archive/
         idx_path = f"{snaps_root.rstrip('/')}/_index/archive/{index_file}"
-    
+
     try:
         txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)  # None für große Indexes
         j = json.loads(txt or '{"version":1,"items":{}}')
@@ -92,6 +92,166 @@ def _load_index(cfg: dict, snaps_root: str, index_file: str = "content_index.jso
     if "items" not in j or not isinstance(j["items"], dict):
         j["items"] = {}
     return j
+
+
+# ============================================================================
+# Pool-Modus (v2-Index: pool_refs mit snapshots={snap:[relpaths]})
+# ============================================================================
+
+def _pool_snap_names(entry) -> set:
+    """Snapshot-Namen aus pool_refs-Eintrag, tolerant gegen alle Formate."""
+    if isinstance(entry, dict):
+        s = entry.get("snapshots")
+        if isinstance(s, dict):  return set(s.keys())
+        if isinstance(s, list):  return set(s)
+        return set()
+    if isinstance(entry, list):  return set(entry)
+    return set()
+
+
+def compare_pool_index_vs_remote(
+    index: dict,
+    pool_root: str,
+    snaps_root: str,
+    by_fileid: Dict[int, dict],
+    by_path: Dict[str, dict],
+) -> dict:
+    """
+    Pool-Tamper-Detect: prueft pro sha256 in pool_refs das _pool/XX/<sha>-Objekt
+    gegen fileid / pcloud_hash / size aus dem Index.
+
+    Checks:
+      1. Pool-Objekt physisch vorhanden (fileid im Remote-Baum)?
+      2. fileid stimmt ueberein?
+      3. pcloud_hash stimmt ueberein?
+      4. size stimmt ueberein?
+      5. pcloud_hash fehlt im Index (Luecke)?
+      6. Stubs: fuer jeden (snap, relpath) existiert der Stub?
+    """
+    pool_refs = index.get("pool_refs", {})
+    ok: List[str] = []
+    missing_pool: List[dict] = []
+    fileid_mismatch: List[dict] = []
+    hash_mismatch: List[dict] = []
+    size_mismatch: List[dict] = []
+    hash_missing: List[dict] = []
+    missing_stubs: List[dict] = []
+
+    index_fileids: Set[int] = set()
+    index_known_paths: Set[str] = set()
+
+    def _pool_obj_path(sha: str) -> str:
+        return f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
+
+    for sha, entry in pool_refs.items():
+        if not isinstance(entry, dict):
+            continue
+        pool_path = _pool_obj_path(sha)
+        index_known_paths.add(pool_path)
+
+        idx_fid   = entry.get("fileid")
+        idx_hash  = entry.get("hash")
+        idx_size  = entry.get("size")
+
+        # Pool-Objekt via fileid oder Pfad suchen
+        remote_md = None
+        if idx_fid and int(idx_fid) in by_fileid:
+            remote_md = by_fileid[int(idx_fid)]
+            index_fileids.add(int(idx_fid))
+        elif pool_path in by_path:
+            remote_md = by_path[pool_path]
+            if remote_md.get("fileid"):
+                index_fileids.add(int(remote_md["fileid"]))
+
+        if remote_md is None:
+            missing_pool.append({"sha256": sha, "pool_path": pool_path, "fileid": idx_fid})
+            continue
+
+        # fileid
+        rem_fid = remote_md.get("fileid")
+        if idx_fid and rem_fid and int(idx_fid) != int(rem_fid):
+            fileid_mismatch.append({"sha256": sha[:16], "pool_path": pool_path,
+                                    "index_fileid": idx_fid, "remote_fileid": rem_fid})
+        # pcloud_hash
+        rem_hash = remote_md.get("hash")
+        if idx_hash and rem_hash:
+            if str(idx_hash) != str(rem_hash):
+                hash_mismatch.append({"sha256": sha[:16], "pool_path": pool_path,
+                                      "index_hash": idx_hash, "remote_hash": rem_hash})
+        elif not idx_hash and rem_hash:
+            hash_missing.append({"sha256": sha[:16], "pool_path": pool_path, "fileid": idx_fid})
+
+        # size
+        if idx_size is not None and rem_hash is not None:
+            rem_size = remote_md.get("size")
+            if rem_size is not None and int(idx_size) != int(rem_size):
+                size_mismatch.append({"sha256": sha[:16], "pool_path": pool_path,
+                                      "index_size": idx_size, "remote_size": rem_size})
+
+        ok.append(sha)
+
+        # Stub-Existenz: fuer jeden (snap, relpath) den Stub-Pfad als bekannt markieren
+        snaps = entry.get("snapshots", {})
+        if isinstance(snaps, dict):
+            for snap, relpaths in snaps.items():
+                for rp in (relpaths or []):
+                    stub_path = f"{snaps_root}/{snap}/{rp}.meta.json"
+                    index_known_paths.add(stub_path)
+                    if stub_path not in by_path:
+                        missing_stubs.append({"sha256": sha[:16], "snap": snap, "relpath": rp,
+                                              "stub_path": stub_path})
+
+    return {
+        "checked": len(ok) + len(missing_pool),
+        "ok": len(ok),
+        "missing_pool": missing_pool,
+        "fileid_mismatch": fileid_mismatch,
+        "hash_mismatch": hash_mismatch,
+        "size_mismatch": size_mismatch,
+        "hash_missing_in_index": hash_missing,
+        "missing_stubs": missing_stubs,
+        "index_fileids": index_fileids,
+        "index_known_paths": index_known_paths,
+    }
+
+
+def print_pool_report(report: dict, unknown_files: List[dict]) -> int:
+    """Pool-Tamper-Detect Report. Gibt Anzahl Issues zurueck."""
+    issues = 0
+    print("\n" + "=" * 70)
+    print("=== ERGEBNIS: tamper-detect (Pool-Modus) ===")
+    print("=" * 70)
+    print(f"\n  Geprueft (pool_refs):    {report['checked']}")
+    print(f"  Davon OK:                {report['ok']}")
+
+    def _section(label, items, key=None, n=10):
+        nonlocal issues
+        print(f"\n  {label:<28} {len(items)}")
+        issues += len(items)
+        for it in items[:n]:
+            print(f"    {it.get('pool_path') or it.get('stub_path') or str(it)[:80]}")
+        if len(items) > n:
+            print(f"    ... und {len(items)-n} weitere")
+
+    _section("Pool-Objekte fehlen:", report["missing_pool"])
+    _section("FileID-Abweichungen:", report["fileid_mismatch"])
+    _section("Hash-Abweichungen:", report["hash_mismatch"])
+    _section("Size-Abweichungen:", report["size_mismatch"])
+
+    h_miss = report["hash_missing_in_index"]
+    print(f"\n  pcloud_hash Luecken:     {len(h_miss)}")
+    # Luecken sind keine Issues (kein Hash im Index != Tamper)
+
+    _section("Fehlende Stubs:", report["missing_stubs"])
+    _section("Unbekannte Pool-Objekte:", unknown_files)
+
+    print(f"\n{'=' * 70}")
+    if issues == 0:
+        print("  ✓ KEINE ABWEICHUNGEN — Pool konsistent mit Index")
+    else:
+        print(f"  ✗ {issues} ABWEICHUNG(EN) — manuelle Pruefung empfohlen")
+    print("=" * 70)
+    return issues
 
 
 def extract_snapshots_from_index(index: dict) -> Set[str]:
@@ -619,12 +779,17 @@ Beispiele:
     print(f"[phase 1] Lade {index_file}...")
     t0 = time.time()
     index = _load_index(cfg, snaps_root, index_file)
-    n_items = len(index.get("items", {}))
-    print(f"[phase 1] Index geladen: {n_items} Nodes ({time.time()-t0:.1f}s)")
-    
-    # 1b) Extrahiere Snapshots aus Index (für Archive-Modus)
+    is_pool = int(index.get("version", 1)) >= 2 and bool(index.get("pool_refs"))
+    if is_pool:
+        n_items = len(index.get("pool_refs", {}))
+        print(f"[phase 1] Index geladen: {n_items} pool_refs (v2, Pool-Modus) ({time.time()-t0:.1f}s)")
+    else:
+        n_items = len(index.get("items", {}))
+        print(f"[phase 1] Index geladen: {n_items} Nodes (1to1-Modus) ({time.time()-t0:.1f}s)")
+
+    # 1b) Extrahiere Snapshots aus Index (für Archive-Modus, nur 1to1)
     snapshot_filter: Optional[Set[str]] = None
-    if is_archive:
+    if is_archive and not is_pool:
         snapshot_filter = extract_snapshots_from_index(index)
         if snapshot_filter:
             sorted_snaps = sorted(snapshot_filter)
@@ -634,68 +799,136 @@ Beispiele:
         else:
             print(f"[phase 1] ⚠ Keine Snapshots im Archive-Index gefunden")
 
-    # 2) Remote-Baum einlesen (ein API-Call, optional gefiltert)
+    # 2) Remote-Baum einlesen
+    # Pool: sowohl _pool/ als auch _snapshots/ (fuer Stub-Check)
+    # 1to1: nur _snapshots/ (wie bisher)
     print()
-    by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter=snapshot_filter)
+    pool_root = f"{dest_root.rstrip('/')}/_pool"
+    if is_pool:
+        # _pool und _snapshots gemeinsam in einem listfolder auf dest_root-Ebene
+        dest_top = dest_root.rstrip("/")
+        print(f"[fetch] Lade Remote-Baum: {dest_top} (Pool + Snapshots, recursive)...")
+        t0 = time.time()
+        top = pc.call_with_backoff(
+            pc.listfolder, cfg, path=dest_top, recursive=True, nofiles=False, showpath=False
+        ) or {}
+        flat = _flatten_tree(top.get("metadata") or {}, parent_path=dest_top, is_root=True)
+        by_fileid: Dict[int, dict] = {}
+        by_path: Dict[str, dict] = {}
+        for f in flat:
+            fid = f.get("fileid")
+            fp = f.get("_full_path", "")
+            if fid is not None:
+                by_fileid[int(fid)] = f
+            if fp:
+                by_path[fp] = f
+        n_pool = sum(1 for p in by_path if f"/{pool_root.split('/')[-1]}/" in p or p.startswith(pool_root))
+        n_stubs = sum(1 for p in by_path if p.endswith(".meta.json"))
+        print(f"[fetch] {len(by_fileid)} Dateien ({n_stubs} stubs) in {time.time()-t0:.1f}s")
+    else:
+        by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter=snapshot_filter)
 
-    # 3) Vergleich Index vs. Remote
-    print()
-    print("[phase 3] Vergleiche Index vs. Remote...")
-    t0 = time.time()
-    report = compare_index_vs_remote(index, by_fileid, by_path, snaps_root)
-    print(f"[phase 3] Vergleich abgeschlossen ({time.time()-t0:.1f}s)")
-
-    # 4) Unbekannte Dateien
-    print()
-    print("[phase 4] Suche unbekannte Dateien...")
-    unknown = find_unknown_files(
-        by_fileid, 
-        by_path, 
-        report["index_fileids"], 
-        snaps_root,
-        report.get("index_known_paths", set())
-    )
-    print(f"[phase 4] {len(unknown)} unbekannte Dateien gefunden")
-
-    # 5) Optional: SHA256-Backfill-Check
-    backfill_ok: List[dict] = []
-    backfill_bad: List[dict] = []
-    if args.backfill_check and report["hash_missing_in_index"]:
+    if is_pool:
+        # Pool-Modus: compare_pool_index_vs_remote
         print()
-        backfill_ok, backfill_bad = backfill_sha256_check(
-            cfg,
-            report["hash_missing_in_index"],
-            sample_size=args.backfill_sample,
-        )
-        print(f"[backfill] OK={len(backfill_ok)}, Mismatch={len(backfill_bad)}")
+        print("[phase 3] Vergleiche Pool-Index vs. Remote...")
+        t0 = time.time()
+        report = compare_pool_index_vs_remote(index, pool_root, snaps_root, by_fileid, by_path)
+        print(f"[phase 3] Vergleich abgeschlossen ({time.time()-t0:.1f}s)")
 
-    # 6) Report
-    issues = print_report(report, unknown, backfill_ok, backfill_bad)
+        print()
+        print("[phase 4] Suche unbekannte Pool-Objekte...")
+        unknown = find_unknown_files(
+            by_fileid, by_path,
+            report["index_fileids"], snaps_root,
+            report.get("index_known_paths", set())
+        )
+        # Im Pool-Modus: unbekannte _pool-Objekte (nicht Stubs, nicht Marker)
+        unknown = [u for u in unknown if f"/{pool_root.split('/')[-1]}/" in u.get("path","")
+                   or u.get("path","").startswith(pool_root)]
+        print(f"[phase 4] {len(unknown)} unbekannte Pool-Objekte gefunden")
+
+        issues = print_pool_report(report, unknown)
+
+    else:
+        # 3) Vergleich Index vs. Remote (1to1)
+        print()
+        print("[phase 3] Vergleiche Index vs. Remote...")
+        t0 = time.time()
+        report = compare_index_vs_remote(index, by_fileid, by_path, snaps_root)
+        print(f"[phase 3] Vergleich abgeschlossen ({time.time()-t0:.1f}s)")
+
+        # 4) Unbekannte Dateien
+        print()
+        print("[phase 4] Suche unbekannte Dateien...")
+        unknown = find_unknown_files(
+            by_fileid,
+            by_path,
+            report["index_fileids"],
+            snaps_root,
+            report.get("index_known_paths", set())
+        )
+        print(f"[phase 4] {len(unknown)} unbekannte Dateien gefunden")
+
+        # 5) Optional: SHA256-Backfill-Check
+        backfill_ok: List[dict] = []
+        backfill_bad: List[dict] = []
+        if args.backfill_check and report["hash_missing_in_index"]:
+            print()
+            backfill_ok, backfill_bad = backfill_sha256_check(
+                cfg,
+                report["hash_missing_in_index"],
+                sample_size=args.backfill_sample,
+            )
+            print(f"[backfill] OK={len(backfill_ok)}, Mismatch={len(backfill_bad)}")
+
+        # 6) Report
+        issues = print_report(report, unknown, backfill_ok, backfill_bad)
 
     dt_total = time.time() - t_total
     print(f"\n[timing] Gesamtlaufzeit: {dt_total:.1f}s")
 
     # 7) JSON-Output
     if args.json_out:
-        json_report = {
-            "timestamp": time.time(),
-            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "dest_root": dest_root,
-            "snaps_root": snaps_root,
-            "index_nodes": n_items,
-            "remote_files": len(by_fileid),
-            "duration_sec": round(dt_total, 2),
-            "issues": issues,
-            "missing_anchors": report["missing_anchors"],
-            "fileid_mismatch": report["fileid_mismatch"],
-            "hash_mismatch": report["hash_mismatch"],
-            "size_mismatch": report["size_mismatch"],
-            "hash_missing_in_index": len(report["hash_missing_in_index"]),
-            "hash_missing_details": report["hash_missing_in_index"][:50],
-            "unknown_files": unknown[:100],
-            "backfill_ok": len(backfill_ok),
-            "backfill_mismatch": backfill_bad,
-        }
+        if is_pool:
+            json_report = {
+                "timestamp": time.time(),
+                "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "dest_root": dest_root,
+                "mode": "pool",
+                "index_refs": n_items,
+                "remote_files": len(by_fileid),
+                "duration_sec": round(dt_total, 2),
+                "issues": issues,
+                "missing_pool": report["missing_pool"],
+                "fileid_mismatch": report["fileid_mismatch"],
+                "hash_mismatch": report["hash_mismatch"],
+                "size_mismatch": report["size_mismatch"],
+                "hash_missing_count": len(report["hash_missing_in_index"]),
+                "missing_stubs": report["missing_stubs"][:50],
+                "unknown_pool_objects": unknown[:100],
+            }
+        else:
+            json_report = {
+                "timestamp": time.time(),
+                "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "dest_root": dest_root,
+                "mode": "1to1",
+                "snaps_root": snaps_root,
+                "index_nodes": n_items,
+                "remote_files": len(by_fileid),
+                "duration_sec": round(dt_total, 2),
+                "issues": issues,
+                "missing_anchors": report["missing_anchors"],
+                "fileid_mismatch": report["fileid_mismatch"],
+                "hash_mismatch": report["hash_mismatch"],
+                "size_mismatch": report["size_mismatch"],
+                "hash_missing_in_index": len(report["hash_missing_in_index"]),
+                "hash_missing_details": report["hash_missing_in_index"][:50],
+                "unknown_files": unknown[:100],
+                "backfill_ok": len(backfill_ok) if not is_pool else 0,
+                "backfill_mismatch": backfill_bad if not is_pool else [],
+            }
         out_path = args.json_out
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
