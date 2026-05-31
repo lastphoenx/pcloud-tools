@@ -1670,12 +1670,6 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     #   verwerfen und sauber neu aufsetzen. Resume/Reconcile ist NICHT zuverlässig:
     #   der content_index wird erst am Ende (aus dem RAM) geschrieben, und listfolder
     #   liefert noch keine SHA256 zum Abgleich. Daher: fresh start via copyfolder.
-    # Flag: wurde der Snapshot-Ordner in diesem Lauf neu aufgesetzt (Wipe)?
-    # Falls ja, darf Phase 4 pool_refs[sha].snapshots[snapshot_name] NICHT als
-    # "bereits fertig" werten — der Eintrag koennte aus einem externen Rebuild
-    # stammen, ohne dass die Stubs je geschrieben wurden.
-    _was_wiped = False
-
     if not dry:
         existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
         if existing_fid:
@@ -1687,9 +1681,33 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pc.deletefolder_recursive(cfg, folderid=int(existing_fid))
             except Exception as e:
                 _log(f"[delta-mode][warn] Konnte unvollständigen Ziel-Ordner nicht entfernen: {e}")
-            _was_wiped = True
-            # Lokalen Index-Checkpoint dieses Snapshots verwerfen: sonst würde Phase 4
-            # Files als 'bereits erledigt' überspringen, deren Stubs gerade weg sind.
+
+            # STAMMDATEN BEREINIGEN: snapshot_name aus pool_refs entfernen.
+            # Der Snapshot-Ordner inkl. aller Stubs wurde soeben geloescht. Ohne
+            # Bereinigung wuerden pool_refs[sha].snapshots[snapshot_name] noch
+            # existieren -> Phase 4 ueberspringt alle added-Files als "bereits fertig"
+            # -> 0 Stubs geschrieben. Indexstand muss dem Remote-Zustand entsprechen.
+            try:
+                _wi_idx = load_content_index(cfg, snapshots_root)
+                _wi_refs = _wi_idx.get("pool_refs", {})
+                _wi_n = 0
+                for _entry in _wi_refs.values():
+                    if not isinstance(_entry, dict):
+                        continue
+                    _snaps = _entry.get("snapshots")
+                    if isinstance(_snaps, dict) and snapshot_name in _snaps:
+                        del _snaps[snapshot_name]
+                        _wi_n += 1
+                    elif isinstance(_snaps, list) and snapshot_name in _snaps:
+                        _snaps.remove(snapshot_name)
+                        _wi_n += 1
+                if _wi_n > 0:
+                    save_content_index(cfg, snapshots_root, _wi_idx, dry=False)
+                    _log(f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus {_wi_n} pool_refs-Eintraegen entfernt")
+            except Exception as e:
+                _log(f"[delta-mode][warn] Stammdaten-Bereinigung fehlgeschlagen: {e}")
+
+            # Lokalen Index-Checkpoint dieses Snapshots verwerfen
             try:
                 import tempfile as _tf
                 _idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
@@ -1981,12 +1999,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
                 return
 
-            # Prüfen ob bereits im Pool (fuer diesen Snapshot abgeschlossen).
-            # NICHT wenn der Ordner gerade frisch gewipet wurde (_was_wiped): dann koennte
-            # der pool_refs-Eintrag aus einem externen Rebuild stammen, ohne dass die Stubs
-            # je geschrieben wurden. In diesem Fall immer Stub schreiben.
+            # Prüfen ob dieser Snapshot fuer dieses File bereits abgeschlossen ist
+            # (Resume-Optimierung: kein erneuter stat auf das Pool-Objekt noetig).
+            # pool_refs ist hier konsistent: beim Wipe wird snapshot_name bereinigt.
             with _state_lock:
-                if not _was_wiped and snapshot_name in _snap_names(pool_refs.get(sha256)):
+                if snapshot_name in _snap_names(pool_refs.get(sha256)):
                     reused += 1
                     return
             
