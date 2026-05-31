@@ -458,7 +458,10 @@ build_and_push() {
   # Manifest-Archivierung wird bereits vom Push-Tool erledigt
   # (nach /srv/pcloud-archive/manifests/)
   
-  # === Delta-Check nach erfolgreichem Upload ===
+  # === Delta-Check nach erfolgreichem Upload (im Dry-Run uebersprungen) ===
+  if [[ "$DRY_RUN" == "1" ]]; then
+    _log INFO "Delta verification uebersprungen (--dry-run)"
+  else
   _log INFO "Starting delta verification..."
   local delta_report="${PCLOUD_TEMP_DIR}/delta_verify_${SNAPNAME}.json"
   
@@ -485,6 +488,7 @@ build_and_push() {
     _db_phase_log "verify" "end" "FAILED"
     _log WARN "Delta-Check failed (non-critical, upload succeeded)"
   fi
+  fi
   # === Ende Delta-Check ===
   
   # Explizites Cleanup (statt trap RETURN)
@@ -500,11 +504,17 @@ build_and_push() {
 #   wrapper_pcloud_sync_1to1.sh [SNAPSHOT|/pfad/zu/SNAPSHOT] [--dry-run] [--use-delta-copy]
 # Flags werden whitelisted und sicher (Array) an das Push-Tool weitergereicht.
 TARGET_SNAPSHOT=""
+DRY_RUN=0
 declare -a EXTRA_PUSH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run|--use-delta-copy)
+    --dry-run)
+      DRY_RUN=1
+      EXTRA_PUSH_ARGS+=("$1")
+      shift
+      ;;
+    --use-delta-copy)
       EXTRA_PUSH_ARGS+=("$1")
       shift
       ;;
@@ -648,8 +658,8 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
   export PCLOUD_SKIP_FINALIZE=1
   for s in "${SNAPS[@]}"; do
     build_and_push "$RTB/$s" || exit 1
-    # Harte Verifikation: Marker muss auf pCloud sein
-    if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+    # Harte Verifikation: Marker muss auf pCloud sein (im Dry-Run uebersprungen)
+    if [[ "$DRY_RUN" != "1" && "$(remote_snapshot_exists "$s")" == "NO" ]]; then
       _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud! Markiere als FAILED."
       exit 1
     fi
@@ -681,7 +691,8 @@ for s in "${local_snaps[@]}"; do
   [[ "$(is_remote_cached "$s")" == "YES" ]] && continue
   _log INFO "Uploading missing snapshot: $s"
   build_and_push "$RTB/$s" || exit 1
-  if [[ "$(remote_snapshot_exists "$s")" == "NO" ]]; then
+  # Im Dry-Run wird nichts hochgeladen -> kein .upload_complete -> Verify ueberspringen
+  if [[ "$DRY_RUN" != "1" && "$(remote_snapshot_exists "$s")" == "NO" ]]; then
     _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud! Markiere als FAILED."
     exit 1
   fi
