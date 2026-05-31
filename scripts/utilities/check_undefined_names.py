@@ -70,7 +70,9 @@ def collect_bound_names(tree: ast.AST) -> set:
 
 
 def check_file(path: str) -> int:
-    with open(path, "r", encoding="utf-8") as f:
+    # utf-8-sig: entfernt ein fuehrendes BOM. Python/py_compile vertragen ein BOM,
+    # aber ast.parse auf dem rohen String wirft sonst "invalid non-printable U+FEFF".
+    with open(path, "r", encoding="utf-8-sig") as f:
         src = f.read()
     tree = ast.parse(src, filename=path)
     bound = collect_bound_names(tree)
