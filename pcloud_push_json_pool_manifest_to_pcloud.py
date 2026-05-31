@@ -663,17 +663,73 @@ def load_content_index(cfg: dict, snapshots_root: str) -> dict:
     except Exception:
         return {"version": 1, "items": {}}
 
+def _snap_names(entry) -> set:
+    """Snapshot-Namen aus einem pool_refs-Eintrag - tolerant gegen ALLE Formate:
+      - bare list (sehr alt):            ["snapA", ...]
+      - dict mit snapshots=list (v1):    {"snapshots": ["snapA", ...]}
+      - dict mit snapshots=map (v2):     {"snapshots": {"snapA": [relpaths], ...}}
+    """
+    if isinstance(entry, dict):
+        s = entry.get("snapshots")
+        if isinstance(s, dict):
+            return set(s.keys())
+        if isinstance(s, list):
+            return set(s)
+        return set()
+    if isinstance(entry, list):
+        return set(entry)
+    return set()
+
+
+def _register_snap(pool_refs: dict, sha: str, snap: str, relpath: str = "",
+                   *, fileid=None, hash=None, size=None) -> None:
+    """Registriert (snap, relpath) fuer eine sha im v2-Format
+    (pool_refs[sha].snapshots = {snap: [relpaths]}) und konvertiert dabei aeltere
+    Formate (bare list / snapshots=list) transparent nach v2. Coords (fileid/hash/size)
+    werden nur gesetzt, wenn noch nicht vorhanden - echte Werte werden nie ueberschrieben.
+    Zentraler Ersatz fuer alle frueheren inline-Registrierungen (kein rohes .append mehr)."""
+    entry = pool_refs.get(sha)
+    if not isinstance(entry, dict):
+        old = entry if isinstance(entry, list) else []
+        entry = {"fileid": fileid, "hash": hash, "size": size, "snapshots": {}}
+        for n in old:
+            entry["snapshots"][n] = []
+        pool_refs[sha] = entry
+    s = entry.get("snapshots")
+    if isinstance(s, list):
+        entry["snapshots"] = {n: [] for n in s}
+        s = entry["snapshots"]
+    elif not isinstance(s, dict):
+        entry["snapshots"] = {}
+        s = entry["snapshots"]
+    rels = s.setdefault(snap, [])
+    if relpath and relpath not in rels:
+        rels.append(relpath)
+    if fileid is not None and not entry.get("fileid"):
+        entry["fileid"] = fileid
+    if hash is not None and not entry.get("hash"):
+        entry["hash"] = hash
+    if size is not None and not entry.get("size"):
+        entry["size"] = size
+
+
 def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool=False) -> None:
     """
     content_index.json effizient schreiben:
     - ohne erneutes ensure()
     - minified JSON
+    - v2: version=2, leeres "items" (1to1-Leiche) wird entfernt
     """
     idx_dir  = f"{snapshots_root.rstrip('/')}/_index"
     idx_name = "content_index.json"
 
+    # v2-Markierung + 1to1-Leiche entfernen (nur wenn leer, um nichts zu zerstoeren)
+    index["version"] = 2
+    if isinstance(index.get("items"), dict) and not index["items"]:
+        index.pop("items", None)
+
     if dry:
-        print(f"[dry] write index: {idx_dir}/{idx_name} (items={len(index.get('items',{}))})")
+        print(f"[dry] write index: {idx_dir}/{idx_name} (pool_refs={len(index.get('pool_refs',{}))})")
         return
 
     # Ordner muss existieren (wurde vorher per Batch-Ensure angelegt)
@@ -1221,8 +1277,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     wrong_snapshot = 0
     
     for sha in manifest_sha256s:
-        entry = pool_refs.get(sha)
-        snapshots_for_sha = entry.get("snapshots", []) if isinstance(entry, dict) else (entry or [])
+        snapshots_for_sha = _snap_names(pool_refs.get(sha))
         if not snapshots_for_sha:
             missing_in_index += 1
         elif snapshot_name not in snapshots_for_sha:
@@ -1895,13 +1950,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
 
             # Prüfen ob bereits im Pool (anderer Snapshot)
             with _state_lock:
-                entry = pool_refs.get(sha256)
-                if isinstance(entry, dict):
-                    snaps = entry.get("snapshots", [])
-                else:
-                    snaps = entry if entry is not None else []
-                
-                if snapshot_name in snaps:
+                if snapshot_name in _snap_names(pool_refs.get(sha256)):
                     reused += 1
                     return
             
@@ -1910,28 +1959,9 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
                 
                 with _state_lock:
-                    if sha256 not in pool_refs:
-                        pool_refs[sha256] = {
-                            "fileid": pool_fileid,
-                            "hash": pcloud_hash,
-                            "size": file_item.get("size"),
-                            "snapshots": [snapshot_name]
-                        }
-                    else:
-                        entry = pool_refs[sha256]
-                        if isinstance(entry, list):
-                            pool_refs[sha256] = {
-                                "fileid": pool_fileid,
-                                "hash": pcloud_hash,
-                                "size": file_item.get("size"),
-                                "snapshots": list(set(entry + [snapshot_name]))
-                            }
-                        else:
-                            if snapshot_name not in entry.get("snapshots", []):
-                                entry.setdefault("snapshots", []).append(snapshot_name)
-                            if not entry.get("fileid"): entry["fileid"] = pool_fileid
-                            if not entry.get("hash"): entry["hash"] = pcloud_hash
-                    
+                    _register_snap(pool_refs, sha256, snapshot_name, relpath,
+                                   fileid=pool_fileid, hash=pcloud_hash,
+                                   size=file_item.get("size"))
                     uploaded += 1
                 
                 _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
@@ -1976,13 +2006,8 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _sha = _it.get("sha256")
                 if not _sha:
                     continue
-                _entry = pool_refs.get(_sha)
-                if isinstance(_entry, dict):
-                    if snapshot_name not in _entry.get("snapshots", []):
-                        _entry.setdefault("snapshots", []).append(snapshot_name)
-                elif isinstance(_entry, list):
-                    if snapshot_name not in _entry:
-                        _entry.append(snapshot_name)
+                _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
+                               size=_it.get("size"))
 
         # Index speichern
         if not dry:
@@ -2012,15 +2037,10 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _sha = _it.get("sha256")
                 if not _sha:
                     continue
-                _entry = pool_refs.get(_sha)
-                if isinstance(_entry, dict):
-                    if snapshot_name not in _entry.get("snapshots", []):
-                        _entry.setdefault("snapshots", []).append(snapshot_name)
-                        _reg += 1
-                elif isinstance(_entry, list):
-                    if snapshot_name not in _entry:
-                        _entry.append(snapshot_name)
-                        _reg += 1
+                if snapshot_name not in _snap_names(pool_refs.get(_sha)):
+                    _reg += 1
+                _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
+                               size=_it.get("size"))
             _log(f"[delta-mode] {_reg} Snapshot-Referenzen im Index ergaenzt (geklonter Snapshot)")
             save_content_index_local(_local_index_path, index)
             save_content_index(cfg, snapshots_root, index, dry=False)
@@ -2379,11 +2399,8 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         # Prüfe ob bereits für DIESEN Snapshot registriert
         already_in_snapshot = set()
         for sha in manifest_sha256_to_item.keys():
-            entry = pool_refs.get(sha)
-            if entry:
-                snaps = entry.get("snapshots", []) if isinstance(entry, dict) else entry
-                if snapshot_name in snaps:
-                    already_in_snapshot.add(sha)
+            if snapshot_name in _snap_names(pool_refs.get(sha)):
+                already_in_snapshot.add(sha)
         
         # Echte Reused: Physisch vorhanden, aber nicht für diesen Snapshot
         reused_sha256s = (set(manifest_sha256_to_item.keys()) & physical_pool_sha256s) - already_in_snapshot
@@ -2409,18 +2426,17 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                         phash = md.get("hash")
                         size = md.get("size")
                         
-                        # In Index schreiben (Upgrade zu Objekt-Format)
-                        old_snaps = []
-                        if sha in pool_refs:
-                            old_entry = pool_refs[sha]
-                            old_snaps = old_entry.get("snapshots", []) if isinstance(old_entry, dict) else old_entry
-                        
-                        pool_refs[sha] = {
-                            "fileid": fid,
-                            "hash": phash,
-                            "size": size,
-                            "snapshots": list(set(old_snaps))
-                        }
+                        # Coords nachtragen, Snapshots-Map (inkl. relpaths) ERHALTEN
+                        entry = pool_refs.get(sha)
+                        if not isinstance(entry, dict):
+                            entry = {"fileid": None, "hash": None, "size": None,
+                                     "snapshots": {n: [] for n in _snap_names(entry)}}
+                            pool_refs[sha] = entry
+                        elif not isinstance(entry.get("snapshots"), dict):
+                            entry["snapshots"] = {n: [] for n in _snap_names(entry)}
+                        entry["fileid"] = fid
+                        entry["hash"] = phash
+                        entry["size"] = size
                         index_changed = True
                 except Exception:
                     pass
@@ -2915,9 +2931,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     if isinstance(_entry, dict) and _entry.get("fileid"):
                         _hl_fileid = _entry.get("fileid")
                         _hl_hash = _entry.get("hash")
-                        if snapshot_name not in _entry.get("snapshots", []):
-                            _entry.setdefault("snapshots", []).append(snapshot_name)
+                        if snapshot_name not in _snap_names(_entry):
                             index_changed = True
+                        _register_snap(pool_refs, sha, snapshot_name, relpath)
                         resumed += 1
             if _hl_fileid:
                 try:
@@ -2932,38 +2948,11 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             try:
                 pool_fileid, pcloud_hash = _upload_to_pool(src_abs, sha)
                 
-                # Update Pool-Refs (thread-safe) - NEU: Enriched Index Format!
+                # Update Pool-Refs (thread-safe) - v2 (snapshots=Map snap->[relpaths])
                 with _state_lock:
-                    if sha not in pool_refs:
-                        # Initialer Eintrag für neue Datei
-                        pool_refs[sha] = {
-                            "fileid": pool_fileid,
-                            "hash": pcloud_hash,
-                            "size": it.get("size"),
-                            "snapshots": [snapshot_name]
-                        }
-                        index_changed = True
-                    else:
-                        # Bestehender SHA256 (aus Preflight oder anderem File im selben Lauf)
-                        entry = pool_refs[sha]
-                        if isinstance(entry, list):
-                            # Auto-Migration von altem Listen-Format
-                            pool_refs[sha] = {
-                                "fileid": pool_fileid,
-                                "hash": pcloud_hash,
-                                "size": it.get("size"),
-                                "snapshots": list(set(entry + [snapshot_name]))
-                            }
-                            index_changed = True
-                        else:
-                            # Update bestehendes Objekt
-                            if snapshot_name not in entry.get("snapshots", []):
-                                entry.setdefault("snapshots", []).append(snapshot_name)
-                                index_changed = True
-                            # Eagerly update metadata if missing (z.B. nach Migration)
-                            if not entry.get("fileid"): entry["fileid"] = pool_fileid
-                            if not entry.get("hash"): entry["hash"] = pcloud_hash
-                    
+                    _register_snap(pool_refs, sha, snapshot_name, relpath,
+                                   fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
+                    index_changed = True
                     uploaded += 1
                 
                 # Stub queuen
@@ -3034,32 +3023,11 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[ERROR] Reused-File {relpath}: Pool-Metadaten nicht findbar (SHA={sha[:16]}...)")
                 return
 
-            # Update Pool-Refs (Snapshots registrieren)
+            # Update Pool-Refs (Snapshots registrieren) - v2 (snapshots=Map snap->[relpaths])
             with _state_lock:
-                if sha not in pool_refs:
-                    pool_refs[sha] = {
-                        "fileid": pool_fileid,
-                        "hash": pcloud_hash,
-                        "size": it.get("size"),
-                        "snapshots": [snapshot_name]
-                    }
-                    index_changed = True
-                else:
-                    entry = pool_refs[sha]
-                    if isinstance(entry, list):
-                        pool_refs[sha] = {
-                            "fileid": pool_fileid,
-                            "hash": pcloud_hash,
-                            "size": it.get("size"),
-                            "snapshots": list(set(entry + [snapshot_name]))
-                        }
-                        index_changed = True
-                    else:
-                        if snapshot_name not in entry.get("snapshots", []):
-                            entry.setdefault("snapshots", []).append(snapshot_name)
-                            index_changed = True
-                        if not entry.get("fileid"): entry["fileid"] = pool_fileid
-                        if not entry.get("hash"): entry["hash"] = pcloud_hash
+                _register_snap(pool_refs, sha, snapshot_name, relpath,
+                               fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
+                index_changed = True
             
             # Stub queuen
             _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
