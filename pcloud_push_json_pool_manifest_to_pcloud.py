@@ -1670,6 +1670,12 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     #   verwerfen und sauber neu aufsetzen. Resume/Reconcile ist NICHT zuverlässig:
     #   der content_index wird erst am Ende (aus dem RAM) geschrieben, und listfolder
     #   liefert noch keine SHA256 zum Abgleich. Daher: fresh start via copyfolder.
+    # Flag: wurde der Snapshot-Ordner in diesem Lauf neu aufgesetzt (Wipe)?
+    # Falls ja, darf Phase 4 pool_refs[sha].snapshots[snapshot_name] NICHT als
+    # "bereits fertig" werten — der Eintrag koennte aus einem externen Rebuild
+    # stammen, ohne dass die Stubs je geschrieben wurden.
+    _was_wiped = False
+
     if not dry:
         existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
         if existing_fid:
@@ -1681,6 +1687,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pc.deletefolder_recursive(cfg, folderid=int(existing_fid))
             except Exception as e:
                 _log(f"[delta-mode][warn] Konnte unvollständigen Ziel-Ordner nicht entfernen: {e}")
+            _was_wiped = True
             # Lokalen Index-Checkpoint dieses Snapshots verwerfen: sonst würde Phase 4
             # Files als 'bereits erledigt' überspringen, deren Stubs gerade weg sind.
             try:
@@ -1974,9 +1981,12 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
                 return
 
-            # Prüfen ob bereits im Pool (anderer Snapshot)
+            # Prüfen ob bereits im Pool (fuer diesen Snapshot abgeschlossen).
+            # NICHT wenn der Ordner gerade frisch gewipet wurde (_was_wiped): dann koennte
+            # der pool_refs-Eintrag aus einem externen Rebuild stammen, ohne dass die Stubs
+            # je geschrieben wurden. In diesem Fall immer Stub schreiben.
             with _state_lock:
-                if snapshot_name in _snap_names(pool_refs.get(sha256)):
+                if not _was_wiped and snapshot_name in _snap_names(pool_refs.get(sha256)):
                     reused += 1
                     return
             
