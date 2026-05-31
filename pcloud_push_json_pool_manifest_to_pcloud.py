@@ -1913,6 +1913,21 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             _batch_write_stubs(cfg, stubs_to_write, dry=False)
             write_ms = (time.time() - t0) * 1000.0
         
+        # Auch UNVERAENDERTE (geklonte) Files fuer diesen Snapshot registrieren,
+        # sonst fehlt der Snapshot in pool_refs[sha].snapshots -> Validation/GC falsch.
+        if not dry:
+            for _it in current_files.values():
+                _sha = _it.get("sha256")
+                if not _sha:
+                    continue
+                _entry = pool_refs.get(_sha)
+                if isinstance(_entry, dict):
+                    if snapshot_name not in _entry.get("snapshots", []):
+                        _entry.setdefault("snapshots", []).append(snapshot_name)
+                elif isinstance(_entry, list):
+                    if snapshot_name not in _entry:
+                        _entry.append(snapshot_name)
+
         # Index speichern
         if not dry:
             save_content_index_local(_local_index_path, index)
@@ -1924,7 +1939,36 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         stubs = 0
         upload_ms = 0.0
         write_ms = 0.0
-    
+        # Index trotzdem laden + neuen (geklonten) Snapshot fuer ALLE SHAs registrieren
+        # (sonst UnboundLocalError bei Validation + fehlende pool_refs-Eintraege).
+        import tempfile
+        _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
+        os.makedirs(_local_index_dir, exist_ok=True)
+        if os.path.exists(_local_index_path):
+            index = load_content_index_local(_local_index_path)
+        else:
+            index = load_content_index(cfg, snapshots_root)
+        pool_refs = index.setdefault("pool_refs", {})
+        if not dry:
+            _reg = 0
+            for _it in current_files.values():
+                _sha = _it.get("sha256")
+                if not _sha:
+                    continue
+                _entry = pool_refs.get(_sha)
+                if isinstance(_entry, dict):
+                    if snapshot_name not in _entry.get("snapshots", []):
+                        _entry.setdefault("snapshots", []).append(snapshot_name)
+                        _reg += 1
+                elif isinstance(_entry, list):
+                    if snapshot_name not in _entry:
+                        _entry.append(snapshot_name)
+                        _reg += 1
+            _log(f"[delta-mode] {_reg} Snapshot-Referenzen im Index ergaenzt (geklonter Snapshot)")
+            save_content_index_local(_local_index_path, index)
+            save_content_index(cfg, snapshots_root, index, dry=False)
+
     # === POST-UPLOAD VALIDATION (wie Full-Pool-Mode!) ===
     validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
     if validation_enabled and not dry:
