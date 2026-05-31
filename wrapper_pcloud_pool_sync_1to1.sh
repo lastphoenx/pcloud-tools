@@ -501,7 +501,7 @@ build_and_push() {
 
 # ========= Start =========
 # Optionaler Direktaufruf:
-#   wrapper_pcloud_sync_1to1.sh [SNAPSHOT|/pfad/zu/SNAPSHOT] [--dry-run] [--use-delta-copy]
+#   wrapper_pcloud_pool_sync_1to1.sh [SNAPSHOT|/pfad/zu/SNAPSHOT] [--dry-run]
 # Flags werden whitelisted und sicher (Array) an das Push-Tool weitergereicht.
 TARGET_SNAPSHOT=""
 DRY_RUN=0
@@ -514,22 +514,17 @@ while [[ $# -gt 0 ]]; do
       EXTRA_PUSH_ARGS+=("$1")
       shift
       ;;
-    --use-delta-copy)
-      EXTRA_PUSH_ARGS+=("$1")
-      shift
-      ;;
     -h|--help)
       cat <<EOF
 Usage:
-  $0 [SNAPSHOT|/path/to/SNAPSHOT] [--dry-run] [--use-delta-copy]
+  $0 [SNAPSHOT|/path/to/SNAPSHOT] [--dry-run]
 
 Examples:
   $0
   $0 2026-04-27-173201 --dry-run
-  $0 /mnt/backup/rtb_nas/2026-04-27-173201 --use-delta-copy
 
 Notes:
-  --dry-run und --use-delta-copy werden an pcloud_push_json_pool_manifest_to_pcloud.py durchgereicht.
+  --dry-run wird an pcloud_push_json_pool_manifest_to_pcloud.py durchgereicht.
 EOF
       exit 0
       ;;
