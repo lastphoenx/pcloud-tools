@@ -3355,6 +3355,22 @@ def main() -> None:
 
     push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
 
+    # Manifest archivieren (mode-unabhaengig, NUR nach erfolgreichem Upload - push_pool_mode
+    # wirft sonst). 1:1 wie Legacy (pcloud_push_json_manifest_to_pcloud.py:2370). Ohne diesen
+    # Schritt verliert die Pipeline ihr Gedaechtnis: der Wrapper loescht das Temp-Manifest
+    # danach, und Scout/Smart-Mode-Referenz des naechsten Laufs braucht manifests/<snap>.json.
+    if not args.dry_run:
+        try:
+            import shutil
+            _snap = manifest.get("snapshot") or "SNAPSHOT"
+            _man_archive_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
+            os.makedirs(_man_archive_dir, exist_ok=True)
+            _man_archive_path = os.path.join(_man_archive_dir, f"{_snap}.json")
+            shutil.copy2(args.manifest, _man_archive_path)
+            _log(f"[archive] Manifest archiviert: {_man_archive_path}")
+        except Exception as e:
+            _log(f"[archive][warn] Manifest-Archivierung fehlgeschlagen: {e}")
+
     # Optional: Retention NACH Upload (Pool). Nicht kritisch, darf Upload nicht blockieren.
     if args.retention_sync:
         print("")
