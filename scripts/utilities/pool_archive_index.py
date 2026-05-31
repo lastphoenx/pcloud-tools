@@ -1,39 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pool_archive_index.py - erzeugt die per-Snapshot Index-Archivkopie nachtraeglich.
+pool_archive_index.py - erzeugt gefilterte per-Snapshot Index-Archive nachtraeglich.
 
-Hintergrund: der Delta-Pfad hat frueher die Snapshot-isolierte Index-Kopie unter
-_snapshots/_index/archive/<snap>_index.json nicht angelegt (nur der Full-Pool-Pfad
-tat das). Fuer kuenftige Snapshots ist das gefixt; fuer bereits geladene Snapshots
-holt dieses Tool die Kopie nach - ohne Re-Run/Klon.
-
-Es kopiert server-seitig die aktuelle Master content_index.json nach
+Erzeugt fuer jeden Snapshot eine GEFILTERTE v2-Archivdatei unter
   _snapshots/_index/archive/<snap>_index.json
-fuer jeden angegebenen Snapshot (identisches Muster wie im Push-Tool).
 
-WICHTIG (Ehrlichkeit): die Kopie enthaelt den AKTUELLEN Master-Stand, nicht den
-Stand zum Finalize-Zeitpunkt des Snapshots. Der Master ist kumulativ/append-only
-und autoritativ; jeder pool_refs-Eintrag traegt seine eigene snapshots-Liste. Fuer
-Recovery ist das ausreichend. Ein echter Finalize-Zeitpunkt-Stand entstuende nur
-durch einen Re-Run des jeweiligen Snapshots.
+Gefiltert bedeutet: nur die pool_refs-Eintraege, deren snapshots-Map diesen
+Snapshot enthaelt, und nur der relpath-Eintrag fuer diesen Snapshot.
+Damit ist jede Archivdatei eigenstaendig und fuer den Recovery dieses Snapshots
+ausreichend (sha -> pool_path + relpaths), ohne kumulativen Ballast der anderen
+Snapshots. Aus allen Archivdateien laesst sich der Master-Index vollstaendig
+rekonstruieren.
+
+Die fehlenden Archive fuer 04-27, 05-01, 05-14 wurden nicht erstellt, weil
+der Archive-Schritt erst in Audit #2 eingebaut wurde und diese Snapshots vorher
+hochgeladen wurden. 05-15 hat bereits ein korrektes v2-Archiv.
 
 Aufruf:
   MAIN_DIR=/opt/apps/pcloud-tools/main \
   python pool_archive_index.py --env-file .env --dest-root /Backup/rtb_pool \
-         --snapshot 2026-05-01-103649 2026-05-14-120009
+         --snapshot 2026-04-27-173201 2026-05-01-103649 2026-05-14-120009
 
-Exit 0 = alle Kopien ok, sonst 1.
+Exit 0 = alle Archive ok, sonst 1.
 """
 from __future__ import annotations
-import os, sys, argparse
+import os, sys, json, argparse
 
 sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Per-Snapshot Index-Archivkopie nachziehen (read-mostly).")
+    ap = argparse.ArgumentParser(description="Gefilterte per-Snapshot v2-Archive nachziehen.")
     ap.add_argument("--env-file", required=True)
     ap.add_argument("--dest-root", required=True)
     ap.add_argument("--snapshot", nargs="+", required=True,
@@ -45,25 +44,51 @@ def main():
     snaps_root = f"{dest}/_snapshots"
     idx_path = f"{snaps_root}/_index/content_index.json"
 
-    # Sicherstellen, dass der Master ueberhaupt existiert
-    if not pc.stat_file_safe(cfg, path=idx_path):
-        print(f"[FAIL] Master-Index nicht gefunden: {idx_path}")
+    # Master laden
+    try:
+        master = json.loads(pc.get_textfile(cfg, path=idx_path))
+        all_refs = master.get("pool_refs") or {}
+        print(f"[ok]   Master geladen: version={master.get('version')} "
+              f"pool_refs={len(all_refs)}")
+    except Exception as e:
+        print(f"[FAIL] Master-Index nicht ladbar: {e}")
         sys.exit(1)
-    print(f"[ok]   Master-Index: {idx_path}")
 
     problems = 0
     for snap in args.snapshot:
+        # Gefiltert: nur SHAs die diesen Snapshot referenzieren, nur dessen relpaths
+        filtered = {}
+        for sha, entry in all_refs.items():
+            if not isinstance(entry, dict):
+                continue
+            snaps_map = entry.get("snapshots")
+            if not isinstance(snaps_map, dict) or snap not in snaps_map:
+                continue
+            filtered[sha] = {
+                "fileid": entry.get("fileid"),
+                "hash":   entry.get("hash"),
+                "size":   entry.get("size"),
+                "snapshots": {snap: snaps_map[snap]}
+            }
+
+        snap_idx = {"version": 2, "pool_refs": filtered}
         archive_path = f"{snaps_root}/_index/archive/{snap}_index.json"
         try:
-            pc.ensure_parent_dirs(cfg, archive_path)
-            pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-            print(f"[ok]   archiviert: {archive_path}")
+            # Zielordner sicherstellen, dann schreiben
+            archive_dir = os.path.dirname(archive_path)
+            fid = pc.stat_folderid_fast(cfg, archive_dir)
+            if not fid:
+                fid = pc.ensure_path(cfg, archive_dir)
+            fname = os.path.basename(archive_path)
+            pc.write_json_to_folderid(cfg, folderid=int(fid), filename=fname,
+                                      obj=snap_idx, minify=False)
+            print(f"[ok]   {snap}: {len(filtered)} SHAs -> {archive_path}")
         except Exception as e:
             problems += 1
             print(f"[FAIL] {snap}: {e}")
 
     print("=" * 60)
-    print("RESULT:", "ALLE KOPIEN OK" if problems == 0 else f"{problems} PROBLEM(E)")
+    print("RESULT:", "ALLE ARCHIVE OK" if problems == 0 else f"{problems} PROBLEM(E)")
     sys.exit(0 if problems == 0 else 1)
 
 
