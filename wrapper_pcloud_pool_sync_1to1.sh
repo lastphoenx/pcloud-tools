@@ -584,6 +584,13 @@ _log INFO "========== pCloud Sync 1to1 Start =========="
 
 validate_inputs_or_exit
 
+# Dry-Run darf die DB NIE anfassen: backup_runs trackt nur echte Backups.
+# Alle _db_*-Funktionen sind hinter PCLOUD_ENABLE_DB gated -> hier global aus.
+if [[ "$DRY_RUN" == "1" && "${PCLOUD_ENABLE_DB}" == "1" ]]; then
+  PCLOUD_ENABLE_DB=0
+  _log INFO "Dry-Run: DB-Tracking deaktiviert (kein Schreiben in backup_runs)"
+fi
+
 # Initialize database
 _db_init
 
