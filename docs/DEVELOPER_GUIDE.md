@@ -3,24 +3,24 @@
 > Lebende Systemdokumentation für Entwickler und Betrieb.
 > Bei strukturellen Änderungen bitte aktualisieren.
 >
-> **Konvention:** Alle Code-Referenzen nutzen Funktionsnamen statt Zeilennummern,
-> damit der Guide auch nach Refactoring aktuell bleibt.
+> **Stand:** Juni 2026 · **Modus:** Pool-only (1to1-Modus eingestellt)
 
 ---
 
 ## 📋 Übersicht
 
-Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
+Die pCloud-Backup-Pipeline besteht aus **vier Säulen (Pool-Modus):**
 
 | # | Säule | Hauptkomponente | Zweck |
 |---|-------|-----------------|-------|
 | 1 | **Fundament** | `pcloud_bin_lib.py` | Binary-API, Streaming, RAM-Schutz |
-| 2 | **Orchestrierung & Smart-Sync** | `wrapper_pcloud_sync_1to1.sh` | Strategiewahl, Lückenreparatur, Flag-Passthrough |
-| 3 | **Upload-Engine (Smart-Controller)** | `pcloud_push_json_manifest_to_pcloud.py` | Turbo-Mode, Template-Safe, Safe-Mode |
-| 4 | **Resilient Restore** | `scripts/pcloud_restore.py` | Binary-safe Download, Dedup |
-| 5 | **Recovery & Time-Travel** | `scripts/pcloud_repair_index.py` | Index-Reparatur, Snapshot-Rekonstruktion |
+| 2 | **Orchestrierung** | `wrapper_pcloud_pool_sync_1to1.sh` | Catch-up-Loop, MariaDB-Tracking, Preflight |
+| 3 | **Pool-Upload-Engine** | `pcloud_push_json_pool_manifest_to_pcloud.py` | Scout, Turbo-Delta, Full-Pool, Validation |
+| 4 | **Verifikation** | `pcloud_quick_delta.py` + `pool_verify_backup.py` | tamper-detect (v2/Pool), Integritätscheck |
 
-**Status:** Production-Ready auf Raspberry Pi
+**Orchestrator:** `rtb_pool_wrapper.sh` → rsync-Dry-Run Gate → `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
+
+**Status:** Production-Ready auf Raspberry Pi (pi-nas)
 
 ---
 
@@ -30,49 +30,39 @@ Die pCloud-Backup-Pipeline besteht aus **fünf Säulen:**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  rtb_wrapper.sh (Orchestrator)                         │
+│  rtb_pool_wrapper.sh (Orchestrator)                    │
 │  ├─ EntropyWatcher Safety Gate                         │
 │  ├─ rsync_tmbackup.sh                                  │
-│  └─ wrapper_pcloud_sync_1to1.sh ⬅ Orchestrator         │
+│  └─ wrapper_pcloud_pool_sync_1to1.sh ⬅ pCloud-Sync     │
 └─────────────────────────────────────────────────────────┘
                          │
-        ┌────────────────┴────────────────┐
-        │                                 │
-        ▼                                 ▼
-┌──────────────────┐            ┌──────────────────┐
-│ Gap-Detection    │            │ Smart-Strategy   │
-│ & Repair         │            │ (Controller) ⭐  │
-├──────────────────┤            ├──────────────────┤
-│ • Conservative   │            │ • TURBO-MODE ⚡  │
-│ • Optimistic ⭐  │            │ • TEMPLATE-SAFE  │
-│ • Aggressive     │            │ • SAFE-MODE      │
-└──────────────────┘            └──────────────────┘
-        │                                 │
-        └────────────┬────────────────────┘
-                     ▼
+                         ▼
 ┌─────────────────────────────────────────────────────────┐
-│  Python-Tools (Backend)                                │
+│  Pool-Upload-Engine                                    │
 ├─────────────────────────────────────────────────────────┤
-│  Upload-Pipeline:                                      │
-│  • pcloud_json_manifest.py    (Manifest-Erzeugung)     │
-│  • pcloud_push_...py          (Upload + Delta-Copy)    │
-│  • pcloud_quick_delta.py      (Tamper-Detection)       │
-│  • pcloud_manifest_diff.py    (Manifest-Diff)          │
+│  • Scout: Jaccard-Similarity → Best-Match Remote-Snap  │
+│    ≥ 70%: Turbo-Delta-Mode (copyfolder + Diff)         │
+│    < 70%: Full-Pool-Mode (Preflight + Upload)          │
 │                                                         │
-│  Recovery-Tools (scripts/):                            │
-│  • pcloud_restore.py          (Snapshot-Download)      │
-│  • pcloud_repair_index.py     (Index-Reparatur)        │
-│  • pcloud_integrity_check.py  (Konsistenz-Prüfung)    │
-│  • pcloud_verify_index_vs_manifests.py                 │
+│  Upload-Pipeline:                                      │
+│  • pcloud_json_pool_manifest.py  (Manifest v4, Smart)  │
+│  • pcloud_push_json_pool_manifest_to_pcloud.py         │
+│  • pcloud_quick_delta.py         (tamper-detect v2)    │
+│                                                         │
+│  Utilities (scripts/utilities/):                       │
+│  • pool_verify_backup.py   (Manifest→Pool+Stubs Check) │
+│  • pool_check_remote.py    (Quick Remote Check)        │
+│  • pool_rebuild_index_v2.py (Index-Rebuild)            │
+│  • check_undefined_names.py (Stdlib-Lint)              │
 │                                                         │
 │  Fundament:                                            │
-│  • pcloud_bin_lib.py          (Binary-API + Streaming) │
+│  • pcloud_bin_lib.py       (Binary-API + Streaming)    │
 └─────────────────────────────────────────────────────────┘
-                     │
-                     ▼
+                         │
+                         ▼
         ┌─────────────────────────────┐
-        │  MariaDB + JSONL Logging    │
-        │  + Archive-System           │
+        │  MariaDB (pcloud_backup)    │
+        │  backup_runs + phases       │
         └─────────────────────────────┘
 ```
 

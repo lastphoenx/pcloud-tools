@@ -1,6 +1,7 @@
 # pCloud Backup Tools - Complete Setup Guide
 
 > **Target Audience:** This guide is for setting up pCloud-Tools on a Raspberry Pi 5 (or similar Debian-based system) with existing RTB (rsync-time-backup) snapshots.
+> **Stand:** Juni 2026 · **Modus:** Pool-only (`wrapper_pcloud_pool_sync_1to1.sh`)
 
 ---
 
@@ -146,7 +147,7 @@ pip install -r requirements.txt
 ### 3. Set Script Permissions
 
 ```bash
-chmod +x wrapper_pcloud_sync_1to1.sh
+chmod +x wrapper_pcloud_pool_sync_1to1.sh
 chmod +x pcloud_status.sh
 chmod +x pcloud_health_check.sh
 ```
@@ -351,7 +352,7 @@ source venv/bin/activate
 # NOTE: Check if wrapper has --dry-run flag, if not, skip this
 
 # Actual backup (replace with your latest snapshot)
-./wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-14__22-00-01 /Backups/NAS
+./wrapper_pcloud_pool_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-14__22-00-01 /Backup/rtb_pool
 ```
 
 **What happens:**
@@ -453,7 +454,7 @@ crontab -e
 
 ```cron
 # pCloud Backup: Run every day at 23:00 (after RTB completes)
-0 23 * * * /opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/latest /Backups/NAS >> /var/log/backup/pcloud_cron.log 2>&1
+0 23 * * * /opt/apps/pcloud-tools/main/wrapper_pcloud_pool_sync_1to1.sh /mnt/backup/rtb_nas/latest /Backup/rtb_pool >> /var/log/backup/pcloud_cron.log 2>&1
 
 # Health Check: Every 15 minutes
 */15 * * * * /opt/apps/pcloud-tools/main/pcloud_health_check.sh || logger -t pcloud_health "Health check failed: exit code $?"
@@ -477,7 +478,7 @@ Wants=network-online.target
 Type=oneshot
 User=YOUR_USER
 WorkingDirectory=/opt/apps/pcloud-tools/main
-ExecStart=/opt/apps/pcloud-tools/main/wrapper_pcloud_sync_1to1.sh /mnt/backup/rtb_nas/latest /Backups/NAS
+ExecStart=/opt/apps/pcloud-tools/main/wrapper_pcloud_pool_sync_1to1.sh /mnt/backup/rtb_nas/latest /Backup/rtb_pool
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=pcloud-backup
@@ -621,5 +622,5 @@ mysql -u pcloud_backup -p pcloud_backup < sql/init_pcloud_db.sql
 
 ---
 
-**Last Updated:** April 14, 2026  
+**Last Updated:** Juni 2026 · Pool-only Modus
 **Version:** 1.0.0 (MariaDB Edition)
