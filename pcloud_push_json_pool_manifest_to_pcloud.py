@@ -5663,7 +5663,7 @@ def main() -> None:
     ap.add_argument("--manifest", required=True, help="Pfad zur Manifest-JSON (schema=2 oder schema=4 für Pool)")
     ap.add_argument("--dest-root", required=True, help="Remote-Wurzel, z.B. /Backup/pcloud-snapshots")
     ap.add_argument("--snapshot-name", help="Überschreibe Snapshot-Name aus Manifest (optional, für Testing)")
-    ap.add_argument("--snapshot-mode", choices=["objects","1to1","pool"], default="objects",
+    ap.add_argument("--snapshot-mode", choices=["pool"], default="pool",
                     help="Upload-Strategie: objects (Hash-Object-Store + Stubs), 1to1 (Materialisieren + Stubs), oder pool (Pool-basiert mit Stubs)")
     ap.add_argument("--use-delta-copy", action="store_true",
                     help="Delta-Copy-Modus: Server-seitiges Klonen + selective Updates (nur mit --snapshot-mode 1to1). "
@@ -5722,76 +5722,32 @@ def main() -> None:
     dest_root = pc._norm_remote_path(args.dest_root)
     schema = int(manifest.get("schema", 0) or 0)
     _log(f"[cli] snapshot-mode={args.snapshot_mode} dry-run={bool(args.dry_run)} schema={schema}")
-    if args.snapshot_mode == "objects" and (schema >= 4 or "POOL" in dest_root.upper()):
-        _log("[cli][warn] snapshot-mode=objects aktiv. Fuer Pool-Delta/Preflight bitte --snapshot-mode pool verwenden.")
 
-    # Upload ZUERST (Retention kommt ans Ende, nach Upload)
-    if args.snapshot_mode == "objects":
-        push_objects_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), objects_layout=args.objects_layout)
-    elif args.snapshot_mode == "pool":
-        # POOL-MODE (NEU)
-        push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
-    else:
-        # 1to1-Mode
-        # Smart Strategy Selection, aber mit Legacy-Kompatibilität für --use-delta-copy
-        if args.use_delta_copy:
-            _log("[legacy] --use-delta-copy Flag erkannt; erzwinge TURBO-MODE (deprecated, nutze Smart-Controller stattdessen)")
-            # Direkt zu Delta-Mode, ohne Metriken zu prüfen
-            push_1to1_delta_mode(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
-        else:
-            # Standard: Smart-Entscheidung
-            push_1to1_smart_controller(cfg, manifest, dest_root, dry=bool(args.dry_run), manifest_path=args.manifest)
+    # POOL-ONLY: 1to1/objects sind abgeschaltet (kein Zurueck). Nur noch Pool-Methode.
+    if args.snapshot_mode != "pool":
+        print(f"[cli][FATAL] snapshot-mode='{args.snapshot_mode}' wird nicht mehr unterstuetzt "
+              f"- nur noch 'pool'.", file=sys.stderr)
+        sys.exit(2)
 
-    # Optional: Retention-Sync NACH Upload (nicht kritisch, darf Upload nicht blockieren)
-    # Auto-Erkennung des Modus für Retention (auch wenn nicht aktiv, für Info-Message)
-    retention_schema = int(manifest.get("schema", 0) or 0)
-    
+    push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
+
+    # Optional: Retention NACH Upload (Pool). Nicht kritisch, darf Upload nicht blockieren.
     if args.retention_sync:
         print("")
         print("="*80)
-        print("RETENTION-SYNC Phase gestartet")
+        print("RETENTION-POOL Phase gestartet")
         print("="*80)
-        
-        if retention_schema == 4:
-            _log("[cli] Auto-Modus Retention: POOL-Manifest erkannt.")
-            mode = "pool"
-        else:
-            mode = "1to1"
-
         local_snaps = list_local_snapshot_names(manifest.get("root", "/"))
         print(f"Lokale Snapshots: {len(local_snaps)}")
-
-        if mode == "pool":
-            try:
-                t_retention = time.time()
-                retention_pool_mode(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
-                retention_duration = time.time() - t_retention
-                print("="*80)
-                print(f"RETENTION-POOL abgeschlossen ({retention_duration:.1f}s)")
-                print("="*80)
-                print("")
-            except Exception as _ret_exc:
-                _log(f"[retention-pool] WARNING: retention_pool_mode fehlgeschlagen: {_ret_exc}")
-        
-        elif mode == "1to1":
-            try:
-                t_retention = time.time()
-                retention_sync_1to1(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
-                retention_duration = time.time() - t_retention
-                print("="*80)
-                print(f"RETENTION-SYNC abgeschlossen ({retention_duration:.1f}s)")
-                print("="*80)
-                print("")
-            except Exception as _ret_exc:
-                _log(f"[retention] WARNING: retention_sync_1to1 fehlgeschlagen: {_ret_exc}")
-    
-    else:
-        if retention_schema == 2:  # Nur Info für 1to1
-            print("")
+        try:
+            t_retention = time.time()
+            retention_pool_mode(cfg, dest_root, local_snaps=local_snaps, dry=bool(args.dry_run))
             print("="*80)
-            print("RETENTION-SYNC übersprungen (--retention-sync nicht gesetzt)")
+            print(f"RETENTION-POOL abgeschlossen ({time.time()-t_retention:.1f}s)")
             print("="*80)
             print("")
+        except Exception as _ret_exc:
+            _log(f"[retention-pool] WARNING: retention_pool_mode fehlgeschlagen: {_ret_exc}")
 
     # --- metrics summary (einheitlich, greppbar) ---
     try:
