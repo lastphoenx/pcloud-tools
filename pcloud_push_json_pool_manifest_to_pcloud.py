@@ -1302,17 +1302,19 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
             _snap_result = pc.call_with_backoff(
                 pc.listfolder, cfg, path=snapshot_dir, recursive=True, nofiles=False)
 
-            # Alle Stub-Pfade aus dem Baum rekonstruieren (rekursiv, O(n))
+            # Alle Stub-Pfade aus dem Baum rekonstruieren.
+            # Iteration beginnt bei den KINDERN des Root-Knotens (root hat
+            # name=snapshot-ordner-name; wuerden wir ihn selbst verarbeiten,
+            # laendet er doppelt im Pfad: snapshot_dir/snapshot_dir/...).
             _remote_stub_paths: set = set()
             def _walk_stubs(node, cur_path):
-                name = node.get("name", "")
-                path = f"{cur_path}/{name}" if name and cur_path else (name or cur_path)
-                if node.get("isfolder"):
-                    for child in node.get("contents", []) or []:
-                        _walk_stubs(child, path)
-                else:
-                    if name.endswith(".meta.json"):
-                        _remote_stub_paths.add(path)
+                for child in node.get("contents", []) or []:
+                    name = child.get("name", "")
+                    child_path = f"{cur_path}/{name}"
+                    if child.get("isfolder"):
+                        _walk_stubs(child, child_path)
+                    elif name.endswith(".meta.json"):
+                        _remote_stub_paths.add(child_path)
             _walk_stubs(
                 _snap_result.get("metadata", {}), cur_path=snapshot_dir.rstrip("/"))
             _log(f"[validate] Remote-Stubs vorhanden: {len(_remote_stub_paths)}")
