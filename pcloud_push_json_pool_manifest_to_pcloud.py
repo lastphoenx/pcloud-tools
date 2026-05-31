@@ -1592,10 +1592,16 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     
     if not dry:
         try:
-            # copyfolder mit toname (Ordner wird umbenannt beim Kopieren)
-            snapshots_fid = pc.ensure_path(cfg, snapshots_root)
-            pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=snapshots_fid,
-                         toname=snapshot_name, copycontentonly=True)
+            # WICHTIG: copycontentonly=True kopiert die KINDER von from_path direkt
+            # nach to_folderid. to_folderid MUSS daher der Snapshot-Ordner SELBST
+            # sein - nicht der _snapshots-Parent. Sonst landen alle Top-Level-Ordner
+            # des Snapshots plus die mitkopierten Marker direkt in _snapshots/ statt
+            # in _snapshots/<snapshot>/. toname wird bei copycontentonly ignoriert.
+            # Gleiches, bewaehrtes Muster wie weiter unten (ensure_path -> Ziel-FID
+            # -> copyfolder hinein).
+            dest_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+            pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=dest_fid,
+                         copycontentonly=True)
             copy_duration = time.time() - t_copy_start
             _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")
 
