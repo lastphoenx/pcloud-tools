@@ -834,15 +834,23 @@ Beispiele:
             return _flatten_tree(res.get("metadata") or {}, parent_path=snap_path, is_root=True)
 
         all_flat: List[dict] = []
+        _total = 1 + len(snap_names)
+        _done = 0
         with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
             futures = {"_pool": _ex.submit(_fetch_pool_tree)}
-            for _s in snap_names:
+            for _s in sorted(snap_names):
                 futures[_s] = _ex.submit(_fetch_snap_tree, _s)
             for key, fut in futures.items():
                 try:
-                    all_flat.extend(fut.result())
+                    result = fut.result()
+                    all_flat.extend(result)
+                    _done += 1
+                    label = "_pool" if key == "_pool" else key
+                    n_files = len(result)
+                    print(f"[fetch] {_done}/{_total} {label}: {n_files} Eintraege", flush=True)
                 except Exception as e:
-                    print(f"[warn] listfolder fehlgeschlagen fuer {key}: {e}")
+                    _done += 1
+                    print(f"[warn] listfolder fehlgeschlagen fuer {key}: {e}", flush=True)
 
         by_fileid: Dict[int, dict] = {}
         by_path: Dict[str, dict] = {}
