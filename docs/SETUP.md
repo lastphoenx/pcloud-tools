@@ -1,626 +1,273 @@
-# pCloud Backup Tools - Complete Setup Guide
+# pCloud Backup Tools - Setup Guide (Pool-Mode)
 
-> **Target Audience:** This guide is for setting up pCloud-Tools on a Raspberry Pi 5 (or similar Debian-based system) with existing RTB (rsync-time-backup) snapshots.
-> **Stand:** Juni 2026 · **Modus:** Pool-only (`wrapper_pcloud_pool_sync_1to1.sh`)
-
----
-
-## Table of Contents
-1. [Prerequisites](#prerequisites)
-2. [MariaDB Installation & Setup](#mariadb-installation--setup)
-3. [pCloud-Tools Installation](#pcloud-tools-installation)
-4. [Configuration (.env)](#configuration-env)
-5. [Database Initialization](#database-initialization)
-6. [First Backup Test](#first-backup-test)
-7. [Health Check Setup](#health-check-setup)
-8. [Automation (Cron/Systemd)](#automation-cronsystemd)
-9. [Troubleshooting](#troubleshooting)
+> **Zielgruppe:** Ersteinrichtung auf Raspberry Pi / Debian-NAS mit bestehenden RTB-Snapshots.
+> **Modus:** Pool-only (`wrapper_pcloud_pool_sync_1to1.sh`)
+> **Stand:** Juni 2026
 
 ---
 
-## Prerequisites
+## Voraussetzungen
 
-### System Requirements
-- Debian/Ubuntu-based Linux (Raspberry Pi OS 11+)
-- Python 3.9+
+- Debian/Ubuntu Linux (Raspberry Pi OS 12+)
+- Python 3.9+ mit venv
 - Bash 4.0+
-- 200GB+ free space for temporary uploads (SSD recommended)
-- Internet connection with stable bandwidth
+- RTB-Snapshots in `/mnt/backup/rtb_nas/`
+- pCloud-Account (EU-Region: `eapi.pcloud.com`)
+- pCloud OAuth2-Token → [Token erneuern via rclone](./RCLONE_TOKEN_REFRESH.md)
 
-### Existing Setup (Required)
-- RTB snapshots in `/mnt/backup/rtb_nas/` (or similar)
-- pCloud account with 2TB+ storage
-- pCloud OAuth2 token ([get one here](https://docs.pcloud.com/))
+---
 
-### Install Dependencies
+## 1. Abhängigkeiten installieren
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
+sudo apt update && sudo apt install -y \
+  mariadb-server mariadb-client \
+  python3 python3-pip python3-venv \
+  curl jq uuid-runtime git
 
-# Install MariaDB server
-sudo apt install -y mariadb-server mariadb-client
-
-# Install Python dependencies
-sudo apt install -y python3 python3-pip python3-venv
-
-# Install utilities
-sudo apt install -y curl jq uuid-runtime
-
-# Optional: Install logrotate (if not already present)
-sudo apt install -y logrotate
+# Python venv erstellen
+cd /opt/apps/pcloud-tools/main
+python3 -m venv /opt/apps/pcloud-tools/venv
+source /opt/apps/pcloud-tools/venv/bin/activate
+pip install requests
 ```
 
 ---
 
-## MariaDB Installation & Setup
-
-### 1. Secure MariaDB Installation
+## 2. MariaDB einrichten
 
 ```bash
-sudo mysql_secure_installation
-```
+sudo mysql_secure_installation  # Root-Passwort setzen, Anonymous Users entfernen
 
-**Prompts:**
-- `Enter current password for root:` → Press Enter (no password yet)
-- `Set root password? [Y/n]` → **Y**, then enter strong password
-- `Remove anonymous users? [Y/n]` → **Y**
-- `Disallow root login remotely? [Y/n]` → **Y**
-- `Remove test database? [Y/n]` → **Y**
-- `Reload privilege tables? [Y/n]` → **Y**
-
-### 2. Create Database and User
-
-```bash
-# Login as root
-sudo mysql -u root -p
-```
-
-**Execute in MySQL prompt:**
-
-```sql
--- Create database for pCloud backup tracking
-CREATE DATABASE IF NOT EXISTS pcloud_backup CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
--- Create dedicated user (replace PASSWORD with strong password!)
-CREATE USER 'pcloud_backup'@'localhost' IDENTIFIED BY 'YOUR_STRONG_PASSWORD_HERE';
-
--- Grant all privileges on pcloud_backup database
-GRANT ALL PRIVILEGES ON pcloud_backup.* TO 'pcloud_backup'@'localhost';
-
--- Apply changes
+sudo mysql -e "
+CREATE DATABASE IF NOT EXISTS pcloud_backup CHARACTER SET utf8mb4;
+CREATE USER 'pcloud_backup'@'localhost' IDENTIFIED BY 'STRONG_PASSWORD';
+GRANT ALL ON pcloud_backup.* TO 'pcloud_backup'@'localhost';
 FLUSH PRIVILEGES;
+"
 
--- Verify database exists
-SHOW DATABASES;
+# Schema initialisieren
+sudo mysql pcloud_backup < /opt/apps/pcloud-tools/main/sql/init_pcloud_db.sql
 
--- Exit
-EXIT;
-```
-
-**Security Note:** Store the password securely - you'll need it for `.env` configuration.
-
-### 3. Test Database Connection
-
-```bash
-# Test login with new user
-mysql -u pcloud_backup -p pcloud_backup
-
-# Should prompt for password, then show MySQL prompt
-# Type: EXIT;
+# Prüfen
+sudo mysql pcloud_backup -e "SHOW TABLES;"
+# Erwartet: backup_runs, backup_phases, gap_backfills + Views
 ```
 
 ---
 
-## pCloud-Tools Installation
-
-### 1. Clone Repository
+## 3. .env konfigurieren
 
 ```bash
-# Choose installation directory
-sudo mkdir -p /opt/apps/pcloud-tools
-cd /opt/apps/pcloud-tools
-
-# Clone repo
-sudo git clone https://github.com/YOUR_USERNAME/pcloud-tools.git main
-
-# Set ownership (replace 'YOUR_USER' with your username)
-sudo chown -R YOUR_USER:YOUR_USER /opt/apps/pcloud-tools/main
-
-# Enter directory
-cd main
+cp /opt/apps/pcloud-tools/main/.env.example /opt/apps/pcloud-tools/main/.env
+nano /opt/apps/pcloud-tools/main/.env
 ```
 
-### 2. Create Virtual Environment (Optional, for Python scripts)
+**Minimale Konfiguration:**
 
 ```bash
-# Create venv
-python3 -m venv venv
+# pCloud API (EU-Region)
+PCLOUD_TOKEN=dein_oauth2_token_hier
+PCLOUD_HOST=eapi.pcloud.com
 
-# Activate
-source venv/bin/activate
+# Remote Pool-Root auf pCloud
+PCLOUD_DEST=/Backup/rtb_pool
 
-# Install Python dependencies (if requirements.txt exists)
-pip install -r requirements.txt
-```
-
-### 3. Set Script Permissions
-
-```bash
-chmod +x wrapper_pcloud_pool_sync_1to1.sh
-chmod +x pcloud_status.sh
-chmod +x pcloud_health_check.sh
-```
-
----
-
-## Configuration (.env)
-
-### 1. Copy Example Config
-
-```bash
-cp .env.example .env
-```
-
-### 2. Edit Configuration
-
-```bash
-nano .env
-```
-
-### 3. Required Settings
-
-**Minimum configuration to edit:**
-
-```bash
-#########################################
-# pCloud API Configuration (REQUIRED)
-#########################################
-PCLOUD_TOKEN=YOUR_PCLOUD_ACCESS_TOKEN_HERE
-
-# API region (eapi.pcloud.com for EU, api.pcloud.com for US)
-PCLOUD_HOST="eapi.pcloud.com"
-
-# Remote folder ID in pCloud (0 = root, or specific folder ID)
-PCLOUD_DEFAULT_FOLDERID="0"
-
-#########################################
-# Paths (REQUIRED)
-#########################################
-# RTB snapshot source directory
-RTB_SNAPSHOT_DIR=/mnt/backup/rtb_nas
-
-# Temporary upload directory (MUST be on fast SSD!)
+# Lokale Pfade
 PCLOUD_TEMP_DIR=/srv/pcloud-temp
-
-# Archive directory for successful manifests
 PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive
+RTB=/mnt/backup/rtb_nas
 
-#########################################
-# MariaDB Configuration (REQUIRED for tracking)
-#########################################
+# MariaDB
 PCLOUD_DB_HOST=localhost
-PCLOUD_DB_PORT=3306
 PCLOUD_DB_NAME=pcloud_backup
 PCLOUD_DB_USER=pcloud_backup
-PCLOUD_DB_PASS=YOUR_STRONG_PASSWORD_HERE  # ← From step 2.2
-
-# Enable database tracking (0=disabled, 1=enabled)
+PCLOUD_DB_PASS=STRONG_PASSWORD
 PCLOUD_ENABLE_DB=1
-
-#########################################
-# Logging (OPTIONAL)
-#########################################
-PCLOUD_LOG=/var/log/backup/pcloud_sync.log
-
-# Enable JSON Lines logging (for log aggregation)
-PCLOUD_ENABLE_JSONL=0
-PCLOUD_JSONL_LOG=/var/log/backup/pcloud_sync.jsonl
-
-#########################################
-# Health Check Thresholds (OPTIONAL)
-#########################################
-# Alert if last backup older than X hours
-BACKUP_AGE_WARNING_HOURS=48
-BACKUP_AGE_CRITICAL_HOURS=72
-
-# Alert if pCloud quota below X GB
-QUOTA_WARNING_GB=500   # 5% of 10TB
-QUOTA_CRITICAL_GB=200  # 2% of 10TB
-
-# Alert if disk space below X percent
-DISK_WARNING_PERCENT=10
 ```
 
-### 4. Create Required Directories
-
 ```bash
-# Create log directory
-sudo mkdir -p /var/log/backup
-
-# Create temp directory (ensure it's on SSD!)
-sudo mkdir -p /srv/pcloud-temp
-
-# Create archive directory
-sudo mkdir -p /srv/pcloud-archive
-
-# Set permissions (replace 'YOUR_USER' with your username)
-sudo chown -R YOUR_USER:YOUR_USER /srv/pcloud-temp /srv/pcloud-archive
-sudo chown -R YOUR_USER:YOUR_USER /var/log/backup
+# Verzeichnisse anlegen
+sudo mkdir -p /srv/pcloud-temp /srv/pcloud-archive/{manifests,indexes,deltas}
+sudo chown -R $USER:$USER /srv/pcloud-temp /srv/pcloud-archive /var/log/backup
 ```
 
 ---
 
-## Database Initialization
-
-### 1. Import Schema
+## 4. Script-Berechtigungen setzen
 
 ```bash
 cd /opt/apps/pcloud-tools/main
-
-# Initialize database schema
-mysql -u pcloud_backup -p pcloud_backup < sql/init_pcloud_db.sql
-```
-
-**Enter password when prompted** (the one from step 2.2)
-
-### 2. Verify Schema
-
-```bash
-# Login to database
-mysql -u pcloud_backup -p pcloud_backup
-
-# Check tables
-SHOW TABLES;
-```
-
-**Expected output:**
-```
-+-------------------------+
-| Tables_in_pcloud_backup |
-+-------------------------+
-| backup_phases           |
-| backup_runs             |
-| gap_backfills           |
-| v_failed_backups        |
-| v_performance_stats     |
-| v_recent_backups        |
-+-------------------------+
-```
-
-```sql
--- Check table structure
-DESCRIBE backup_runs;
-
--- Exit
-EXIT;
-```
-
-### 3. Test Database Connection (via script)
-
-```bash
-# Source .env
-source .env
-
-# Test pcloud_status.sh
-./pcloud_status.sh --stats
-```
-
-**Expected output:**
-```
-pCloud Backup Statistics (Last 30 Days)
-========================================
-
-  Total Runs: 0
-  Successful: 0
-  Failed: 0
-  Success Rate: N/A
-
-  Average Duration: 0.00 minutes
-  Total Data: 0.00 GB
-  Average per Run: 0.00 GB
-  Gap Backfills: 0
-```
-
-If you see this, **database connection is working!** ✅
-
----
-
-## First Backup Test
-
-### 1. Identify Latest RTB Snapshot
-
-```bash
-# List snapshots
-ls -lah /mnt/backup/rtb_nas/
-
-# Should show directories like:
-# 2026-04-14__22-00-01/
-# 2026-04-13__22-00-01/
-# ...
-```
-
-### 2. Run First Backup (Dry-Run Recommended)
-
-```bash
-cd /opt/apps/pcloud-tools/main
-
-# Activate venv if using Python scripts
-source venv/bin/activate
-
-# Dry-run mode (no actual upload)
-# NOTE: Check if wrapper has --dry-run flag, if not, skip this
-
-# Actual backup (replace with your latest snapshot)
-./wrapper_pcloud_pool_sync_1to1.sh /mnt/backup/rtb_nas/2026-04-14__22-00-01 /Backup/rtb_pool
-```
-
-**What happens:**
-1. Script generates manifest of local files
-2. Queries pCloud for existing files (delta detection)
-3. Creates folder structure in pCloud
-4. Uploads only new/changed files
-5. Logs run to database (if `PCLOUD_ENABLE_DB=1`)
-
-### 3. Monitor Progress
-
-**Open second terminal:**
-
-```bash
-# Watch logs in real-time
-tail -f /var/log/backup/pcloud_sync.log
-```
-
-**Check database (third terminal):**
-
-```bash
-./pcloud_status.sh --current
-```
-
-### 4. Verify After Completion
-
-```bash
-# Check backup status
-./pcloud_status.sh recent
-
-# Expected output:
-# Run ID: abc-123-def-456
-#   Snapshot: 2026-04-14__22-00-01
-#   Status: SUCCESS
-#   Started: 2026-04-14 22:05:00
-#   Finished: 2026-04-14 23:15:00
-#   Duration: 1h 10m 0s
-#   Files: 45678
-#   Bytes: 125.3 GB
+chmod +x wrapper_pcloud_pool_sync_1to1.sh pcloud_pool_gc.py
+chmod +x scripts/utilities/*.py
 ```
 
 ---
 
-## Health Check Setup
+## 5. Erster Lauf: Initialer Pool-Upload (Bootstrap)
 
-### 1. Test Health Check Manually
-
-```bash
-cd /opt/apps/pcloud-tools/main
-
-# Run health check (verbose)
-./pcloud_health_check.sh --verbose
-```
-
-**Expected output:**
-```
-=== pCloud Backup Health Check ===
-
-[1] Backup Age & Gap Detection
-  Latest RTB snapshot: 2026-04-14__22-00-01 (2h ago)
-  Latest pCloud backup: 2026-04-14__22-00-01 (2h ago)
-  ✓ OK: Backup age healthy (2h ago)
-
-[2] pCloud Quota
-  Total: 10240 GB | Used: 150 GB | Free: 10090 GB
-  ✓ OK: pCloud quota healthy: 10090 GB free
-
-[3] Disk Space (/srv/pcloud-temp)
-  Usage: 5% | Available: 1.9T
-  ✓ OK: Disk space healthy: 95% free (1.9T available)
-
-[4] Database Connectivity
-  ✓ OK: Database connection healthy
-
-========================================
-✓ Status: HEALTHY
-========================================
-```
-
-### 2. Check Exit Code
+Beim ersten Mal gibt es noch keine Remote-Snapshots. Der erste Upload läuft im Full-Pool-Mode:
 
 ```bash
-./pcloud_health_check.sh
-echo $?  # Should be 0 (healthy)
+# .env laden
+export ENV_FILE=/opt/apps/pcloud-tools/main/.env
+
+# Syntax-Check vor erstem Lauf
+bash -n wrapper_pcloud_pool_sync_1to1.sh && echo "OK"
+python scripts/utilities/check_undefined_names.py \
+  pcloud_push_json_pool_manifest_to_pcloud.py && echo "OK"
+
+# Dry-Run des ältesten Snapshots (read-only, kein Upload)
+./wrapper_pcloud_pool_sync_1to1.sh 2026-04-27-173201 --dry-run
+
+# Produktionslauf: ältesten Snapshot zuerst
+./wrapper_pcloud_pool_sync_1to1.sh 2026-04-27-173201
+```
+
+Erwarteter Ablauf:
+1. Manifest erzeugt (Full-Hash aller Dateien, dauert je nach Datenmenge)
+2. Pool-Preflight: `listfolder(_pool)` → 0 SHA256s (Pool leer)
+3. Alle Dateien hochladen (~45 MB/s je nach Bandbreite)
+4. 19808 Stubs schreiben
+5. Post-Upload-Validation: Pool-SHA-Check + Stub-100%-Check
+6. `.upload_complete` gesetzt
+
+---
+
+## 6. Catch-up: alle weiteren Snapshots hochladen
+
+```bash
+# Alle fehlenden Snapshots automatisch der Reihe nach hochladen:
+./wrapper_pcloud_pool_sync_1to1.sh
+
+# Der Wrapper ermittelt: remote vorhanden vs. lokal vorhanden → Differenz
+# Lädt chronologisch hoch; Scout wählt für jeden besten Basis-Snapshot
+# Scout ≥ 70% Similarity → Turbo-Delta (~2 Min/Snapshot)
+# Scout < 70% → Full-Pool-Mode (bei neu hinzugekommenen Geräten)
+```
+
+Fortschritt beobachten:
+```bash
+tail -f /var/log/backup/rtb_wrapper.log
 ```
 
 ---
 
-## Automation (Cron/Systemd)
+## 7. v2-Index aufbauen (nach initialem Catch-up)
 
-### Option A: Cron (Simple)
-
-```bash
-# Edit crontab
-crontab -e
-```
-
-**Add entries:**
-
-```cron
-# pCloud Backup: Run every day at 23:00 (after RTB completes)
-0 23 * * * /opt/apps/pcloud-tools/main/wrapper_pcloud_pool_sync_1to1.sh /mnt/backup/rtb_nas/latest /Backup/rtb_pool >> /var/log/backup/pcloud_cron.log 2>&1
-
-# Health Check: Every 15 minutes
-*/15 * * * * /opt/apps/pcloud-tools/main/pcloud_health_check.sh || logger -t pcloud_health "Health check failed: exit code $?"
-```
-
-### Option B: Systemd Timer (Advanced)
-
-**Create service file:**
+Nach dem initialen Catch-up enthält `pool_refs` nur SHA256-Keys. Der **v2-Index mit Relpaths** (für Restore-by-Pfad) wird via Rebuild aufgebaut:
 
 ```bash
-sudo nano /etc/systemd/system/pcloud-backup.service
+# 1. Fehlende Delta-Manifeste regenerieren (falls nicht archiviert)
+RTB=/mnt/backup/rtb_nas; MD=/srv/pcloud-archive/manifests
+REF="$MD/<ältester_snap>.json"
+for s in <snap1> <snap2> ...; do
+  python pcloud_json_pool_manifest.py \
+    --root "$RTB/$s" --snapshot "$s" \
+    --out "$MD/$s.json" --hash sha256 --ref-manifest "$REF"
+done
+
+# 2. v2-Index lokal aufbauen (Read-only, zur Inspektion)
+MAIN_DIR=/opt/apps/pcloud-tools/main \
+python scripts/utilities/pool_rebuild_index_v2.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --out /srv/pcloud-temp/content_index_v2.json
+
+# Stichprobe prüfen:
+python -c "
+import json
+d=json.load(open('/srv/pcloud-temp/content_index_v2.json'))
+k=next(iter(d['pool_refs']))
+print(k[:16], json.dumps(d['pool_refs'][k]['snapshots'], indent=2)[:200])
+"
+
+# 3. v2-Index auf pCloud schreiben (nach Prüfung)
+# → --upload hält Backup des alten Index unter _index/archive/
+python scripts/utilities/pool_rebuild_index_v2.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --out /srv/pcloud-temp/content_index_v2.json \
+  --upload
 ```
 
-```ini
-[Unit]
-Description=pCloud Backup Upload
-After=network-online.target mariadb.service
-Wants=network-online.target
+---
 
-[Service]
-Type=oneshot
-User=YOUR_USER
-WorkingDirectory=/opt/apps/pcloud-tools/main
-ExecStart=/opt/apps/pcloud-tools/main/wrapper_pcloud_pool_sync_1to1.sh /mnt/backup/rtb_nas/latest /Backup/rtb_pool
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=pcloud-backup
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Create timer file:**
+## 8. Integrität verifizieren
 
 ```bash
-sudo nano /etc/systemd/system/pcloud-backup.timer
+# Vollständiger Check (Manifest→Pool + Manifest→Stubs, ~5s):
+MAIN_DIR=/opt/apps/pcloud-tools/main \
+python scripts/utilities/pool_verify_backup.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --manifests-dir /srv/pcloud-archive/manifests
+
+# Mit Stub-Inhalt-Probe (sha256 + fileid gegengeprüft):
+... --stub-sample 100
+
+# Erwartete Ausgabe:
+# ✓ ALLE CHECKS OK — Backup vollstaendig integr (5.1s)
 ```
 
-```ini
-[Unit]
-Description=pCloud Backup Timer
-Requires=pcloud-backup.service
+---
 
-[Timer]
-OnCalendar=daily
-OnCalendar=23:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-**Enable and start:**
+## 9. systemd-Service umstellen und aktivieren
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable pcloud-backup.timer
-sudo systemctl start pcloud-backup.timer
+# Service auf Pool-Wrapper umstellen:
+sudo systemctl edit --full backup-pipeline.service
+# → ExecStart=/opt/apps/rtb/rtb_pool_wrapper.sh
 
-# Check status
-sudo systemctl status pcloud-backup.timer
+# Prüfen ob richtig:
+systemctl cat backup-pipeline.service | grep ExecStart
+
+# Timer aktivieren:
+sudo systemctl enable --now backup-pipeline.timer
+sudo systemctl status backup-pipeline.timer
 ```
 
 ---
 
 ## Troubleshooting
 
-### Database Connection Failed
-
+### pCloud-Token abgelaufen
 ```bash
-# Check if MariaDB is running
-sudo systemctl status mariadb
-
-# Test connection manually
-mysql -u pcloud_backup -p pcloud_backup
-
-# Check credentials in .env
-grep PCLOUD_DB_ .env
+curl -s "https://eapi.pcloud.com/userinfo?auth=$PCLOUD_TOKEN" | python -m json.tool
+# "error": 1000 → Token ungültig → neuen Token via rclone holen
+# Siehe RCLONE_TOKEN_REFRESH.md
 ```
 
-**Fix:** Verify password, user, and database name in `.env`
-
----
-
-### Permission Denied Errors
-
+### MariaDB-Verbindungsfehler
 ```bash
-# Fix script permissions
-chmod +x /opt/apps/pcloud-tools/main/*.sh
-
-# Fix directory permissions
-sudo chown -R YOUR_USER:YOUR_USER /srv/pcloud-temp /srv/pcloud-archive /var/log/backup
+sudo mysql pcloud_backup -e "SELECT 1"  # kein Passwort nötig (root via Unix-Socket)
+sudo mysql pcloud_backup -e "SHOW TABLES;"
 ```
 
----
-
-### pCloud API Errors
-
+### Snapshot lädt nicht hoch (FAILED im Log)
 ```bash
-# Test token manually
-curl -s "https://eapi.pcloud.com/userinfo?auth=YOUR_TOKEN" | jq .
+# Letzten Fehler sehen:
+sudo mysql pcloud_backup -e \
+  "SELECT snapshot_name, status, error_message FROM backup_runs ORDER BY started_at DESC LIMIT 5;"
 
-# Expected: JSON with quota, email, userid
-# If error: Token expired or invalid - get new one from pCloud dashboard
+# Unvollständigen Remote-Snapshot neu starten:
+# Der Wrapper erkennt fehlendes .upload_complete und startet automatisch neu.
+./wrapper_pcloud_pool_sync_1to1.sh <snapshot>
 ```
 
----
-
-### Disk Space Full
-
+### Pool-Objekt fehlt in Validation
 ```bash
-# Check disk usage
+# SHA identifizieren:
+python scripts/utilities/pool_check_remote.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --snapshot <snap>
+
+# Vollständiger Check:
+python scripts/utilities/pool_verify_backup.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --manifests-dir /srv/pcloud-archive/manifests --stub-sample 50
+```
+
+### Disk full (/srv/pcloud-temp)
+```bash
 df -h /srv
-
-# Clean old temp files (safe - only if no backup running!)
+# Alte Temp-Dateien bereinigen (nur wenn kein Backup läuft!):
 find /srv/pcloud-temp -type f -mtime +7 -delete
-
-# Check archive folder size
-du -sh /srv/pcloud-archive
 ```
-
-**Config:** Reduce `RETENTION_COUNT` in `.env` to keep fewer snapshots
-
----
-
-### Health Check Always Reports Critical
-
-```bash
-# Run verbose to see exact issue
-./pcloud_health_check.sh --verbose
-
-# Adjust thresholds in .env if needed:
-BACKUP_AGE_WARNING_HOURS=96   # Increase if RTB runs infrequently
-BACKUP_AGE_CRITICAL_HOURS=168
-```
-
----
-
-### Database Schema Mismatch (after updates)
-
-```bash
-# Check current schema version
-mysql -u pcloud_backup -p pcloud_backup -e "DESCRIBE backup_runs;"
-
-# If columns missing: Re-import schema (safe - uses CREATE IF NOT EXISTS)
-mysql -u pcloud_backup -p pcloud_backup < sql/init_pcloud_db.sql
-```
-
----
-
-## Next Steps
-
-- 📊 **Monitoring Dashboard:** Generate HTML: `./pcloud_status.sh html /var/www/html/pcloud.html`
-- 🔔 **Alerting:** Set up Telegram/Discord webhooks (see docs/ALERTING.md - coming soon)
-- 📈 **Grafana Integration:** Export metrics to Prometheus (see docs/METRICS.md - coming soon)
-- 🔐 **Encrypted Backups:** Use pCloud Crypto folders for sensitive data
-
----
-
-## Support
-
-- **Issues:** https://github.com/YOUR_USERNAME/pcloud-tools/issues
-- **Documentation:** https://github.com/YOUR_USERNAME/pcloud-tools/docs
-- **Changelog:** https://github.com/YOUR_USERNAME/pcloud-tools/blob/main/CHANGELOG.md
-
----
-
-**Last Updated:** Juni 2026 · Pool-only Modus
-**Version:** 1.0.0 (MariaDB Edition)

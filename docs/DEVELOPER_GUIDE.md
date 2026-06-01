@@ -1,3049 +1,442 @@
-# Developer Guide: pCloud Backup-Pipeline
+# Developer Guide: pCloud Backup-Pipeline (Pool-Mode)
 
 > Lebende Systemdokumentation für Entwickler und Betrieb.
 > Bei strukturellen Änderungen bitte aktualisieren.
 >
-> **Stand:** Juni 2026 · **Modus:** Pool-only (1to1-Modus eingestellt)
+> **Stand:** Juni 2026 · **Modus:** Pool-only
+> Architekturübersicht: [ARCHITECTURE.md](./ARCHITECTURE.md)
 
 ---
 
 ## 📋 Übersicht
 
-Die pCloud-Backup-Pipeline besteht aus **vier Säulen (Pool-Modus):**
+| # | Komponente | Datei | Zweck |
+|---|---|---|---|
+| 1 | **Binary-API** | `pcloud_bin_lib.py` | pCloud HTTP-API, Streaming, Chunked Upload, Connection-Pooling |
+| 2 | **Manifest-Generator** | `pcloud_json_pool_manifest.py` | Snapshot scannen → SHA256, mtime, inode → Manifest v4 |
+| 3 | **Pool-Upload** | `pcloud_push_json_pool_manifest_to_pcloud.py` | Scout, Turbo-Delta, Full-Pool, Validation, Index-Management |
+| 4 | **tamper-detect** | `pcloud_quick_delta.py` | Pool-Index v2 vs. Remote (fileid, hash, size, Stubs) |
+| 5 | **Verifikation** | `scripts/utilities/pool_verify_backup.py` | Vollständiger Integritätscheck: Manifest→Pool→Stubs |
+| 6 | **GC** | `pcloud_pool_gc.py` | Verwaiste Pool-Objekte entfernen |
+| 7 | **Orchestrator** | `wrapper_pcloud_pool_sync_1to1.sh` | Catch-up-Loop, MariaDB, Preflight, tamper-detect |
 
-| # | Säule | Hauptkomponente | Zweck |
-|---|-------|-----------------|-------|
-| 1 | **Fundament** | `pcloud_bin_lib.py` | Binary-API, Streaming, RAM-Schutz |
-| 2 | **Orchestrierung** | `wrapper_pcloud_pool_sync_1to1.sh` | Catch-up-Loop, MariaDB-Tracking, Preflight |
-| 3 | **Pool-Upload-Engine** | `pcloud_push_json_pool_manifest_to_pcloud.py` | Scout, Turbo-Delta, Full-Pool, Validation |
-| 4 | **Verifikation** | `pcloud_quick_delta.py` + `pool_verify_backup.py` | tamper-detect (v2/Pool), Integritätscheck |
-
-**Orchestrator:** `rtb_pool_wrapper.sh` → rsync-Dry-Run Gate → `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
-
-**Status:** Production-Ready auf Raspberry Pi (pi-nas)
-
----
-
-## 🏗️ Architekturübersicht
-
-### Komponenten-Stack
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  rtb_pool_wrapper.sh (Orchestrator)                    │
-│  ├─ EntropyWatcher Safety Gate                         │
-│  ├─ rsync_tmbackup.sh                                  │
-│  └─ wrapper_pcloud_pool_sync_1to1.sh ⬅ pCloud-Sync     │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  Pool-Upload-Engine                                    │
-├─────────────────────────────────────────────────────────┤
-│  • Scout: Jaccard-Similarity → Best-Match Remote-Snap  │
-│    ≥ 70%: Turbo-Delta-Mode (copyfolder + Diff)         │
-│    < 70%: Full-Pool-Mode (Preflight + Upload)          │
-│                                                         │
-│  Upload-Pipeline:                                      │
-│  • pcloud_json_pool_manifest.py  (Manifest v4, Smart)  │
-│  • pcloud_push_json_pool_manifest_to_pcloud.py         │
-│  • pcloud_quick_delta.py         (tamper-detect v2)    │
-│                                                         │
-│  Utilities (scripts/utilities/):                       │
-│  • pool_verify_backup.py   (Manifest→Pool+Stubs Check) │
-│  • pool_check_remote.py    (Quick Remote Check)        │
-│  • pool_rebuild_index_v2.py (Index-Rebuild)            │
-│  • check_undefined_names.py (Stdlib-Lint)              │
-│                                                         │
-│  Fundament:                                            │
-│  • pcloud_bin_lib.py       (Binary-API + Streaming)    │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-        ┌─────────────────────────────┐
-        │  MariaDB (pcloud_backup)    │
-        │  backup_runs + phases       │
-        └─────────────────────────────┘
-```
+**Pipeline-Aufruf:** `rtb_pool_wrapper.sh` → `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
 
 ---
 
-## 🧠 Säule 3: Die Smart-Upload-Engine — SmartStrategyController (v2.0)
-
-Seit dem Architektur-Refactoring (v2.0) nutzt die Pipeline einen **Efficiency-Rating-Algorithmus**. Statt bloßer Prozentwerte entscheidet das System basierend auf der **absoluten API-Last-Einsparung** und einem **proaktiven Quota-Schutz (Safe-Gate)**.
-
-### Der Single-Point-of-Decision
-
-Es gibt genau einen Eintrittspunkt für die Strategiewahl. Der Controller erhält alle relevanten Metriken über den `_get_sync_metrics_unified`-Block.
-
-```python
-# pcloud_push_json_manifest_to_pcloud.py
-def push_1to1_smart_controller(cfg, manifest, dest_root, ...):
-    # 1. Metriken einheitlich erfassen (Unified Metrics v2.0)
-    metrics = _get_sync_metrics_unified(cfg, manifest, dest_root, archive_dir)
-    
-    # 2. Strategie deterministisch wählen
-    controller = SmartStrategyController()
-    strategy = controller.decide(metrics)
-    
-    # 3. Entscheidung loggen (mit Performance-Prognose)
-    controller.log_decision(strategy, metrics, snapshot_name)
-    ...
-```
-
-### Die Entscheidungs-Kaskade (2.0)
-
-Der Controller prüft Bedingungen in einer festen Reihenfolge:
-
-1. **Initial-Gate:** Weniger als 2 Snapshots vorhanden? → **SAFE-MODE** (Full-Upload).
-2. **Quota-Investition (Safe-Gate):** Basis-Snapshot hat eine `stub_ratio` < 80%? → **SAFE-MODE**. 
-   *Grund: Wir erzwingen einen Transformations-Run, um alle Dateien in Stubs zu wandeln, damit zukünftige Backups hocheffizient klonen können.*
-3. **Efficiency-Rating (Turbo-Check):**
-   * `saved_calls` = Identische Dateien (müssen nicht angefasst werden).
-   * `cleanup_calls` = Gelöschte + Geänderte Dateien (müssen in pCloud gelöscht werden).
-   * **TURBO-MODE** wird gewählt, wenn:
-     1. `saved_calls > cleanup_calls` (Netto-Gewinn an API-Calls).
-     2. `saved_calls >= 1000` (Mindestlast, damit sich das Klonen lohnt).
-4. **Template-Fallback:** Wenn Turbo nicht zieht, aber das Ordner-Template zu > 90% passt? → **TEMPLATE-SAFE**.
-5. **Fallback:** Sonst → **SAFE-MODE**.
-
-### Unified Metrics (v2.0)
-
-Die Metriken basieren auf dem inhaltlichen Vergleich (SHA256/mtime) und liefern absolute Werte:
-
-* **identical_count**: Dateien, die 1:1 übernommen werden können.
-* **new_count / changed_count**: Dateien, die hochgeladen werden müssen.
-* **deleted_count**: Dateien, die aus dem geklonten Snapshot gelöscht werden müssen.
-* **upload_bytes**: Gesamtes Datenvolumen, das übertragen werden muss.
-* **saved_calls**: Einsparung gegenüber SAFE-MODE (entspricht `identical_count`).
-* **cleanup_calls**: API-Overhead im Turbo-Mode (`deleted_count` + `changed_count`).
-
-### CLI-Flags & Environment Overrides
-
-| Flag / ENV | Wirkung |
-|------------|---------|
-| `--dry-run` | Simuliert die gesamte Entscheidung und Planung ohne API-Writes. |
-| `--use-delta-copy` | Erzwingt **TURBO-MODE** (Delta-Copy), ignoriert alle Gates (außer Initial-Gate). |
-| `PCLOUD_SMART_STUB_TRANSFORM_THRESHOLD` | Threshold für Quota-Gate (Default: `0.80`). |
-| `PCLOUD_SMART_SAVED_CALLS_MIN` | Mindestanzahl identischer Dateien für Turbo (Default: `1000`). |
-| `PCLOUD_SMART_TEMPLATE_STRONG_THRESHOLD` | Threshold für Template-Match (Default: `0.90`). |
-
----
-
-## 🧱 Säule 1: Das Fundament — pcloud_bin_lib.py (2065 Zeilen)
-
-Die gesamte Pipeline baut auf `pcloud_bin_lib.py` auf. Diese Bibliothek implementiert
-die **pCloud Binary-API** (kein REST-SDK, sondern ein eigener Binär-Protokoll-Client)
-und stellt alle Tools bereit, die die oberen Schichten nutzen.
+## 🧱 Säule 1: Das Fundament — pcloud_bin_lib.py
 
 ### Warum eine eigene Binary-API?
 
-pCloud bietet neben der REST-API eine **binäre TCP/TLS-Schnittstelle** auf Port 8399.
-Der Vorteil: kompakteres Request/Response-Format, weniger Overhead.
-Die Bibliothek implementiert einen minimalen Decoder (`_BinReader`), der die
-pCloud-spezifischen Typenbereiche (Strings 0-7/100-199, Numbers 8-15/200-219,
-Hashes Typ 16, Arrays Typ 17, Booleans 18/19, Data 20) parst.
-
-**Kern-Ablauf jedes API-Calls:**
-
-```
-1. Request bauen      → _build_request(method, params, data_len)
-2. TLS-Verbindung     → _connect(host, port, timeout) mit DNS-Cache
-3. Senden + Empfangen → _rpc() → (response_hash, optional_data_bytes)
-4. Ergebnis prüfen    → _expect_ok() → RuntimeError bei result != 0
-```
+pCloud bietet zwei APIs: JSON-API (einfach, langsam, Dateilimit) und Binary-API (schnell, streaming-fähig, kein Limit). Das Tool nutzt ausschließlich die Binary-API über HTTPS mit persistenten TCP-Verbindungen.
 
 ### Kritische Funktion: `read_json_at_path()`
 
-```python
-def read_json_at_path(cfg, path, maxbytes=None):
-    """
-    Liest JSON von pCloud.
-    
-    KRITISCH: maxbytes=None (Default) = unbegrenzt.
-    
-    Hintergrund: Der frühere Default war 1MB (maxbytes=1048576).
-    Das führte bei großen content_index.json (>1MB bei 20k+ Dateien)
-    zu abgeschnittenem JSON → JSONDecodeError → Pipeline-Crash.
-    
-    Fix: maxbytes=None entfernt das Limit komplett.
-    Alle Aufrufer (restore, quick_delta, push) nutzen jetzt maxbytes=None.
-    """
-    txt = get_textfile(cfg, path=path, maxbytes=maxbytes)
-    return json.loads(txt)
-```
-
-**Warum das wichtig ist:** Jedes Tool, das den content_index.json liest,
-ruft letztlich diese Funktion auf. Ein falsches Limit = defekter Index = Chaos.
+Alle Metadata-Operationen gehen durch diese Funktion. Sie handled:
+- Automatische Retry-Logik bei transienten Fehlern
+- Timeout-Handling (konfigurierbar via `PCLOUD_COPYFOLDER_TIMEOUT`)
+- Response-Validation (pCloud gibt manchmal `{}` statt Fehler zurück)
 
 ### Drei Stufen des Datei-Downloads
 
-Die Library bietet drei Wege, Dateien von pCloud zu holen — jeder für einen
-anderen Use-Case optimiert:
+1. **`get_textfile()`** — Kleine Dateien (<1 MB): lädt komplett in RAM
+2. **`download_binaryfile_to()`** — RAM-schonender Streaming-Download für beliebige Größen (chunked, 4 MB Chunks)
+3. **`checksumfile()`** — Nur SHA256/pCloud-Hash anfordern, ohne Dateiinhalt zu laden
 
-| Funktion | RAM-Verbrauch | Use-Case |
-|----------|---------------|----------|
-| `get_textfile()` | Gesamte Datei im RAM | Kleine Texte (<1MB): JSON, Manifeste |
-| `get_binaryfile()` | Gesamte Datei im RAM | Kleine Binärdateien |
-| `download_binaryfile_to()` | **Konstant ~8 MiB** | Große Dateien: Fotos, Videos, Archive |
-
-#### `download_binaryfile_to()` — RAM-schonender Streaming-Download
-
-Das ist **die** kritische Funktion für den Raspberry Pi (512 MB - 4 GB RAM).
-Ohne Streaming würde ein 500 MB Video den gesamten RAM belegen.
-
-**So funktioniert es (vereinfacht für Nicht-Python-Entwickler):**
+### Chunked Upload mit Resume (große Dateien >5 GB)
 
 ```python
-def download_binaryfile_to(cfg, *, path=None, fileid=None,
-                            local_path, sha256_verify=None, chunk_size=8*1024*1024):
-    # 1. Signierten Download-Link holen (getfilelink API)
-    link = get_signed_download_link(cfg, path or fileid)
-    
-    # 2. Streaming-Download: statt r.content (= alles in RAM)
-    #    nutzen wir r.iter_content() (= 8 MiB Häppchen)
-    hash_obj = hashlib.sha256()
-    
-    with session.get(link, stream=True) as r:      # stream=True = Kern des Tricks!
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size): # 8 MiB pro Iteration
-                f.write(chunk)                       # Sofort auf Disk
-                hash_obj.update(chunk)               # SHA256 mitberechnen
-    
-    # 3. SHA256-Verifikation (optional aber empfohlen)
-    actual_sha = hash_obj.hexdigest()
-    if sha256_verify and actual_sha != sha256_verify:
-        os.remove(local_path)  # Korrupte Datei sofort löschen
-        raise ValueError(f"SHA256 MISMATCH: expected {sha256_verify}, got {actual_sha}")
-    
-    return actual_sha
+# Konfiguration via .env:
+PCLOUD_RESUME_THRESHOLD_GB=5    # ab wann Chunked-Upload
+PCLOUD_RESUME_CHUNK_MB=128      # Chunk-Größe
 ```
 
-**Der Trick erklärt:**
-- `stream=True` sagt der HTTP-Library: "Lade den Body NICHT sofort komplett."
-- `iter_content(chunk_size=8MB)` gibt die Daten stückweise zurück.
-- Jedes Stück wird sofort auf die Festplatte geschrieben und für den SHA256-Hash verarbeitet.
-- **Maximaler RAM-Verbrauch: ~8 MiB** — egal ob die Datei 1 MB oder 10 GB groß ist.
+**Mechanismus:**
+1. `_upload_file_smart()`: wählt automatisch zwischen normalem und Chunked-Upload
+2. `_upload_file_resumable()`: Initiiert Upload-Session, schreibt Resume-State nach jedem Chunk
+3. Bei Unterbrechung: `server_offset` aus pCloud API gelesen, Upload ab diesem Byte fortgesetzt
+4. Resume-State wird in `/srv/pcloud-archive/resume/` persistiert (Dateiname = `<safe_path>_<sha256>.state.json`)
 
-### Weitere wichtige Funktionen
+### Parallele Uploads (kleine Dateien)
 
-| Funktion | Zweck |
-|----------|-------|
-| `copyfolder()` | Server-seitiges Klonen (Delta-Copy Phase 2) |
-| `copyfile()` | Server-seitige Dateikopie (Index-Archivierung) |
-| `ensure_path()` / `ensure_path_cached()` | Ordnerstruktur rekursiv anlegen |
-| `upload_streaming()` | Datei-Upload via REST mit Keep-Alive Session |
-| `delete_folder(recursive=True)` | Snapshot-Löschung (Gap-Handling) |
-| `stat_file()` | Datei-Metadaten (fileid, size, hash) |
-| `call_with_backoff()` | Retry mit exponential Backoff bei API-Fehlern |
-| `effective_config()` | Config aus .env + Profilen + Overrides zusammenbauen |
+```python
+PCLOUD_UPLOAD_THREADS=4          # Default: 4 Threads
+PCLOUD_SMALL_FILE_THRESHOLD_MB=50  # Dateien < 50 MB → parallel
+```
+
+Kleine Dateien (<50 MB) werden mit 4 Threads parallel hochgeladen. Große Dateien laufen sequenziell (Chunked-Resume nicht thread-safe).
 
 ### Keep-Alive Session & DNS-Cache
 
-Zwei Performance-Optimierungen, die bei tausenden API-Calls den Unterschied machen:
-
 ```python
-# 1. Globale Keep-Alive Session (Modul-Level, einmalig)
-_session = requests.Session()
-_session.headers.update({"Connection": "keep-alive"})
-adapter = HTTPAdapter(max_retries=2, pool_connections=10, pool_maxsize=10)
-# → Wiederverwendet TCP-Verbindungen statt jedes Mal neu aufzubauen
-
-# 2. DNS-Cache (verhindert tausende DNS-Lookups)
-_dns_cache = {}
-def _resolve_cached(host, port):
-    key = (host, port)
-    if key not in _dns_cache:
-        _dns_cache[key] = socket.getaddrinfo(host, port, AF_INET, SOCK_STREAM)[0][4][0]
-    return _dns_cache[key]
+# Globale Session (Modul-Level, einmalig initialisiert)
+_SESSION = requests.Session()
+_SESSION.mount('https://', HTTPAdapter(pool_connections=4, pool_maxsize=8))
 ```
+
+Verhindert TCP-Reconnects zwischen API-Calls. Spart ~50 ms pro Call bei stabiler Verbindung.
 
 ---
 
-### Folder-Template für schnelle Ordner-Erstellung
+## 🗃️ Säule 2: Pool-Struktur & v2-Index
 
-**Problem:** Bei jedem neuen Snapshot müssen 1000+ Ordner einzeln angelegt werden (5+ Minuten bei 1101 Ordnern).
-
-**Lösung:** Intelligentes Template-System mit auto-management:
-- Erstes Upload: Template wird nach Ordner-Anlage erstellt (Ordner leer!)
-- Weitere Uploads: Template via `copyfolder` kopieren statt 1101× `ensure_path`
-- Delta-Korrektur: Fehlende anlegen, Überflüssige löschen
-- Auto-Update: Template bei Struktur-Änderung aktualisieren
-
-#### Mechanismus
-
-**Erstes Upload (Bootstrap oder neuer Snapshot):**
-
-```python
-# pcloud_push_json_manifest_to_pcloud.py
-# 1. Ordner einzeln anlegen (parallel, nach Tiefe)
-_create_folders_parallel(manifest_folders, threads=4)
-
-# 2. Template erstellen (JETZT - Ordner sind leer!)
-if len(manifest_folders) > 50:
-    pc.copyfolder(dest_snapshot_dir → template_path)
-    _save_template_manifest(folders, snapshot_name)
-```
-
-**Timing-Fenster:** Template wird erstellt **nachdem** Ordner angelegt wurden, aber **bevor** Dateien hochgeladen werden → Ordner sind leer → kein Datei-Löschaufwand!
-
-**Weiteres Upload:**
-
-```python
-# 1. IST-Zustand von pCloud laden (pCloud = Single Source of Truth!)
-template_folders = _list_remote_folders_from_template(cfg, template_path)
-
-# 2. SOLL-Zustand aus aktuellem Manifest
-manifest_folders = set(...)
-
-# 3. Diff berechnen
-to_add = manifest_folders - template_folders       # Neue Ordner
-to_delete = template_folders - manifest_folders    # Überflüssige
-
-# 4. Template kopieren (1 API-Call statt 1101!)
-pc.copyfolder(template_path → dest_snapshot_dir)
-
-# 5. Delta-Korrektur
-for folder in to_delete:
-    pc.delete_folder(folder, recursive=False)  # Tiefste zuerst
-for folder in to_add:
-    pc.ensure_path(folder)  # Parallel nach Tiefe
-
-# 6. Template aktualisieren (bei Struktur-Änderung)
-if to_add or to_delete:
-    pc.delete_folder(template_path, recursive=True)
-    pc.copyfolder(dest_snapshot_dir → template_path)
-    _save_template_manifest(manifest_folders, snapshot_name)
-```
-
-**Resultat:** `/Backup/rtb_1to1/_folder_template/` mit 1101 leeren Ordnern
-
-#### Performance-Gewinn
-
-**Ohne Template (Erstes Upload):**
-```
-[folders] 1101 Ordner einzeln mit ensure_path() anlegen
-[folders] 4 Threads, ebenenweise
-[folders] ✓ 1101 Ordner erfolgreich angelegt (298s)
-[template] Erstelle initiales Template (Ordner sind noch leer)...
-[template] ✓ Template erstellt via copyfolder
-→ Dauer: ~5 Minuten + Template-Erstellung
-```
-
-**Mit Template (Weitere Uploads):**
-```
-[template] Lade aktuellen Template-Zustand von pCloud... (1.2s, 1101 folders)
-[template] Überlapp: 1095/1101 (99%) | Delta: +6 neue, -0 überflüssige
-[template] Kopiere Template → 2026-04-28-120000 ...
-[template] ✓ Template kopiert (~2-5s statt ~5min)
-[template] Lege 6 fehlende Ordner an... (parallel)
-→ Dauer: ~5 Sekunden
-→ Speedup: 60× schneller! 🚀
-```
-
-#### Implementation Details
-
-**Code-Location:** `pcloud_push_json_manifest_to_pcloud.py` Zeilen ~1540-1750
-
-**Wichtige Funktionen:**
-```python
-def _list_remote_folders_from_template(cfg, template_path):
-    """Lädt IST-Zustand des Templates von pCloud (1 API-Call)."""
-    # listfolder(recursive=True, nofiles=True)
-    # → Set von Ordner-relpaths
-
-def _load_template_manifest(archive_dir):
-    """Lädt lokales Manifest (nur für Dokumentation)."""
-    # Gibt None zurück wenn fehlt
-
-def _save_template_manifest(archive_dir, template_path, folders, snapshot_name):
-    """Speichert Manifest nach Template-Update (atomic write)."""
-    # /srv/pcloud-archive/folder_template_manifest.json
-```
-
-**pCloud = Single Source of Truth:**
-- IST-Zustand: Via `listfolder` von pCloud (nicht lokales Manifest!)
-- SOLL-Zustand: Aus aktuellem Snapshot-Manifest
-- Diff: IST vs. SOLL
-- Vorteil: Robust gegen Manifest-Korruption, immer aktuell
-
-**Lokales Manifest:**
-- Wird **nur zum Speichern** verwendet (Dokumentation)
-- **Nicht für Diff-Berechnung** (zu gefährlich!)
-- Zeigt letzten bekannten Stand
-
-#### Environment Variables
-
-```bash
-# Pfad zum Archiv-Verzeichnis (für Manifest-Speicherung)
-export PCLOUD_ARCHIVE_DIR="/srv/pcloud-archive"  # default
-
-# Parallele Threads für Ordner-Anlage
-export PCLOUD_FOLDER_THREADS=4  # default
-
-# Template-Verzeichnisname (hardcoded: _folder_template)
-```
-
-#### Log-Ausgabe
-
-**Erstes Upload (Template-Erstellung):**
-```
-[folders] Einzeln anlegen (kein Template vorhanden)...
-[folders] Erstelle 1101 Ordner (4 Threads, nach Tiefe)...
-[folders] ✓ 1101 Ordner erfolgreich angelegt (298s)
-[template] Erstelle initiales Template (Ordner sind noch leer)...
-[template] ✓ Template erstellt: /Backup/rtb_1to1/_folder_template
-[template] Manifest gespeichert: 1101 Ordner
-```
-
-**Weiteres Upload (Template-Nutzung):**
-```
-[template] Lade aktuellen Template-Zustand von pCloud...
-[template] Template hat 1101 Ordner (1.2s)
-[template] Überlapp: 1095/1101 (99%)
-[template] Delta: +6 neue, -0 überflüssige
-[template] Kopiere Template → 2026-04-28-120000 ...
-[template] ✓ Template kopiert (~2-5s statt ~5min)
-[template] Lege 6 fehlende Ordner an...
-[template] ✓ 6 neue Ordner angelegt (0.8s)
-```
-
-**Template-Update (Struktur-Änderung):**
-```
-[template] Delta: +50 neue, -10 überflüssige
-[template] Aktualisiere Template mit neuer Struktur...
-[template] ✓ Template aktualisiert (1141 Ordner)
-```
-
-#### Verifikation
-
-Prüfe ob Template korrekt erstellt wurde:
-
-```bash
-# 1. Template-Existenz
-ls -la /srv/pcloud-archive/folder_template_manifest.json
-
-# 2. Via pCloud API
-python3 -c "
-import pcloud_bin_lib as pc
-cfg = pc.effective_config()
-result = pc.listfolder(cfg, path='/Backup/rtb_1to1/_folder_template', recursive=True, nofiles=True)
-folders = [c['name'] for c in result['metadata']['contents']]
-print(f'Template: {len(folders)} Ordner')
-"
-
-# Erwartung: 1101 Ordner, KEINE Dateien
-```
-
-#### Troubleshooting
-
-**Template fehlt nach erstem Upload:**
-- Check: Snapshot hatte < 50 Ordner? (Threshold nicht erreicht)
-- Lösung: Template wird beim nächsten Upload automatisch erstellt
-
-**Template veraltet:**
-- Symptom: Viele Delta-Korrekturen bei jedem Upload
-- Auto-Fix: Template wird automatisch aktualisiert (bei Delta > 0)
-- Manuell: Template löschen → wird beim nächsten Upload neu erstellt
-
-**Template-Manifest fehlt:**
-- Unkritisch: Wird beim nächsten Update neu erstellt
-- Lokales Manifest ist nur Dokumentation (nicht für Diff!)
-
----
-
-## 🔍 Säule 2: Gap-Handling & Upload-Orchestrierung
-
-### 1. Implementierung (wrapper_pcloud_sync_1to1.sh, 645 Zeilen)
-
-**Hauptfunktionen:**
-
-#### `validate_snapshot_integrity()`
-
-**Zweck:** Prüft ob ein Snapshot konsistent ist (3-Stufen-Check).
-Wird im Optimistic-Modus aufgerufen, um zwischen Scenario A und B zu unterscheiden.
-
-**Check-Sequence:**
-```bash
-1. Manifest lokal vorhanden?
-   → /srv/pcloud-archive/manifests/${snapshot}.json
-   → MISSING_MANIFEST falls nicht vorhanden
-
-2. ref_snapshot auslesen (via jq)
-   → "null" = erstes Manifest → OK
-   → Wert vorhanden → Weiter zu Check 3
-
-3. Referenz-Snapshot remote vorhanden?
-   → remote_snapshot_exists("${ref_snapshot}")
-   → NO = BROKEN_CHAIN
-   → YES = OK
-```
-
-**Return-Codes:**
-- `OK` - Snapshot intakt
-- `MISSING_MANIFEST` - Kein lokales Manifest
-- `BROKEN_CHAIN` - Referenz fehlt remote
-
-**Erweiterungsfähig:**
-```bash
-# Optional: Deep-Validation via pcloud_quick_delta
-# Aktuell: Nur Manifest + Ref-Check (Performance-Optimiert)
-# Aktivierbar via: PCLOUD_DEEP_GAP_VALIDATION=1
-```
-
----
-
-#### `delete_remote_snapshot()`
-
-**Zweck:** Löscht Remote-Snapshot rekursiv
-
-**Technik:**
-- Python-Inline via HERE-Doc
-- Nutzt `pcloud_bin_lib.delete_folder(recursive=True)`
-- Fehlerbehandlung: EXIT 1 bei Fehler
-
-**API-Call:**
-```python
-pc.delete_folder(cfg, path="/Backup/rtb_1to1/_snapshots/YYYY-MM-DD", recursive=True)
-```
-
-**Logging:**
-```
-_log INFO "Deleting remote snapshot: 2026-04-15"
-→ OK (stdout) oder ERROR: ... (stderr + exit 1)
-```
-
----
-
-#### Gap-Detection-Loop (Hauptschleife nach `# Sync-Check`)
-
-**Workflow:**
-
-```bash
-1. Snapshot-Listen laden
-   local_snaps=()   # find $RTB -type d (lokal)
-   remote_snaps=()  # load_remote_snapshots (Python → REST listfolder)
-
-2. For each local_snap:
-   IF remote existiert NICHT:
-     → Prüfe: Existieren SPÄTERE Snapshots remote?
-       JA → Gap detected (is_gap=1)
-       NEIN → Neuer Snapshot (regulärer Upload via build_and_push)
-
-3. Gap-Handling nach Strategie:
-   → Conservative: ABORT + Manual
-   → Optimistic: validate_snapshot_integrity() → Scenario A/B
-   → Aggressive: DELETE + REBUILD
-```
-
-**Gap-Strategien:**
-
-| Strategie | Validierung | Verhalten | Use-Case |
-|-----------|-------------|-----------|----------|
-| **Conservative** | Keine | ABORT + Manual | PoC-Testing |
-| **Optimistic** ⭐ | Ja (Smart) | A/B-Detection | Produktion |
-| **Aggressive** | Keine | Force-Rebuild | Disaster-Recovery |
-
-**Scenario-Unterscheidung (Optimistic):**
-
-```bash
-# Alle späteren Snapshots validieren
-for later in "${later_snaps[@]}"; do
-  status=$(validate_snapshot_integrity "$later")
-  
-  if [[ "$status" != "OK" ]]; then
-    needs_rebuild=1  # Scenario A
-    break
-  fi
-done
-
-if [[ $needs_rebuild -eq 1 ]]; then
-  # SCENARIO A: Broken Chain
-  # → DELETE alle späteren
-  # → UPLOAD Gap + Rebuild alle
-else
-  # SCENARIO B: Intact Chain
-  # → UPLOAD nur Gap
-fi
-```
-
-**Performance-Metriken:**
-
-```bash
-uploaded_count   # Gesamt hochgeladene Snapshots
-gap_count        # Gefüllte Gaps
-new_count        # Neue Snapshots (kein Gap)
-rebuild_count    # Rebuilder Snapshots (Scenario A)
-
-# → MariaDB (Tabelle: backup_runs):
-#   gaps_synced       = Anzahl gefüllter Lücken
-#   new_snapshots     = Neu hochgeladene Snapshots
-#   rebuilt_snapshots = Anzahl Snapshots die wegen Scenario A (Broken Chain)
-#                       gelöscht und komplett neu hochgeladen werden mussten.
-#                       Ein hoher Wert hier deutet auf häufige Upload-Unterbrechungen hin.
-```
-
-#### `build_and_push()` — Der Upload-Kernel
-
-Diese Funktion ist der Kern jedes Snapshot-Uploads (ob neu, Gap-Fill oder Rebuild).
-Sie orchestriert drei Phasen:
+### Pool-Struktur auf pCloud
 
 ```
-Phase 1: MANIFEST erstellen
-  → pcloud_json_manifest.py --root $SNAP --snapshot $SNAPNAME --hash sha256
-  → Smart-Mode: Sucht automatisch letztes archiviertes Manifest als Referenz
-  → Dauer wird in MariaDB als manifest_duration_sec geloggt
+/Backup/rtb_pool/
+  _pool/
+    00/ … FF/           ← 256 Ordner (erster Byte von SHA256)
+      <sha256>          ← physische Datei (Originalinhalt, einmal gespeichert)
 
-Phase 2: UPLOAD
-  → pcloud_push_json_manifest_to_pcloud.py --manifest $mani --dest-root $PCLOUD_DEST
-  → Bei PCLOUD_USE_DELTA_COPY=1: Delta-Mode (copyfolder + selective update)
-  → Sonst: Full-Mode (alle Dateien + Stubs neu schreiben)
-  → Dauer wird als upload_duration_sec geloggt
+  _snapshots/
+    <snap>/
+      <relpath>.meta.json   ← Stub (Zeiger auf Pool-Objekt)
+      .upload_started        ← Upload-Marker: läuft
+      .upload_complete       ← Upload-Marker: fertig + validiert
 
-Phase 3: VERIFY (Delta-Check)
-  → pcloud_quick_delta.py → Vergleicht LIVE vs. Index
-  → Delta-Report wird archiviert: ${PCLOUD_ARCHIVE_DIR}/deltas/
-  → Non-critical: Fehlschlag blockiert NICHT den Upload-Erfolg
+    _index/
+      content_index.json         ← Master-Index v2
+      archive/
+        <snap>_index.json        ← gefilterte per-Snapshot-Kopie
 ```
 
-**Wichtig:** Bei Phase-2-Fehler wird das temporäre Manifest gelöscht und `return 1`
-ausgelöst — die Gap-Handling-Schleife entscheidet dann über Abbruch oder Fortfahrt.
+### v2-Index-Format (content_index.json)
 
----
+Der Index ist **SHA256-keyed** (Pool ist sha-nativ: ein SHA = eine Datei, N Referenzen). `snapshots` ist eine **Map** `{snap → [relpaths]}`, nicht mehr eine Liste:
 
-### 2. MariaDB-Integration
-
-**Tabellen:** `backup_runs` (Haupttabelle) und `backup_phases` (Phase-Timing)
-
-**Tracking-Funktionen:**
-
-#### `_db_run_start()`
-```bash
-# Generiert Run-ID (uuidgen oder /proc/sys/kernel/random/uuid)
-# INSERT INTO backup_runs (run_id, snapshot_name, status, started_at)
-```
-
-#### `_db_run_end()`
-```bash
-# Parameter: status (SUCCESS/FAILED), error_msg
-# UPDATE backup_runs SET status, finished_at, duration_sec, error_message
-```
-
-#### `_db_phase_log()`
-```bash
-# Loggt Phasen-Start/Ende in backup_phases Tabelle
-# Parameter: phase_name (manifest/upload/verify), action (start/end), status
-```
-
-#### `_db_update_metrics()`
-```bash
-# Parameter: SQL-Fragment (z.B. "gaps_synced = 1, rebuilt_snapshots = 2")
-# UPDATE backup_runs SET <metrics> WHERE run_id = $RUN_ID
-```
-
-**Metriken-Spalten in backup_runs:**
-```sql
-gaps_synced INT DEFAULT 0,         -- Gefüllte Lücken (Scenario A + B)
-new_snapshots INT DEFAULT 0,       -- Erstmalig hochgeladene Snapshots
-rebuilt_snapshots INT DEFAULT 0,   -- Wegen Broken Chain neu gebaute Snapshots
-manifest_duration_sec INT,
-upload_duration_sec INT,
-verify_duration_sec INT
-```
-
-**Beispiel-Query:**
-```sql
-SELECT run_id, gaps_synced, rebuilt_snapshots, status
-FROM backup_runs
-WHERE gaps_synced > 0
-ORDER BY started_at DESC
-LIMIT 10;
-```
-
----
-
-### 3. Logging-System
-
-**Dual-Output:**
-
-1. **Human-Readable (STDOUT + pcloud_sync.log)**
-   ```
-   2026-04-17T10:30:00+02:00 [WARN] Gap detected: Snapshot 2026-04-15 missing
-   2026-04-17T10:30:05+02:00 [INFO] Validating integrity of later snapshots...
-   2026-04-17T10:30:10+02:00 [INFO]   → 2026-04-16: OK
-   ```
-
-2. **Structured JSONL (pcloud_sync.jsonl)**
-   ```json
-   {"timestamp":"2026-04-17T10:30:00+02:00","level":"WARN","message":"Gap detected...","run_id":"abc123"}
-   {"timestamp":"2026-04-17T10:30:05+02:00","level":"INFO","message":"Validating...","run_id":"abc123"}
-   ```
-
-**Query-Beispiel:**
-```bash
-jq -r 'select(.level == "WARN" or .level == "ERROR")' /var/log/backup/pcloud_sync.jsonl
-```
-
----
-
-## ⚡ Säule 3: Delta-Copy-Modus (TURBO)
-
-### Implementierung (pcloud_push_json_manifest_to_pcloud.py, 2093 Zeilen)
-
-#### `push_1to1_delta_mode()`
-
-**6-Phasen-Workflow:**
-
-```python
-Phase 1: Basis-Snapshot finden
-  → Letzten vollständigen Snapshot (mit .upload_complete)
-  → Sortiert absteigend (neueste zuerst)
-  → Fallback zu push_1to1_mode() falls keiner gefunden
-
-Phase 1.5: Stub-Ratio-Check ⭐ KRITISCH!
-  → _compute_snapshot_stub_ratio(index, basis_snapshot)
-  → Threshold: >=50% Stubs + >=100 Dateien
-  → Verhindert: copyfolder von echten Files (doppelte Quota!)
-  → Fallback: Safe-Mode (neuer Aufbau mit Stub-Struktur)
-
-Phase 2: copyfolder() - Server-Side Clone
-  → API: pc.copyfolder(from=basis, to=new, copycontentonly=True)
-  → Dauer: ~2-5s (statt 3.5h bei vollem Upload)
-  → Timeout: 300s (Meta-Operation bei 20k+ Dateien)
-  → Polling: 30x mit 2s Delay (Snapshot-Sichtbarkeit)
-
-Phase 3: Manifest-Diff berechnen
-  → pcloud_manifest_diff.py (current vs. reference)
-  → Kategorien: identical, new, changed, deleted
-  → Dauer: ~10s bei 100k Dateien
-
-Phase 4: DELETE-Loop
-  → Gelöschte Dateien: API delete
-  → Geänderte Dateien: API delete (dann in Phase 5 re-upload)
-
-Phase 5: WRITE-Loop
-  → Neue Dateien: Upload + Index-Update
-  → Geänderte Dateien: Upload + Index-Update
-  → Stubs: JSON-Write via _batch_write_stubs()
-
-Phase 6: Index + Marker schreiben
-  → content_index.json aktualisieren
-  → .upload_complete Marker setzen
-```
-
-**Performance:**
-- **Typisch:** 60x-210x schneller bei minimalen Änderungen
-- **Extremfall:** 100k Dateien, 1 Änderung: 3.5h → <2min
-
----
-
-#### `_compute_snapshot_stub_ratio()`
-
-**Zweck:** Berechnet Stub-Ratio für Snapshot (lokal, O(n))
-
-**Algorithmus:**
-```python
-for sha, node in index["items"].items():
-    anchor_path = node.get("anchor_path")
-    
-    # Extrahiere Snapshot-Name aus Anchor
-    anchor_snap = extract_snapshot_from_path(anchor_path)
-    
-    # Prüfe Holder
-    is_holder = any(h.get("snapshot") == snapshot_name for h in node["holders"])
-    
-    if anchor_snap == snapshot_name or is_holder:
-        total += 1
-        if anchor_snap != snapshot_name:  # Holder aber kein Anchor
-            stub_count += 1
-
-ratio = stub_count / total if total > 0 else 0.0
-return (total, stub_count, ratio)
-```
-
-**Threshold-Check:**
-```python
-_min_stub_ratio = float(os.environ.get("PCLOUD_COPYFOLDER_MIN_STUB_RATIO", "0.5"))
-_min_files = int(os.environ.get("PCLOUD_COPYFOLDER_MIN_FILES", "100"))
-
-if total < _min_files or ratio < _min_stub_ratio:
-    # SAFE-MODE: Baue mit frischer Stub-Struktur auf
-    return push_1to1_mode(...)  # Einmalige Transformation
-else:
-    # TURBO-MODE: copyfolder + Delta
-    ...
-```
-
-**Reasoning:**
-- **Problem:** copyfolder klont echte Files → doppelte Quota
-- **Lösung:** Nur bei Stub-dominierten Snapshots nutzen
-- **Transformation:** Erster Run nach Migration = Safe-Mode, danach TURBO
-
----
-
-## 🔍 Integrity-Verification
-
-### pcloud_quick_delta.py (Tamper-Detection)
-
-**Verbesserungen in aktueller Version:**
-
-#### Marker-Files-Ignorierung in `_flatten_tree()`
-
-**Problem:** `.upload_started`, `.upload_complete` wurden als "UNKNOWN" gemeldet
-
-**Fix:**
-```python
-def _flatten_tree(metadata: dict, ...):
-    MARKER_FILES = {
-        ".upload_started", 
-        ".upload_complete", 
-        ".upload_aborted", 
-        ".upload_incomplete"
+```json
+{
+  "version": 2,
+  "pool_refs": {
+    "f153611a35...9886": {
+      "fileid": 96720201405,
+      "hash": 5016324286669844513,
+      "size": 805637,
+      "snapshots": {
+        "2026-04-27-173201": ["Gemeinsam/Rest/dokument.pdf"],
+        "2026-05-15-120009": [
+          "Gemeinsam/Rest/dokument.pdf",
+          "Gemeinsam/Haus/Solar/dokument.pdf"
+        ]
+      }
     }
-    
-    if name in MARKER_FILES:
-        return []  # Skip Marker-Dateien
-```
-
-**Resultat:** Keine False-Positives mehr in Delta-Reports
-
----
-
-#### Index-Archive-Support in `_load_index()`
-
-**Feature:** Unterstützt Snapshot-isolierte Archive-Indexes
-
-```python
-def _load_index(cfg, snaps_root, index_file="content_index.json"):
-    is_archive = (index_file != "content_index.json")
-    
-    if is_archive:
-        # Archive-Indexes unter _index/archive/
-        idx_path = f"{snaps_root}/_index/archive/{index_file}"
-    else:
-        # Master-Index
-        idx_path = f"{snaps_root}/_index/content_index.json"
-```
-
-**Use-Case:** Recovery, Debugging, historische Checks
-
----
-
-#### Snapshot-Filtering via `extract_snapshots_from_index()`
-
-**Feature:** Nur bestimmte Snapshots prüfen
-
-```python
-def extract_snapshots_from_index(index: dict) -> Set[str]:
-    # Extrahiert Snapshot-Namen aus holders
-    snapshots = set()
-    for sha, node in index["items"].items():
-        for h in node.get("holders", []):
-            snap = h.get("snapshot")
-            if snap:
-                snapshots.add(snap)
-    return snapshots
-
-# Usage:
-snapshot_filter = {"2026-04-15", "2026-04-16"}
-by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter)
-```
-
-**Performance:** Massiv schneller bei partiellen Checks
-
----
-
-## 📦 Manifest-Diff (Delta-Copy-Basis)
-
-### pcloud_manifest_diff.py
-
-**Kategorisierung:**
-
-```python
-identical = []  # Pfad, SHA256, mtime gleich → SKIP
-new = []        # Nur in current → UPLOAD
-changed = []    # Pfad gleich, aber SHA256/mtime anders → DELETE + UPLOAD
-deleted = []    # Nur in reference → DELETE
-```
-
-**Algorithmus:**
-```python
-1. Indizes aufbauen: relpath → item
-2. Set-Operationen:
-   new_paths = current_paths - reference_paths
-   deleted_paths = reference_paths - current_paths
-   common_paths = current_paths & reference_paths
-
-3. Common-Paths prüfen:
-   for relpath in common_paths:
-       cur_hash = current_files[relpath].get("sha256")
-       ref_hash = reference_files[relpath].get("sha256")
-       
-       if cur_hash == ref_hash:
-           identical.append(...)
-       else:
-           changed.append(...)
-```
-
-**Integration in Delta-Copy:**
-```python
-# Phase 3: Diff berechnen
-diff = compare_manifests(current_manifest, reference_manifest)
-
-# Phase 4: DELETE-Loop
-for item in diff["deleted"] + diff["changed"]:
-    delete_file(item["relpath"])
-
-# Phase 5: WRITE-Loop
-for item in diff["new"] + diff["changed"]:
-    upload_or_stub(item)
-```
-
----
-
-## � Chunked Upload with Resume (Large File Support)
-
-**Status:** Production-Ready (seit April 2026)  
-**Komponente:** `pcloud_push_json_manifest_to_pcloud.py`  
-**Zweck:** Robuste Uploads für große Dateien (>5 GB) mit automatischem Resume bei Abbruch
-
-### Problemstellung
-
-**Vorher:** Große Dateien (z.B. 50 GB VM-Images) wurden bei Netzwerkunterbrechungen von 0 neu hochgeladen.  
-**Overhead:** 98% Upload → 2% fehlen → Timeout → 100% Neustart ❌
-
-**Jetzt:** Chunked-Upload mit State-Persistenz → Resume bei Unterbrechung ✅
-
-### Architektur-Übersicht
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  _upload_file_smart() - Routing                        │
-│  ├─ Datei < 5 GB  → Standard-Upload (wie vorher)       │
-│  └─ Datei ≥ 5 GB  → _upload_file_resumable()           │
-└─────────────────────────────────────────────────────────┘
-                         │
-        ┌────────────────┴────────────────┐
-        │                                 │
-        ▼                                 ▼
-┌──────────────────┐            ┌──────────────────┐
-│ Standard-Upload  │            │ Chunked-Upload   │
-│                  │            │                  │
-├──────────────────┤            ├──────────────────┤
-│ • pc.upload_file │            │ • upload_create  │
-│ • 12 Retries     │            │ • upload_write   │
-│ • Schnell        │            │ • upload_save    │
-│ • < 5 GB         │            │ • upload_info    │
-│                  │            │ • 5 Retries/Chunk│
-│                  │            │ • State-Files    │
-└──────────────────┘            └──────────────────┘
-```
-
-### Kern-Funktionen
-
-#### 1. `_upload_file_smart(cfg, local_path, remote_path, dry)`
-
-**Zweck:** Routing-Funktion → Smart-Selection basierend auf Dateigröße
-
-**Logik:**
-```python
-file_size = os.path.getsize(local_path)
-
-if file_size > RESUME_THRESHOLD_BYTES:  # Default: 5 GB
-    return _upload_file_resumable(cfg, local_path, remote_path, dry=dry)
-else:
-    return pc.call_with_backoff(pc.upload_file, cfg, local_path=local_path, 
-                                remote_path=remote_path, attempts=12, max_sleep=60.0)
-```
-
-**Konfiguration:**
-```bash
-# Threshold anpassen (Standard: 5 GB)
-export PCLOUD_RESUME_THRESHOLD_GB=10  # Nur Dateien > 10 GB chunked
-
-# Chunk-Größe anpassen (Standard: 128 MB)
-export PCLOUD_RESUME_CHUNK_MB=256     # Größere Chunks (weniger API-Calls)
-```
-
----
-
-#### 2. `_upload_file_resumable(cfg, local_path, remote_path, dry)`
-
-**Zweck:** Chunked-Upload mit State-Persistenz und Server-Synchronisation
-
-**3-Phasen-Workflow:**
-
-```python
-Phase 1: Initialisierung & State-Laden
-  → State-Dir ermitteln: /srv/pcloud-archive/resume/ (prod) oder ~/.pcloud_resume/
-  → State-File: {filename}_{sha256_hash}.state.json (eindeutig via remote_path)
-  → Existiert State? → Lade uploadid, offset, file_hash
-  → Kein State? → Berechne SHA256 für Datei (einmalig)
-
-Phase 2: Server-Synchronisation (bei Resume)
-  → upload_info(uploadid) → Hole aktuellen Server-Offset
-  → Vergleiche: local_offset vs server_offset
-  → Mismatch? → Korrektur auf server_offset (Server = Source of Truth)
-  → Metrik: MET_RESUMED_FILES += 1
-
-Phase 3: Chunked-Upload mit Retry-Logik
-  → Chunk-Loop: 128 MB pro Iteration
-  → upload_write(uploadid, offset, chunk_data)
-    → Bei Fehler: 5 Retry-Attempts mit Exponential Backoff (2^n Sekunden)
-  → State speichern nach JEDEM Chunk (für Resume)
-  → Progress-Log alle 10 Chunks
-  
-  → Finalisierung: upload_save(uploadid, folderid, name)
-    → Bei Fehler: 5 Retry-Attempts (kritisch!)
-  
-  → SHA256-Verifikation: checksumfile(fileid) vs. local_hash
-  → State-Cleanup bei Erfolg
-```
-
-**State-File-Format:**
-```json
-{
-  "uploadid": 1696654321,
-  "offset": 3221225472,
-  "chunks_uploaded": 24,
-  "file_hash": "abc123def456...",
-  "file_size": 10737418240,
-  "remote_path": "/My Cloud/Backup/rtb_1to1/_snapshots/.../large.img",
-  "status": "in_progress",
-  "updated_at": 1745668800.123
+  }
 }
 ```
 
-**Retry-Strategie:**
-- **upload_write():** 5 Attempts mit 2-16s Exponential Backoff
-- **upload_save():** 5 Attempts mit 2-16s Exponential Backoff
-- **Gesamt:** Jeder Chunk wird bis zu 5x versucht (transiente Fehler überleben)
-
----
-
-#### 3. `_get_resume_state_dir()`
-
-**Zweck:** Ermittelt State-Directory mit Fallback-Logik
-
-**Prioritäten:**
-```python
-1. ENV: PCLOUD_RESUME_DIR (manuelles Override)
-2. Production: /srv/pcloud-archive/resume/ (wenn schreibbar)
-3. User: ~/.pcloud_resume/ (Fallback 1)
-4. Temp: /tmp/pcloud_resume/ (Fallback 2, immer schreibbar)
-```
-
-**Write-Permission-Test:** Erstellt Test-File vor Auswahl (verhindert Permission-Errors später)
-
----
-
-### Binary Protocol: Upload-Funktionen
-
-Die Chunked-Upload-Funktionen nutzen die pCloud Binary API (implementiert in `pcloud_bin_lib.py`):
-
-| Funktion | API-Call | Zweck |
-|----------|----------|-------|
-| `upload_create(cfg)` | `upload_create` | Erstellt Upload-Session → `uploadid` |
-| `upload_write(cfg, uploadid, offset, data)` | `upload_write` | Schreibt Chunk an Offset |
-| `upload_save(cfg, uploadid, folderid, name)` | `upload_save` | Finalisiert Upload → File-Metadata |
-| `upload_info(cfg, uploadid)` | `upload_info` | Fragt Server-Status ab → Offset |
-| `checksumfile(cfg, fileid)` | `checksumfile` | Holt SHA256 vom Server |
-
-**Performance:**
-- **Chunk-Write:** ~1-2s pro 128 MB (Netzwerk-abhängig)
-- **upload_info():** <100ms (leichtgewichtige Meta-Abfrage)
-- **SHA256-Berechnung:** ~500 MB/s (lokal, CPU-abhängig)
-
----
-
-### Integration in Upload-Modi
-
-**Alle drei Modi nutzen automatisch `_upload_file_smart()`:**
-
-#### push_objects_mode() (Hash-Object-Store)
-```python
-obj_path = object_path_for(objects_root, sha, ext, layout=objects_layout)
-md = stat_file_safe(cfg, path=obj_path)
-if not md:
-    _upload_file_smart(cfg, it["source_path"], obj_path, dry=dry)  # ← Auto-Routing
-```
-
-#### push_1to1_mode() (Snapshot-Trees)
-```python
-def _upload_real_file(abs_src, dst_path):
-    res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)  # ← Auto-Routing
-    return (fileid, pcloud_hash)
-```
-
-#### push_1to1_delta_mode() (Incremental)
-```python
-def _upload_real_file(abs_src, dst_path):
-    res = _upload_file_smart(cfg, abs_src, dst_path, dry=dry)  # ← Auto-Routing
-    return (fileid, pcloud_hash)
-```
-
-**➡️ Transparente Integration:** Kleine Dateien nutzen weiterhin Standard-Upload (keine Performance-Änderung), nur große Dateien profitieren vom Chunked-Modus.
-
----
-
-### Resume-Szenarien
-
-#### Szenario 1: Netzwerk-Timeout bei 30%
-```
-1. Upload startet: 10 GB Datei
-2. Bei 3 GB: Netzwerk-Timeout → Script-Abbruch
-3. State-File gespeichert: offset=3GB, chunks_uploaded=23
-4. Neustart: Script erkennt State
-5. upload_info(): Server bestätigt 3 GB
-6. Resume bei 3 GB → Upload von 3-10 GB
-7. Erfolg: SHA256 verifiziert
-8. State-File gelöscht
-```
-
-#### Szenario 2: upload_save() schlägt fehl
-```
-1. Upload: Alle 10 GB Chunks hochgeladen
-2. upload_save(): Netzwerkfehler bei Finalisierung ❌
-3. State-File: offset=10GB (alle Chunks da)
-4. Datei existiert NICHT auf pCloud (nicht finalisiert)
-5. Neustart: Script erkennt State
-6. upload_info(): Server sagt 10 GB
-7. Keine weiteren Chunks → Direkt zu upload_save()
-8. upload_save() mit 5 Retries → Erfolg ✅
-```
-
-#### Szenario 3: Offset-Mismatch (Server vs. Lokal)
-```
-1. Upload: Bei 5 GB unterbrochen
-2. State-File: offset=5GB
-3. Server hatte Timeout → letzte Chunks nicht gespeichert
-4. upload_info(): Server sagt 4.5 GB
-5. Offset-Korrektur: 5GB → 4.5GB (Server = Source of Truth)
-6. Resume bei 4.5 GB → Restliche 5.5 GB
-7. Erfolg ohne Duplikate oder Lücken
-```
-
----
-
-### Performance-Charakteristiken
-
-| Dateigröße | Methode | Chunks | Upload-Zeit (Schätzung) | Resume-Overhead |
-|------------|---------|--------|-------------------------|-----------------|
-| 1 GB | Standard | N/A | 2-5 Min | N/A |
-| 5 GB | Standard | N/A | 10-15 Min | N/A |
-| 6 GB | Chunked (48x 128MB) | 48 | 12-18 Min | +30s (SHA256) |
-| 20 GB | Chunked (160x 128MB) | 160 | 40-60 Min | +90s (SHA256) |
-| 50 GB | Chunked (400x 128MB) | 400 | 100-150 Min | +240s (SHA256) |
-
-**Resume-Overhead:**
-- **SHA256-Berechnung:** Bei Resume nur wenn nicht im State (erste Upload-Attempt)
-- **upload_info():** <100ms (vernachlässigbar)
-- **State-File I/O:** <10ms pro Chunk (lokal, nicht netzwerk-kritisch)
-
-**Netzwerk-Effizienz:**
-- **API-Overhead:** Chunked ~0.5% mehr Calls als Standard (48 Chunks statt 1 Stream)
-- **Resume-Benefit:** Bei Abbruch 0% Duplikate (vs. 100% bei Standard)
-
----
-
-### Konfiguration & Tuning
-
-**Umgebungsvariablen:**
-```bash
-# Threshold (Standard: 5 GB)
-export PCLOUD_RESUME_THRESHOLD_GB=10   # Höherer Threshold = weniger Overhead
-export PCLOUD_RESUME_THRESHOLD_GB=1    # Niedrigerer Threshold = mehr Dateien mit Resume
-
-# Chunk-Größe (Standard: 128 MB)
-export PCLOUD_RESUME_CHUNK_MB=256      # Größere Chunks = weniger API-Calls
-export PCLOUD_RESUME_CHUNK_MB=64       # Kleinere Chunks = feineres Resume-Granulat
-
-# State-Directory (Optional)
-export PCLOUD_RESUME_DIR=/custom/path  # Manuelles Override (z.B. für Tests)
-```
-
-**Empfehlungen:**
-- **Produktion:** 5 GB Threshold, 128 MB Chunks (optimale Balance)
-- **Testing:** 1 GB Threshold, 64 MB Chunks (schnellere Tests)
-- **High-Throughput:** 10 GB Threshold, 256 MB Chunks (weniger API-Overhead)
-
----
-
-### Testing
-
-**PoC-Script:** `scripts/testing/poc_chunked_resume.py`
-```bash
-# Simpler Test mit einzelner 200 MB Datei
-python3 scripts/testing/poc_chunked_resume.py
-
-# Features:
-# - Upload-Session erstellen
-# - Chunked-Upload (2 MB Chunks im PoC)
-# - Interrupt-Simulation
-# - Resume mit upload_info() Server-Sync
-# - SHA256-Verifikation
-```
-
-**Production-Grade-Test:** `scripts/test_chunked_rtb_snapshot.sh`
-```bash
-# End-to-End-Test mit echtem RTB-Snapshot
-bash scripts/test_chunked_rtb_snapshot.sh
-
-# Features:
-# - RTB-Snapshot mit 5+ Dateien (1 KB bis 6 GB)
-# - Mixed-Mode-Upload (Standard + Chunked im selben Job)
-# - Resume-Test (Upload nach 60s killen, dann neustarten)
-# - SHA256-Verifikation aller Dateien
-# - Isolierte Test-Index-DB (keine Produktions-Kontamination)
-# - Automatic Cleanup
-
-# Dauer: ~5-7 Min (inkl. SHA256-Berechnung)
-```
-
-**Dokumentation:**
-- **Test-README:** `scripts/README_test_chunked.md`
-- **Security/Isolation:** Index-DB-Isolation via `--index-path`
-
----
-
-### Metrics & Monitoring
-
-**Neue Metrik:**
-```python
-MET_RESUMED_FILES = 0  # Anzahl resumed Uploads
-
-# Wird hochgezählt bei jedem erfolgreichen Resume
-# (nicht nur bei Offset-Mismatch, sondern bei jedem State-Load)
-```
-
-**Log-Patterns:**
-```
-[chunked] Große Datei (15.23 GB): backup.img
-[chunked] Berechne SHA256 für backup.img (15.23 GB)...
-[chunked] Erstelle Upload-Session...
-[chunked] uploadid: 1696654321
-[chunked] Starte Upload: 15.23 GB @ 128 MB Chunks
-[chunked] Progress: 1,342,177,280/16,356,000,000 Bytes (8.2%)
-[chunked] Progress: 2,684,354,560/16,356,000,000 Bytes (16.4%)
-...
-[chunked] Finalisiere Upload...
-[chunked] Upload abgeschlossen: FileID=93799999999
-[chunked] ✓ SHA256 verifiziert
-
-# Bei Resume:
-[chunked] Lade State: backup.img_abc123.state.json
-[chunked] Resume @ 3,221,225,472 Bytes (19.7%)
-[chunked] Offset-Korrektur: Lokal=3221225472 Server=3355443200
-[chunked] Progress: 4,697,620,480/16,356,000,000 Bytes (28.7%)
-...
-```
-
-**Troubleshooting:**
-```bash
-# State-Files prüfen
-ls -lh /srv/pcloud-archive/resume/
-cat /srv/pcloud-archive/resume/*.state.json | jq .
-
-# Stuck-Uploads erkennen
-find /srv/pcloud-archive/resume/ -name "*.state.json" -mtime +1  # Älter als 24h
-
-# State manuell löschen (→ Upload von vorne)
-rm /srv/pcloud-archive/resume/stuck_file_*.state.json
-```
-
----
-
-### Edge-Cases & Error-Handling
-
-#### 1. Datei ändert sich während Upload
-```python
-# State enthält file_hash
-if state.get("file_hash") != recalculated_hash:
-    _log("[chunked] Datei geändert seit letztem Upload - starte neu")
-    os.remove(state_file)
-    # → Upload von 0 mit neuem Hash
-```
-
-#### 2. uploadid auf Server abgelaufen
-```python
-try:
-    server_info = pc.upload_info(cfg, uploadid)
-except Exception:
-    _log("[chunked] upload_info fehlgeschlagen - erstelle neuen Upload")
-    uploadid = None
-    # → Neuer upload_create()
-```
-
-#### 3. State-File korrupt
-```python
-try:
-    state = json.load(f)
-except Exception as e:
-    _log(f"[chunked] State-Load fehlgeschlagen: {e}")
-    uploadid = None
-    file_hash = None
-    # → Fallback zu Upload von 0
-```
-
-#### 4. Parallele Uploads (gleicher remote_path)
-**Gelöst via State-File-Naming:**
-```python
-state_key = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
-state_file = f"{safe_filename}_{state_key}.state.json"
-# → Unique Key pro remote_path (keine Kollisionen)
-```
-
----
-
-### Commit-Historie (Development-Tracking)
-
-| Commit | Datum | Beschreibung |
-|--------|-------|--------------|
-| `7d988a4` | 2026-04-26 | Initial Integration (Chunked Upload) |
-| `10249fc` | 2026-04-26 | Critical Fixes (Metrik, Retry, SHA256-Performance) |
-| `e63b9ed` | 2026-04-26 | Production-Grade-Test (RTB-Snapshot) |
-| `0ea6d68` | 2026-04-26 | Code-Cleanup (Redundant Import) |
-| `d1bf283` | 2026-04-26 | CRITICAL: Index-Isolation für Test-Script |
-| `7d3b011` | 2026-04-26 | Documentation Updates (DEVELOPER_GUIDE + README) |
-| `996a2c6` | 2026-04-27 | Parallel Uploads mit Thread-Safety |
-
----
-
-## 🚀 Parallel Uploads (Small Files Optimization)
-
-### Problem
-
-**Sequentielle Uploads verschwenden Bandbreite bei kleinen Dateien:**
-
-API-Overhead (Latenz, Handshake, Finalisierung) dominiert bei kleinen Files:
-- Kleine Datei (1 MB): Upload 0.1s, Overhead 0.3s → **75% overhead**
-- Große Datei (5 GB): Upload 500s, Overhead 0.3s → **0.06% overhead**
-
-**Beispiel: 17,000 kleine Dateien (5 MB Durchschnitt)**
-```
-Sequentiell:  17,000 × 0.8s = 13,600s = 3.8 Stunden ❌
-Parallel (4×): 17,000 × 0.8s / 4 = 3,400s = 57 Minuten ✅
-→ 4× Speedup!
-```
-
-### Lösung
-
-**Size-basierte Parallelisierung:**
-
-```python
-# Configuration (ENV-Variablen)
-SMALL_FILE_THRESHOLD_BYTES = 50 * 1024**2  # 50 MB (default)
-PARALLEL_UPLOAD_THREADS = 4                # 4 Threads (default)
-
-# Files klassifizieren
-small_files = [f for f in files if f['size'] < 50 MB]
-large_files = [f for f in files if f['size'] >= 50 MB]
-
-# Small files: Parallel (API-Overhead kompensieren)
-with ThreadPoolExecutor(max_workers=4) as ex:
-    ex.map(_process_file, small_files)
-
-# Large files: Sequentiell (volle Bandbreite nutzen)
-for large in large_files:
-    _process_file(large)
-```
-
-**Warum 50 MB Threshold?**
-- < 50 MB: API-Overhead signifikant (parallelisieren!)
-- ≥ 50 MB: Upload-Zeit dominiert (sequentiell für volle Bandbreite)
-- Bei 10 MB/s Upload dauert 50 MB nur ~5s → Overhead wird vernachlässigbar
-
----
-
-### Thread-Safe Implementation
-
-**Shared State (benötigt Locks):**
-- `items` dict (Content-Index)
-- `seen_inodes` dict (Hardlink-Tracking)
-- `uploaded`, `resumed`, `stubs` counters
-- Globale Metriken (`MET_UPLOADED_FILES`, `MET_STUBS_WRITTEN`, etc.)
-
-**Lock-Strategie:**
-
-```python
-import threading
-
-# Global: Für alle MET_* Metriken
-_metrics_lock = threading.Lock()
-
-# Lokal: Für mode-spezifischen State
-_state_lock = threading.Lock()
-
-def _process_file_item(it: dict):
-    # Index-Zugriff (thread-safe)
-    with _state_lock:
-        node = items.setdefault(sha, {"holders": []})
-        # ... Index-Checks ...
-    
-    # Upload (außerhalb Lock für Parallelität!)
-    fileid, hash = _upload_real_file(src, dst)
-    
-    # Index-Updates (thread-safe)
-    with _state_lock:
-        node["fileid"] = fileid
-        uploaded += 1
-    
-    # Globale Metriken (thread-safe)
-    with _metrics_lock:
-        globals()["MET_UPLOADED_FILES"] += 1
-```
-
-**Kritisch:** Uploads passieren **außerhalb** der Locks → volle Parallelität!
-
----
-
-### Integration in alle 3 Modi
-
-#### 1. `push_objects_mode()` (Object-Store)
-
-```python
-_small_objects = [f for f in file_items if f["size"] < SMALL_FILE_THRESHOLD_BYTES]
-_large_objects = [f for f in file_items if f["size"] >= SMALL_FILE_THRESHOLD_BYTES]
-
-# Objects parallel hochladen (Dedupe-Store profitiert extrem!)
-if _small_objects and PARALLEL_UPLOAD_THREADS > 1:
-    with ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
-        list(ex.map(_upload_object, _small_objects))
-
-# Große sequentiell
-for obj in _large_objects:
-    _upload_object(obj)
-```
-
-#### 2. `push_1to1_mode()` (Snapshot-Upload)
-
-```python
-_file_items = [it for it in items if it["type"] == "file"]
-_small_files = [f for f in _file_items if f["size"] < SMALL_FILE_THRESHOLD_BYTES]
-_large_files = [f for f in _file_items if f["size"] >= SMALL_FILE_THRESHOLD_BYTES]
-
-_log(f"[parallel] {len(_small_files)} kleine Dateien parallel, "
-     f"{len(_large_files)} große sequentiell")
-
-# Small files parallel
-if _small_files and PARALLEL_UPLOAD_THREADS > 1:
-    with ThreadPoolExecutor(max_workers=PARALLEL_UPLOAD_THREADS) as ex:
-        list(ex.map(_process_file_item, _small_files))
-
-# Large files sequentiell
-for f in _large_files:
-    _process_file_item(f)
-```
-
-#### 3. `push_1to1_delta_mode()` (Inkrementelles Update)
-
-Gleiche Strategie, aber für `write_items` (new + changed):
-
-```python
-_small_writes = [f for f in write_items if f["size"] < SMALL_FILE_THRESHOLD_BYTES]
-_large_writes = [f for f in write_items if f["size"] >= SMALL_FILE_THRESHOLD_BYTES]
-
-# Parallel für kleine, sequentiell für große
-```
-
-**Besonders effektiv:** Delta-Uploads haben oft viele kleine geänderte Dateien!
-
----
-
-### Configuration
-
-**Umgebungsvariablen:**
-
-```bash
-# Threshold für "kleine" Dateien (Default: 50 MB)
-export PCLOUD_SMALL_FILE_THRESHOLD_MB=50
-
-# Anzahl paralleler Upload-Threads (Default: 4)
-export PCLOUD_UPLOAD_THREADS=4
-
-# Resume-State Cleanup (Default: enabled, 7 Tage)
-export PCLOUD_RESUME_CLEANUP=1
-export PCLOUD_RESUME_CLEANUP_DAYS=7
-```
-
-**Tuning-Empfehlungen:**
-
-| Upload-Speed | THRESHOLD_MB | THREADS | Begründung |
-|--------------|--------------|---------|------------|
-| 5-10 MB/s    | 50           | 4       | Standard (Safe Zone) |
-| 10-25 MB/s   | 100          | 4-6     | Mehr Bandbreite, größerer Threshold |
-| 25-50 MB/s   | 200          | 6-8     | High-Speed (Cave: Rate Limits!) |
-| > 50 MB/s    | 500          | 8       | Gigabit+ (selten nötig) |
-
-**Warnung:** Mehr als 8 Threads können pCloud Rate-Limits auslösen!
-
----
-
-### Performance-Beispiel
-
-**Szenario:** 17,000 Dateien, 98 GB total
-- 80% kleine Files (< 50 MB): 13,600 files, ~20 GB
-- 20% große Files (≥ 50 MB): 3,400 files, ~78 GB
-
-**Vor Optimierung (sequentiell):**
-```
-Small: 13,600 × 0.8s = 10,880s = 3.0 Stunden
-Large: 3,400 × 8s = 27,200s = 7.6 Stunden
-Total: ~10.6 Stunden
-```
-
-**Nach Optimierung (parallel):**
-```
-Small: 13,600 × 0.8s / 4 threads = 2,720s = 45 Minuten ✅
-Large: 3,400 × 8s = 27,200s = 7.6 Stunden
-Total: ~8.2 Stunden
-→ 23% Speedup
-```
-
-**Bei 95% kleine Files:** Speedup → ~60-70%! 🚀
-
----
-
-## 🔄 Manifest-Reuse & Resume-Robustheit
-
-### Problem: Crash-Recovery vor Commit c19d82b
-
-**Alte Implementierung (bis April 2026):**
-```bash
-# wrapper_pcloud_sync_1to1.sh (ALT):
-mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.$$.json"
-# Beispiel: pcloud_mani.2026-04-27-173201.3243283.json
-#                                           ^^^^^^^ PID ändert sich bei jedem Restart!
-```
-
-**Probleme:**
-1. **Manifest-Regenerierung nach Crash:** Nach Neustart hat der Prozess eine neue PID → neuer Filename → altes Manifest nicht gefunden → 17min Manifest-Generierung VERSCHWENDET!
-2. **JSONL-Resume defekt:** JSONL-Streaming (`pcloud_json_manifest.py`) sucht nach `.tmp.jsonl` mit gleichem Filename → findet nichts → startet von vorne!
-3. **Unnötige Komplexität:** Lock (`/run/backup_pipeline.lock`) verhindert bereits parallele Runs → PID-Suffix war redundant!
-
-### Lösung: Deterministische Filenames (Commit c19d82b)
-
-```bash
-# wrapper_pcloud_sync_1to1.sh (NEU):
-local mani="${PCLOUD_TEMP_DIR}/pcloud_mani.${SNAPNAME}.json"
-local mani_jsonl="${mani}.tmp.jsonl"
-
-# Prüfe ob Manifest bereits vollständig vorhanden
-if [[ -f "$mani" ]]; then
-  if jq -e '.items' "$mani" >/dev/null 2>&1; then
-    manifest_exists=1
-    _log INFO "✓ Verwende existierendes Manifest: $(basename "$mani")"
-  else
-    _log INFO "⚠ Manifest existiert aber ist ungültig - neu generieren"
-    rm -f "$mani"
-  fi
-elif [[ -f "$mani_jsonl" ]]; then
-  manifest_incomplete=1
-  local jsonl_lines=$(wc -l < "$mani_jsonl" 2>/dev/null || echo 0)
-  _log INFO "⚠ Unvollständige Manifest-Generierung erkannt (${jsonl_lines} Items) - setze fort"
-fi
-```
-
-**Vorteile:**
-1. **Manifest-Reuse:** Existierendes Manifest wird erkannt und wiederverwendet → spart 17 Minuten!
-2. **JSONL-Resume:** Unvollständige Generierung wird fortgesetzt statt neu gestartet
-3. **Deterministisch:** Immer gleicher Filename für gleichen Snapshot → konsistent!
-
-**JSONL-Streaming in `pcloud_json_manifest.py`:**
-```python
-# Sortierte File-Liste (deterministisch!)
-all_paths.sort(key=lambda x: x[1])
-
-# Resume-Detection
-resume_from = 0
-if jsonl_tmp and os.path.exists(jsonl_tmp):
-    with open(jsonl_tmp) as f:
-        resume_from = sum(1 for _ in f)  # Anzahl bereits verarbeiteter Items
-    print(f"[resume] Setze fort ab Item {resume_from}", file=sys.stderr)
-
-# Streaming-Write mit sofortigem flush (crash-resistant!)
-for idx, (inode_key, relpath, ...) in enumerate(all_paths[resume_from:], start=resume_from):
-    entry = {...}
-    jsonl_file.write(json.dumps(entry) + "\n")
-    jsonl_file.flush()  # ← Kritisch: Sofort auf Disk!
-
-# Finalize: JSONL → JSON konvertieren
-if jsonl_tmp and os.path.exists(jsonl_tmp):
-    with open(jsonl_tmp) as f:
-        items = [json.loads(line) for line in f]
-    os.remove(jsonl_tmp)
-```
-
-**Performance:**
-- Konstante RAM-Nutzung (~99% Reduktion bei großen Manifests)
-- Konstante Speed (kein "Schneeball-Effekt")
-- 100% crash-resistent durch `.flush()` nach jedem Item
-
----
-
-## ✅ Upload-Complete Marker Check (Commit f25a75b)
-
-### Problem: False-Positive "Snapshot vollständig"
-
-**Szenario:**
-1. Upload startet → `.upload_started` Marker gesetzt
-2. Upload crasht (z.B. Threading-Bug, Netzwerk-Fehler)
-3. Snapshot-Ordner existiert auf pCloud (z.B. 1101 leere Ordner)
-4. ABER: `.upload_complete` Marker fehlt!
-5. rtb_wrapper prüft: "Snapshot 2026-04-27-173201 auf pCloud?" → JA (Ordner existiert!)
-6. Fehlschluss: "Alles fertig" → überspringt Upload → DATENVERLUST!
-
-**Alte Implementierung (`load_remote_snapshots()`):**
-```python
-# Nur Ordner-Existenz geprüft (FALSCH!)
-for c in metadata.get("contents", []):
-    if c.get("isfolder") and c.get("name") != "_index":
-        names.append(c["name"])  # ← Kein Marker-Check!
-```
-
-### Lösung: Expliziter `.upload_complete` Check
-
-```python
-# wrapper_pcloud_sync_1to1.sh → load_remote_snapshots()
-for c in (js.get("metadata") or {}).get("contents", []) or []:
-    if c.get("isfolder") and c.get("name") != "_index":
-        snapname = c["name"]
-        
-        # Prüfe ob Upload vollständig (.upload_complete Marker vorhanden)
-        marker_path = f"{snap_root}/{snapname}/.upload_complete"
-        try:
-            pc.stat_file(cfg, path=marker_path, with_checksum=False)
-            # Marker existiert → Upload war vollständig ✓
-            names.append(snapname)
-        except Exception:
-            # Marker fehlt → Upload unvollständig oder fehlgeschlagen ✗
-            # Snapshot wird NICHT als "vorhanden" gelistet
-            pass
-```
-
-**Wann wird `.upload_complete` gesetzt?**
-
-```python
-# pcloud_push_json_manifest_to_pcloud.py (Ende von push_1to1_mode):
-pc.put_textfile(cfg, path=f"{dest_snapshot_dir}/.upload_complete", 
-                text=json.dumps({
-                    "snapshot": snapshot_name,
-                    "completed_at": time.time(),
-                    "host": os.uname().nodename,
-                    "duration_sec": int(time.time() - run_start_time),
-                    "files_uploaded": MET_FILES_UPLOADED,
-                    "stubs_written": MET_STUBS_WRITTEN
-                }))
-```
-
-**Marker-Hierarchie:**
-```
-.upload_started       → Upload hat begonnen (für Monitoring)
-.upload_complete      → Upload erfolgreich abgeschlossen ✓
-.upload_incomplete    → Upload unvollständig (für Gap-Detection)
-```
-
-**Resultat:**
-- Unvollständige Uploads werden **NICHT** als "fertig" erkannt
-- rtb_wrapper startet Upload korrekt neu
-- Daten-Integrität garantiert
-
----
-
-### Limitations & Caveats
-
-1. **Rate Limits:**
-   - pCloud hat Account-basierte Rate-Limits
-   - 4 Threads = Safe Zone (getestet)
-   - > 8 Threads können zu 429 Errors führen
-
-2. **Hardlink-Detection:**
-   - Läuft thread-safe mit `seen_inodes` Lock
-   - Keine Race Conditions mehr
-
-3. **Index-Locking:**
-   - Alle Index-Updates thread-safe (Lock)
-   - Minimaler Overhead (~µs pro Lock)
-
-4. **Chunked Upload + Parallel:**
-   - Files > 5 GB nutzen Chunked Upload (sequentiell)
-   - Files < 50 MB parallel
-   - → Beide koexistieren perfekt!
-
----
-
-### Resume-State Management
-
-**Snapshot-Validierung:**
-
-State-Files enthalten jetzt `snapshot_name`:
+**Felder:**
+- `fileid`: pCloud-interne Datei-ID (für direkten Download ohne Pfad-Lookup)
+- `hash`: pCloud-interner CRC/Hash (für Tamper-Detection via `listfolder`)
+- `size`: Dateigröße in Bytes
+- `snapshots`: Map `{snapshot_name → [relpaths_in_diesem_snapshot]}`
+  - Eine SHA kann in einem Snapshot an mehreren Pfaden liegen (Dedup: z.B. leere Placeholder-Dateien)
+  - `snapshots.keys()` = alle Snapshots die diese Datei enthalten (GC-Basis)
+
+**Warum SHA-keyed statt Pfad-keyed?**
+Der Pool ist sha-nativ: jede SHA wird physisch genau einmal gespeichert, egal wie viele Snapshots darauf zeigen. Pfade sind Metadaten — sie stehen in den Stubs und im `snapshots`-Map des Index.
+
+### Stubs (.meta.json)
+
+Jeder Stub unter `_snapshots/<snap>/<relpath>.meta.json` enthält:
 ```json
 {
-  "uploadid": "...",
-  "file_hash": "sha256...",
-  "remote_path": "/_snapshots/2026-04-27-backup/file.dat",
-  "snapshot_name": "2026-04-27-backup",
-  "status": "in_progress"
+  "format_version": 1,
+  "kind": "stub",
+  "type": "pool_stub",
+  "sha256": "f153611a35...",
+  "pcloud_hash": 5016324286669844513,
+  "size": 805637,
+  "mtime": 1714220400.0,
+  "relpath": "Gemeinsam/Rest/dokument.pdf",
+  "pool_path": "/Backup/rtb_pool/_pool/f1/f153611a35...",
+  "pool_fileid": 96720201405,
+  "snapshot": "2026-04-27-173201"
 }
 ```
 
-**Validierungen:**
-1. `remote_path` muss matchen
-2. `file_size` muss matchen
-3. **`snapshot_name` muss matchen** (verhindert Snapshots-Mixup)
-4. `upload_info()` prüft Server-Status
+**Restore-Logik:** Nutzer nennt Pfad → Stub lesen → `pool_fileid` → `download_binaryfile_to(fileid=...)`.
 
-**Bei Mismatch:** State-File wird gelöscht, Upload startet neu.
+### Lokale Artefakte (`/srv/pcloud-archive/`)
 
-**Auto-Cleanup:**
-```python
-_cleanup_orphaned_resume_states(state_dir, max_age_days=7)
 ```
-- Löscht Files älter als 7 Tage
-- Löscht Error-Status Files nach 24h
-- Löscht korrupte JSON-Files
-- Läuft automatisch beim ersten Upload (einmalig pro Prozess)
-
----
-
-## �📊 Archive-System
-
-### Komponenten
-
-**1. Manifest-Archivierung:**
-```bash
-/srv/pcloud-archive/manifests/
-  ├─ 2026-04-10-075334.json
-  ├─ 2026-04-12-121042.json
-  └─ 2026-04-15-093021.json
-```
-
-**Trigger:** Nach erfolgreichem Upload (in `push_1to1_mode()`)
-
-```python
-if manifest_path and not dry:
-    archive_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
-    os.makedirs(archive_dir, exist_ok=True)
-    archive_path = os.path.join(archive_dir, f"{snapshot_name}.json")
-    shutil.copy2(manifest_path, archive_path)
-    _log(f"[archive] Manifest archiviert: {archive_path}")
+manifests/                      ← Snapshot-Manifeste (je Snapshot ein JSON)
+  <snap>.json                   ← relpath, sha256, mtime, size, inode, source_path
+indexes/
+  content_index_master.json     ← lokaler Spiegel des Remote-Index
+deltas/
+  delta_verify_<snap>.json      ← tamper-detect Reports
 ```
 
 ---
 
-**2. Index-Archivierung:**
+## 🚀 Säule 3: Pool-Upload-Engine
 
-**Lokal (Master):**
-```bash
-/srv/pcloud-archive/indexes/
-  └─ content_index_master.json  # Alle Snapshots zusammen
-```
-
-**Remote (per Snapshot):**
-```bash
-/Backup/rtb_1to1/_snapshots/_index/archive/
-  ├─ 2026-04-10-075334_index.json
-  ├─ 2026-04-12-121042_index.json
-  └─ 2026-04-15-093021_index.json
-```
-
-**Trigger:** Nach Index-Update (in `push_1to1_mode()`)
-
-```python
-# Remote archivieren
-idx_path = f"{snapshots_root}/_index/content_index.json"
-archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
-pc.ensure_parent_dirs(cfg, archive_path)
-pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-
-# Master lokal aktualisieren
-master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR"), "indexes", "content_index_master.json")
-save_content_index_local(master_index_path, index)
-```
-
-**Use-Case:**
-- Recovery nach Index-Korruption
-- Debugging (historische Zustände)
-- Gap-Validation (Deep-Mode)
-
----
-
-**3. Delta-Reports:**
-```bash
-/srv/pcloud-archive/deltas/
-  ├─ delta_verify_2026-04-15.json
-  └─ delta_verify_2026-04-16.json
-```
-
-**Trigger:** Nach Upload-Verification (in `build_and_push()`)
-
-```python
-delta_report = f"{PCLOUD_TEMP_DIR}/delta_verify_{SNAPNAME}.json"
-
-if "${PY}" "$DELTA_CHECK" --dest-root "$PCLOUD_DEST" --snapshot "$SNAPNAME" --json-out "$delta_report"; then
-    mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
-fi
-```
-
-**Content:**
-```json
-{
-  "snapshot": "2026-04-15",
-  "status": "OK",
-  "missing_anchors": [],
-  "unknown_files": [],
-  "hash_mismatches": []
-}
-```
-
----
-
-## 🚀 Performance-Optimierungen
-
-### 1. Folder-Cache (Stub-Writing)
-
-**Problem:** Sequential `ensure_path()` bei tausenden Stubs = langsam
-
-**Lösung in `_batch_write_stubs()`:**
-
-```python
-# 1. Einen rekursiven listfolder-Call (statt N ensure-Calls)
-folder_cache = _build_folder_cache_from_tree(cfg, snapshot_root)
-
-# 2. Cache-Lookup (O(1))
-if normalized_parent in folder_cache:
-    parent_fids[parent] = folder_cache[normalized_parent]
-    _cache_hits += 1
-else:
-    # Cache-Miss: Ordner anlegen
-    fid = pc.ensure_path(cfg, path=parent)
-    parent_fids[parent] = int(fid)
-    _cache_misses += 1
-```
-
-**Resultat:**
-```
-[stubs] ✓ API-Calls: 5 (statt 2000) → 400x Reduktion
-```
-
-**Fallback:**
-```python
-if not folder_cache and _total_parents > 10:
-    _log("[WARN] → Fallback zu Legacy-Mode (sequential ensure_path)")
-    # Erwartet: ~{_total_parents * 0.5 / 60}min statt <5s
-```
-
----
-
-### 2. Diff-basierte Ordner-Anlage
-
-**Problem:** Alle Manifest-Ordner immer anlegen = verschwendet API-Calls
-
-**Lösung in `push_1to1_mode()` (Diff-basierte Ordner-Anlage):**
-
-```python
-# 1. Remote-Ordner via listfolder holen
-result = pc.listfolder(cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
-remote_folders = extract_folders(result)
-
-# 2. Manifest-Ordner sammeln
-manifest_folders = {it["relpath"] for it in manifest["items"] if it["type"] == "dir"}
-
-# 3. Diff: Nur fehlende anlegen
-missing_folders = manifest_folders - remote_folders
-
-if missing_folders:
-    # Ebenen-basierte Parallelisierung
-    folders_by_depth = group_by_depth(missing_folders)
-    for depth in sorted(folders_by_depth.keys()):
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            ex.map(_create_folder, folders_by_depth[depth])
-```
-
-**Resultat:**
-```
-[folders] Alle 1234 Ordner existieren bereits (Skip)
-# Statt: 1234 ensure_path-Calls
-```
-
----
-
-### 3. Periodisches Index-Saving
-
-**Problem:** Index-Schreibfehler nach 3h Upload = Datenverlust
-
-**Lösung:**
-
-```python
-# Hybrid-Trigger: Anzahl ODER Zeit
-_SAVE_INTERVAL = 100           # Alle 100 Dateien
-_SAVE_INTERVAL_TIME = 300.0    # Alle 5 Minuten
-
-_count_trigger = (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
-_time_trigger = (time.time() - _t_last_index_save) >= _SAVE_INTERVAL_TIME
-
-if _count_trigger or _time_trigger:
-    save_content_index_local(_local_index_path, index)
-    _last_saved_count = uploaded + resumed + stubs
-    _t_last_index_save = time.time()
-```
-
-**Workflow:**
-```
-Upload läuft → Periodisch lokal speichern → Am Ende: Remote hochladen → Lokal löschen
-```
-
-**Vorteil:** Resume nach Absturz möglich (lokale Kopie bleibt)
-
----
-
-### 4. Index-Driven Skip (Resume) — nur `push_1to1_mode`
-
-**Problem:** Unterbrochene Uploads starten von vorne
-
-**Entscheidungsbaum beim Neustart:**
-
-```
-.upload_started vorhanden?
-├── NEIN → Frischer Upload (normaler Pfad)
-└── JA
-    ├── .upload_complete vorhanden? → JA → Snapshot vollständig, sofort return
-    └── NEIN → Resume: Index laden + Already-in-Snapshot-Skip
-```
-
-**Lokaler Index-Cache (der eigentliche Resume-Trick):**
-
-```python
-# Beim Resume: lokale Kopie bevorzugen (schnell, kein Remote-API-Call)
-_local_index_path = f"/tmp/pcloud_index_{snapshot_name}.json"
-
-if os.path.exists(_local_index_path):
-    index = load_content_index_local(_local_index_path)
-    _log("[resume] Lokaler Index-Cache gefunden → kein Remote-Load nötig")
-else:
-    index = load_content_index(cfg, snapshots_root)  # Remote fallback
-```
-
-Der lokale Index wird durch periodisches Index-Saving (siehe §3) laufend
-aktualisiert. Bei einem Absturz enthält er den Stand der letzten 100 Dateien
-oder 5 Minuten — alle bereits hochgeladenen Dateien sind darin vermerkt.
-
-**Index-Driven Skip:**
-
-```python
-# Prüfe ob bereits im Index für diesen Snapshot
-already_in_snapshot = any(
-    h.get("snapshot") == snapshot_name and h.get("relpath") == relpath
-    for h in node.get("holders", [])
-)
-
-if already_in_snapshot:
-    resumed += 1
-    continue  # Skip Upload
-```
-
-**Marker-System:**
-```python
-# Start: .upload_started setzen
-pc.put_textfile(cfg, path=f"{dest_snapshot_dir}/.upload_started", text=json.dumps({...}))
-
-# Ende: .upload_complete setzen
-pc.put_textfile(cfg, path=f"{dest_snapshot_dir}/.upload_complete", text=json.dumps({...}))
-
-# Nächster Run: Prüfe Marker
-if exists(".upload_started") and not exists(".upload_complete"):
-    _log("[resume] Setze Upload fort...")
-```
-
-**Resultat:**
-```
-[push] uploaded=0 resumed=19573 stubs=0
-→ Kein Re-Upload nötig!
-```
-
-**Detaillierter Mechanismus: Wie werden bereits hochgeladene Dateien erkannt?**
-
-Das Skript verwendet **drei aufeinander aufbauende Mechanismen**, um unnötige Uploads zu vermeiden:
-
-**1. Lokaler Index-Check (SCHNELL, KEINE API-Calls)**
-
-```python
-# Zeile 1579-1589 in pcloud_push_json_manifest_to_pcloud.py
-with _state_lock:
-    node = items.setdefault(sha256, {"holders": []})
-    
-    # Prüfen ob DIESER Snapshot + relpath bereits im Index
-    already_in_snapshot = any(
-        h.get("snapshot") == snapshot_name and 
-        h.get("relpath") == relpath
-        for h in node.get("holders", [])
-    )
-    
-    if already_in_snapshot:
-        resumed += 1  # ← Im Log als "resumed=603" sichtbar
-        return        # ← SKIP ohne API-Call!
-```
-
-**Wann greift dieser Check:**
-- Bei Resume nach Absturz/Unterbrechung
-- Lokaler Index aus `/srv/pcloud-temp/pcloud_index_{snapshot}.json` vorhanden
-- Datei wurde in diesem Snapshot bereits verarbeitet
-- **Ergebnis:** Datei wird übersprungen, KEIN API-Call zu pCloud
-
-**2. Deduplizierung via SHA256 (Index-basiert)**
-
-```python
-# Zeile 1608-1615 in pcloud_push_json_manifest_to_pcloud.py
-if sha in known_anchors:
-    anchor_path, anchor_fid = known_anchors[sha]
-    # Verwende anchor_path → Stub statt Upload!
-    stubs += 1  # ← Im Log als "stubs=1688" sichtbar
-    _queue_stub(relpath, item, node)
-    return
-```
-
-**Wann greift dieser Check:**
-- Datei mit identischem SHA256 wurde bereits in anderem Snapshot hochgeladen
-- `anchor_path` zeigt auf erste Upload-Instanz (z.B. älterer Snapshot)
-- **Ergebnis:** Nur `.meta.json` Stub wird erstellt, KEIN Upload der Datei
-
-**3. Echter Upload (NUR wenn nicht im Index)**
-
-```python
-# Zeile 1619-1630 in pcloud_push_json_manifest_to_pcloud.py
-if not anchor_path:
-    # Datei ist neu → Upload erforderlich
-    fid, pcloud_hash = _upload_real_file(src_abs, dst_path)
-    uploaded += 1  # ← Im Log als "uploaded=17294" sichtbar
-    
-    # Index aktualisieren für künftige Deduplizierung
-    with _state_lock:
-        node["anchor_path"] = dst_path
-        node["fileid"] = fid
-        node["pcloud_hash"] = pcloud_hash
-```
-
-**Wann wird wirklich hochgeladen:**
-- Datei ist neu (SHA256 nicht im Index)
-- Keine frühere Upload-Instanz bekannt (kein `anchor_path`)
-- **Ergebnis:** Echter API-Upload zu pCloud
-
-**Beispiel-Log-Ausgabe erklärt:**
-
-```
-[push] 19643/19808 (99%) | 53.45/89.59 GB (60%) | uploaded=17351 resumed=603 stubs=1688
-```
-
-- **uploaded=17351:** Neue Dateien hochgeladen (kein Index-Eintrag, kein anchor_path)
-- **resumed=603:** Im Index gefunden → Skip OHNE API-Call (Mechanismus 1)
-- **stubs=1688:** Deduplizierte Dateien (SHA256 Match) → Stub statt Upload (Mechanismus 2)
-- **Total:** 17351 + 603 + 1688 = 19642 Dateien verarbeitet
-
-**Effizienz-Gewinn:**
-- Nur **17351 echte API-Calls** (Uploads) statt 19642
-- **~12% API-Calls gespart** durch Index-basierte Checks
-- Resume nach Absturz: 603 Dateien nicht erneut hochgeladen
-- Deduplizierung: 1688 Dateien nicht doppelt gespeichert
-
-**Index-Speicherorte:**
-- **Laufend:** `/srv/pcloud-temp/pcloud_index_{snapshot}.json` (lokaler Cache)
-- **Abschluss:** `/srv/pcloud-archive/indexes/pcloud_index_{snapshot}.json` (Archiv)
-- **Remote:** `/pCloud/snapshots/.indexes/pcloud_index_{snapshot}.json` (auf pCloud)
-
-> **⚠️ Kein Resume in `push_1to1_delta_mode`:**
-> Der Delta-Copy-Modus hat keinen eigenen Resume-Mechanismus — kein
-> Marker-Check am Anfang, keinen lokalen Index-Cache, kein periodisches
-> Index-Saving. Bei einem Abbruch in Phase 5 (WRITE-Loop) wird beim nächsten
-> Lauf der abgebrochene Ziel-Snapshot gelöscht (Phase 2, Fix `dfb2ad3`) und
-> der gesamte `copyfolder` + Delta-Write neu gestartet. Da Turbo-Mode
-> typischerweise 1–3 Minuten dauert, ist das vertretbar.
-
----
-
-## 🔧 Konfiguration & Env-Vars
-
-### .env Konfigurationsdatei
-
-**Speicherort:** `/opt/apps/pcloud-tools/main/.env` (oder via `ENV_FILE` überschreibbar)
-
-**Laden:** Das Shell-Wrapper-Skript (`wrapper_pcloud_sync_1to1.sh`) lädt automatisch alle `PCLOUD_*` Variablen aus der `.env`:
+### Phase 1: Manifest-Erstellung (`pcloud_json_pool_manifest.py`)
 
 ```bash
-# Zeile 31-50 in wrapper_pcloud_sync_1to1.sh:
-while IFS='=' read -r key val; do
-  if [[ "$key" =~ ^PCLOUD_ ]]; then
-    # Quotes entfernen, Kommentare filtern
-    export "${key}=${val}"
-  fi
-done < "${ENV_FILE}"
+pcloud_json_pool_manifest.py \
+  --root /mnt/backup/rtb_nas/<snap> \
+  --snapshot <snap> \
+  --out /srv/pcloud-temp/pcloud_mani.<snap>.json \
+  --hash sha256 \
+  [--ref-manifest /srv/pcloud-archive/manifests/<prev>.json]
 ```
 
-Python-Tools lesen dann die exportierten Shell-Environment-Variablen via `os.environ.get()`.
+**Smart-Mode** (`--ref-manifest`): nutzt `mtime + size + inode` des Vorgänger-Manifests als SHA256-Cache. Nur geänderte Dateien werden neu gehasht (~40× schneller bei inkrementellen Backups).
 
-**Beispiel `.env`:**
+`ReferenceCache.lookup()`:
+1. Gleicher `relpath` + gleiche `mtime` + gleiche `size` → SHA aus Cache
+2. Gleicher `inode` (Hardlink) → SHA aus Cache
+3. Sonst: frisch berechnen
+
+### Scout: Best-Match-Suche (`scout_best_pool_basis`)
+
+Bevor der Upload startet, sucht der Scout den besten Basis-Snapshot für Turbo-Delta:
+
+```python
+# Jaccard-Similarity: |current_shas ∩ basis_shas| / |current_shas ∪ basis_shas|
+similarity = len(current_sha_set & basis_sha_set) / len(current_sha_set | basis_sha_set)
+```
+
+Kandidaten = Remote-Snapshots ∩ lokale Manifeste (ohne current). Scout wählt den mit höchster Similarity.
+
+- **≥ 70%** → Turbo-Delta-Mode
+- **< 70%** → Full-Pool-Mode
+
+### Turbo-Delta-Mode (`push_pool_delta_mode`)
+
+1. **Wipe incomplete**: besteht ein unvollständiger Remote-Snapshot (kein `.upload_complete`), wird er gelöscht und aus `pool_refs` entfernt
+2. **`copyfolder(basis → neu)`**: Server-seitiger Klon (ein API-Call, ~50s für 20k Dateien)
+3. **Manifest-Diff**: `current_paths - basis_paths` = added, deleted, changed
+4. **Phase 3**: veraltete Stubs aus dem Klon löschen
+5. **Phase 4**: neue/geänderte Dateien in `_pool` hochladen, Stubs schreiben
+6. **Index aktualisieren**: alle Manifest-SHAs in `pool_refs[sha].snapshots[snap]` registrieren
+7. **Post-Upload-Validation**
+
+**Fail-fast:** Kann eine Datei nicht in den Pool geladen werden → `failed`-Liste → `RuntimeError` vor Stubs/Index/Marker.
+
+**Wipe + Bereinigung:** Beim Wipe eines unvollständigen Snapshots wird `snapshot_name` aus allen `pool_refs`-Einträgen entfernt (Stammdaten-Bereinigung), damit der Early-Return-Check in Phase 4 korrekt arbeitet.
+
+**Early-Return-Check** ist auf `(sha, relpath, snapshot)` präzise: ein SHA kann in einem Snapshot an mehreren Relpaths liegen (Dedup) → Prüfung auf relpath-Ebene, nicht nur sha-Ebene.
+
+### Full-Pool-Mode (`push_pool_mode`)
+
+1. **Preflight**: `listfolder(_pool)` → alle vorhandenen SHAs → Delta = Manifest-SHAs - Pool-SHAs
+2. **Ordnerstruktur**: 256 `_pool/XX`-Ordner anlegen (idempotent)
+3. **Upload**: Delta-SHAs hochladen (4 Threads für kleine, sequenziell für große)
+4. **Stubs**: für alle Manifest-Dateien schreiben
+5. **Index aktualisieren**
+6. **Post-Upload-Validation**
+
+### Post-Upload-Validation
+
+Läuft nach **jedem** Modus. Ohne erfolgreiche Validation kein `.upload_complete`:
+
+```python
+# 1. Pool-SHA-Check: alle Manifest-SHAs physisch im Pool?
+missing_in_pool = manifest_sha256s - pool_sha256s
+
+# 2. Index-Konsistenz: alle SHAs in pool_refs mit korrektem Snapshot?
+for sha in manifest_sha256s:
+    assert snapshot_name in pool_refs[sha]['snapshots']
+
+# 3. Stub-Vollcheck (100%): listfolder(snapshot_dir) → Set aller Stub-Pfade
+#    Für jeden Manifest-relpath: stub_path in remote_stub_paths?
+missing_stubs = [rp for rp in manifest_items if stub_path not in remote_stub_paths]
+```
+
+Der Stub-Check verwendet `listfolder(snapshot_dir)` als Set-Lookup (1 API-Call, O(n) Set-Vergleich). Stichproben waren unzuverlässig (0.5% Abdeckung hatte 9 fehlende Stubs nicht gefangen).
+
+---
+
+## ✅ Säule 4: Verifikation & Integritätscheck
+
+### tamper-detect (`pcloud_quick_delta.py`, Pool-Modus)
+
+Auto-erkennung via `index["version"] >= 2 and pool_refs`:
+
+```
+listfolder(_pool + _snapshots, recursive)  →  1 API-Call, ~5s
+listfolder gibt: fileid, pcloud_hash, size pro Objekt
+```
+
+Pro `pool_refs[sha]`:
+- Pool-Objekt vorhanden? (`fileid` in `by_fileid` oder Pfad in `by_path`)
+- `fileid` == `pool_refs[sha].fileid`?
+- `pcloud_hash` == `pool_refs[sha].hash`?
+- `size` == `pool_refs[sha].size`?
+- Alle Stubs aus `snapshots`-Map vorhanden?
+
+### Vollständiger Integritätscheck (`pool_verify_backup.py`)
+
+Manifest-getriebener Check: **lokale Manifeste als Ground Truth** × Remote-Zustand.
+
+```
+Phase 0 (parallel, ~5s):
+  Thread 1: listfolder(_pool)      → SHA-Set (Dateiname = SHA256)
+  Thread 2: listfolder(_snapshots) → Stub-Pfad-Set
+  Thread 3: content_index.json     → pool_refs
+
+Phase 1 (RAM, <1s):
+  A) Für jede Manifest-SHA: in Pool-SHA-Set?
+     → GC-Hinweis: Pool-SHAs ohne Manifest-Referenz
+  B) Für jeden Manifest-relpath: Stub-Pfad im Stub-Set?
+
+Phase 2 optional --stub-sample N:
+  N zufällige Stubs lesen (8 Threads parallel)
+  stub.sha256 == manifest.sha256?
+  stub.pool_fileid == pool_refs[sha].fileid?
+```
+
+**Laufzeit:** ~5s für alle 4 Snapshots (~80k Dateien), +2s für 100 Stub-Sample.
 
 ```bash
-# === API-Credentials (PFLICHT) ===
-PCLOUD_TOKEN="YOUR_TOKEN_HERE"
-PCLOUD_HOST="eapi.pcloud.com"     # eu.api.pcloud.com für EU-Region
-PCLOUD_PORT="8399"
-PCLOUD_TIMEOUT_SECS="90"
-PCLOUD_DEVICE="backup/hostname"
+# Standardlauf:
+MAIN_DIR=/opt/apps/pcloud-tools/main python scripts/utilities/pool_verify_backup.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --manifests-dir /srv/pcloud-archive/manifests
 
-# === MariaDB (für Tracking) ===
+# Mit Stub-Inhalt-Probe:
+... --stub-sample 100
+```
+
+### GC (`pcloud_pool_gc.py`)
+
+Keys off `pool_refs.keys()`: alle SHAs die im Index referenziert sind. SHAs die physisch im Pool existieren, aber nicht im Index → löschen.
+
+```bash
+python pcloud_pool_gc.py --dest-root /Backup/rtb_pool --env-file "$ENV_FILE"
+```
+
+**GC-Lock:** `.gc_lock`-Datei verhindert Race-Condition zwischen laufendem Upload und GC.
+
+---
+
+## 🔧 Konfiguration (`.env`)
+
+```bash
+# pCloud API
+PCLOUD_TOKEN=...
+PCLOUD_HOST=eapi.pcloud.com        # EU: eapi, US: api
+
+# Pfade
+PCLOUD_TEMP_DIR=/srv/pcloud-temp
+PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive
+RTB=/mnt/backup/rtb_nas            # RTB Snapshot-Root
+PCLOUD_DEST=/Backup/rtb_pool       # Remote Pool-Root
+
+# MariaDB
 PCLOUD_DB_HOST=localhost
-PCLOUD_DB_PORT=3306
 PCLOUD_DB_NAME=pcloud_backup
 PCLOUD_DB_USER=pcloud_backup
-PCLOUD_DB_PASS='your_password'
+PCLOUD_DB_PASS=...
 PCLOUD_ENABLE_DB=1
 
-# === Threading-Konfiguration (WICHTIG!) ===
-PCLOUD_UPLOAD_THREADS=16          # File-Uploads parallel (Standard: 4)
-PCLOUD_FOLDER_THREADS=8           # Ordner-Creation parallel (Standard: 4)
-PCLOUD_STUB_THREADS=8             # Stub-Writes parallel (Standard: 4)
+# Performance
+PCLOUD_UPLOAD_THREADS=4
+PCLOUD_SMALL_FILE_THRESHOLD_MB=50
+PCLOUD_RESUME_THRESHOLD_GB=5
+PCLOUD_RESUME_CHUNK_MB=128
+PCLOUD_COPYFOLDER_TIMEOUT=300      # Meta-Operationen: 300s statt 30s
 
-# === Pfade ===
-PCLOUD_TEMP_DIR="/srv/pcloud-temp"
-PCLOUD_ARCHIVE_DIR="/srv/pcloud-archive"
+# Scout
+PCLOUD_SCOUT_THRESHOLD=0.70        # Mindest-Similarity für Turbo-Delta
 
-# === Optionale Einstellungen ===
-PCLOUD_PRETTY_JSON=1              # JSON menschen-lesbar (Debug)
-PCLOUD_USE_DELTA_COPY=0           # Delta-Copy-Modus (Beta)
-PCLOUD_GAP_STRATEGY=optimistic    # conservative|optimistic|aggressive
+# Validation
+PCLOUD_VALIDATE_UPLOAD=1           # 0 = überspringen (nur Notfall)
+
+# Logging
+PCLOUD_LOG=/var/log/backup/pcloud_sync.log
 ```
-
----
-
-### Gap-Handling
-
-| Variable | Default | Beschreibung |
-|----------|---------|--------------|
-| `PCLOUD_GAP_STRATEGY` | `optimistic` | Conservative, Optimistic, Aggressive |
-| `PCLOUD_DEEP_GAP_VALIDATION` | `0` | Deep-Check via pcloud_quick_delta |
-
-### Delta-Copy
-
-| Variable | Default | Beschreibung |
-|----------|---------|--------------|
-| `PCLOUD_USE_DELTA_COPY` | `0` | Delta-Copy-Modus aktivieren |
-| `PCLOUD_COPYFOLDER_MIN_STUB_RATIO` | `0.5` | Min. Stub-Ratio für copyfolder |
-| `PCLOUD_COPYFOLDER_MIN_FILES` | `100` | Min. Anzahl Files für copyfolder |
-| `PCLOUD_TIMEOUT` | `60` | API-Timeout (s) |
-| `PCLOUD_SNAPSHOT_SCAN_LIMIT` | `60` | Max. Snapshots bei load_remote_snapshots (neueste zuerst) |
-
-### Threading & Performance
-
-| Variable | Default | Empfohlen (RPi 5) | Beschreibung |
-|----------|---------|-------------------|--------------|
-| `PCLOUD_UPLOAD_THREADS` | `4` | **16** | Parallele File-Uploads (<50MB) |
-| `PCLOUD_STUB_THREADS` | `4` | **8** | Parallele Stub-Writes |
-| `PCLOUD_FOLDER_THREADS` | `4` | **8** | Parallele Ordner-Anlage |
-| `PCLOUD_SMALL_FILE_THRESHOLD_MB` | `50` | `50` | Grenze für parallelen Upload |
-| `PCLOUD_INDEX_SAVE_INTERVAL` | `100` | `100` | Periodisches Index-Save (Anzahl) |
-| `PCLOUD_INDEX_SAVE_INTERVAL_TIME` | `300` | `300` | Periodisches Index-Save (Sekunden) |
-| `PCLOUD_STUB_PROGRESS_INTERVAL` | `500` | `500` | Progress-Log-Intervall (Stubs) |
-
-**Threading-Tuning:**
-
-- **UPLOAD_THREADS:** Kritisch für Performance! Default 4 ist zu konservativ für moderne Hardware.
-  - RPi 5: 16 Threads → **~4x Speedup** bei vielen kleinen Dateien
-  - Netzwerk-limitiert, nicht CPU-limitiert
-  
-- **FOLDER_THREADS:** Ordner-Creation ist API-limitiert, 8 reicht meist aus.
-
-- **STUB_THREADS:** Stub-Writes sind kleine JSON-Files, 8 ist optimal.
-
-**Retry-Strategie:**
-- File-Uploads: 12 Versuche (kritisch, Netzwerk-sensitiv)
-- Stubs/Ordner: 5 Versuche (weniger kritisch, schnell wiederholbar)
-- Implementiert in `call_with_backoff()` (pcloud_bin_lib.py)
-
-### Archive
-
-| Variable | Default | Beschreibung |
-|----------|---------|--------------|
-| `PCLOUD_ARCHIVE_DIR` | `/srv/pcloud-archive` | Basis-Verzeichnis |
-| `PCLOUD_ARCHIVE_INDEX` | `0` | Index archivieren |
-| `PCLOUD_MANIFEST_ARCHIVE` | `/srv/pcloud-archive` | Manifest-Archive |
-
-### Logging
-
-| Variable | Default | Beschreibung |
-|----------|---------|--------------|
-| `PCLOUD_ENABLE_JSONL` | `1` | Structured JSONL-Logging |
-| `PCLOUD_JSONL_LOG` | `/var/log/.../pcloud_sync.jsonl` | JSONL-Pfad |
-| `PCLOUD_VERBOSE` | `0` | Verbose-Modus |
-| `PCLOUD_TIMING` | `0` | Performance-Metriken |
-| `PCLOUD_PRETTY_JSON` | `0` | JSON Pretty-Print |
 
 ---
 
 ## 📈 Metriken & Monitoring
 
-### MariaDB-Spalten (backup_runs)
-
-**Basis:**
-```sql
-run_id VARCHAR(36),
-snapshot_name VARCHAR(255),
-status VARCHAR(20),        -- RUNNING, SUCCESS, FAILED
-started_at DATETIME,
-finished_at DATETIME,
-duration_sec INT,
-error_message TEXT
-```
-
-**Gap-Handling:**
-```sql
-gaps_synced INT DEFAULT 0,
-new_snapshots INT DEFAULT 0,
-rebuilt_snapshots INT DEFAULT 0    -- ⬅ Scenario-A-Indikator (Broken Chain)
-```
-
-> **`rebuilt_snapshots` erklärt:** Wenn das Gap-Handling im Optimistic-Modus
-> eine gebrochene Referenz-Kette erkennt (Scenario A), werden alle späteren
-> Snapshots gelöscht und **komplett neu hochgeladen**. Jeder dieser Rebuilds
-> zählt als +1 auf `rebuilt_snapshots`. Ein hoher Wert deutet auf häufige
-> Upload-Unterbrechungen oder äußere Störungen hin.
-
-**Performance:**
-```sql
-manifest_duration_sec INT,
-upload_duration_sec INT,
-verify_duration_sec INT
-```
-
-**Phasen-Tabelle (backup_phases):**
-```sql
-run_id VARCHAR(36),
-phase_name VARCHAR(50),    -- manifest, upload, verify
-status VARCHAR(20),
-started_at DATETIME,
-finished_at DATETIME,
-duration_sec INT
-```
-
-**Beispiel-Queries:**
+### MariaDB (`pcloud_backup`)
 
 ```sql
--- Gap-Events finden
-SELECT run_id, snapshot_name, gaps_synced, rebuilt_snapshots, status
-FROM backup_runs
-WHERE gaps_synced > 0
-ORDER BY started_at DESC;
+-- Lauf-Übersicht
+SELECT snapshot_name, status, started_at, duration_sec, files_uploaded
+FROM backup_runs ORDER BY started_at DESC LIMIT 10;
 
--- Performance-Trend
-SELECT 
-  DATE(started_at) as date,
-  AVG(upload_duration_sec) as avg_upload_sec,
-  AVG(rebuilt_snapshots) as avg_rebuilds
-FROM backup_runs
-WHERE status = 'SUCCESS'
-  AND started_at > NOW() - INTERVAL 30 DAY
-GROUP BY DATE(started_at);
+-- Phasen eines Laufs
+SELECT phase_name, status, duration_sec
+FROM backup_phases WHERE run_id = '...' ORDER BY started_at;
 
--- Error-Rate
-SELECT 
-  status,
-  COUNT(*) as count,
-  COUNT(*) * 100.0 / SUM(COUNT(*)) OVER() as percent
-FROM backup_runs
-WHERE started_at > NOW() - INTERVAL 7 DAY
-GROUP BY status;
+-- Pool-Wachstum (pro Lauf)
+SELECT snapshot_name, files_uploaded, bytes_uploaded/1073741824 AS gb
+FROM backup_runs WHERE status='SUCCESS' ORDER BY started_at;
 ```
 
----
-
-### JSONL-Queries
-
-```bash
-# Alle Gap-Events
-jq -r 'select(.message | contains("Gap detected"))' /var/log/backup/pcloud_sync.jsonl
-
-# Nur Scenario A (Rebuild)
-jq -r 'select(.message | contains("rebuilt chain"))' /var/log/backup/pcloud_sync.jsonl
-
-# Performance-Metriken extrahieren
-jq -r 'select(.message | contains("[timing]")) | .message' /var/log/backup/pcloud_sync.jsonl
-
-# Fehler-Zusammenfassung
-jq -r 'select(.level == "ERROR") | "\(.timestamp) \(.message)"' /var/log/backup/pcloud_sync.jsonl
-```
-
----
-
-## 📚 Dokumentation
-
-### Vorhandene Dokumentation (docs/)
+### [metrics]-Zeile im Log
 
 ```
-docs/
-├── DEVELOPER_GUIDE.md              (dieses Dokument)
-├── GAP_HANDLING.md                 (Gap-System Referenz)
-├── GAP_HANDLING_FAQ.md             (Q&A)
-├── GAP_HANDLING_WORKFLOWS.md       (Mermaid-Diagramme)
-├── DELTA_COPY_ANALYSIS.md          (Delta-Copy-Technologie)
-├── ARCHITECTURE.md                 (System-Architektur)
-├── SETUP.md                        (Installation)
-├── APPRISE_SETUP.md                (Notifications)
-└── RCLONE_TOKEN_REFRESH.md         (OAuth-Token)
+[metrics] uploaded_files=316 pool_reused=284 stubs_written=632 ...
 ```
 
----
-
-## 🎯 Kritische Code-Stellen
-
-### 1. Stub-Ratio-Check (Quota-Protection)
-
-**Location:** `_compute_snapshot_stub_ratio()` in `pcloud_push_json_manifest_to_pcloud.py`
-und Threshold-Check in `push_1to1_delta_mode()`
-
-**Warum kritisch?**
-- Falsch → copyfolder klont echte Files = **doppelte Quota**
-- Threshold zu hoch → Never TURBO-Mode
-- Threshold zu niedrig → Quota-Explosion
-
-**Current-Threshold:** >=50% Stubs + >=100 Dateien
-
-**Tuning-Scenarios:**
-```python
-# Aggressiv (mehr TURBO, höheres Risiko)
-PCLOUD_COPYFOLDER_MIN_STUB_RATIO=0.3
-PCLOUD_COPYFOLDER_MIN_FILES=50
-
-# Konservativ (weniger TURBO, sicherer)
-PCLOUD_COPYFOLDER_MIN_STUB_RATIO=0.7
-PCLOUD_COPYFOLDER_MIN_FILES=200
-```
-
----
-
-### 2. Gap-Validation-Loop (Scenario-Detection)
-Gap-Detection-Loop in `wrapper_pcloud_sync_1to1.sh` (Optimistic-Branch)
-**Location:** wrapper_pcloud_sync_1to1.sh:602-610
-
-**Warum kritisch?**
-- Falsche Entscheidung A/B = Performance-Verlust oder Datenverlust
-- Validierung fehlgeschlagen = Safe-Fallback zu Scenario A
-
-**Failsafe:**
-```bash
-if [[ "$status" != "OK" ]]; then
-    # Conservative-Bias: Lieber rebuilden als Risiko
-    needs_rebuild=1
-
-**Location:** Phase 5 (WRITE-Loop) in `push_1to1_delta_mode()` und Index-Save in `push_1to1_mode()`
-```
-
-**Erweiterung:** Deep-Validation (optional)
-```bash
-if [[ "${PCLOUD_DEEP_GAP_VALIDATION:-0}" == "1" ]]; then
-    "${PY}" "$DELTA_CHECK" --snapshot "$later" --json-out "/tmp/validate_${later}.json"
-    # Prüfe missing_anchors, hash_mismatches, etc.
-fi
-```
-
----
-
-### 3. Index-Update in Delta-Copy (Phase 5)
-Phase 5 (WRITE-Loop) in `push_1to1_delta_mode()` und Index-Save in `push_1to1_mode()`
-**Location:** pcloud_push_json_manifest_to_pcloud.py:1800-1900 (geschätzt)
-
-**Warum kritisch?**
-- Nodes nicht gespeichert = Dateien "verloren"
-- Holders nicht aktualisiert = Broken References
-
-**Validation:**
-```python
-# Nach Phase 5: Index-Consistency-Check
-for sha in diff["new"] + diff["changed"]:
-    assert sha in index["items"], f"Node {sha} nicht im Index!"
-    assert any(h.get("snapshot") == snapshot_name for h in index["items"][sha]["holders"])
-```
-
----
-
-### 4. Marker-Files-Handling
-
-**Location:** `_flatten_tree()` in `pcloud_quick_delta.py`
-
-**Warum kritisch?**
-- Marker als "UNKNOWN" = False-Positives
-- Delta-Check failed = Upload blockiert
-
-**Implementierung:**
-```python
-MARKER_FILES = {".upload_started", ".upload_complete", ".upload_aborted", ".upload_incomplete"}
-if name in MARKER_FILES:
-    return []  # Skip
-```
-
-**Validation:**
-```bash
-# Delta-Check sollte KEINE Marker melden
-jq '.unknown_files[] | select(.name | contains(".upload_"))' delta_report.json
-# Should be empty
-```
+- `uploaded_files`: echte neue Pool-Objekte hochgeladen
+- `pool_reused`: Pool-Objekte die schon existierten (Dedup-Treffer)
+- `stubs_written`: immer 2× `uploaded_files` + reused (Delta + alle Manifest-Dateien)
 
 ---
 
 ## 🔐 Sicherheitsaspekte
 
-### 1. Daten-Integrität
+### Daten-Integrität
 
-**Schutz-Mechanismen:**
+- Post-Upload-Validation verhindert `.upload_complete` bei inkonsistentem Snapshot
+- Fail-fast bei Upload-Fehlern: kein Stub/Index ohne Pool-Objekt
+- GC-Lock verhindert Race zwischen Upload und GC
 
-- **Read-Only Validation:** `validate_snapshot_integrity()` ändert nichts
-- **Explizite Deletion:** Nur bei confirmed BROKEN_CHAIN
-- **Lokale Manifeste bleiben:** Remote-Deletion löscht nicht lokal
-- **All-or-Nothing:** Upload-Fehler → Rollback (exit 1)
-- **Markers:** .upload_complete nur bei Erfolg
+### Wipe-Schutz
 
-**Worst-Case:**
-```
-Aggressive-Strategie + Scenario B
-→ Unnötige Re-Uploads (langsam)
-→ ABER: Kein Datenverlust!
-```
+Unvollständige Snapshots werden beim Neustart automatisch erkannt und bereinigt. Stammdaten (`pool_refs`) werden vor dem Neuaufbau konsistent gehalten: `snapshot_name` wird aus allen Einträgen entfernt.
 
----
+### Concurrency
 
-### 2. Concurrency Protection
-
-**Global Lock:**
-```bash
-LOCKFILE=/run/backup_pipeline.lock
-exec 9>"$LOCKFILE"
-flock -n 9 || {
-    log ERROR "Another instance is running"
-    exit 1
-}
-```
-
-**Marker-basiertes State-Management:**
-```python
-# Verhindert parallele Uploads zum selben Snapshot
-if exists(".upload_started"):
-    if not exists(".upload_complete"):
-        _log("[resume] Fortsetzen (bereits läuft?)")
-    else:
-        _log("[skip] Bereits vollständig")
-        return
-```
+Thread-Safety im Delta-Mode via `threading.Lock()` (`_state_lock`):
+- Alle Schreibzugriffe auf `pool_refs` und Counter-Updates
+- `_upload_to_pool()` kann parallel aufgerufen werden; Pool-Check intern serialisiert
 
 ---
 
-### 3. Quota-Protection
-
-**copyfolder-Safeguard:**
-```python
-# Stub-Ratio-Check verhindert Quota-Explosion
-if ratio < 0.5:
-    _log("[SAFE-MODE] Baue mit Stub-Struktur auf")
-    return push_1to1_mode(...)  # Einmalige Transformation
-```
-
-**Monitoring:**
-```sql
--- Quota-Trend überwachen
-SELECT snapshot, uploaded_count, stubs_count
-FROM pcloud_metrics
-WHERE run_start > NOW() - INTERVAL 7 DAY;
-```
-
----
-
-## 🔄 Säule 4: Resilient Restore System (scripts/pcloud_restore.py)
-
-Das Restore-Tool ist das universelle Gegenstück zum Upload. Es wurde von einem einfachen Snapshot-Tool zu einem Hochleistungs-Recovery-System ausgebaut, das sowohl historische Backups als auch Live-Daten effizient wiederherstellen kann.
-
-### Architektur & Modi
-
-Das System unterscheidet zwischen zwei grundlegenden Arbeitsweisen:
-
-1.  **Snapshot-Mode**: Nutzt den `content_index.json` (Deduplizierung via SHA256).
-2.  **Direct-Mode**: Lädt Dateien direkt via pCloud-Pfad oder ID (`folderid`, `fileid`), ohne einen Index zu benötigen.
-
-| Modus | Zielstruktur | Use-Case |
-| :--- | :--- | :--- |
-| **flat** (Default) | `out-dir/[snapshot]/relpath` | Klassische Wiederherstellung auf Datei-Ebene. |
-| **object-store** | `_objects/ab/sha256` + `_snapshots/snap/relpath` | Platzsparende Speicherung mehrerer Snapshots via Hardlinks. |
-
-### Hochleistungs-Parallelisierung
-
-Um den Durchsatz zu maximieren (insbesondere bei tausenden kleinen Dateien), nutzt das Skript eine hybride Download-Strategie:
-
-```mermaid
-flowchart TD
-    A[Start Restore] --> B{Dateigröße?}
-    B -- "< 50 MB" --> C[Parallel Download]
-    B -- ">= 50 MB" --> D[Sequential Download]
-    
-    C --> C1[ThreadPoolExecutor]
-    C1 --> C2[16 Threads gleichzeitig]
-    
-    D --> D1[Volle Bandbreite pro Datei]
-    D1 --> D2[RAM-schonendes Streaming]
-    
-    C2 --> E[Zusammenführung Stats]
-    D2 --> E
-    E --> F[Abschlussbericht]
-```
-
-- **Kleine Dateien (< 50MB)**: Werden standardmäßig mit **16 Threads** parallel verarbeitet (`PARALLEL_DOWNLOAD_THREADS`). Dies kompensiert die Latenz einzelner API-Calls.
-- **Große Dateien (>= 50MB)**: Werden nacheinander geladen, um die verfügbare Bandbreite optimal zu nutzen und den Overhead durch Thread-Context-Switches bei massiven Datenmengen zu vermeiden.
-
-### Smart Resume (Stage 1)
-
-Das System erkennt bereits vorhandene Dateien im Zielverzeichnis und überspringt diese intelligent:
-
-1.  **Snapshot-Mode (SHA-basiert)**: Wenn `local_file` existiert + `SHA256` im Index steht + `--verify` aktiv ist -> Vollständige Inhaltsprüfung vor Skip.
-2.  **Direct-Mode (Size-basiert)**: Da pCloud-Live-Ordner oft keine SHA-Werte direkt liefern, prüft das Tool die Dateigröße. `local_size == remote_size` -> Skip.
-
-### Sicherheitskonzept: Path-Traversal-Guard
-
-Da `relpath`-Werte aus externen Quellen (Index oder API-Response) kommen, wird jeder Zielpfad vor dem Schreiben validiert:
-
-```python
-# Path-Traversal-Guard
-expected_prefix = os.path.normpath(base_out_dir) + os.sep
-normalized_dest = os.path.normpath(local_dest)
-if not normalized_dest.startswith(expected_prefix):
-    raise SecurityError("Path-Traversal Versuch blockiert")
-```
-
-Dies stellt sicher, dass keine Dateien außerhalb des definierten `--out-dir` geschrieben werden können (z.B. durch Manipulation von `relpath` zu `../../etc/shadow`).
-
-### Thread-Safety & Stats
-
-Alle Status-Updates (Erfolgsrate, Download-Volumen, Fortschritt) werden über einen globalen `threading.Lock()` abgesichert. Die Fortschrittsanzeige berechnet dynamisch die Geschwindigkeit (MB/s) und die verbleibende Zeit (ETA) über den gesamten Batch.
-
-### CLI-Anwendungsfälle
+## 🧪 Wichtige Testszenarien
 
 ```bash
-# A. Snapshot-Restore (Dedupliziert & Parallel)
-python pcloud_restore.py --manifest pcloud --snapshot 2026-04-15-120000 --out-dir /mnt/recovery --download --verify
+# 1. Dry-Run eines bestehenden Snapshots
+./wrapper_pcloud_pool_sync_1to1.sh 2026-05-15-120009 --dry-run
 
-# B. Direct Folder Download (Kein Index nötig)
-python pcloud_restore.py --manifest pcloud --folder "/Wichtig/Projekte/2026" --out-dir ./local_copy --download
+# 2. Vollständiger Integritätscheck
+python scripts/utilities/pool_verify_backup.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --manifests-dir /srv/pcloud-archive/manifests --stub-sample 100
 
-# C. Gezielte Datei-Rettung via ID
-python pcloud_restore.py --manifest pcloud --fileid 12345678 --out-dir . --download
+# 3. Pool-Check remote (quick)
+python scripts/utilities/pool_check_remote.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --snapshot 2026-05-15-120009
+
+# 4. tamper-detect
+python pcloud_quick_delta.py --dest-root /Backup/rtb_pool --env-file "$ENV_FILE"
+
+# 5. Undefined-Names-Check (vor Deployment)
+python scripts/utilities/check_undefined_names.py \
+  pcloud_push_json_pool_manifest_to_pcloud.py \
+  pcloud_json_pool_manifest.py pcloud_quick_delta.py
+
+# 6. Simulate Wipe+Restart (manuell)
+# .upload_complete löschen → nächster Lauf wipet + startet sauber neu
 ```
 
 ---
 
-## ⏳ Säule 5: Recovery & Time-Travel (scripts/pcloud_repair_index.py)
-
-Wenn `pcloud_quick_delta.py` "missing_anchors" meldet — also Dateien, die im Index
-stehen, aber auf pCloud nicht mehr existieren — dann greift dieses Tool.
-Es ist **mehr als ein Bugfix-Script**: Es ermöglicht Time-Travel-Rekonstruktion
-vergangener Snapshot-Zustände.
-
-### 4-Phasen-Workflow
-
-```
-Phase 1: Delta-Report laden
-  → Liest JSON-Output von pcloud_quick_delta.py
-  → Extrahiert missing_anchors (Dateien mit Index-Eintrag aber ohne reale Datei)
-
-Phase 2: Remote content_index.json laden
-  → Holt aktuellen Master-Index von pCloud
-  → Nutzt get_textfile() (kein maxbytes-Limit)
-
-Phase 3: Index reparieren (repair_index())
-  → Für jeden missing_anchor: Zugehörige Holder-Einträge entfernen
-  → Schema-Validierung: Erkennt korrupte Holder (String statt Dict)
-  → Verwaiste Nodes (keine Holder + kein Anchor) komplett löschen
-  → Anchor-Felder (anchor_path, fileid, pcloud_hash) bei fehlenden Anchors entfernen
-
-Phase 4: Reparierten Index lokal speichern
-  → /srv/pcloud-temp/pcloud_index_{snapshot}.json
-  → Beim nächsten Upload: push_1to1_mode() lädt diesen lokalen Index
-  → Resume-Mechanismus erkennt fehlende Dateien und lädt sie nach
-```
-
-### Die `repair_index()` Funktion im Detail
-
-Diese Funktion ist das Herzstück und verdient eine genaue Erklärung,
-weil sie drei verschiedene Arten von Problemen gleichzeitig behandelt:
-
-```python
-def repair_index(index, missing_anchors, snaps_root, *, cleanup_all=False):
-    """
-    Was passiert hier Schritt für Schritt:
-    
-    1. LOOKUP aufbauen: anchor_path → missing_anchor_info
-       (damit wir schnell prüfen können, ob ein Node betroffen ist)
-    
-    2. Für JEDEN Node im Index:
-       a) Ist sein anchor_path in der missing-Liste?
-       b) Sind seine Holder gültige Dicts? (Schema-Check)
-       
-    3. Schema-Check für ALLE Nodes (nicht nur fehlende):
-       - Dict-Holder bei fehlenden Anchors → entfernen wenn Pfad matcht
-       - String-Holder (korrupt!) bei fehlenden Anchors → IMMER entfernen
-       - String-Holder bei existierenden Anchors → nur mit --cleanup-all
-       
-    4. Bei fehlenden Anchors: anchor_path, fileid, pcloud_hash löschen
-       (der Node selbst bleibt, wenn noch andere Holder existieren)
-       
-    5. Verwaiste Nodes (keine Holder + kein Anchor) → komplett löschen
-    """
-```
-
-**Warum ist der Schema-Check wichtig?**
-
-Durch einen früheren Bug konnten Holder als Strings statt als Dicts im Index landen.
-Das Tool erkennt und bereinigt diese automatisch:
-
-```python
-# Korrupter Holder (String):
-"holders": ["2026-04-15/photos/bild.jpg"]  # ← FALSCH
-
-# Korrekter Holder (Dict):
-"holders": [{"snapshot": "2026-04-15", "relpath": "photos/bild.jpg"}]  # ← RICHTIG
-```
-
-### Time-Travel-Rekonstruktion
-
-Das Archive-System speichert für **jeden Snapshot** einen eigenen Index:
-
-```
-Remote: /Backup/rtb_1to1/_snapshots/_index/archive/
-  ├─ 2026-04-10-075334_index.json   ← Zustand nach Snapshot 1
-  ├─ 2026-04-12-121042_index.json   ← Zustand nach Snapshot 2
-  └─ 2026-04-15-093021_index.json   ← Zustand nach Snapshot 3
-```
-
-**Wenn der Master-Index korrupt ist**, kann man jeden einzelnen
-historischen Zustand rekonstruieren:
-
-```bash
-# 1. Quick-Delta mit Archive-Index laufen lassen
-python pcloud_quick_delta.py \
-    --dest-root /Backup/rtb_1to1 \
-    --index-file 2026-04-15-093021_index.json \
-    --json-out /tmp/delta_archive.json
-
-# 2. Mit diesem Report den Index reparieren
-python pcloud_repair_index.py \
-    --delta-report /tmp/delta_archive.json \
-    --dest-root /Backup/rtb_1to1
-
-# 3. Nächster Upload nutzt automatisch den lokal reparierten Index
-```
-
-### Error 2002 Robustness (Graceful Fallback)
-
-`load_remote_index()` fängt den Fall ab, dass der Remote-Pfad noch gar nicht
-existiert (pCloud API Error 2002 = "Directory does not exist"):
-
-```python
-def load_remote_index(cfg, snaps_root):
-    idx_path = f"{snaps_root}/_index/content_index.json"
-    try:
-        txt = pc.get_textfile(cfg, path=idx_path)
-        j = json.loads(txt or '{"version":1,"items":{}}')
-    except Exception:
-        # Pfad existiert noch nicht oder Index nicht lesbar
-        # → Leeren Index zurückgeben statt Crash
-        sys.exit(2)  # Expliziter Fehler, kein Stille
-```
-
-### CLI-Beispiele
-
-```bash
-# Schritt 1: Delta-Report erzeugen
-python pcloud_quick_delta.py \
-    --dest-root /Backup/rtb_1to1 \
-    --json-out /srv/pcloud-temp/delta.json
-
-# Schritt 2: Dry-Run (nur Report, keine Änderungen)
-python pcloud_repair_index.py \
-    --delta-report /srv/pcloud-temp/delta.json \
-    --dest-root /Backup/rtb_1to1 \
-    --dry-run
-
-# Schritt 3: Reparatur durchführen
-python pcloud_repair_index.py \
-    --delta-report /srv/pcloud-temp/delta.json \
-    --dest-root /Backup/rtb_1to1
-
-# Optional: Alle korrupten String-Holder aufräumen
-python pcloud_repair_index.py \
-    --delta-report /srv/pcloud-temp/delta.json \
-    --dest-root /Backup/rtb_1to1 \
-    --cleanup-all
-
-# Output:
-# [phase 3] Holders entfernt:     12
-# [phase 3] Nodes bereinigt:      8
-# [phase 3] Nodes komplett gelöscht: 3
-# [phase 4] Index gespeichert: /srv/pcloud-temp/pcloud_index_2026-04-15.json
-```
-
----
-
-## 🧪 Testing-Empfehlungen
-
-### Unit-Tests (Manuell)
-
-**Test 1: Conservative-Abort**
-```bash
-# Setup: Gap schaffen
-delete_snapshot_remote "2026-04-14"
-
-# Run: Conservative
-sudo PCLOUD_GAP_STRATEGY=conservative bash /opt/apps/rtb/rtb_wrapper.sh
-
-# Expected: EXIT 1 + ERROR-Log
-```
-
-**Test 2: Optimistic Scenario B**
-```bash
-# Setup: Gap, but intact chain
-delete_snapshot_remote "2026-04-14"
-# 2026-04-15, 2026-04-16 bleiben
-
-# Run: Optimistic
-sudo PCLOUD_GAP_STRATEGY=optimistic bash /opt/apps/rtb/rtb_wrapper.sh
-
-# Expected: Nur 2026-04-14 upload, 15+16 unberührt
-# Check: rebuilt_snapshots = 0
-```
-
-**Test 3: Optimistic Scenario A**
-```bash
-# Setup: Broken chain
-rm /srv/pcloud-archive/manifests/2026-04-14.json
-
-# Run: Optimistic
-sudo PCLOUD_GAP_STRATEGY=optimistic bash /opt/apps/rtb/rtb_wrapper.sh
-
-# Expected: DELETE 15+16, UPLOAD 14+15+16
-# Check: rebuilt_snapshots = 2
-```
-
----
-
-### Integration-Tests
-
-**Test 4: Delta-Copy TURBO-Mode**
-```bash
-# Setup: Bereits 1 Snapshot mit Stubs
-ls /Backup/rtb_1to1/_snapshots/2026-04-15  # exists
-stub_ratio=$(check_stub_ratio "2026-04-15")  # >50%
-
-# Run: Delta-Copy
-sudo PCLOUD_USE_DELTA_COPY=1 bash /opt/apps/rtb/rtb_wrapper.sh
-
-# Expected: copyfolder + selective update
-# Log: "[TURBO-MODE] Stub-Ratio OK"
-```
-
-**Test 5: Resume after Crash**
-```bash
-# Setup: Crash simulieren (Kill während Upload)
-sudo PCLOUD_USE_DELTA_COPY=1 bash /opt/apps/rtb/rtb_wrapper.sh &
-PID=$!
-sleep 60
-kill -9 $PID
-
-# Run: Nochmals
-sudo PCLOUD_USE_DELTA_COPY=1 bash /opt/apps/rtb/rtb_wrapper.sh
-
-# Expected: "[resume] Setze Upload fort..."
-# Check: resumed > 0, uploaded = new files only
-```
-
----
-
-### Stress-Tests
-
-**Test 6: Massive Gaps (10 Snapshots)**
-```bash
-# Setup: Lösche 10 Snapshots remote
-for i in {5..14}; do
-    delete_snapshot_remote "2026-04-${i}"
-done
-
-# Run: Optimistic
-sudo PCLOUD_GAP_STRATEGY=optimistic bash /opt/apps/rtb/rtb_wrapper.sh
-
-# Expected: Scenario-Detection, korrekte Reihenfolge
-# Monitor: gaps_synced = 10
-```
-
----
-
-## 🐛 Known Issues (Git-History)
-
-**Commit bf22cf1 (2026-04-27) - Fix: Threading UnboundLocalError:**
-```
-PROBLEM: `UnboundLocalError: cannot access local variable 'threading'`
-ROOT CAUSE: Redundante lokale `import threading` in Funktionen (Zeile 854, 1481)
-           Python-Scoping: Lokales Import macht Variable lokal für GESAMTE Funktion
-           → threading.Lock() bei Zeile 1282 schlägt fehl (Variable noch nicht definiert)
-FIX: Redundante lokale Imports entfernt, globales Import (Zeile 36) reicht
-STATUS: ✅ Resolved
-```
-
-**Commit c19d82b (2026-04-27) - Fix: Manifest PID-Suffix:**
-```
-PROBLEM: PID im Manifest-Filename verhindert Reuse nach Crash
-         • pcloud_mani.{SNAPNAME}.$$.json → PID ändert sich bei Restart
-         • Manifest-Regenerierung: 17min verschwendet
-         • JSONL-Resume defekt (sucht alten Filename)
-FIX: PID entfernt → pcloud_mani.{SNAPNAME}.json (deterministisch)
-     Manifest-Existenz-Check vor Regenerierung
-STATUS: ✅ Resolved, ~17min Zeitersparnis bei Crashes
-```
-
-**Commit f25a75b (2026-04-27) - Fix: .upload_complete Check:**
-```
-PROBLEM: load_remote_snapshots() prüfte nur Ordner-Existenz
-         → Unvollständige Uploads als "fertig" erkannt
-         → False-Positive: "All snapshots already on pCloud"
-FIX: Expliziter .upload_complete Marker-Check via pc.stat_file()
-     Nur Snapshots mit Marker werden als vollständig gelistet
-STATUS: ✅ Resolved, verhindert Daten-Inkonsistenzen
-```
-
-**Commit d0e789e (Fix: Index Update):**
-```
-PROBLEM: New nodes in Delta-Copy Phase 5 wurden nicht gespeichert
-FIX: Improved holders update logic, error logging
-STATUS: ✅ Resolved
-```
-
-**Commit 5dd39e5 (Fix: Marker-Files):**
-```
-PROBLEM: .upload_* Marker als UNKNOWN in delta-check
-FIX: _flatten_tree() skips marker files
-STATUS: ✅ Resolved
-```
-
-**Commit b9416dc (Fix: pcloud_restore):**
-```
-PROBLEM: Binärdaten-Korrumpierung + Dedup-Bug
-FIX: Streaming-Download, fileid-Fallback
-STATUS: ✅ Resolved
-```
-
----
-
-## 📊 Performance-Daten (Geschätzt)
-
-### Gap-Handling
-
-| Scenario | Snapshots | Strategie | Zeit | Speedup |
-|----------|-----------|-----------|------|---------|
-| **B (Intact)** | Gap + 2 later | Conservative | Manual | - |
-| **B (Intact)** | Gap + 2 later | Aggressive | ~21h | 1x |
-| **B (Intact)** | Gap + 2 later | Optimistic | ~7h | **3x** |
-| **A (Broken)** | Gap + 2 later | Optimistic | ~21h | 1x |
-| **A (Broken)** | Gap + 2 later | Aggressive | ~21h | 1x |
-
-**Annahmen:** 150 GB/Snapshot, 50 Mbit Upload
-
----
-
-### Delta-Copy
-
-| Files | Changes | Full Mode | Delta Mode | Speedup |
-|-------|---------|-----------|------------|---------|
-| 100k | 1 | 3.5h | <2min | **105x** |
-| 100k | 10 | 3.5h | <5min | **42x** |
-| 100k | 100 | 3.5h | <15min | **14x** |
-| 100k | 1000 | 3.5h | <45min | **4.7x** |
-| 100k | 10000 | 3.5h | ~2h | **1.75x** |
-
-**Annahmen:** Stub-Ratio >50%, copyfolder ~5s
-
----
-
-### Folder-Cache
-
-| Parents | Legacy (sequential) | Cache-Mode | Speedup |
-|---------|---------------------|------------|---------|
-| 100 | ~50s | <1s | **50x** |
-| 1000 | ~500s (8min) | ~5s | **100x** |
-| 5000 | ~2500s (42min) | ~10s | **250x** |
-
----
-
-## 🎓 Bewertung & Empfehlungen
-
-### ✅ Stärken
-
-1. **Gap-Handling:**
-   - ✅ 3 Strategien (Conservative, Optimistic, Aggressive)
-   - ✅ Scenario A/B automatisch erkannt
-   - ✅ Safe-Fallback (Conservative-Bias)
-   - ✅ Vollständig getestet
-
-2. **Delta-Copy:**
-   - ✅ 60x-210x Performance bei minimalen Änderungen
-   - ✅ Quota-Protection (Stub-Ratio-Check)
-   - ✅ Graceful Fallback (Safe-Mode)
-   - ✅ Resume-Support
-
-3. **Monitoring:**
-   - ✅ MariaDB-Tracking
-   - ✅ JSONL-Structured-Logging
-   - ✅ Delta-Reports archiviert
-   - ✅ Performance-Metriken
-
-4. **Dokumentation:**
-   - ✅ 5 Dokumentations-Dateien
-   - ✅ 12 Mermaid-Diagramme
-   - ✅ FAQ, Quick-Start, Workflows
-   - ✅ Production-Ready
-
----
-
-### ⚠️ Potentielle Schwachstellen
-
-1. **Stub-Ratio-Threshold:**
-   - ⚠️ Hardcoded Default (0.5)
-   - ⚠️ Kein automatisches Tuning
-   - **Empfehlung:** Adaptive Threshold basierend auf Snapshot-Größe
-
-2. **Concurrency:**
-   - ⚠️ Global Lock nur auf Script-Ebene
-   - ⚠️ Keine API-seitige Sperre gegen manuelles Löschen
-   - **Empfehlung:** Web-UI-Lock oder Read-Only-Check vor Gap-Handling
-
-3. **Deep-Validation:**
-   - ⚠️ Optional, nicht Standard
-   - ⚠️ Könnte False-Negatives übersehen (Scenario B als A)
-   - **Empfehlung:** Deep-Check bei kritischen Snapshots (z.B. monatlich)
-
-4. **Error-Recovery:**
-   - ⚠️ copyfolder-Fehler → Fallback unklar
-   - ⚠️ Partielle Deletes bei Aggressive-Mode
-   - **Empfehlung:** Transaktions-Log für Rollback
-
----
-
-### 🚀 Optimierungs-Potenzial
-
-1. **Parallelisierung:**
-   ```python
-   # Aktuell: Sequential validation
-   for later in later_snaps:
-       status = validate_snapshot_integrity(later)
-   
-   # Optimiert: Parallel validation
-   with ThreadPoolExecutor(max_workers=4) as ex:
-       statuses = ex.map(validate_snapshot_integrity, later_snaps)
-   ```
-
-2. **Cache-Warming:**
-   ```python
-   # Pre-populate remote_snapshots bei Script-Start
-   global _REMOTE_SNAPSHOT_CACHE
-   _REMOTE_SNAPSHOT_CACHE = set(load_remote_snapshots())
-   ```
-
-3. **Adaptive Stub-Ratio:**
-   ```python
-   # Threshold basierend auf Snapshot-Größe
-   if total_files < 1000:
-       min_ratio = 0.3  # Kleiner Snapshot → relaxed
-   elif total_files > 50000:
-       min_ratio = 0.7  # Großer Snapshot → streng
-   else:
-       min_ratio = 0.5  # Default
-   ```
-
-4. **Incremental Index-Updates:**
-   ```python
-   # Nur geänderte Nodes schreiben (Delta-Index)
-   delta_index = {"version": 1, "items": {sha: node for sha in changed_nodes}}
-   # Merge bei Restore
-   ```
-
----
-
-### 🎯 Production-Readiness-Score
-
-| Kategorie | Score | Begründung |
-|-----------|-------|------------|
-| **Funktionalität** | 9/10 | Alle Features implementiert, getestet |
-| **Performance** | 9/10 | 60x-210x Speedup, Optimierungen vorhanden |
-| **Sicherheit** | 8/10 | Quota-Protection, Safe-Fallback, aber: Concurrency-Lücken |
-| **Monitoring** | 9/10 | MariaDB + JSONL + Delta-Reports |
-| **Dokumentation** | 10/10 | Umfassend, vollständig, mit Diagrammen |
-| **Testbarkeit** | 7/10 | Manuelle Tests dokumentiert, Unit-Tests fehlen |
-| **Error-Handling** | 8/10 | Robust, aber: Partielle States möglich |
-| **Code-Qualität** | 8/10 | Gut strukturiert, aber: Komplexität hoch |
-
-**Gesamt: 8.5/10** - **Production-Ready mit kleineren Vorbehalten**
-
----
-
-## 🔮 Nächste Schritte (Empfohlen)
-
-### Phase 1: Immediate (Pre-Production)
-
-1. ✅ **Test 1-6 durchführen** (Conservative, Optimistic A/B, Delta-Copy, Resume, Stress)
-2. ✅ **Performance-Baseline messen** (5 Runs, Durchschnitt)
-3. ✅ **Monitoring-Alerts konfigurieren** (gaps_synced > 0, rebuilt > 2)
-4. ⬜ **Rollback-Prozedur dokumentieren** (Wie Manual-Intervention bei Conservative?)
-
-### Phase 2: Short-Term (1-2 Wochen)
-
-1. ⬜ **Deep-Validation testen** (`PCLOUD_DEEP_GAP_VALIDATION=1`)
-2. ⬜ **Adaptive Stub-Ratio implementieren** (Größenbasiert)
-3. ⬜ **Unit-Tests schreiben** (pytest für Python-Komponenten)
-4. ⬜ **Grafana-Dashboard** (MariaDB-Metriken visualisieren)
-
-### Phase 3: Mid-Term (1-2 Monate)
-
-1. ⬜ **Parallel Validation** (ThreadPoolExecutor bei Gap-Check)
-2. ⬜ **Transaktions-Log** (Rollback-Support für Aggressive-Mode)
-3. ⬜ **API-Rate-Limiting** (Schutz vor pCloud-Throttling)
-4. ⬜ **CI/CD-Integration** (Auto-Tests bei Git-Push)
-
-### Phase 4: Long-Term (3-6 Monate)
-
-1. ⬜ **Incremental Index** (Delta-Updates statt Full-Write)
-2. ⬜ **Web-UI-Lock** (Verhindert manuelle Löschungen während Backup)
-3. ⬜ **Auto-Recovery** (Selbstheilung bei Scenario A)
-4. ⬜ **Multi-Region-Support** (Geo-Redundanz)
-
----
-
-## 📌 Fazit
-
-### Zusammenfassung
-
-Das **pCloud Gap-Handling & Delta-Copy System** ist eine **hochmoderne, produktionsreife Implementierung** mit folgenden Highlights:
-
-✅ **Intelligentes Gap-Handling** - 3 Strategien, automatische Scenario-Detection  
-✅ **TURBO-Modus** - 60x-210x schneller bei Delta-Copy  
-✅ **Quota-Protection** - Stub-Ratio-Check verhindert Explosion  
-✅ **Vollständiges Monitoring** - MariaDB + JSONL + Delta-Reports  
-✅ **Umfassende Dokumentation** - 5 Docs, 12 Diagramme, Production-Ready  
-
-⚠️ **Potentielle Risiken:**
-- Stub-Ratio-Threshold statisch (könnte optimiert werden)
-- Deep-Validation optional (könnte Standardized werden)
-- Concurrency-Lücken (manuelles Löschen während Backup)
-
-🎯 **Empfehlung:**  
-**DEPLOY in Produktion** mit folgenden Safeguards:
-1. Start mit `PCLOUD_GAP_STRATEGY=conservative` (1 Woche)
-2. Wechsel zu `optimistic` nach erfolgreichen Tests
-3. `PCLOUD_USE_DELTA_COPY=1` nur bei Stub-Ratio >50%
-4. Monitoring-Alerts für `gaps_synced > 0`
-
-**Overall-Rating: 8.5/10** - Ausgezeichnete Arbeit! 🎉
-
----
-
-*Analyse abgeschlossen: 2026-04-17 11:30 UTC*  
-*Nächste Review: Nach 1 Woche Production-Betrieb*
+## 📚 Verwandte Dokumentation
+
+| Datei | Inhalt |
+|---|---|
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | System-Übersicht, Datenstrukturen, Modi |
+| [SETUP.md](./SETUP.md) | Ersteinrichtung, Abhängigkeiten, Pool-Bootstrap |
+| [ENV_VARIABLES.md](./ENV_VARIABLES.md) | Vollständige ENV-Variablen-Referenz |
+| [BACKUP_RETENTION_DEEP_DIVE.md](./BACKUP_RETENTION_DEEP_DIVE.md) | RTB + Pool Retention-Strategie |
+| [VENV_MANAGEMENT.md](./VENV_MANAGEMENT.md) | Python-venv Setup |
