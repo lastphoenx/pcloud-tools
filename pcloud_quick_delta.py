@@ -805,43 +805,57 @@ Beispiele:
     print()
     pool_root = f"{dest_root.rstrip('/')}/_pool"
     if is_pool:
-        # WICHTIG: Zwei SEPARATE listfolder-Calls (parallel), nicht ein kombinierter
-        # Call auf den Parent. Ein rekursiver Call auf /Backup/rtb_pool/ listet
-        # _pool (60k+ Objekte) + _snapshots (100k+ Stubs) zusammen → pCloud API 5000
-        # "Internal error" ab einer bestimmten Gesamtgrösse. Zwei separate Calls
-        # auf _pool/ und _snapshots/ bleiben unter dem Limit. Gleiches Muster wie
-        # pool_verify_backup.py (dort funktioniert es zuverlässig).
+        # Fetch-Strategie Pool-Mode (gelernt aus API-Limits):
+        # - listfolder(_pool, recursive=True)         → OK (~60k Objekte, ~3s)
+        # - listfolder(_snapshots, recursive=True)    → API 5000 (~1M Stubs, zu gross)
+        # - listfolder(_snapshots/<snap>, recursive)  → OK pro Snapshot (~50k, ~1s)
+        # Loesung: _pool einmal + jeden Snapshot einzeln (parallel).
         import concurrent.futures as _cf
-        print(f"[fetch] Lade Pool ({pool_root}) und Snapshots ({snaps_root}) parallel...")
+
+        # Snapshot-Liste aus pool_refs
+        snap_names = set()
+        for _e in index.get("pool_refs", {}).values():
+            if isinstance(_e, dict):
+                _s = _e.get("snapshots")
+                snap_names.update(_s.keys() if isinstance(_s, dict) else (_s or []))
+
+        print(f"[fetch] Lade _pool + {len(snap_names)} Snapshots einzeln (parallel)...")
         t0 = time.time()
 
         def _fetch_pool_tree():
             res = pc.call_with_backoff(
-                pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False, showpath=False)
+                pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False)
             return _flatten_tree(res.get("metadata") or {}, parent_path=pool_root, is_root=True)
 
-        def _fetch_snaps_tree():
+        def _fetch_snap_tree(snap):
+            snap_path = f"{snaps_root}/{snap}"
             res = pc.call_with_backoff(
-                pc.listfolder, cfg, path=snaps_root, recursive=True, nofiles=False, showpath=False)
-            return _flatten_tree(res.get("metadata") or {}, parent_path=snaps_root, is_root=True)
+                pc.listfolder, cfg, path=snap_path, recursive=True, nofiles=False)
+            return _flatten_tree(res.get("metadata") or {}, parent_path=snap_path, is_root=True)
 
-        with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-            _fp = _ex.submit(_fetch_pool_tree)
-            _fs = _ex.submit(_fetch_snaps_tree)
-            pool_flat = _fp.result()
-            snaps_flat = _fs.result()
+        all_flat: List[dict] = []
+        with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
+            futures = {"_pool": _ex.submit(_fetch_pool_tree)}
+            for _s in snap_names:
+                futures[_s] = _ex.submit(_fetch_snap_tree, _s)
+            for key, fut in futures.items():
+                try:
+                    all_flat.extend(fut.result())
+                except Exception as e:
+                    print(f"[warn] listfolder fehlgeschlagen fuer {key}: {e}")
 
         by_fileid: Dict[int, dict] = {}
         by_path: Dict[str, dict] = {}
-        for f in pool_flat + snaps_flat:
+        for f in all_flat:
             fid = f.get("fileid")
             fp = f.get("_full_path", "")
             if fid is not None:
                 by_fileid[int(fid)] = f
             if fp:
                 by_path[fp] = f
+        n_pool = sum(1 for p in by_path if "/_pool/" in p)
         n_stubs = sum(1 for p in by_path if p.endswith(".meta.json"))
-        print(f"[fetch] {len(by_fileid)} Dateien ({len(pool_flat)} pool, {n_stubs} stubs) in {time.time()-t0:.1f}s")
+        print(f"[fetch] {len(by_fileid)} Dateien ({n_pool} pool, {n_stubs} stubs) in {time.time()-t0:.1f}s")
     else:
         by_fileid, by_path = fetch_remote_tree(cfg, snaps_root, snapshot_filter=snapshot_filter)
 
