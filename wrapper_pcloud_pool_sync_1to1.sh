@@ -468,17 +468,31 @@ build_and_push() {
   T0=$(date +%s)
   _db_phase_log "verify" "start"
   
-  if "${PY}" "$DELTA_CHECK" \
-    --dest-root "$PCLOUD_DEST" \
-    --env-file "$ENV_FILE" \
-    --json-out "$delta_report" 2>&1 | tee -a "$PCLOUD_LOG"; then
-    
+  local _delta_ok=0
+  local _delta_attempt=0
+  local _delta_max_attempts=2
+  local _delta_retry_wait=${PCLOUD_DELTA_RETRY_WAIT:-120}   # Wartezeit bei API 5000 (default 120s)
+
+  while [[ $_delta_attempt -lt $_delta_max_attempts && $_delta_ok -eq 0 ]]; do
+    _delta_attempt=$(( _delta_attempt + 1 ))
+    if [[ $_delta_attempt -gt 1 ]]; then
+      _log WARN "Delta-Check Retry $_delta_attempt/$_delta_max_attempts nach API-Fehler (warte ${_delta_retry_wait}s...)"
+      sleep "$_delta_retry_wait"
+    fi
+
+    if "${PY}" "$DELTA_CHECK" \
+      --dest-root "$PCLOUD_DEST" \
+      --env-file "$ENV_FILE" \
+      --json-out "$delta_report" 2>&1 | tee -a "$PCLOUD_LOG"; then
+      _delta_ok=1
+    fi
+  done
+
+  if [[ $_delta_ok -eq 1 ]]; then
     local verify_duration=$(( $(date +%s) - T0 ))
     _db_phase_log "verify" "end" "SUCCESS"
     _db_update_metrics "verify_duration_sec = $verify_duration"
     _log INFO "Delta-Check successful (${verify_duration}s)"
-    
-    # Delta-Report archivieren
     if [[ -f "$delta_report" ]]; then
       mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
       _log INFO "Delta report archived: delta_verify_${SNAPNAME}.json"
@@ -486,7 +500,7 @@ build_and_push() {
   else
     local verify_duration=$(( $(date +%s) - T0 ))
     _db_phase_log "verify" "end" "FAILED"
-    _log WARN "Delta-Check failed (non-critical, upload succeeded)"
+    _log WARN "Delta-Check failed nach $_delta_max_attempts Versuch(en) (non-critical, upload succeeded)"
   fi
   fi
   # === Ende Delta-Check ===
