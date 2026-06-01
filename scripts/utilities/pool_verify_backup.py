@@ -295,26 +295,50 @@ def main() -> int:
     stub_paths: Set[str] = set()
     pool_refs:  dict     = {}
 
+    # _fetch_stubs: listfolder(_snapshots, recursive=True) scheitert bei ~1M Stubs
+    # mit pCloud API 5000. Loesung: jeden Snapshot einzeln listen (parallel).
     def _fetch_pool():
         res = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False)
         return _walk_pool(res.get("metadata", {}))
 
-    def _fetch_stubs():
-        res = pc.call_with_backoff(pc.listfolder, cfg, path=snaps_root, recursive=True, nofiles=False)
-        return _walk_stubs(res.get("metadata", {}), snaps_root)
+    def _fetch_snap_stubs(snap):
+        snap_path = f"{snaps_root}/{snap}"
+        res = pc.call_with_backoff(pc.listfolder, cfg, path=snap_path, recursive=True, nofiles=False)
+        paths: Set[str] = set()
+        def _walk(node, cur):
+            for child in node.get("contents", []) or []:
+                name = child.get("name", "")
+                p = f"{cur}/{name}"
+                if child.get("isfolder"):
+                    _walk(child, p)
+                elif name.endswith(".meta.json"):
+                    paths.add(p)
+        _walk(res.get("metadata", {}), snap_path)
+        return paths
 
     def _fetch_index():
         txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
         idx = json.loads(txt or "{}")
         return idx.get("pool_refs") or {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    # Pool + Index parallel, dann Snapshots mit 8 Threads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
         f_pool  = ex.submit(_fetch_pool)
-        f_stubs = ex.submit(_fetch_stubs)
         f_index = ex.submit(_fetch_index)
-        pool_shas  = f_pool.result()
-        stub_paths = f_stubs.result()
-        pool_refs  = f_index.result()
+        pool_refs = f_index.result()
+        pool_shas = f_pool.result()
+        # Stubs: alle Snapshots parallel
+        snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
+        done = 0
+        for snap, fut in snap_futures.items():
+            try:
+                snap_stubs = fut.result()
+                stub_paths |= snap_stubs
+                done += 1
+                print(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs", flush=True)
+            except Exception as e:
+                done += 1
+                print(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
 
     dt_fetch = time.time() - t_fetch
     print(f"[fetch] Pool: {len(pool_shas)} SHA256s | "
