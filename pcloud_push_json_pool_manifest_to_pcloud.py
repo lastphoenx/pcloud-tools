@@ -1292,10 +1292,11 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         _log(f"[validate] ✓ Index: Alle {total_unique_sha256s} SHA256s korrekt in pool_refs")
     
     # === 5. STUB-VOLLCHECK via listfolder (100% Coverage, 1 API-Call) ===
-    # Frueherer Ansatz: N × stat_file_safe (Stichprobe 100/20107 = 0.5% → fehlende Stubs
-    # wurden nicht gefunden). Neuer Ansatz: 1 × listfolder(snapshot_dir) → Set aller
-    # vorhandenen Stubs → Manifest-Pfade dagegen in O(1). Gleiche Kosten wie der
-    # listfolder der bereits in _batch_write_stubs lauft.
+    # listfolder(snapshot_dir, recursive=True) kann bei grossen Snapshots (70k Ordner +
+    # 100k Stubs) von pCloud trunciert werden → False-Positive-Fehler. Truncation-Schutz:
+    # wenn remote_stubs < 90% der erwarteten Stubs, Scan als unzuverlaessig werten und
+    # uebergehen statt falsch zu melden. pool_verify_backup.py ist die Alternative fuer
+    # vollstaendige Pruefung (macht per-Snapshot-Calls, robust gegen Truncation).
     if total_files > 0:
         try:
             _log(f"[validate] Lade Snapshot-Dateiliste (Stub-Vollcheck)...")
@@ -1319,21 +1320,33 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
                 _snap_result.get("metadata", {}), cur_path=snapshot_dir.rstrip("/"))
             _log(f"[validate] Remote-Stubs vorhanden: {len(_remote_stub_paths)}")
 
-            missing_stubs = []
-            for item in manifest_items:
-                relpath = item.get("relpath")
-                if relpath:
-                    stub_path = f"{snapshot_dir}/{relpath}.meta.json"
-                    if stub_path not in _remote_stub_paths:
-                        missing_stubs.append(relpath)
-            if missing_stubs:
-                errors.append(f"Stubs fehlen: {len(missing_stubs)}")
-                for rp in missing_stubs[:10]:
-                    errors.append(f"  - Stub fehlt: {rp}")
-                if len(missing_stubs) > 10:
-                    errors.append(f"  ... und {len(missing_stubs)-10} weitere")
+            # Truncation-Schutz: Wenn API-Antwort zu wenige Stubs liefert, ist der Scan
+            # unzuverlaessig. Schwelle: < 90% der erwarteten UND mehr als 100 fehlen.
+            # Beides noetig, damit bei echten kleinen Differenzen (z.B. 1-2 fehlende Stubs)
+            # trotzdem Fehler gemeldet werden.
+            _truncation_suspect = (
+                len(_remote_stub_paths) < total_files * 0.9
+                and total_files - len(_remote_stub_paths) > 100
+            )
+            if _truncation_suspect:
+                _log(f"[validate][WARN] Stub-Scan trunciert: {len(_remote_stub_paths)} von ~{total_files} erwartet")
+                _log(f"[validate][WARN] Stub-Vollcheck uebersprungen – pool_verify_backup.py fuer vollstaendige Pruefung verwenden")
             else:
-                _log(f"[validate] ✓ Stubs: Alle {total_files} vorhanden (100% Coverage)")
+                missing_stubs = []
+                for item in manifest_items:
+                    relpath = item.get("relpath")
+                    if relpath:
+                        stub_path = f"{snapshot_dir}/{relpath}.meta.json"
+                        if stub_path not in _remote_stub_paths:
+                            missing_stubs.append(relpath)
+                if missing_stubs:
+                    errors.append(f"Stubs fehlen: {len(missing_stubs)}")
+                    for rp in missing_stubs[:10]:
+                        errors.append(f"  - Stub fehlt: {rp}")
+                    if len(missing_stubs) > 10:
+                        errors.append(f"  ... und {len(missing_stubs)-10} weitere")
+                else:
+                    _log(f"[validate] ✓ Stubs: Alle {total_files} vorhanden (100% Coverage)")
         except Exception as e:
             _log(f"[validate][WARN] Stub-Vollcheck fehlgeschlagen: {e} - uebersprungen")
     
@@ -1651,13 +1664,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     _log(f"[delta-mode] Basis: {basis_snapshot_name}")
     _log(f"[delta-mode] Pool: {pool_root}")
     
-    # Timeout-Protection: copyfolder ist eine Meta-Operation, die bei 100k Dateien
-    # 60-120s+ dauert. Default 30s ist viel zu kurz und war die Ursache der
-    # Fallback-Kaskade. Analog zum 1to1-Delta-Mode auf 300s anheben (override:
-    # PCLOUD_COPYFOLDER_TIMEOUT).
+    # Timeout-Protection: copyfolder ist ein Socket-Read-Timeout pro Antwort-Byte.
+    # Bei 80k Stubs + 70k Ordnern dauert der Server-seitige Copy ~600s (beobachtet
+    # 2026-06-04). Default 300s löst 2 Retries aus bevor Erfolg → ineffizient und
+    # fragil. Neuer Default: 700s (genug Reserve über 591s Messwert).
+    # Override via PCLOUD_COPYFOLDER_TIMEOUT.
     current_timeout = int(cfg.get("timeout", 30))
     if current_timeout <= 60:
-        cfg["timeout"] = int(os.environ.get("PCLOUD_COPYFOLDER_TIMEOUT", "300"))
+        cfg["timeout"] = int(os.environ.get("PCLOUD_COPYFOLDER_TIMEOUT", "700"))
         _log(f"[delta-mode] Timeout erhöht: {current_timeout}s → {cfg['timeout']}s (Meta-Operationen)")
     else:
         _log(f"[delta-mode] Timeout beibehalten: {current_timeout}s")
@@ -2707,7 +2721,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         _log(f"[push] Starte Upload: {_total_items} Dateien, {_total_size/1024**3:.2f} GB")
         
         # ============================================================================
-        # === PHASE 1: FOLDER CREATION (1:1 wie Original mit Template!) ===
+        # === PHASE 1: FOLDER CREATION ===
         # ============================================================================
         _log("[pool-mode] Phase 1: Ordnerstruktur anlegen...")
         t_folder_start = time.time()
@@ -2722,180 +2736,99 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     manifest_folders.add(relpath)
         
         _log(f"[pool-mode] Manifest hat {len(manifest_folders)} Ordner")
-        
-        # Template-Pfade
-        _FOLDER_TEMPLATE_DIRNAME = "_folder_template"
-        template_path = f"{dest_root.rstrip('/')}/{_FOLDER_TEMPLATE_DIRNAME}"
-        template_force_active = os.environ.get("PCLOUD_FOLDER_TEMPLATE_FORCE", "0") == "1"
-        
-        # Prüfe ob Template existiert
-        template_exists = False
+
         if not dry:
-            try:
-                template_md = pc.stat_file(cfg, path=template_path, with_checksum=False)
-                template_exists = bool(template_md and template_md.get("isfolder"))
-            except Exception:
-                pass
-        
-        # Entscheidung: Template nutzen oder Einzeln anlegen? (1:1 Original Zeile 2008)
-        template_used = False
-        
-        if template_exists and template_force_active and not dry:
-            # === Template-basierte Anlage (SCHNELL!) ===
-            _log(f"[pool-mode] Nutze Template: {template_path}")
-            try:
-                # 1. Template-Ordner laden
-                _log("[pool-mode] Lade Template-Struktur...")
-                template_folders = set()
+            from collections import defaultdict
+
+            # --- Checkpoint: Resume nach Abbruch ohne teuren listfolder ---
+            # Datei: {archive_dir}/state/folder_checkpoint_{snapshot_name}.json
+            # Beim ersten Lauf: listfolder → missing_folders berechnen → Checkpoint speichern.
+            # Beim Resume: Checkpoint laden → listfolder überspringen → ab created_count weitermachen.
+            _state_dir = os.path.join(archive_dir, "state")
+            _cp_path = os.path.join(_state_dir, f"folder_checkpoint_{snapshot_name}.json")
+            _checkpoint = None
+            if os.path.exists(_cp_path):
                 try:
-                    result = pc.call_with_backoff(pc.listfolder, cfg, path=template_path, recursive=True, nofiles=True)
+                    with open(_cp_path, encoding="utf-8") as _f:
+                        _cp = json.load(_f)
+                    if _cp.get("snapshot") == snapshot_name and _cp.get("status") == "in_progress":
+                        _checkpoint = _cp
+                        _log(f"[folders] Resume-Checkpoint: {_cp['created_count']}/{_cp['total_folders']} bereits erstellt")
+                except Exception as _e:
+                    _log(f"[folders] Checkpoint lesen fehlgeschlagen: {_e} – starte neu")
+
+            if _checkpoint:
+                # Resume: gespeicherte (depth-geordnete) Ordnerliste verwenden
+                _flat_ordered = _checkpoint["flat_ordered"]
+                _resume_from  = _checkpoint["created_count"]
+                total_folders = _checkpoint["total_folders"]
+            else:
+                # Erster Lauf: Remote-Zustand via listfolder ermitteln
+                remote_folders = set()
+                try:
+                    result = pc.call_with_backoff(
+                        pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
                     def _collect_folders(obj, parent_path=""):
                         if isinstance(obj, dict) and obj.get("isfolder"):
                             folder_name = obj.get("name", "")
                             folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
-                            template_folders.add(folder_path)
+                            remote_folders.add(folder_path)
                             for child in obj.get("contents") or []:
                                 _collect_folders(child, folder_path)
                     metadata = result.get("metadata") or {}
                     for child in metadata.get("contents") or []:
                         _collect_folders(child, "")
-                    _log(f"[pool-mode] Template hat {len(template_folders)} Ordner")
+                    _log(f"[pool-mode] {len(remote_folders)} Remote-Ordner gefunden")
                 except Exception as e:
-                    _log(f"[warn] Template-Laden fehlgeschlagen: {e}")
-                    raise
-                
-                # 2. Diff berechnen
-                to_add = manifest_folders - template_folders
-                to_delete = template_folders - manifest_folders
-                shared = manifest_folders & template_folders
-                
-                overlap_pct = len(shared)/len(manifest_folders)*100 if manifest_folders else 0
-                _log(f"[pool-mode] Überlapp: {len(shared)}/{len(manifest_folders)} ({overlap_pct:.0f}%)")
-                _log(f"[pool-mode] Delta: +{len(to_add)} neue, -{len(to_delete)} überflüssige")
-                
-                # 3. Template kopieren (1 API-Call!)
-                _log(f"[pool-mode] Kopiere Template → {snapshot_name}...")
-                dest_snapshot_fid = pc.call_with_backoff(pc.ensure_path, cfg, dest_snapshot_dir)
-                pc.call_with_backoff(pc.copyfolder, cfg, from_path=template_path, to_folderid=dest_snapshot_fid, noover=True, copycontentonly=True)
-                _log("[pool-mode] ✓ Template kopiert (~2-5s statt ~5min)")
-                template_used = True
-                
-                # 4. Überflüssige Ordner löschen (tiefste zuerst)
-                if to_delete:
-                    _log(f"[pool-mode] Lösche {len(to_delete)} überflüssige Ordner...")
-                    deleted = 0
-                    for relpath in sorted(to_delete, key=lambda p: -p.count("/")):
-                        try:
-                            pc.call_with_backoff(pc.delete_folder, cfg, path=f"{dest_snapshot_dir}/{relpath}", recursive=False)
-                            deleted += 1
-                        except Exception as e:
-                            _log(f"[warn] Konnte {relpath} nicht löschen: {e}")
-                    _log(f"[pool-mode] ✓ {deleted} überflüssige Ordner gelöscht")
-                
-                # 5. Fehlende Ordner anlegen (parallel mit PCLOUD_FOLDER_THREADS)
-                if to_add:
-                    from collections import defaultdict
-                    _log(f"[pool-mode] Lege {len(to_add)} fehlende Ordner an...")
-                    
-                    folders_by_depth = defaultdict(list)
-                    for reldir in to_add:
-                        folders_by_depth[reldir.count("/")].append(reldir)
-                    
-                    threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
-                    created = 0
-                    created_lock = threading.Lock()
-                    total = len(to_add)
-                    t_add_start = time.time()
-                    
-                    def _create_template_folder(reldir: str) -> bool:
-                        """Erstellt Ordner mit Progress-Logging"""
-                        nonlocal created
-                        try:
-                            _ensure(f"{dest_snapshot_dir}/{reldir}")
-                            with created_lock:
-                                created += 1
-                                # Progress alle 100 oder am Ende
-                                if created % 100 == 0 or created == total:
-                                    elapsed = time.time() - t_add_start
-                                    rate = created / elapsed if elapsed > 0 else 0
-                                    pct = int((created / total) * 100)
-                                    _log(f"[pool-mode] Template-Delta: {created}/{total} ({pct}%) | Rate: {rate:.1f}/s")
-                            return True
-                        except Exception as e:
-                            _log(f"[warn] Ordner {reldir} konnte nicht erstellt werden: {e}")
-                            return False
-                    
-                    for depth in sorted(folders_by_depth.keys()):
-                        batch = folders_by_depth[depth]
-                        if threads > 1 and len(batch) > 1:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
-                                list(ex.map(_create_template_folder, batch))
-                        else:
-                            for reldir in batch:
-                                _create_template_folder(reldir)
-                    
-                    _log(f"[pool-mode] ✓ {created} neue Ordner angelegt")
-                
-                # 6. Template aktualisieren (wenn Struktur sich änderte)
-                if to_add or to_delete:
-                    _log("[pool-mode] Aktualisiere Template mit neuer Struktur...")
+                    if "2005" in str(e) or "not found" in str(e).lower():
+                        _log("[pool-mode] Snapshot-Ordner existiert noch nicht (erstes Upload)")
+                    else:
+                        _log(f"[warn] listfolder fehlgeschlagen: {e}")
+
+                # Tiefengeordnete, deterministisch sortierte Liste fehlender Ordner
+                missing_folders = manifest_folders - remote_folders
+                _by_depth_init = defaultdict(list)
+                for _r in missing_folders:
+                    _by_depth_init[_r.count("/")].append(_r)
+                _flat_ordered = []
+                for _d in sorted(_by_depth_init.keys()):
+                    _flat_ordered.extend(sorted(_by_depth_init[_d]))
+                _resume_from  = 0
+                total_folders = len(_flat_ordered)
+
+                # Checkpoint initial speichern (enthält flat_ordered für möglichen Resume)
+                if _flat_ordered:
+                    os.makedirs(_state_dir, exist_ok=True)
                     try:
-                        pc.call_with_backoff(pc.delete_folder, cfg, path=template_path, recursive=True)
-                        template_fid = pc.call_with_backoff(pc.ensure_path, cfg, template_path)
-                        pc.call_with_backoff(pc.copyfolder, cfg, from_path=dest_snapshot_dir, to_folderid=template_fid, noover=True, copycontentonly=True)
-                        _log("[pool-mode] ✓ Template aktualisiert")
-                    except Exception as e:
-                        _log(f"[warn] Template-Update fehlgeschlagen: {e}")
-            
-            except Exception as e:
-                _log(f"[warn] Template-Nutzung fehlgeschlagen: {e} – Fallback zu Einzeln-Anlage")
-                template_used = False
-        
-        # Fallback: Ordner einzeln anlegen (wenn kein Template oder Template-Fehler)
-        if not template_used and not dry:
-            _log("[pool-mode] Lege Ordner einzeln an (kein Template)...")
-            
-            # Remote-Ordner sammeln (was IST bereits da)
-            remote_folders = set()
-            try:
-                result = pc.call_with_backoff(pc.listfolder, cfg, path=dest_snapshot_dir, recursive=True, nofiles=True)
-                def _collect_folders(obj, parent_path=""):
-                    if isinstance(obj, dict) and obj.get("isfolder"):
-                        folder_name = obj.get("name", "")
-                        folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
-                        remote_folders.add(folder_path)
-                        for child in obj.get("contents") or []:
-                            _collect_folders(child, folder_path)
-                metadata = result.get("metadata") or {}
-                for child in metadata.get("contents") or []:
-                    _collect_folders(child, "")
-                _log(f"[pool-mode] {len(remote_folders)} Remote-Ordner gefunden")
-            except Exception as e:
-                if "2005" in str(e) or "not found" in str(e).lower():
-                    _log("[pool-mode] Snapshot-Ordner existiert noch nicht (erstes Upload)")
-                else:
-                    _log(f"[warn] listfolder fehlgeschlagen: {e}")
-            
-            # Differenz berechnen
-            missing_folders = manifest_folders - remote_folders
-            
-            if missing_folders:
-                from collections import defaultdict
-                _log(f"[pool-mode] Lege {len(missing_folders)} fehlende Ordner an (von {len(manifest_folders)} gesamt)")
-                
+                        with open(_cp_path, "w", encoding="utf-8") as _f:
+                            json.dump({
+                                "snapshot":      snapshot_name,
+                                "total_folders": total_folders,
+                                "flat_ordered":  _flat_ordered,
+                                "created_count": 0,
+                                "status":        "in_progress",
+                            }, _f, ensure_ascii=False)
+                        _log(f"[folders] Checkpoint angelegt: {_cp_path}")
+                    except Exception as _e:
+                        _log(f"[folders] Checkpoint schreiben fehlgeschlagen: {_e}")
+
+            # Nur die noch ausstehenden Ordner verarbeiten
+            _pending = _flat_ordered[_resume_from:]
+            if _pending:
+                _log(f"[pool-mode] Lege {len(_pending)} Ordner an (von {total_folders} gesamt"
+                     + (f", {_resume_from} bereits erledigt" if _resume_from else "") + ")")
+
                 folders_by_depth = defaultdict(list)
-                for reldir in missing_folders:
+                for reldir in _pending:
                     folders_by_depth[reldir.count("/")].append(reldir)
-                
+
                 threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
-                _folders_created = 0
+                _folders_created = _resume_from
                 _folders_lock = threading.Lock()
                 _last_progress_pct = 0
                 _folders_start_time = time.time()
-                total_folders = len(missing_folders)
-                
+
                 def _create_folder(reldir: str) -> bool:
-                    """1:1 vom Original - Zeile 2132-2159"""
                     nonlocal _folders_created, _last_progress_pct
                     try:
                         _ensure(f"{dest_snapshot_dir}/{reldir}")
@@ -2909,21 +2842,34 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                             )
                             if show_progress:
                                 _last_progress_pct = current_pct
-                                # Dynamische ETA: Echte Geschwindigkeit statt hardcoded 0.05s!
                                 elapsed = time.time() - _folders_start_time
-                                if _folders_created > 0 and elapsed > 0:
-                                    rate = _folders_created / elapsed  # Ordner pro Sekunde
+                                done_this_run = _folders_created - _resume_from
+                                if done_this_run > 0 and elapsed > 0:
+                                    rate = done_this_run / elapsed
                                     remaining_s = (total_folders - _folders_created) / rate if rate > 0 else 0
                                 else:
                                     remaining_s = 0
                                 eta_str = f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s/60)}min"
                                 _log(f"[folders] {_folders_created}/{total_folders} ({current_pct}%) | {eta_str} verbleibend")
+                            # Checkpoint alle 1000 Ordner
+                            if _folders_created % 1000 == 0:
+                                try:
+                                    with open(_cp_path, "w", encoding="utf-8") as _cf:
+                                        json.dump({
+                                            "snapshot":      snapshot_name,
+                                            "total_folders": total_folders,
+                                            "flat_ordered":  _flat_ordered,
+                                            "created_count": _folders_created,
+                                            "status":        "in_progress",
+                                        }, _cf, ensure_ascii=False)
+                                    _log(f"[folders] Checkpoint: {_folders_created}/{total_folders}")
+                                except Exception as _ce:
+                                    _log(f"[folders][warn] Checkpoint-Update fehlgeschlagen: {_ce}")
                         return True
                     except Exception as e:
-                        print(f"[warn] Ordner-Anlage fehlgeschlagen für {reldir}: {e}", file=sys.stderr)
+                        print(f"[warn] Ordner-Anlage fehlgeschlagen fuer {reldir}: {e}", file=sys.stderr)
                         return False
-                
-                # Ordner nach Tiefe erstellen (Parents zuerst) - 1:1 Original Zeile 2160-2175
+
                 _log(f"[folders] {len(folders_by_depth)} Ebenen, {threads} Threads pro Ebene")
                 for depth in sorted(folders_by_depth.keys()):
                     folders_at_depth = folders_by_depth[depth]
@@ -2933,10 +2879,18 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     else:
                         for folder in folders_at_depth:
                             _create_folder(folder)
-                
+
                 _log(f"[folders] ✓ {total_folders} Ordner erfolgreich angelegt")
             else:
                 _log("[pool-mode] Alle Ordner existieren bereits")
+
+            # Checkpoint löschen (Phase 1 erfolgreich abgeschlossen)
+            if os.path.exists(_cp_path):
+                try:
+                    os.remove(_cp_path)
+                    _log(f"[folders] Checkpoint geloescht: {_cp_path}")
+                except Exception as _e:
+                    _log(f"[folders][warn] Checkpoint loeschen fehlgeschlagen: {_e}")
         
         folder_duration = time.time() - t_folder_start
         _log(f"[pool-mode] Phase 1 abgeschlossen: Ordnerstruktur ({folder_duration:.1f}s)")
