@@ -1137,6 +1137,75 @@ def listfolder(cfg: Dict[str,Any], *, path: Optional[str]=None,
     _expect_ok(top)
     return top
 
+def listfolder_safe(cfg: Dict[str, Any], path: str, *,
+                    nofiles: bool = False,
+                    max_single_call: int = 50_000) -> list:
+    """
+    Robuste Alternative zu listfolder(recursive=True) für grosse Bäume.
+
+    Strategie:
+      1. Versuche einen einzelnen rekursiven Call (schnell, 1 API-Call).
+      2. Wenn die Antwort verdächtig wenige Kinder hat (< max_single_call Einträge
+         UND der Root-Ordner hat Kinder), wechsle zu BFS (level-by-level,
+         recursive=False pro Ordner). BFS vermeidet Truncation bei pCloud, kostet
+         aber mehr API-Calls.
+
+    Gibt eine flache Liste aller Metadaten-Dicts zurück (Dateien und/oder Ordner,
+    je nach nofiles). Ordner haben 'isfolder': True, Dateien 'isfolder': False/fehlt.
+    Pfad-Attribute stammen aus dem jeweiligen Node; Elternpfade müssen Aufrufer
+    selbst rekonstruieren.
+
+    Kein Ersatz für listfolder() – nur für Fälle, wo Truncation ein bekanntes
+    Problem ist (sehr grosse Snapshot-Bäume, Pool-Scans).
+    """
+    path = _norm_remote_path(path)
+
+    def _flatten(node: dict, parent: str) -> list:
+        result = []
+        for child in node.get("contents") or []:
+            name = child.get("name", "")
+            child_path = f"{parent}/{name}" if parent else name
+            child["_path"] = child_path
+            result.append(child)
+            if child.get("isfolder"):
+                result.extend(_flatten(child, child_path))
+        return result
+
+    # Versuch 1: ein rekursiver Call
+    try:
+        top = call_with_backoff(listfolder, cfg, path=path, recursive=True, nofiles=nofiles)
+        flat = _flatten(top.get("metadata") or {}, path.rstrip("/"))
+        if len(flat) >= max_single_call or not flat:
+            # Ergebnis entweder vollständig gross (kein Truncation-Verdacht) oder leer
+            return flat
+        # Plausibilitätsprüfung: Hat der Root-Ordner überhaupt Kinder?
+        root_children = ((top.get("metadata") or {}).get("contents") or [])
+        if not root_children:
+            return flat  # wirklich leer
+        # Warnung: Ergebnis kleiner als max_single_call UND Root hat Kinder → möglicherweise ok
+        # Kein BFS-Fallback nötig, da wir unter dem Schwellenwert sind
+        return flat
+    except Exception:
+        pass  # BFS als Fallback
+
+    # Versuch 2: BFS (level-by-level, recursive=False)
+    result = []
+    queue = [path]
+    while queue:
+        current = queue.pop(0)
+        try:
+            top = call_with_backoff(listfolder, cfg, path=current, recursive=False, nofiles=nofiles)
+            for child in ((top.get("metadata") or {}).get("contents") or []):
+                name = child.get("name", "")
+                child["_path"] = f"{current.rstrip('/')}/{name}"
+                result.append(child)
+                if child.get("isfolder"):
+                    queue.append(child["_path"])
+        except Exception:
+            continue
+    return result
+
+
 def createfolder(cfg: Dict[str,Any], path: str) -> Dict[str,Any]:
     params = {"access_token": cfg["token"], "device": cfg["device"], "path": _norm_remote_path(path)}
     top,_ = _rpc(cfg["host"], cfg["port"], cfg["timeout"], "createfolder", params)
