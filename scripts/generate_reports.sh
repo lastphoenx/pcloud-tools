@@ -314,6 +314,8 @@ get_failed_backups() {
 
 # =====================================================
 # Query: Phase Performance (avg per phase, last 30 days)
+# Pool-Pipeline: manifest → upload → verify (Retention/GC separat via pcloud_pool_gc.py)
+# Legacy 1:1: folder_creation, retention_sync (historische Daten)
 # =====================================================
 get_phase_stats() {
   local result
@@ -328,7 +330,10 @@ get_phase_stats() {
     FROM backup_phases
     WHERE started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
     GROUP BY phase_name
-    ORDER BY FIELD(phase_name, 'manifest', 'folder_creation', 'upload', 'verify', 'retention_sync');
+    ORDER BY FIELD(phase_name,
+      'manifest', 'upload', 'verify',
+      'pool_retention', 'pool_gc',
+      'folder_creation', 'retention_sync');
   " 2>/dev/null || echo "")
 
   if [[ -z "$result" ]]; then

@@ -14,7 +14,7 @@ These scripts manage the **pcloud_backup** database, which tracks backup runs, p
 - **User**: `pcloud_backup` (dedicated user with limited permissions)
 - **Tables**:
   - `backup_runs`: Main run tracking (one row per backup execution)
-  - `backup_phases`: Phase-level tracking (manifest, upload, verify, etc.)
+  - `backup_phases`: Phase-level tracking (Pool: manifest, upload, verify; GC separat: pool_retention, pool_gc)
   - `gap_backfills`: Tracks backfilled gaps (missing snapshots)
 - **Views**: Analytics views for dashboards and monitoring
 
@@ -47,6 +47,31 @@ EXIT;
 # Run schema initialization (idempotent - safe to run multiple times)
 mysql -u pcloud_backup -p pcloud_backup < /opt/apps/pcloud-tools/main/sql/init_pcloud_db.sql
 ```
+
+### 2b. Migration: Pool-Mode Phasen (bestehende Installation)
+
+Wenn die DB noch das alte ENUM ohne `pool_retention`/`pool_gc` hat:
+
+```bash
+mysql -u pcloud_backup -p pcloud_backup < /opt/apps/pcloud-tools/main/sql/migrate_pool_phases.sql
+```
+
+**Pool-Pipeline-Phasen** (pro Backup-Lauf via `wrapper_pcloud_pool_sync_1to1.sh`):
+
+| Phase | Bedeutung |
+|-------|-----------|
+| `manifest` | Manifest generieren/hochladen |
+| `upload` | Pool-Upload (Stubs + Pool-Dateien) |
+| `verify` | Integritaetspruefung |
+
+**Separat** (manuell/Cron via `pcloud_pool_gc.py`, noch ohne DB-Logging):
+
+| Phase | Bedeutung |
+|-------|-----------|
+| `pool_retention` | Remote-Snapshots ohne lokales RTB |
+| `pool_gc` | Verwaiste Pool-Dateien loeschen |
+
+Legacy 1:1-Phasen (`folder_creation`, `retention_sync`) bleiben fuer historische Eintraege erhalten.
 
 **Expected output**:
 - Creates 3 tables: `backup_runs`, `backup_phases`, `gap_backfills`
