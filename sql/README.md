@@ -20,6 +20,19 @@ These scripts manage the **pcloud_backup** database, which tracks backup runs, p
 
 ---
 
+## Maintenance Scripts
+
+### `fix_verify_phases_noncritical.sql`
+
+Korrigiert `backup_phases.verify = FAILED` wenn der zugehörige `backup_runs.status = SUCCESS` ist (Pool-Wrapper: Delta-Verify non-critical). Nach bestandenem `pool_verify_backup.py` ausführen, danach `generate_reports.sh`.
+
+```bash
+sudo mysql pcloud_backup < sql/fix_verify_phases_noncritical.sql
+sudo /opt/apps/pcloud-tools/main/scripts/generate_reports.sh
+```
+
+---
+
 ## Initial Setup (First Time)
 
 ### 1. Create Database and User

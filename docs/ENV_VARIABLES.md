@@ -257,6 +257,16 @@ PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive
 
 Siehe `docs/STORAGE_PATHS.md`.
 
+### `PCLOUD_DEST`
+**Beschreibung:** Remote Pool-Root auf pCloud (`/_pool`, `/_snapshots` darunter).  
+**Default (Pool-Wrapper):** `/Backup/rtb_pool` — wird im Wrapper gesetzt, fehlt oft in `.env`  
+**Wichtig:** Bei manuellem `source .env` ohne Wrapper **explizit setzen**, sonst landen Delta-Checks unter `/_snapshots` (API-Fehler 2002)  
+**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`, `pcloud_quick_delta.py`, `pool_verify_backup.py`
+
+```bash
+PCLOUD_DEST=/Backup/rtb_pool
+```
+
 ### `PCLOUD_TEMP_DIR`
 **Beschreibung:** Temp-Verzeichnis für Manifeste und Index-Checkpoints während Upload.  
 **Default (Wrapper):** `/tmp` falls unset; **pi-nas `.env`:** `/srv/pcloud-temp` (Bind-Mount SSD2)  
