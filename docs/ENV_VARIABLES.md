@@ -246,23 +246,24 @@ PCLOUD_ENV_FILE=/opt/apps/pcloud-tools/main/.env
 ## 📁 Caching & Pfade
 
 ### `PCLOUD_ARCHIVE_DIR`
-**Beschreibung:** Archiv-Verzeichnis für Manifests & Indexes.  
+**Beschreibung:** Archiv-Verzeichnis für Manifests, Master-Index, Deltas, Resume.  
 **Default:** `/srv/pcloud-archive`  
-**Empfohlen:** Persistentes Verzeichnis mit ausreichend Platz  
-**Verwendet in:** `pcloud_push_json_manifest_to_pcloud.py`, `create_folder_template.py`
+**pi-nas (verifiziert):** Bind-Mount auf `/dev/sdd1` (SSD2) — nicht Micro-SD, nicht `/srv/nas/pcloud-archive`  
+**Verwendet in:** Wrapper, `pcloud_push_json_manifest_to_pcloud.py`, Verify/Audit-Tools
 
 ```bash
 PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive
 ```
 
+Siehe `docs/STORAGE_PATHS.md`.
+
 ### `PCLOUD_TEMP_DIR`
-**Beschreibung:** Temp-Verzeichnis für lokale Index-Kopien während Upload.  
-**Default:** System-Temp (`/tmp`)  
-**Empfohlen:** SSD/NVMe für schnelle Index-Updates  
-**Verwendet in:** `pcloud_push_json_manifest_to_pcloud.py`
+**Beschreibung:** Temp-Verzeichnis für Manifeste und Index-Checkpoints während Upload.  
+**Default (Wrapper):** `/tmp` falls unset; **pi-nas `.env`:** `/srv/pcloud-temp` (Bind-Mount SSD2)  
+**Verwendet in:** Wrapper, `pcloud_push_json_manifest_to_pcloud.py`
 
 ```bash
-PCLOUD_TEMP_DIR=/tmp
+PCLOUD_TEMP_DIR=/srv/pcloud-temp
 ```
 
 ### `PCLOUD_FOLDERID_CACHE`

@@ -7,9 +7,10 @@ Kein rekursives find — nur direkte Verzeichnis-Listen und gezielte pCloud-API-
 
 Aufruf:
   MAIN_DIR=/opt/apps/pcloud-tools/main \\
-  PCLOUD_ARCHIVE_DIR=/srv/nas/pcloud-archive \\
   python scripts/utilities/pool_audit_status.py \\
     --env-file .env --pool-root /Backup/rtb_pool
+
+  Manifest-Pfad kommt aus .env (PCLOUD_ARCHIVE_DIR, Default /srv/pcloud-archive).
 """
 from __future__ import annotations
 
@@ -94,6 +95,36 @@ def _check_complete_parallel(
         for snap, ok in ex.map(_one, snaps):
             result[snap] = ok
     return result
+
+
+def _storage_line(path: str) -> str:
+    """Kurze df-Zeile fuer einen Pfad (Filesystem + Mount)."""
+    try:
+        proc = subprocess.run(
+            ["df", "-h", path, "--output=source,fstype,size,used,avail,pcent,target"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip() and not ln.startswith("Filesystem")]
+        return lines[0] if lines else "?"
+    except Exception:
+        return "?"
+
+
+def _warn_nas_duplicate(manifests_dir: str) -> None:
+    """Warnt wenn /srv/nas/pcloud-archive ein separater Baum ist (nicht Pipeline-Pfad)."""
+    nas_manifests = "/srv/nas/pcloud-archive/manifests"
+    if not os.path.isdir(nas_manifests):
+        return
+    try:
+        if os.path.samefile(manifests_dir, nas_manifests):
+            return
+    except OSError:
+        pass
+    _log(f"[warn] {nas_manifests} existiert separat (mergerfs) — "
+         f"Pipeline nutzt {manifests_dir}")
 
 
 def _load_env_file(path: str) -> Dict[str, str]:
@@ -191,9 +222,9 @@ def main() -> int:
     ap.add_argument("--env-file", required=True)
     ap.add_argument("--pool-root", help="Remote Pool-Root, z.B. /Backup/rtb_pool")
     ap.add_argument("--dest-root", help="(deprecated) Alias fuer --pool-root")
-    ap.add_argument("--rtb-root", default=os.environ.get("RTB", "/mnt/backup/rtb_nas"))
-    _archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
-    ap.add_argument("--manifests-dir", default=os.path.join(_archive, "manifests"))
+    ap.add_argument("--rtb-root", default=None)
+    ap.add_argument("--manifests-dir", default=None,
+                    help="Default: <PCLOUD_ARCHIVE_DIR aus .env>/manifests")
     ap.add_argument("--skip-db", action="store_true", help="MariaDB nicht abfragen")
     ap.add_argument("--workers", type=int, default=8, help="Parallele .upload_complete Checks")
     args = ap.parse_args()
@@ -205,16 +236,31 @@ def main() -> int:
     if args.dest_root and not args.pool_root:
         _log("[warn] --dest-root ist deprecated, bitte --pool-root verwenden")
 
+    env_vars = _load_env_file(args.env_file)
+    archive_dir = (
+        env_vars.get("PCLOUD_ARCHIVE_DIR")
+        or os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    )
+    if not args.rtb_root:
+        args.rtb_root = env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
+    if not args.manifests_dir:
+        args.manifests_dir = os.path.join(archive_dir, "manifests")
+    temp_dir = env_vars.get("PCLOUD_TEMP_DIR") or os.environ.get("PCLOUD_TEMP_DIR", "/srv/pcloud-temp")
+
     t0 = time.time()
     cfg = pc.effective_config(env_file=args.env_file)
     dest = pc._norm_remote_path(pool_root_raw).rstrip("/")
     snaps_root = f"{dest}/_snapshots"
-    env_vars = _load_env_file(args.env_file)
 
     _log("=== pool_audit_status ===")
     _log(f"RTB:        {args.rtb_root}")
     _log(f"Manifeste:  {args.manifests_dir}")
+    _log(f"Archiv:     {archive_dir}")
+    _log(f"Temp:       {temp_dir}")
     _log(f"Pool-Root:  {dest}")
+    _log(f"Storage:    archive {_storage_line(archive_dir)}")
+    _log(f"Storage:    temp    {_storage_line(temp_dir)}")
+    _warn_nas_duplicate(args.manifests_dir)
     _log("")
 
     # --- Lokale Listen (schnell) ---

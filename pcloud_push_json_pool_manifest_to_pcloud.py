@@ -173,7 +173,7 @@ def _get_resume_state_dir() -> str:
     
     Priorität:
     1. ENV: PCLOUD_RESUME_DIR
-    2. /srv/pcloud-archive/resume/ (production)
+    2. $PCLOUD_ARCHIVE_DIR/resume/ (production, default /srv/pcloud-archive/resume)
     3. ~/.pcloud_resume/ (user home)
     4. /tmp/pcloud_resume/ (fallback)
     """
@@ -185,7 +185,9 @@ def _get_resume_state_dir() -> str:
         except Exception:
             pass
     
-    production_dir = "/srv/pcloud-archive/resume"
+    production_dir = os.path.join(
+        os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "resume"
+    )
     if os.path.exists("/srv"):
         try:
             os.makedirs(production_dir, exist_ok=True)
