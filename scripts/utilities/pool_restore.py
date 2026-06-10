@@ -12,9 +12,9 @@ Aufloesung:
 
 Aufruf:
   MAIN_DIR=/opt/apps/pcloud-tools/main \\
-  python pool_restore.py --env-file .env --dest-root /Backup/rtb_pool --list-snapshots
+  python pool_restore.py --env-file .env --pool-root /Backup/rtb_pool --list-snapshots
 
-  python pool_restore.py --env-file .env --dest-root /Backup/rtb_pool \\
+  python pool_restore.py --env-file .env --pool-root /Backup/rtb_pool \\
     --snapshot 2026-05-28-120014 --out-dir /tmp/restore --download --verify
 """
 from __future__ import annotations
@@ -61,6 +61,16 @@ def _log(msg: str, *, level: str = "info") -> None:
     stream = sys.stderr if level in ("error", "warn") else sys.stdout
     prefix = f"[{level}] " if level != "info" else ""
     print(f"[{ts}] {prefix}{msg}", file=stream, flush=True)
+
+
+def resolve_pool_root(args: argparse.Namespace) -> Optional[str]:
+    """--pool-root (bevorzugt) oder deprecated --dest-root."""
+    if getattr(args, "pool_root", None) and getattr(args, "dest_root", None):
+        _log("Sowohl --pool-root als auch --dest-root gesetzt; --pool-root hat Vorrang", level="warn")
+    pool_root = getattr(args, "pool_root", None) or getattr(args, "dest_root", None)
+    if pool_root and getattr(args, "dest_root", None) and not getattr(args, "pool_root", None):
+        _log("--dest-root ist deprecated, bitte --pool-root verwenden", level="warn")
+    return pool_root
 
 
 def _pool_obj_path(dest_root: str, sha256: str) -> str:
@@ -370,18 +380,19 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
-  %(prog)s --env-file .env --dest-root /Backup/rtb_pool --list-snapshots
-  %(prog)s --env-file .env --dest-root /Backup/rtb_pool \\
+  %(prog)s --env-file .env --pool-root /Backup/rtb_pool --list-snapshots
+  %(prog)s --env-file .env --pool-root /Backup/rtb_pool \\
     --snapshot 2026-05-28-120014 --out-dir /tmp/restore
-  %(prog)s --env-file .env --dest-root /Backup/rtb_pool \\
-    --snapshot 2026-05-28-120014 --filter "home/user/" --out-dir /tmp/restore --download --verify
-  %(prog)s --env-file .env --dest-root /Backup/rtb_pool \\
+  %(prog)s --env-file .env --pool-root /Backup/rtb_pool \\
+    --snapshot 2026-05-28-120014 --filter "Gemeinsam/Rest/" --out-dir /tmp/restore --download --verify
+  %(prog)s --env-file .env --pool-root /Backup/rtb_pool \\
     --snapshot 2026-05-28-120014 --relpath "home/user/datei.txt" \\
     --out-dir /tmp/restore --download --verify
         """,
     )
     ap.add_argument("--env-file", required=True)
-    ap.add_argument("--dest-root", required=True, help="Remote Root, z.B. /Backup/rtb_pool")
+    ap.add_argument("--pool-root", help="Remote Pool-Root auf pCloud (Quelle), z.B. /Backup/rtb_pool")
+    ap.add_argument("--dest-root", help="(deprecated) Alias fuer --pool-root")
     ap.add_argument("--list-snapshots", action="store_true", help="Verfuegbare Snapshots anzeigen")
     ap.add_argument("--snapshot", help="Snapshot-Name")
     ap.add_argument("--relpath", help="Einzelne Datei (Stub-Weg)")
@@ -393,8 +404,13 @@ Beispiele:
                     help="Snapshot ohne .upload_complete trotzdem erlauben")
     args = ap.parse_args()
 
+    pool_root_raw = resolve_pool_root(args)
+    if not pool_root_raw:
+        _log("--pool-root erforderlich (--dest-root ist deprecated)", level="error")
+        return 2
+
     cfg = pc.effective_config(env_file=args.env_file)
-    dest = pc._norm_remote_path(args.dest_root).rstrip("/")
+    dest = pc._norm_remote_path(pool_root_raw).rstrip("/")
 
     if args.list_snapshots:
         try:
