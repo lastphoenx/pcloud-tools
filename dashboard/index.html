@@ -541,6 +541,21 @@
           || ms.safety_gate || bp.live_safety_gate || '';
     }
 
+    function resolveSafetyGateExplain(rtb, status) {
+      const bp = ((status || {}).services || {})['backup-pipeline'] || {};
+      return (status && status.live_sg_explain) || (rtb && rtb.live_sg_explain)
+          || bp.live_sg_explain || '';
+    }
+
+    function renderSgExplainBox(explain, sgLive) {
+      if (!explain) return '';
+      const border = sgLive === 'RED' ? 'var(--red)'
+        : sgLive === 'YELLOW' ? 'var(--yellow)'
+        : sgLive === 'GREEN' ? 'var(--green)' : 'var(--muted)';
+      return '<div class="integrity-hint" style="border-left-color:' + border + ';margin-top:6px">'
+        + esc(explain) + '</div>';
+    }
+
     function tileBackup(rtb, cloud, reports, status) {
       // Use explicit undefined check — status_code=0 is falsy but means "OK"
       const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
@@ -554,6 +569,7 @@
         || ((cloud.checks || {}).backup_age || {}).snapshot_count
         || 0;
       const sgLive     = resolveSafetyGate(rtb, status);
+      const sgExplain  = resolveSafetyGateExplain(rtb, status);
       const sgHist     = rtb.safety_gate || '';
       const sgDisplay  = sgLive || sgHist || '\u2014';
       const sgLabel    = sgLive ? 'Safety-Gate (live)' : sgHist ? 'Safety-Gate (hist.)' : 'Safety-Gate';
@@ -601,6 +617,7 @@
         +     (rtb.status_source === 'db_fallback' ? (
                 '<div class="info-row"><span class="lbl">RTB-Quelle</span><span class="val yellow" title="rtb_wrapper.log leer — Status aus MariaDB">DB-Fallback</span></div>'
               ) : '')
+        +     renderSgExplainBox(sgExplain, sgLive)
         +   '</div>'
         + '</div>';
 
@@ -651,6 +668,7 @@
       const stableFiles = ew.flagged_stable_detailed || [];
       const missingRecentFiles = ew.missing_files_recent || [];
       const sgLive = resolveSafetyGate(rtb, status);
+      const sgExplain = resolveSafetyGateExplain(rtb, status);
       const failedCount = items.filter(i => i.status === 'failed').length;
       const monitorOk = items.filter(i => i.status !== 'failed').length;
 
@@ -682,7 +700,8 @@
         +     '<strong>Jump</strong> = Entropie-Sprung (Alarm) &middot; '
         +     '<strong>Stabil hoch</strong> = dauerhaft hoch (oft harmlos) &middot; '
         +     '<strong>Missing Scan</strong> = DB-Stand beim letzten Lauf (nicht gleich Missing 7d)'
-        +   '</div>';
+        +   '</div>'
+        +   renderSgExplainBox(sgExplain, sgLive);
 
       if (!hasIntegritySummary && flaggedTotal > 0) {
         html += '<div class="integrity-hint" style="border-left-color:var(--yellow)">'
@@ -979,6 +998,8 @@
         rows += drow('Live Safety-Gate', item.live_safety_gate, sgValCls(item.live_safety_gate));
       if (item.live_sg_details)
         rows += drow('\u2514 Komponenten', item.live_sg_details, sgValCls(item.live_safety_gate), 200);
+      if (item.live_sg_explain)
+        rows += drow('\u2514 Begr\xfcndung', item.live_sg_explain, sgValCls(item.live_safety_gate), 240);
       if (item.message && item.message !== 'N/A')
         rows += drow('Message', item.message, '', 200);
       return '<div class="dcard">'
@@ -997,6 +1018,8 @@
         rows += drow('Live Safety-Gate', rtb.live_safety_gate, sgValCls(rtb.live_safety_gate));
       if (rtb.live_sg_details)
         rows += drow('\u2514 Komponenten', rtb.live_sg_details, sgValCls(rtb.live_safety_gate), 150);
+      if (rtb.live_sg_explain)
+        rows += drow('\u2514 Begr\xfcndung', rtb.live_sg_explain, sgValCls(rtb.live_safety_gate), 240);
       // ── Letzter Lauf ──────────────────────────────────────────
       rows += drow('Status letzter Lauf', rtb.status || 'unknown', rtbCls(rtb.status))
         + drow('Letzter Lauf', fmtTs(rtb.last_run))
@@ -1333,6 +1356,10 @@
 
       if (s === 'WARNING') {
         const parts = [];
+        const sgExplain = resolveSafetyGateExplain(rtb, data);
+        if (sgExplain && (rtb.live_safety_gate === 'YELLOW' || rtb.live_safety_gate === 'RED'
+            || data.live_safety_gate === 'YELLOW' || data.live_safety_gate === 'RED'))
+          parts.push(sgExplain);
         // Blocked services
         const blocked = Object.entries(services)
           .filter(([,v]) => (v.exit_code||'').includes('(blocked)'))
