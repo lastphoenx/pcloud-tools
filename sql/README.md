@@ -53,7 +53,7 @@ mysql -u pcloud_backup -p pcloud_backup < /opt/apps/pcloud-tools/main/sql/init_p
 Wenn die DB noch das alte ENUM ohne `pool_retention`/`pool_gc` hat:
 
 ```bash
-mysql -u pcloud_backup -p pcloud_backup < /opt/apps/pcloud-tools/main/sql/migrate_pool_phases.sql
+sudo mysql pcloud_backup < /opt/apps/pcloud-tools/main/sql/migrate_pool_phases.sql
 ```
 
 **Pool-Pipeline-Phasen** (pro Backup-Lauf via `wrapper_pcloud_pool_sync_1to1.sh`):
