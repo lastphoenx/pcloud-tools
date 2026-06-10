@@ -1,6 +1,6 @@
 -- Migration: Pool-Mode Phasen in backup_phases
 -- Ausfuehren auf bestehender pcloud_backup DB (einmalig):
---   mysql -u pcloud_backup -p pcloud_backup < sql/migrate_pool_phases.sql
+--   sudo mysql pcloud_backup < sql/migrate_pool_phases.sql
 --
 -- Hintergrund: Pool-Wrapper loggt manifest/upload/verify — kein retention_sync mehr.
 -- Retention/GC laeuft separat (pcloud_pool_gc.py); ENUM erweitert fuer kuenftiges Logging.
