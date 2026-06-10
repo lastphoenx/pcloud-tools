@@ -545,4 +545,4 @@ python pcloud_push_json_pool_manifest_to_pcloud.py ...
    ```
 3. **📊 Monitoring** (Dashboard Integration)
 4. **🔄 Migration planen** (1to1 → Pool)
-5. **📦 Restore-Script** (optional, für Pool-Download)
+5. **✅ Restore-Script** (`scripts/utilities/pool_restore.py` — siehe `pool_restore.md` + SETUP.md §10)

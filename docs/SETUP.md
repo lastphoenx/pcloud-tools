@@ -209,7 +209,90 @@ python scripts/utilities/pool_verify_backup.py \
 
 ---
 
-## 9. systemd-Service umstellen und aktivieren
+## 9. Pool Garbage Collection
+
+Der Pool wächst durch Deduplizierung — verwaiste SHA256-Objekte (nicht mehr im Index referenziert) werden periodisch gelöscht.
+
+**Wann ausführen:** nach Retention-Löschungen, wöchentlich per Cron — **nicht** während laufender Backups (`.gc_lock` schützt davor).
+
+```bash
+# Dry-Run: zeigt Kandidaten ohne zu löschen
+python pcloud_pool_gc.py \
+  --env-file "$ENV_FILE" \
+  --dest-root /Backup/rtb_pool \
+  --dry-run --verbose
+
+# Produktions-GC (Grace Period 24h, Index-basiert)
+python pcloud_pool_gc.py \
+  --env-file "$ENV_FILE" \
+  --dest-root /Backup/rtb_pool \
+  --grace-hours 24
+
+# Wöchentlich per Cron (Sonntag 03:00):
+# 0 3 * * 0 cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py \
+#   --env-file .env --dest-root /Backup/rtb_pool >> /var/log/backup/pool_gc.log 2>&1
+```
+
+GC-Kandidaten vorab anzeigen (ohne Löschen):
+
+```bash
+MAIN_DIR=/opt/apps/pcloud-tools/main \
+python scripts/utilities/pool_verify_backup.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --manifests-dir /srv/pcloud-archive/manifests
+# → Zeile "gc_candidates" = Pool-Objekte ohne Manifest-Referenz
+```
+
+---
+
+## 10. Daten wiederherstellen (Pool Restore)
+
+Dateien aus dem Pool wiederherstellen — per Snapshot, Pfad-Filter oder Einzeldatei.
+
+**Voraussetzung:** v2-Index mit Relpaths (§7) und `.upload_complete` am Snapshot.
+
+```bash
+# Verfügbare Snapshots
+MAIN_DIR=/opt/apps/pcloud-tools/main \
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --list-snapshots
+
+# Plan-Modus (Vorschau, kein Download)
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --snapshot 2026-05-28-120014 \
+  --out-dir /srv/restore
+
+# Ganzer Snapshot mit SHA256-Verifikation
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --snapshot 2026-05-28-120014 \
+  --out-dir /srv/restore \
+  --download --verify
+
+# Nur ein Ordner
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --snapshot 2026-05-28-120014 \
+  --filter "home/user/Documents/" \
+  --out-dir /srv/restore \
+  --download --verify
+
+# Einzelne Datei (Stub-Weg)
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --snapshot 2026-05-28-120014 \
+  --relpath "home/user/datei.txt" \
+  --out-dir /srv/restore \
+  --download --verify
+```
+
+Ergebnis liegt unter `/srv/restore/<snapshot>/<relpath>`. Details: `scripts/utilities/pool_restore.md`.
+
+---
+
+## 11. systemd-Service umstellen und aktivieren
 
 ```bash
 # Service auf Pool-Wrapper umstellen:

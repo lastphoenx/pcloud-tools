@@ -180,7 +180,7 @@ def _load_refs_from_index(
     _log("[gc] PHASE 1: Loading references from content_index.json...")
     t_start = time.time()
     
-    index_path = f"{snapshots_root}/content_index.json"
+    index_path = f"{snapshots_root}/_index/content_index.json"
     
     try:
         # Download Index
@@ -690,11 +690,7 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
     args = parser.parse_args()
     
     # Config laden
-    cfg = pc.load_config_from_env(args.env_file)
-    
-    if not cfg:
-        _log("[ERROR] Konnte pCloud Config nicht laden!")
-        sys.exit(1)
+    cfg = pc.effective_config(env_file=args.env_file)
     
     # Run GC
     result = run_pool_gc(
