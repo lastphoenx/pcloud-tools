@@ -341,13 +341,11 @@ check_rtb_wrapper() {
   if [[ "$safety_gate" != "N/A" ]]; then
     json="$json,\"safety_gate\":\"$safety_gate\""
   fi
-  if [[ "$live_safety_gate" != "N/A" ]]; then
-    json="$json,\"live_safety_gate\":\"$live_safety_gate\""
-    if [[ -n "$live_sg_details" ]]; then
-      local esc_live_sg
-      esc_live_sg=$(escape_json "$live_sg_details")
-      json="$json,\"live_sg_details\":\"$esc_live_sg\""
-    fi
+  json="$json,\"live_safety_gate\":\"$live_safety_gate\""
+  if [[ -n "$live_sg_details" ]]; then
+    local esc_live_sg
+    esc_live_sg=$(escape_json "$live_sg_details")
+    json="$json,\"live_sg_details\":\"$esc_live_sg\""
   fi
   if [[ "$dry_run_result" != "unknown" ]]; then
     json="$json,\"dry_run_result\":\"$dry_run_result\""
@@ -358,6 +356,69 @@ check_rtb_wrapper() {
   json="$json}"
   
   echo "$json"
+}
+
+# =====================================================
+# RTB JSON enrichment (pool-mode / empty log fallbacks)
+# =====================================================
+# When rtb_wrapper.log is empty (common with pool pipeline) but DB/pCloud
+# show healthy backups, derive status from reports.json + pCloud health check.
+enrich_rtb_json() {
+  local rtb_json="$1"
+  local pcloud_json="$2"
+
+  if ! command -v jq &>/dev/null; then
+    echo "$rtb_json"
+    return
+  fi
+
+  local rtb_status rtb_snaps pcloud_snaps last_db_status last_db_snap last_db_time new_status new_msg
+  rtb_status=$(echo "$rtb_json" | jq -r '.status // "unknown"')
+  rtb_snaps=$(echo "$rtb_json" | jq -r '.snapshot_count // 0')
+  pcloud_snaps=$(echo "$pcloud_json" | jq -r '.checks.backup_age.snapshot_count // 0' 2>/dev/null || echo "0")
+
+  if [[ "$pcloud_snaps" =~ ^[0-9]+$ ]] && [[ "$pcloud_snaps" -gt "$rtb_snaps" ]]; then
+    rtb_json=$(echo "$rtb_json" | jq --argjson n "$pcloud_snaps" '.snapshot_count = $n')
+  fi
+
+  if [[ "$rtb_status" != "empty_log" && "$rtb_status" != "unknown" && "$rtb_status" != "no_log" ]]; then
+    echo "$rtb_json"
+    return
+  fi
+
+  if [[ ! -f "$REPORTS_JSON" ]]; then
+    echo "$rtb_json"
+    return
+  fi
+
+  last_db_status=$(jq -r '.recent_backups[0].status // empty' "$REPORTS_JSON" 2>/dev/null || echo "")
+  last_db_snap=$(jq -r '.recent_backups[0].snapshot // empty' "$REPORTS_JSON" 2>/dev/null || echo "")
+  last_db_time=$(jq -r '.recent_backups[0].finished_at // .recent_backups[0].started_at // empty' "$REPORTS_JSON" 2>/dev/null || echo "")
+
+  if [[ -z "$last_db_status" ]]; then
+    echo "$rtb_json"
+    return
+  fi
+
+  case "$last_db_status" in
+    SUCCESS) new_status="success" ; new_msg="Letzter DB-Lauf OK (Log leer — Pool-Pipeline)" ;;
+    FAILED)  new_status="failed"  ; new_msg="Letzter DB-Lauf fehlgeschlagen (Log leer)" ;;
+    RUNNING) new_status="running" ; new_msg="Backup läuft (DB)" ;;
+    *)       new_status="idle"    ; new_msg="Status aus DB: ${last_db_status} (rtb_wrapper.log leer)" ;;
+  esac
+
+  rtb_json=$(echo "$rtb_json" | jq \
+    --arg st "$new_status" \
+    --arg msg "$new_msg" \
+    --arg lr "$last_db_time" \
+    --arg ls "$last_db_snap" \
+    '.status = $st
+     | .message = $msg
+     | (if ($lr | length) > 0 then .last_run = $lr else . end)
+     | (if ($ls | length) > 0 then .latest_snapshot = $ls else . end)
+     | .status_source = "db_fallback"')
+
+  echo "$rtb_json"
 }
 
 # =====================================================
@@ -392,6 +453,8 @@ check_pcloud() {
 check_live_safety_gate() {
   if [[ ! -x "$ENTROPYWATCHER_SAFETY_GATE" ]]; then
     log "Live Safety-Gate: script not found at $ENTROPYWATCHER_SAFETY_GATE"
+    LIVE_SG_STATUS="UNKNOWN"
+    export LIVE_SG_STATUS
     return
   fi
 
@@ -627,6 +690,9 @@ RTB_JSON=$(check_rtb_wrapper)
 log "Checking pCloud backup..."
 PCLOUD_JSON=$(check_pcloud)
 
+log "Enriching RTB status (pool-mode / DB fallback)..."
+RTB_JSON=$(enrich_rtb_json "$RTB_JSON" "$PCLOUD_JSON")
+
 # Determine overall status
 # Priority: failed > running > skipped > success > unknown
 OVERALL_STATUS="OK"
@@ -709,6 +775,8 @@ cat > "$MONITORING_OUTPUT" <<EOF
   "dashboard_url": "$DASHBOARD_URL",
   "overall_status": "$OVERALL_STATUS",
   "exit_code": $EXIT_CODE,
+  "live_safety_gate": "${LIVE_SG_STATUS:-N/A}",
+  "live_sg_details": "$(escape_json "${LIVE_SG_DETAILS:-}")",
   "services": {
 $(echo -e "$SERVICES_JSON")
   },
