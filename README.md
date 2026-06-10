@@ -279,6 +279,7 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/utilities/pool_restore.py` | Pool-Mode Restore (pool_refs / Stubs → _pool) |
 | `scripts/utilities/pool_verify_backup.py` | Integritätscheck Manifest ↔ Pool ↔ Index |
 | `scripts/utilities/pool_audit_status.py` | Schneller Status RTB vs. Manifeste vs. pCloud vs. DB |
+| `docs/STORAGE_PATHS.md` | Lokale Pfade pi-nas (Bind-Mounts, was **nicht** Pipeline ist) |
 | `pcloud_pool_gc.py` | Pool Garbage Collection (verwaiste SHA256s löschen, siehe `pcloud_pool_gc.md`) |
 | `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
 

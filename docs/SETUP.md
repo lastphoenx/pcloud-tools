@@ -87,10 +87,21 @@ PCLOUD_ENABLE_DB=1
 ```
 
 ```bash
-# Verzeichnisse anlegen
-sudo mkdir -p /srv/pcloud-temp /srv/pcloud-archive/{manifests,indexes,deltas}
-sudo chown -R $USER:$USER /srv/pcloud-temp /srv/pcloud-archive /var/log/backup
+# Verzeichnisse anlegen (auf SSD2, dann Bind-Mount — pi-nas Ist-Zustand)
+sudo mkdir -p /mnt/ssd2/pcloud-archive/{manifests,indexes,deltas,resume}
+sudo mkdir -p /mnt/ssd2/pcloud-temp
+sudo mkdir -p /srv/pcloud-archive /srv/pcloud-temp
+# fstab-Einträge (Beispiel pi-nas, /dev/sdd1 = SSD2):
+# /mnt/ssd2/pcloud-archive  /srv/pcloud-archive  none  bind  0  0
+# /mnt/ssd2/pcloud-temp     /srv/pcloud-temp     none  bind  0  0
+sudo mount -a
+sudo chown -R $USER:$USER /mnt/ssd2/pcloud-archive /mnt/ssd2/pcloud-temp /var/log/backup
+
+# Verifizieren: Pipeline-Pfade auf SSD, nicht Micro-SD
+df -h /srv/pcloud-archive /srv/pcloud-temp /
 ```
+
+Ausführlich: `docs/STORAGE_PATHS.md` (pi-nas verifiziert). **Nicht** `/srv/nas/pcloud-archive` für die Pipeline verwenden.
 
 ---
 
