@@ -278,7 +278,7 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/utilities/pcloud_restore.py` | Legacy 1to1-Restore (anchor_path, nicht Pool) |
 | `scripts/utilities/pool_restore.py` | Pool-Mode Restore (pool_refs / Stubs → _pool) |
 | `scripts/utilities/pool_verify_backup.py` | Integritätscheck Manifest ↔ Pool ↔ Index |
-| `pcloud_pool_gc.py` | Pool Garbage Collection (verwaiste SHA256s löschen) |
+| `pcloud_pool_gc.py` | Pool Garbage Collection (verwaiste SHA256s löschen, siehe `pcloud_pool_gc.md`) |
 | `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
 
 **Testing & Development:**

@@ -219,19 +219,21 @@ Der Pool wächst durch Deduplizierung — verwaiste SHA256-Objekte (nicht mehr i
 # Dry-Run: zeigt Kandidaten ohne zu löschen
 python pcloud_pool_gc.py \
   --env-file "$ENV_FILE" \
-  --dest-root /Backup/rtb_pool \
+  --pool-root /Backup/rtb_pool \
   --dry-run --verbose
 
 # Produktions-GC (Grace Period 24h, Index-basiert)
 python pcloud_pool_gc.py \
   --env-file "$ENV_FILE" \
-  --dest-root /Backup/rtb_pool \
+  --pool-root /Backup/rtb_pool \
   --grace-hours 24
 
 # Wöchentlich per Cron (Sonntag 03:00):
 # 0 3 * * 0 cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py \
-#   --env-file .env --dest-root /Backup/rtb_pool >> /var/log/backup/pool_gc.log 2>&1
+#   --env-file .env --pool-root /Backup/rtb_pool >> /var/log/backup/pool_gc.log 2>&1
 ```
+
+Ausführliche Doku: `pcloud_pool_gc.md`
 
 GC-Kandidaten vorab anzeigen (ohne Löschen):
 
@@ -255,40 +257,40 @@ Dateien aus dem Pool wiederherstellen — per Snapshot, Pfad-Filter oder Einzeld
 # Verfügbare Snapshots
 MAIN_DIR=/opt/apps/pcloud-tools/main \
 python scripts/utilities/pool_restore.py \
-  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
   --list-snapshots
 
 # Plan-Modus (Vorschau, kein Download)
 python scripts/utilities/pool_restore.py \
-  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
   --snapshot 2026-05-28-120014 \
   --out-dir /srv/restore
 
 # Ganzer Snapshot mit SHA256-Verifikation
 python scripts/utilities/pool_restore.py \
-  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
   --snapshot 2026-05-28-120014 \
   --out-dir /srv/restore \
   --download --verify
 
 # Nur ein Ordner
 python scripts/utilities/pool_restore.py \
-  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
   --snapshot 2026-05-28-120014 \
-  --filter "home/user/Documents/" \
+  --filter "Gemeinsam/Playmobil_Youtube/mein_ordner/" \
   --out-dir /srv/restore \
   --download --verify
 
 # Einzelne Datei (Stub-Weg)
 python scripts/utilities/pool_restore.py \
-  --env-file "$ENV_FILE" --dest-root /Backup/rtb_pool \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
   --snapshot 2026-05-28-120014 \
   --relpath "home/user/datei.txt" \
   --out-dir /srv/restore \
   --download --verify
 ```
 
-Ergebnis liegt unter `/srv/restore/<snapshot>/<relpath>`. Details: `scripts/utilities/pool_restore.md`.
+Ergebnis liegt unter `/srv/restore/<snapshot>/<relpath>`. Ausführliche Doku: `scripts/utilities/pool_restore.md`.
 
 ---
 

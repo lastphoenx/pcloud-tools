@@ -33,7 +33,7 @@ PERFORMANCE:
 USAGE:
   # Standard-GC (Index-basiert, schnell)
   python pcloud_pool_gc.py \
-    --dest-root /Backup/rtb_1to1 \
+    --pool-root /Backup/rtb_pool \
     --env-file .env \
     [--dry-run] \
     [--grace-hours 24] \
@@ -41,13 +41,14 @@ USAGE:
   
   # Deep-Audit (validiert Index gegen Stubs, langsam!)
   python pcloud_pool_gc.py \
-    --dest-root /Backup/rtb_1to1 \
+    --pool-root /Backup/rtb_pool \
     --env-file .env \
     --audit-mode \
     --dry-run
 
 ARGUMENTE:
-  --dest-root       Remote Root (z.B. /Backup/rtb_1to1)
+  --pool-root       Remote Pool-Root auf pCloud (z.B. /Backup/rtb_pool)
+  --dest-root       (deprecated) Alias fuer --pool-root
   --env-file        .env mit PCLOUD_USER + PCLOUD_PASS
   --dry-run         Zeige nur was gelöscht würde (kein echtes Löschen)
   --audit-mode      Deep-Audit: Validiere Index gegen physische Stubs
@@ -648,14 +649,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 BEISPIEL (Standard - Index-basiert, schnell):
-  python pcloud_pool_gc.py --dest-root /Backup/rtb_1to1 --env-file .env --dry-run
-  python pcloud_pool_gc.py --dest-root /Backup/rtb_1to1 --env-file .env --verbose
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --dry-run
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --verbose
 
 BEISPIEL (Audit-Mode - validiert Index gegen Stubs, langsam!):
-  python pcloud_pool_gc.py --dest-root /Backup/rtb_1to1 --env-file .env --audit-mode --dry-run
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --audit-mode --dry-run
 
 BEISPIEL (mit Grace Period 48h):
-  python pcloud_pool_gc.py --dest-root /Backup/rtb_1to1 --env-file .env --grace-hours 48
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --grace-hours 48
 
 WANN AUSFÜHREN:
   - Nach Retention (wenn Snapshots gelöscht wurden)
@@ -670,12 +671,14 @@ OPTIMIERUNGEN:
   - Audit-Mode: Optional Deep-Validation
 
 CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
-  0 3 * * 0 cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py --dest-root /Backup/rtb_1to1 --env-file .env --grace-hours 24 >> /var/log/backup/pool_gc.log 2>&1
+  0 3 * * 0 cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --grace-hours 24 >> /var/log/backup/pool_gc.log 2>&1
 """
     )
     
-    parser.add_argument("--dest-root", required=True,
-                        help="Remote Root (z.B. /Backup/rtb_1to1)")
+    parser.add_argument("--pool-root",
+                        help="Remote Pool-Root auf pCloud, z.B. /Backup/rtb_pool")
+    parser.add_argument("--dest-root",
+                        help="(deprecated) Alias fuer --pool-root")
     parser.add_argument("--env-file", default=".env",
                         help=".env Datei mit PCLOUD_USER + PCLOUD_PASS (default: .env)")
     parser.add_argument("--dry-run", action="store_true",
@@ -688,6 +691,12 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
                         help="Verbose Logging")
     
     args = parser.parse_args()
+
+    pool_root = args.pool_root or args.dest_root
+    if not pool_root:
+        parser.error("--pool-root erforderlich (--dest-root ist deprecated)")
+    if args.dest_root and not args.pool_root:
+        _log("--dest-root ist deprecated, bitte --pool-root verwenden")
     
     # Config laden
     cfg = pc.effective_config(env_file=args.env_file)
@@ -695,7 +704,7 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
     # Run GC
     result = run_pool_gc(
         cfg,
-        args.dest_root,
+        pool_root,
         dry=args.dry_run,
         audit_mode=args.audit_mode,
         grace_hours=args.grace_hours,
