@@ -46,12 +46,19 @@ CREATE TABLE IF NOT EXISTS backup_runs (
 -- =====================================================
 -- TABLE: backup_phases
 -- =====================================================
--- Tracks individual phases within a backup run (manifest, upload, verify)
+-- Tracks individual phases within a backup run.
+-- Pool-Pipeline (wrapper_pcloud_pool_sync_1to1.sh): manifest, upload, verify
+-- Retention/GC (pcloud_pool_gc.py, separat): pool_retention, pool_gc
+-- Legacy 1:1: folder_creation, retention_sync
 CREATE TABLE IF NOT EXISTS backup_phases (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     run_id CHAR(36) NOT NULL,
     
-    phase_name ENUM('manifest', 'folder_creation', 'upload', 'verify', 'retention_sync') NOT NULL,
+    phase_name ENUM(
+        'manifest', 'upload', 'verify',
+        'pool_retention', 'pool_gc',
+        'folder_creation', 'retention_sync'
+    ) NOT NULL,
     status ENUM('RUNNING', 'SUCCESS', 'FAILED') NOT NULL DEFAULT 'RUNNING',
     
     started_at DATETIME NOT NULL,
