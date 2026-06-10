@@ -525,8 +525,8 @@
       const cloud = ((status.scripts || {}).pcloud_backup  || {});
 
       document.getElementById('tiles').innerHTML =
-        tileBackup(rtb, cloud, reports) +
-        tileMalware(svc, reports, rtb) +
+        tileBackup(rtb, cloud, reports, status) +
+        tileMalware(svc, reports, rtb, status) +
         tileSysHealth(svc, reports);
 
       renderDetails(svc, rtb, cloud, reports, status);
@@ -534,22 +534,30 @@
 
     // ---- Tile 1: Backup-Status ----------------------------------
 
-    function tileBackup(rtb, cloud, reports) {
+    function resolveSafetyGate(rtb, status) {
+      const ms = (status && status.malware_summary) || {};
+      const bp = ((status || {}).services || {})['backup-pipeline'] || {};
+      return (rtb && rtb.live_safety_gate) || (status && status.live_safety_gate)
+          || ms.safety_gate || bp.live_safety_gate || '';
+    }
+
+    function tileBackup(rtb, cloud, reports, status) {
       // Use explicit undefined check — status_code=0 is falsy but means "OK"
       const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
-      const rtbOk   = rtb.status === 'success';
+      const rtbOk   = rtb.status === 'success' || rtb.status === 'idle';
       const cloudOk = cloudCode === 0;
       const tileCls = (rtbOk && cloudOk) ? 'ok'
                     : (rtb.status === 'failed' || cloudCode >= 2) ? 'bad'
                     : 'warning';
 
-      const snapCount = rtb.snapshot_count || 0;
-      // Show LIVE SG if available, fall back to historical — label makes source explicit
-      const sgLive     = rtb.live_safety_gate || '';
+      const snapCount = rtb.snapshot_count
+        || ((cloud.checks || {}).backup_age || {}).snapshot_count
+        || 0;
+      const sgLive     = resolveSafetyGate(rtb, status);
       const sgHist     = rtb.safety_gate || '';
       const sgDisplay  = sgLive || sgHist || '\u2014';
       const sgLabel    = sgLive ? 'Safety-Gate (live)' : sgHist ? 'Safety-Gate (hist.)' : 'Safety-Gate';
-      const sgClass    = sgDisplay === 'GREEN' ? 'green' : sgDisplay === 'YELLOW' ? 'yellow' : sgDisplay === 'RED' ? 'red' : 'gray';
+      const sgClass    = sgDisplay === 'GREEN' ? 'green' : sgDisplay === 'YELLOW' ? 'yellow' : sgDisplay === 'RED' ? 'red' : sgDisplay === 'UNKNOWN' ? 'yellow' : 'gray';
 
       const perf       = ((reports || {}).performance_stats || {});
       const successPct = perf.total_runs > 0
@@ -586,9 +594,12 @@
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
         +     (perf.total_runs ? (
-                '<div class="info-row"><span class="lbl">Erfolgsrate 30d</span><span class="val ' + (successPct >= 90 ? 'green' : successPct >= 70 ? 'yellow' : 'red') + '">' + successPct + '%</span></div>'
+                '<div class="info-row"><span class="lbl">Erfolgsrate 30d</span><span class="val ' + (successPct >= 90 ? 'green' : successPct >= 70 ? 'yellow' : 'red') + '" title="' + (perf.successful_runs||0) + '/' + (perf.total_runs||0) + ' Läufe OK">' + successPct + '%</span></div>'
               + '<div class="info-row"><span class="lbl">\xD8 Dauer</span><span class="val">' + perf.avg_duration_min + ' min</span></div>'
-              + '<div class="info-row"><span class="lbl">Gesamt hochgeladen (30d)</span><span class="val">' + perf.total_gb_uploaded + ' GB</span></div>'
+              + '<div class="info-row"><span class="lbl">Gesamt hochgeladen (30d)</span><span class="val" title="Pool-Mode: oft 0 wenn Bytes nicht in DB">' + perf.total_gb_uploaded + ' GB</span></div>'
+              ) : '')
+        +     (rtb.status_source === 'db_fallback' ? (
+                '<div class="info-row"><span class="lbl">RTB-Quelle</span><span class="val yellow" title="rtb_wrapper.log leer — Status aus MariaDB">DB-Fallback</span></div>'
               ) : '')
         +   '</div>'
         + '</div>';
@@ -618,7 +629,7 @@
 
     // ---- Tile 2: Ransomware & Virenschutz ----------------------
 
-    function tileMalware(svc, reports, rtb) {
+    function tileMalware(svc, reports, rtb, status) {
       const names = ['entropywatcher-nas','entropywatcher-os','entropywatcher-nas-av','entropywatcher-os-av','honeyfile-monitor'];
       const items = names.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
 
@@ -639,14 +650,14 @@
       const jumpFiles = ew.flagged_jumps_detailed || [];
       const stableFiles = ew.flagged_stable_detailed || [];
       const missingRecentFiles = ew.missing_files_recent || [];
-      const sgLive = (rtb && rtb.live_safety_gate) || '';
+      const sgLive = resolveSafetyGate(rtb, status);
       const failedCount = items.filter(i => i.status === 'failed').length;
-      const activeCount = items.filter(i => i.status === 'active').length;
+      const monitorOk = items.filter(i => i.status !== 'failed').length;
 
-      const sgCls = sgLive === 'GREEN' ? 'green' : sgLive === 'YELLOW' ? 'yellow' : sgLive === 'RED' ? 'red' : 'gray';
+      const sgCls = sgLive === 'GREEN' ? 'green' : sgLive === 'YELLOW' ? 'yellow' : sgLive === 'RED' ? 'red' : sgLive === 'UNKNOWN' ? 'yellow' : 'gray';
       let tileCls = 'ok';
       if (anyFailed || avEvents > 0 || sgLive === 'RED' || jumpAlerts > 0) tileCls = 'bad';
-      else if (sgLive === 'YELLOW' || missingRecent > 0 || flaggedNew > 0) tileCls = 'warning';
+      else if (sgLive === 'YELLOW' || sgLive === 'UNKNOWN' || flaggedNew > 0) tileCls = 'warning';
 
       let html = '<div class="tile">'
         + '<div class="tile-header">'
@@ -664,13 +675,13 @@
         +   '<div class="summary-row summary-row-secondary">'
         +     '<div class="summary-box gray"><div class="big">' + stableHigh + '</div><div class="lbl">Stabil hoch</div></div>'
         +     '<div class="summary-box gray"><div class="big">' + missingRecent + '</div><div class="lbl">Missing (' + missingDays + 'd)</div></div>'
-        +     '<div class="summary-box gray"><div class="big">' + flaggedTotal + '</div><div class="lbl">DB gesamt</div></div>'
-        +     '<div class="summary-box green"><div class="big">' + activeCount + '</div><div class="lbl">Aktiv</div></div>'
+        +     '<div class="summary-box gray"><div class="big">' + flaggedTotal + '</div><div class="lbl">Flagged DB</div></div>'
+        +     '<div class="summary-box green"><div class="big">' + monitorOk + '</div><div class="lbl">Monitore OK</div></div>'
         +   '</div>'
         +   '<div class="integrity-hint">'
-        +     '<strong>Jump</strong> = Entropie stark gestiegen (Ransomware-Verdacht) &middot; '
-        +     '<strong>Stabil hoch</strong> = dauerhaft hohe Entropie (Archive/Stubs) &middot; '
-        +     '<strong>AV</strong> = ClamAV-Fund'
+        +     '<strong>Jump</strong> = Entropie-Sprung (Alarm) &middot; '
+        +     '<strong>Stabil hoch</strong> = dauerhaft hoch (oft harmlos) &middot; '
+        +     '<strong>Missing Scan</strong> = DB-Stand beim letzten Lauf (nicht gleich Missing 7d)'
         +   '</div>';
 
       if (!hasIntegritySummary && flaggedTotal > 0) {
@@ -707,7 +718,7 @@
 
       if (missingRecentFiles.length > 0) {
         html += '<button class="detail-toggle" id="btn-missing-recent" onclick="toggleDetail(\'missing-recent\')">'
-          + '<span>Fehlend (' + missingDays + 'd: ' + missingRecentFiles.length + ')</span><span class="arrow">\u25BC</span></button>'
+          + '<span>Fehlend ' + missingDays + 'd: ' + missingRecent + ' gesamt (' + missingRecentFiles.length + ' angezeigt)</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-missing-recent"><div class="tile-detail-inner">'
           + buildMissingTable(missingRecentFiles)
           + '</div></div>';
@@ -739,13 +750,13 @@
       }
       if (!latest.length) return '';
       return '<table class="scan-mini-table"><thead><tr>'
-        + '<th>Quelle</th><th>Scan</th><th>Neu</th><th>Missing</th><th>AV</th>'
+        + '<th>Quelle</th><th>Scan</th><th>Neu</th><th title="Fehlend in DB beim Scan-Ende">Fehlt (Scan)</th><th>AV</th>'
         + '</tr></thead><tbody>'
         + latest.map(s => '<tr>'
           + '<td><span class="badge ' + esc(s.source || '') + '">' + esc(s.source || '\u2014') + '</span></td>'
           + '<td>' + fmtTs(s.finished_at) + '</td>'
           + '<td>' + (s.flagged_new || 0) + '</td>'
-          + '<td>' + (s.missing_count || 0) + '</td>'
+          + '<td title="Gesamt missing_since in DB nach diesem Lauf">' + (s.missing_count || 0) + '</td>'
           + '<td>' + (s.av_found || 0) + '</td>'
           + '</tr>').join('')
         + '</tbody></table>';
@@ -824,7 +835,7 @@
               '<div class="info-row"><span class="lbl">' + p.phase + '</span>'
             + '<span class="val ' + (p.failed > 0 ? 'red' : 'green') + '">'
             + p.avg_duration_sec + 's'
-            + (p.failed > 0 ? ' (' + p.failed + ' Fehler)' : '')
+            + (p.failed > 0 ? ' (' + p.failed + '\u00d7 fail, 30d)' : '')
             + '</span></div>'
             ).join('')
           + '</div>';
@@ -1374,7 +1385,8 @@
     }
 
     function rtbCls(status) {
-      if (status === 'success') return 'green';
+      if (status === 'success' || status === 'idle') return 'green';
+      if (status === 'skipped') return 'green';
       if (status === 'failed')  return 'red';
       if (status === 'blocked') return 'yellow';
       if (status === 'running') return 'blue';
@@ -1382,9 +1394,11 @@
     }
     function rtbIcon(status) {
       if (status === 'success') return '\u2713';
+      if (status === 'idle' || status === 'skipped') return '\u2713';
       if (status === 'failed')  return '\u2717';
       if (status === 'blocked') return '\u2296';
       if (status === 'running') return '\u21BB';
+      if (status === 'empty_log' || status === 'no_log') return '\u2014';
       return '?';
     }
     function cloudStatusCls(cloud) {
