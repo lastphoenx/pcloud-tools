@@ -489,10 +489,20 @@ check_database
 # Output Summary
 # =====================================================
 if [[ $JSON_MODE -eq 1 ]]; then
-  # JSON output for aggregation
-  # Escapes: Replace " with \" and newlines with \n
   escape_json() {
-    echo "$1" | sed 's/"/\\"/g' | tr '\n' ' ' | sed 's/  */ /g'
+    if command -v python3 &>/dev/null; then
+      printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1], end="")'
+    elif command -v jq &>/dev/null; then
+      jq -n --arg s "$1" '$s' | sed -e 's/^"//' -e 's/"$//'
+    else
+      local str="$1"
+      str="${str//\\/\\\\}"
+      str="${str//\"/\\\"}"
+      str="${str//$'\n'/\\n}"
+      str="${str//$'\r'/\\r}"
+      str="${str//$'\t'/\\t}"
+      echo "$str"
+    fi
   }
   
   # Build JSON manually (avoid jq dependency)
@@ -509,9 +519,9 @@ if [[ $JSON_MODE -eq 1 ]]; then
   echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[backup_age_message]:-Check not run}")\","
   echo "      \"snapshot_count\": ${CHECK_RESULTS[snapshot_count]:-0},"
   echo "      \"manifest_count\": ${CHECK_RESULTS[manifest_count]:-0},"
-  echo "      \"rtb_snapshot\": \"${CHECK_RESULTS[rtb_snapshot]:-unknown}\","
+  echo "      \"rtb_snapshot\": \"$(escape_json "${CHECK_RESULTS[rtb_snapshot]:-unknown}")\","
   echo "      \"rtb_age_hours\": ${CHECK_RESULTS[rtb_age_hours]:-0},"
-  echo "      \"pcloud_snapshot\": \"${CHECK_RESULTS[pcloud_snapshot]:-unknown}\","
+  echo "      \"pcloud_snapshot\": \"$(escape_json "${CHECK_RESULTS[pcloud_snapshot]:-unknown}")\","
   echo "      \"pcloud_age_hours\": ${CHECK_RESULTS[pcloud_age_hours]:-0}"
   echo "    },"
   
@@ -529,9 +539,9 @@ if [[ $JSON_MODE -eq 1 ]]; then
   echo "      \"status\": ${CHECK_RESULTS[disk_status]:-3},"
   echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[disk_message]:-Check not run}")\","
   echo "      \"rtb_used_pct\": ${CHECK_RESULTS[rtb_used_pct]:-0},"
-  echo "      \"rtb_avail\": \"${CHECK_RESULTS[rtb_avail]:-unknown}\","
+  echo "      \"rtb_avail\": \"$(escape_json "${CHECK_RESULTS[rtb_avail]:-unknown}")\","
   echo "      \"staging_used_pct\": ${CHECK_RESULTS[staging_used_pct]:-0},"
-  echo "      \"staging_avail\": \"${CHECK_RESULTS[staging_avail]:-unknown}\""
+  echo "      \"staging_avail\": \"$(escape_json "${CHECK_RESULTS[staging_avail]:-unknown}")\""
   echo "    },"
   
   # Database Check

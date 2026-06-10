@@ -53,13 +53,22 @@ log() {
 }
 
 escape_json() {
-  local str="$1"
-  str="${str//\\/\\\\}"  # Backslash
-  str="${str//\"/\\\"}"  # Quote
-  str="${str//$'\n'/\\n}" # Newline
-  str="${str//$'\r'/}"    # Carriage return
-  str="${str//$'\t'/ }"   # Tab to space
-  echo "$str"
+  # RFC 8259-safe string content (without surrounding quotes) for manual JSON assembly.
+  if command -v python3 &>/dev/null; then
+    printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1], end="")'
+  elif command -v jq &>/dev/null; then
+    jq -n --arg s "$1" '$s' | sed -e 's/^"//' -e 's/"$//'
+  else
+    local str="$1"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    str="${str//$'\n'/\\n}"
+    str="${str//$'\r'/\\r}"
+    str="${str//$'\t'/\\t}"
+    str="${str//$'\f'/\\f}"
+    str="${str//$'\b'/\\b}"
+    echo "$str"
+  fi
 }
 
 # =====================================================
@@ -786,11 +795,13 @@ for service in "${SYSTEMD_SERVICES[@]}"; do
   service_status=$(check_systemd_service "$service")
   service_count=$((service_count + 1))
   
-  # Add comma only if not last service
+  # Real newlines only — never echo -e this blob (would reinterpret \\ in escaped messages).
   if [[ $service_count -lt $total_services ]]; then
-    SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status},\n"
+    SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status},
+"
   else
-    SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status}\n"
+    SERVICES_JSON="${SERVICES_JSON}    \"${service}\": ${service_status}
+"
   fi
 done
 
@@ -828,7 +839,7 @@ elif [[ "$RTB_STATUS" == "running" && "$OVERALL_STATUS" != "CRITICAL" ]]; then
 fi
 
 # Check systemd service failures
-if echo -e "$SERVICES_JSON" | grep -q '"status":"failed"'; then
+if printf '%s' "$SERVICES_JSON" | grep -q '"status":"failed"'; then
   if [[ "$OVERALL_STATUS" != "CRITICAL" ]]; then
     OVERALL_STATUS="WARNING"
     EXIT_CODE=1
@@ -863,7 +874,7 @@ fi
 
 for service in "${SYSTEMD_SERVICES[@]}"; do
   if [[ "$service" == entropywatcher-* ]] || [[ "$service" == "honeyfile-monitor" ]]; then
-    service_data=$(echo -e "$SERVICES_JSON" | grep "\"$service\"" -A 20 || echo "")
+    service_data=$(printf '%s' "$SERVICES_JSON" | grep "\"$service\"" -A 20 || echo "")
     if [[ -n "$service_data" ]]; then
       # Count active services
       if echo "$service_data" | grep -q '"status":\s*"active"'; then
@@ -878,18 +889,20 @@ for service in "${SYSTEMD_SERVICES[@]}"; do
   fi
 done
 
+ESC_DASHBOARD_URL=$(escape_json "$DASHBOARD_URL")
+
 cat > "$MONITORING_OUTPUT" <<EOF
 {
   "timestamp": "$TIMESTAMP",
   "hostname": "$HOSTNAME",
-  "dashboard_url": "$DASHBOARD_URL",
+  "dashboard_url": "$ESC_DASHBOARD_URL",
   "overall_status": "$OVERALL_STATUS",
   "exit_code": $EXIT_CODE,
   "live_safety_gate": "${LIVE_SG_STATUS:-N/A}",
   "live_sg_details": "$(escape_json "${LIVE_SG_DETAILS:-}")",
   "live_sg_explain": "$(escape_json "${LIVE_SG_EXPLAIN:-}")",
   "services": {
-$(echo -e "$SERVICES_JSON")
+$(printf '%s' "$SERVICES_JSON")
   },
   "scripts": {
     "rtb_wrapper": $RTB_JSON,
@@ -913,6 +926,13 @@ EOF
 
 # Set permissions (readable by web server)
 chmod 644 "$MONITORING_OUTPUT"
+
+if command -v jq &>/dev/null; then
+  if ! jq empty "$MONITORING_OUTPUT" 2>/dev/null; then
+    log "ERROR: invalid JSON written to $MONITORING_OUTPUT"
+    exit 3
+  fi
+fi
 
 log "Aggregation complete. Status: $OVERALL_STATUS"
 
