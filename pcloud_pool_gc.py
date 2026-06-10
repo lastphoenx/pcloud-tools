@@ -57,11 +57,13 @@ ARGUMENTE:
 """
 
 from __future__ import annotations
-import os, sys, json, argparse, time, datetime
+import os, sys, json, argparse, time, datetime, re
 import concurrent.futures
 import threading
-from typing import Set, Dict, List
+from typing import Set, Dict, List, Tuple, Optional
 from collections import defaultdict
+
+_SNAP_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}-\d{6}$")
 
 # ---- Logging mit Timestamp (RTB-Stil) ----
 def _log(msg: str, *, file=sys.stderr) -> None:
@@ -155,6 +157,298 @@ class _GCStats:
             }
 
 
+def _load_env_file(path: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not path or not os.path.isfile(path):
+        return out
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip("'\"")
+    return out
+
+
+def _snap_names(entry) -> Set[str]:
+    """Snapshot-Namen aus pool_refs-Eintrag (v1/v2 tolerant)."""
+    if isinstance(entry, dict):
+        s = entry.get("snapshots")
+        if isinstance(s, dict):
+            return set(s.keys())
+        if isinstance(s, list):
+            return set(s)
+        return set()
+    if isinstance(entry, list):
+        return set(entry)
+    return set()
+
+
+def _list_local_rtb_snaps(rtb_root: str) -> Set[str]:
+    if not os.path.isdir(rtb_root):
+        return set()
+    return {
+        name for name in os.listdir(rtb_root)
+        if _SNAP_RE.match(name) and os.path.isdir(os.path.join(rtb_root, name))
+    }
+
+
+def _list_remote_snapshot_names(cfg: dict, snapshots_root: str) -> Set[str]:
+    result = pc.listfolder(cfg, path=snapshots_root, recursive=False, nofiles=True)
+    return {
+        c["name"]
+        for c in (result.get("metadata", {}) or {}).get("contents", []) or []
+        if c.get("isfolder") and c.get("name") and c.get("name") != "_index"
+        and _SNAP_RE.match(c.get("name", ""))
+    }
+
+
+def _load_index(cfg: dict, snapshots_root: str) -> Tuple[dict, dict]:
+    index_path = f"{snapshots_root}/_index/content_index.json"
+    index_content = pc.get_textfile(cfg, path=index_path)
+    index = json.loads(index_content or "{}")
+    pool_refs = index.get("pool_refs") or {}
+    return index, pool_refs
+
+
+def _referenced_shas(pool_refs: dict, active_snapshots: Set[str]) -> Set[str]:
+    """SHAs mit mindestens einem Snapshot in active_snapshots."""
+    refs: Set[str] = set()
+    for sha, entry in pool_refs.items():
+        if _snap_names(entry) & active_snapshots:
+            refs.add(sha.lower())
+    return refs
+
+
+def _shas_orphaned_after_retention(
+    pool_refs: dict,
+    retention_candidates: Set[str],
+    remote_snaps: Set[str],
+) -> Set[str]:
+    """SHAs deren letzte Remote-Snapshot-Referenz durch Retention entfiele."""
+    orphaned: Set[str] = set()
+    for sha, entry in pool_refs.items():
+        on_remote = _snap_names(entry) & remote_snaps
+        if not on_remote:
+            continue
+        if not (on_remote - retention_candidates):
+            orphaned.add(sha.lower())
+    return orphaned
+
+
+def _purge_snaps_from_index(index: dict, snaps_to_remove: Set[str]) -> Dict[str, int]:
+    pool_refs = index.setdefault("pool_refs", {})
+    removed_snap_refs = 0
+    removed_shas = 0
+    for sha in list(pool_refs.keys()):
+        entry = pool_refs.get(sha)
+        if not isinstance(entry, dict):
+            del pool_refs[sha]
+            removed_shas += 1
+            continue
+        snaps = entry.get("snapshots")
+        if isinstance(snaps, dict):
+            for s in snaps_to_remove:
+                if s in snaps:
+                    del snaps[s]
+                    removed_snap_refs += 1
+            if not snaps:
+                del pool_refs[sha]
+                removed_shas += 1
+        elif isinstance(snaps, list):
+            new_list = [s for s in snaps if s not in snaps_to_remove]
+            removed_snap_refs += len(snaps) - len(new_list)
+            if new_list:
+                entry["snapshots"] = new_list
+            else:
+                del pool_refs[sha]
+                removed_shas += 1
+    index["version"] = 2
+    if isinstance(index.get("items"), dict) and not index["items"]:
+        index.pop("items", None)
+    return {"removed_snap_refs": removed_snap_refs, "removed_shas": removed_shas}
+
+
+def _save_index(cfg: dict, snapshots_root: str, index: dict, env_file: str, *, dry: bool) -> None:
+    index_path = f"{snapshots_root}/_index/content_index.json"
+    env_vars = _load_env_file(env_file)
+    archive_dir = env_vars.get("PCLOUD_ARCHIVE_DIR") or os.environ.get(
+        "PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"
+    )
+    master_path = os.path.join(archive_dir, "indexes", "content_index_master.json")
+    if dry:
+        _log(f"[dry] write index: {index_path} (pool_refs={len(index.get('pool_refs', {}))})")
+        _log(f"[dry] write local master: {master_path}")
+        return
+    pc.write_json_at_path(cfg, index_path, index)
+    os.makedirs(os.path.dirname(master_path), exist_ok=True)
+    with open(master_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, separators=(",", ":"))
+    _log(f"[retention] Index aktualisiert: {index_path}")
+    _log(f"[retention] Master-Index: {master_path}")
+
+
+def _list_pool_files(cfg: dict, pool_root: str) -> List[dict]:
+    result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
+    pool_files: List[dict] = []
+
+    def _walk(obj: dict) -> None:
+        if not isinstance(obj, dict):
+            return
+        if not obj.get("isfolder"):
+            filename = (obj.get("name") or "").lower()
+            if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
+                pool_files.append({
+                    "name": filename,
+                    "path": obj.get("path", ""),
+                    "size": obj.get("size", 0),
+                    "modified": obj.get("modified"),
+                })
+            return
+        for child in obj.get("contents", []) or []:
+            _walk(child)
+
+    _walk(result.get("metadata", {}) or {})
+    return pool_files
+
+
+def run_retention_forecast(
+    cfg: dict,
+    dest_root: str,
+    rtb_root: str,
+    *,
+    verbose: bool = False,
+) -> dict:
+    dest_root = pc._norm_remote_path(dest_root).rstrip("/")
+    snapshots_root = f"{dest_root}/_snapshots"
+    pool_root = f"{dest_root}/_pool"
+
+    _log("[retention-forecast] ===== START =====")
+    local_snaps = _list_local_rtb_snaps(rtb_root)
+    remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
+    to_delete = sorted(remote_snaps - local_snaps)
+    keep_remote = remote_snaps & local_snaps
+
+    _log(f"[retention-forecast] RTB lokal:     {len(local_snaps)}")
+    _log(f"[retention-forecast] Remote:        {len(remote_snaps)}")
+    _log(f"[retention-forecast] Nachzug (del): {len(to_delete)} Snapshots")
+
+    if to_delete:
+        for snap in to_delete:
+            _log(f"  - {snap}")
+    else:
+        _log("[retention-forecast] Kein Remote-Snapshot ohne lokales RTB-Pendant")
+
+    index, pool_refs = _load_index(cfg, snapshots_root)
+    refs_now = _referenced_shas(pool_refs, remote_snaps)
+    refs_after = _referenced_shas(pool_refs, keep_remote)
+    orphan_shas = _shas_orphaned_after_retention(pool_refs, set(to_delete), remote_snaps)
+
+    _log(f"[retention-forecast] Index-SHAs (remote-gebunden): {len(refs_now)}")
+    _log(f"[retention-forecast] SHAs nach Retention noch referenziert: {len(refs_after)}")
+    _log(f"[retention-forecast] Pool-GC-Kandidaten (neu): {len(orphan_shas)}")
+
+    pool_files = _list_pool_files(cfg, pool_root)
+    pool_by_name = {p["name"]: p for p in pool_files}
+    reclaim_bytes = sum(pool_by_name.get(s, {}).get("size", 0) for s in orphan_shas if s in pool_by_name)
+    missing_in_pool = sum(1 for s in orphan_shas if s not in pool_by_name)
+
+    _log(f"[retention-forecast] Pool-Einsparung (simuliert): "
+         f"{reclaim_bytes / (1024**3):.2f} GB ({len(orphan_shas) - missing_in_pool} Dateien)")
+    if missing_in_pool:
+        _log(f"[retention-forecast] [warn] {missing_in_pool} Kandidaten-SHAs nicht physisch im Pool")
+
+    current_unreferenced = {p["name"] for p in pool_files if p["name"] not in refs_now}
+    _log(f"[retention-forecast] Aktueller GC ohne Retention: {len(current_unreferenced)} Pool-Dateien "
+         f"({sum(p['size'] for p in pool_files if p['name'] in current_unreferenced) / (1024**3):.2f} GB)")
+
+    _log("[retention-forecast] Empfehlung:")
+    if to_delete:
+        _log("  1. python pcloud_pool_gc.py --retention-apply --dry-run ...")
+        _log("  2. python pcloud_pool_gc.py --retention-apply --run-gc ...")
+    else:
+        _log("  Retention-Nachzug nicht noetig; periodischer GC reicht.")
+
+    _log("[retention-forecast] ===== DONE =====")
+    return {
+        "local_snaps": len(local_snaps),
+        "remote_snaps": len(remote_snaps),
+        "to_delete": to_delete,
+        "orphan_shas": len(orphan_shas),
+        "reclaim_bytes": reclaim_bytes,
+    }
+
+
+def run_retention_apply(
+    cfg: dict,
+    dest_root: str,
+    rtb_root: str,
+    *,
+    dry: bool = False,
+    run_gc: bool = False,
+    grace_hours: int = 24,
+    verbose: bool = False,
+    env_file: str = ".env",
+) -> dict:
+    dest_root = pc._norm_remote_path(dest_root).rstrip("/")
+    snapshots_root = f"{dest_root}/_snapshots"
+
+    _log("[retention] ===== RETENTION APPLY =====")
+    if dry:
+        _log("[retention] DRY-RUN — keine Loeschungen")
+
+    local_snaps = _list_local_rtb_snaps(rtb_root)
+    remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
+    to_delete = sorted(remote_snaps - local_snaps)
+
+    _log(f"[retention] Zu loeschen: {len(to_delete)} Remote-Snapshots")
+    errors = 0
+    deleted = 0
+    deleted_snaps: Set[str] = set()
+
+    for snap in to_delete:
+        snap_path = f"{snapshots_root}/{snap}"
+        if dry:
+            _log(f"[dry] deletefolderrecursive({snap_path})")
+            deleted += 1
+            deleted_snaps.add(snap)
+            continue
+        try:
+            _log(f"[retention] Loesche Snapshot: {snap_path}")
+            pc.delete_folder(cfg, path=snap_path, recursive=True)
+            deleted += 1
+            deleted_snaps.add(snap)
+            _log(f"[retention] ✓ {snap}")
+        except Exception as e:
+            _log(f"[retention][ERROR] {snap}: {e}")
+            errors += 1
+
+    if deleted_snaps:
+        index, _ = _load_index(cfg, snapshots_root)
+        purge_stats = _purge_snaps_from_index(index, deleted_snaps)
+        _log(f"[retention] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
+             f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt")
+        _save_index(cfg, snapshots_root, index, env_file, dry=dry)
+    else:
+        _log("[retention] Nichts zu loeschen — Index unveraendert")
+
+    result = {"deleted": deleted, "errors": errors, "to_delete": to_delete}
+
+    if run_gc and not dry:
+        _log("[retention] Starte Pool-GC nach Retention...")
+        gc_result = run_pool_gc(
+            cfg, dest_root, dry=False, audit_mode=False,
+            grace_hours=grace_hours, verbose=verbose,
+        )
+        result["gc"] = gc_result
+    elif run_gc and dry:
+        _log("[retention] --run-gc mit --dry-run: GC separat mit --dry-run ausfuehren")
+
+    _log("[retention] ===== DONE =====")
+    return result
+
+
 def _load_refs_from_index(
     cfg: dict,
     snapshots_root: str,
@@ -162,57 +456,41 @@ def _load_refs_from_index(
     verbose: bool = False
 ) -> Set[str]:
     """
-    Lädt referenzierte SHA256s aus content_index.json (ULTRA-SCHNELL!).
-    
-    Dies ist die Standard-Methode für GC. Der Index enthält bereits alle Referenzen
-    in pool_refs = {sha256: [snapshot1, snapshot2, ...]}.
-    
-    Performance: ~0.1s statt Stunden bei Stub-Scan!
-    
-    Args:
-        cfg: pCloud Config
-        snapshots_root: Snapshots-Root (z.B. /_snapshots)
-        stats: GC Stats Object
-        verbose: Verbose Logging
-    
-    Returns:
-        Set[str] - Alle referenzierten SHA256s
+    Laedt referenzierte SHA256s aus content_index.json (snapshot-aware).
+
+    Nur SHAs deren pool_refs mindestens einen noch existierenden Remote-Snapshot
+    referenzieren zaehlen — stale Index-Eintraege ohne Remote-Ordner blockieren GC nicht.
     """
     _log("[gc] PHASE 1: Loading references from content_index.json...")
     t_start = time.time()
-    
+
     index_path = f"{snapshots_root}/_index/content_index.json"
-    
+
     try:
-        # Download Index
         if verbose:
             _log(f"[gc] Downloading {index_path}...")
-        
+
         index_content = pc.get_textfile(cfg, path=index_path)
         index = json.loads(index_content)
-        
-        # pool_refs extrahieren
         pool_refs = index.get("pool_refs", {})
-        
+
         if not pool_refs:
-            _log("[gc][WARN] Index enthält keine pool_refs! Fallback auf Stub-Scan.")
+            _log("[gc][WARN] Index enthaelt keine pool_refs! Fallback auf Stub-Scan.")
             return set()
-        
-        # Alle SHA256s sammeln (Keys von pool_refs)
-        referenced_sha256s = set(pool_refs.keys())
-        
-        # Optional: Zähle Snapshot-Zuordnungen
-        total_refs = sum(
-            len(v.get("snapshots", [])) if isinstance(v, dict) else len(v)
-            for v in pool_refs.values()
-        )
-        
+
+        remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
+        referenced_sha256s = _referenced_shas(pool_refs, remote_snaps)
+
+        total_refs = sum(len(_snap_names(v)) for v in pool_refs.values())
+        stale_keys = set(pool_refs.keys()) - referenced_sha256s
+
         duration = time.time() - t_start
-        _log(f"[gc] PHASE 1 DONE: {len(referenced_sha256s)} unique SHA256s, "
-             f"{total_refs} total refs ({duration:.2f}s)")
-        
+        _log(f"[gc] PHASE 1 DONE: {len(referenced_sha256s)} active SHA256s "
+             f"({len(remote_snaps)} remote snaps, {len(stale_keys)} stale index keys) "
+             f"({duration:.2f}s)")
+
         return referenced_sha256s
-    
+
     except Exception as e:
         _log(f"[gc][ERROR] Failed to load index: {e}")
         _log("[gc] Fallback auf Stub-Scan (langsam!)...")
@@ -658,6 +936,13 @@ BEISPIEL (Audit-Mode - validiert Index gegen Stubs, langsam!):
 BEISPIEL (mit Grace Period 48h):
   python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --grace-hours 48
 
+BEISPIEL (Retention — Forecast, read-only):
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --retention-forecast --rtb-root /mnt/backup/rtb_nas
+
+BEISPIEL (Retention — scharf + Pool-GC):
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --retention-apply --run-gc --env-file .env
+  python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --retention-apply --dry-run
+
 WANN AUSFÜHREN:
   - Nach Retention (wenn Snapshots gelöscht wurden)
   - Periodisch (z.B. wöchentlich via Cron)
@@ -689,8 +974,19 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
                         help="Grace Period in Stunden (default: 24, 0=deaktiviert)")
     parser.add_argument("--verbose", action="store_true",
                         help="Verbose Logging")
+    parser.add_argument("--retention-forecast", action="store_true",
+                        help="Retention-Simulation: RTB vs. Remote, GC-Einsparung schaetzen (read-only)")
+    parser.add_argument("--retention-apply", action="store_true",
+                        help="Retention scharf: Remote-Snapshots ohne lokales RTB loeschen + Index bereinigen")
+    parser.add_argument("--rtb-root", default=None,
+                        help="Lokales RTB-Verzeichnis (default: RTB aus .env oder /mnt/backup/rtb_nas)")
+    parser.add_argument("--run-gc", action="store_true",
+                        help="Nach --retention-apply Pool-GC ausfuehren (ohne --dry-run)")
     
     args = parser.parse_args()
+
+    if args.retention_forecast and args.retention_apply:
+        parser.error("--retention-forecast und --retention-apply schliessen sich aus")
 
     pool_root = args.pool_root or args.dest_root
     if not pool_root:
@@ -700,6 +996,27 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
     
     # Config laden
     cfg = pc.effective_config(env_file=args.env_file)
+    env_vars = _load_env_file(args.env_file)
+    rtb_root = args.rtb_root or env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
+
+    if args.retention_forecast:
+        run_retention_forecast(cfg, pool_root, rtb_root, verbose=args.verbose)
+        sys.exit(0)
+
+    if args.retention_apply:
+        result = run_retention_apply(
+            cfg, pool_root, rtb_root,
+            dry=args.dry_run,
+            run_gc=args.run_gc,
+            grace_hours=args.grace_hours,
+            verbose=args.verbose,
+            env_file=args.env_file,
+        )
+        if result.get("errors", 0) > 0:
+            _log("[retention] ⚠ Abgeschlossen mit Fehlern")
+            sys.exit(1)
+        _log("[retention] ✓ Erfolgreich abgeschlossen")
+        sys.exit(0)
     
     # Run GC
     result = run_pool_gc(
@@ -715,6 +1032,8 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
     if result.get("errors", 0) > 0:
         _log("[gc] ⚠ GC abgeschlossen mit Fehlern")
         sys.exit(1)
+    elif result.get("aborted"):
+        sys.exit(2)
     else:
         _log("[gc] ✓ GC erfolgreich abgeschlossen")
         sys.exit(0)

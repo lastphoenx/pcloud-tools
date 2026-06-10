@@ -23,15 +23,18 @@ Der deduplizierte Pool (`_pool/XX/<sha256>`) wächst mit jedem neuen Dateiinhalt
   .gc_lock                           ← gesetzt während laufendem Backup-Upload
 ```
 
-### GC-Formel
+### GC-Formel (snapshot-aware)
 
 ```
-pool_files  = alle Dateien unter _pool/ (rekursiv, 64-Hex-Dateinamen)
-referenced  = Keys von pool_refs in content_index.json
-candidates  = pool_files − referenced
+remote_snaps = Snapshot-Ordner unter _snapshots/ (ohne _index)
+referenced   = SHAs in pool_refs, die mindestens einen remote_snaps-Eintrag haben
+pool_files   = alle Dateien unter _pool/ (rekursiv, 64-Hex-Dateinamen)
+candidates   = pool_files − referenced
 ```
 
 Nur `candidates` werden gelöscht — und nur wenn sie älter als die **Grace Period** sind.
+
+Stale Index-Einträge (SHAs nur noch in gelöschten Snapshots referenziert) blockieren GC nicht mehr.
 
 ---
 
@@ -59,7 +62,7 @@ Während ein Backup läuft, setzt `pcloud_push_json_pool_manifest_to_pcloud.py` 
 
 ### Phase 1: Referenzen laden (Index-basiert, ~8s)
 
-Lädt `_snapshots/_index/content_index.json` und extrahiert alle SHA256-Keys aus `pool_refs`.
+Lädt `_snapshots/_index/content_index.json` und ermittelt **aktive** SHAs: nur solche, deren `pool_refs`-Eintrag mindestens einen noch existierenden Remote-Snapshot referenziert.
 
 **Performance:** ~0,1–10s statt Stunden bei Stub-Scan.
 
@@ -117,6 +120,10 @@ Wenn nach Retention-Löschungen Zahlen divergieren (z.B. 100904 refs, 101200 poo
 | `--grace-hours` | Mindestalter in Stunden bevor Löschung (Default: 24, `0` = deaktiviert) |
 | `--audit-mode` | Deep-Audit: validiert Index gegen physische Stubs (langsam!) |
 | `--verbose` | Detailliertes Logging pro Datei |
+| `--retention-forecast` | Retention-Simulation (read-only): RTB vs. Remote, geschätzte Pool-Einsparung |
+| `--retention-apply` | Retention scharf: Remote-Snapshots ohne lokales RTB löschen + Index bereinigen |
+| `--rtb-root` | Lokales RTB-Verzeichnis (Default: `RTB` aus `.env` oder `/mnt/backup/rtb_nas`) |
+| `--run-gc` | Nach `--retention-apply` direkt Pool-GC ausführen (nur ohne `--dry-run`) |
 
 ### Umgebungsvariablen
 
@@ -168,12 +175,55 @@ python pcloud_pool_gc.py \
   --dry-run --verbose
 ```
 
+### Retention Forecast (read-only)
+
+```bash
+python pcloud_pool_gc.py \
+  --env-file .env \
+  --pool-root /Backup/rtb_pool \
+  --retention-forecast \
+  --rtb-root /mnt/backup/rtb_nas
+```
+
+Zeigt: Remote-Snapshots ohne lokales RTB-Pendant, simulierte Pool-GC-Kandidaten und geschätzte GB-Einsparung.
+
+### Retention Apply (scharf)
+
+```bash
+# Erst Dry-Run
+python pcloud_pool_gc.py \
+  --env-file .env \
+  --pool-root /Backup/rtb_pool \
+  --retention-apply --dry-run
+
+# Dann produktiv inkl. Pool-GC
+python pcloud_pool_gc.py \
+  --env-file .env \
+  --pool-root /Backup/rtb_pool \
+  --retention-apply --run-gc --grace-hours 24
+```
+
+**Ablauf `--retention-apply`:**
+1. `remote_snaps − local_rtb_snaps` → Remote-Snapshot-Ordner löschen
+2. `content_index.json` bereinigen (Snapshot-Refs + verwaiste `pool_refs`-Keys)
+3. Lokalen Master-Index (`$PCLOUD_ARCHIVE_DIR/indexes/content_index_master.json`) aktualisieren
+4. Optional `--run-gc`: verwaiste Pool-Dateien entfernen
+
+Der Wrapper ruft **kein** `--retention-sync` mehr auf — Retention gehört ins GC-Skript.
+
 ### Cron (wöchentlich, Sonntag 03:00)
 
 ```cron
+# Nur Pool-GC (wenn Retention separat)
 0 3 * * 0 cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py \
   --env-file .env --pool-root /Backup/rtb_pool --grace-hours 24 \
   >> /var/log/backup/pool_gc.log 2>&1
+
+# Retention + GC (z.B. monatlich)
+0 4 1 * * cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py \
+  --env-file .env --pool-root /Backup/rtb_pool \
+  --retention-apply --run-gc --grace-hours 24 \
+  >> /var/log/backup/pool_retention.log 2>&1
 ```
 
 ---
@@ -182,6 +232,7 @@ python pcloud_pool_gc.py \
 
 | Situation | GC sinnvoll? |
 |-----------|--------------|
+| Nach lokaler RTB-Retention | **Ja** — `--retention-apply --run-gc` |
 | Nach Retention (Snapshots gelöscht) | **Ja** — freigibt Pool-Speicher |
 | Wöchentlich per Cron | **Ja** — präventiv |
 | Platzbudget knapp | **Ja** — nach Dry-Run |
