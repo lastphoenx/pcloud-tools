@@ -100,6 +100,10 @@ EW_DB_NAME="${EW_DB_NAME:-entropywatcher}"
 EW_DB_USER="${EW_DB_USER:-entropyuser}"
 EW_DB_PASS="${EW_DB_PASS:-}"
 
+# Jump-alert window (minutes) — aligned with nas HEALTH_WINDOW_MIN default
+EW_JUMP_WINDOW_MIN="${EW_JUMP_WINDOW_MIN:-75}"
+EW_MISSING_RECENT_DAYS="${EW_MISSING_RECENT_DAYS:-7}"
+
 # If DB_DEFAULTS_FILE is set, use it (contains [client] section with password)
 DB_DEFAULTS_FILE="${DB_DEFAULTS_FILE:-}"
 
@@ -536,6 +540,186 @@ get_ew_missing_files() {
 }
 
 # =====================================================
+# Query: EntropyWatcher - Missing Files (recent only)
+# =====================================================
+get_ew_missing_files_recent() {
+  local days="${EW_MISSING_RECENT_DAYS:-7}"
+  local result
+  result=$(ew_db_query "
+    SELECT
+      COALESCE(source, 'unknown') AS source,
+      CONVERT(path USING utf8mb4) AS path,
+      DATE_FORMAT(missing_since, '%Y-%m-%d %H:%i:%S') AS missing_since
+    FROM files
+    WHERE missing_since IS NOT NULL
+      AND missing_since >= DATE_SUB(NOW(), INTERVAL ${days} DAY)
+    ORDER BY missing_since DESC
+    LIMIT 100;
+  ")
+
+  if [[ -z "$result" ]]; then
+    echo "[]"
+    return
+  fi
+
+  local json="["
+  local first=1
+
+  while IFS=$'\t' read -r source path missing_since; do
+    [[ "$first" -eq 0 ]] && json="${json},"
+    first=0
+    local path_escaped
+    path_escaped=$(escape_json "$path")
+    json="${json}{\"source\":\"${source}\",\"path\":\"${path_escaped}\",\"missing_since\":\"${missing_since}\"}"
+  done <<< "$result"
+
+  json="${json}]"
+  echo "$json"
+}
+
+# =====================================================
+# Query: EntropyWatcher - Integrity summary counters
+# =====================================================
+get_ew_integrity_summary() {
+  local win="${EW_JUMP_WINDOW_MIN:-75}"
+  local days="${EW_MISSING_RECENT_DAYS:-7}"
+
+  local jump_alerts stable_high flagged_total flagged_new missing_recent missing_total
+  jump_alerts=$(ew_db_query "
+    SELECT COUNT(*) FROM files
+    WHERE flagged = 1 AND note LIKE '%jump%'
+      AND last_time >= DATE_SUB(NOW(), INTERVAL ${win} MINUTE);
+  " | head -1)
+  stable_high=$(ew_db_query "
+    SELECT COUNT(*) FROM files
+    WHERE flagged = 1 AND note LIKE '%abs%'
+      AND (note NOT LIKE '%jump%' OR note IS NULL);
+  " | head -1)
+  flagged_total=$(ew_db_query "
+    SELECT COUNT(*) FROM files WHERE flagged = 1;
+  " | head -1)
+  flagged_new=$(ew_db_query "
+    SELECT COALESCE(SUM(s.flagged_new_count), 0)
+    FROM scan_summary s
+    INNER JOIN (
+      SELECT source, MAX(finished_at) AS max_finished
+      FROM scan_summary
+      WHERE source IS NOT NULL
+      GROUP BY source
+    ) latest ON s.source = latest.source AND s.finished_at = latest.max_finished;
+  " | head -1)
+  missing_recent=$(ew_db_query "
+    SELECT COUNT(*) FROM files
+    WHERE missing_since IS NOT NULL
+      AND missing_since >= DATE_SUB(NOW(), INTERVAL ${days} DAY);
+  " | head -1)
+  missing_total=$(ew_db_query "
+    SELECT COUNT(*) FROM files WHERE missing_since IS NOT NULL;
+  " | head -1)
+
+  jump_alerts="${jump_alerts:-0}"
+  stable_high="${stable_high:-0}"
+  flagged_total="${flagged_total:-0}"
+  flagged_new="${flagged_new:-0}"
+  missing_recent="${missing_recent:-0}"
+  missing_total="${missing_total:-0}"
+
+  cat <<SUMEOF
+{
+  "jump_alerts_window": ${jump_alerts},
+  "jump_window_minutes": ${win},
+  "flagged_stable_high": ${stable_high},
+  "flagged_total": ${flagged_total},
+  "flagged_new_last_scan": ${flagged_new},
+  "missing_recent_days": ${days},
+  "missing_recent": ${missing_recent},
+  "missing_total": ${missing_total}
+}
+SUMEOF
+}
+
+# =====================================================
+# Query: EntropyWatcher - Jump alerts (detailed, windowed)
+# =====================================================
+get_ew_flagged_jumps_detailed() {
+  local win="${EW_JUMP_WINDOW_MIN:-75}"
+  local result
+  result=$(ew_db_query "
+    SELECT
+      COALESCE(source, 'unknown') AS source,
+      CONVERT(path USING utf8mb4) AS path,
+      ROUND(COALESCE(prev_entropy, 0), 3) AS prev_entropy,
+      ROUND(COALESCE(last_entropy, 0), 3) AS entropy,
+      COALESCE(note, '') AS reason,
+      DATE_FORMAT(last_time, '%Y-%m-%d %H:%i:%S') AS last_time
+    FROM files
+    WHERE flagged = 1 AND note LIKE '%jump%'
+      AND last_time >= DATE_SUB(NOW(), INTERVAL ${win} MINUTE)
+    ORDER BY last_time DESC
+    LIMIT 100;
+  ")
+
+  if [[ -z "$result" ]]; then
+    echo "[]"
+    return
+  fi
+
+  local json="["
+  local first=1
+
+  while IFS=$'\t' read -r source path prev_entropy entropy reason last_time; do
+    [[ "$first" -eq 0 ]] && json="${json},"
+    first=0
+    local path_escaped reason_escaped
+    path_escaped=$(escape_json "$path")
+    reason_escaped=$(escape_json "$reason")
+    json="${json}{\"source\":\"${source}\",\"path\":\"${path_escaped}\",\"prev_entropy\":${prev_entropy},\"entropy\":${entropy},\"reason\":\"${reason_escaped}\",\"last_time\":\"${last_time}\"}"
+  done <<< "$result"
+
+  json="${json}]"
+  echo "$json"
+}
+
+# =====================================================
+# Query: EntropyWatcher - Stable high entropy (detailed)
+# =====================================================
+get_ew_flagged_stable_detailed() {
+  local result
+  result=$(ew_db_query "
+    SELECT
+      COALESCE(source, 'unknown') AS source,
+      CONVERT(path USING utf8mb4) AS path,
+      ROUND(COALESCE(last_entropy, 0), 3) AS entropy,
+      COALESCE(note, '') AS reason
+    FROM files
+    WHERE flagged = 1 AND note LIKE '%abs%'
+      AND (note NOT LIKE '%jump%' OR note IS NULL)
+    ORDER BY last_entropy DESC
+    LIMIT 50;
+  ")
+
+  if [[ -z "$result" ]]; then
+    echo "[]"
+    return
+  fi
+
+  local json="["
+  local first=1
+
+  while IFS=$'\t' read -r source path entropy reason; do
+    [[ "$first" -eq 0 ]] && json="${json},"
+    first=0
+    local path_escaped reason_escaped
+    path_escaped=$(escape_json "$path")
+    reason_escaped=$(escape_json "$reason")
+    json="${json}{\"source\":\"${source}\",\"path\":\"${path_escaped}\",\"entropy\":${entropy},\"reason\":\"${reason_escaped}\"}"
+  done <<< "$result"
+
+  json="${json}]"
+  echo "$json"
+}
+
+# =====================================================
 # Main
 # =====================================================
 
@@ -556,7 +740,11 @@ if ! check_db &>/dev/null; then
   "phase_stats": [],
   "entropywatcher": {
     "last_scans": [],
+    "integrity_summary": {},
     "flagged_files": {},
+    "flagged_jumps_detailed": [],
+    "flagged_stable_detailed": [],
+    "missing_files_recent": [],
     "av_events": []
   }
 }
@@ -601,6 +789,22 @@ log "Querying EntropyWatcher missing files..."
 EW_MISSING_FILES=$(get_ew_missing_files)
 [[ -z "$EW_MISSING_FILES" || "$EW_MISSING_FILES" == "" ]] && EW_MISSING_FILES="[]"
 
+log "Querying EntropyWatcher integrity summary..."
+EW_INTEGRITY_SUMMARY=$(get_ew_integrity_summary)
+[[ -z "$EW_INTEGRITY_SUMMARY" || "$EW_INTEGRITY_SUMMARY" == "" ]] && EW_INTEGRITY_SUMMARY="{}"
+
+log "Querying EntropyWatcher jump alerts (detailed)..."
+EW_FLAGGED_JUMPS=$(get_ew_flagged_jumps_detailed)
+[[ -z "$EW_FLAGGED_JUMPS" || "$EW_FLAGGED_JUMPS" == "" ]] && EW_FLAGGED_JUMPS="[]"
+
+log "Querying EntropyWatcher stable-high flagged (detailed)..."
+EW_FLAGGED_STABLE=$(get_ew_flagged_stable_detailed)
+[[ -z "$EW_FLAGGED_STABLE" || "$EW_FLAGGED_STABLE" == "" ]] && EW_FLAGGED_STABLE="[]"
+
+log "Querying EntropyWatcher missing files (recent)..."
+EW_MISSING_RECENT=$(get_ew_missing_files_recent)
+[[ -z "$EW_MISSING_RECENT" || "$EW_MISSING_RECENT" == "" ]] && EW_MISSING_RECENT="[]"
+
 log "Writing output to: $REPORTS_OUTPUT"
 
 # Debug: Show variable lengths in verbose mode
@@ -621,10 +825,14 @@ cat > "$REPORTS_OUTPUT" <<EOF
   "phase_stats": ${PHASE_STATS},
   "entropywatcher": {
     "last_scans": ${EW_LAST_SCANS},
+    "integrity_summary": ${EW_INTEGRITY_SUMMARY},
     "flagged_files": ${EW_FLAGGED},
     "flagged_files_detailed": ${EW_FLAGGED_FILES_DETAILED},
+    "flagged_jumps_detailed": ${EW_FLAGGED_JUMPS},
+    "flagged_stable_detailed": ${EW_FLAGGED_STABLE},
     "av_events": ${EW_AV_EVENTS},
-    "missing_files": ${EW_MISSING_FILES}
+    "missing_files": ${EW_MISSING_FILES},
+    "missing_files_recent": ${EW_MISSING_RECENT}
   }
 }
 EOF
