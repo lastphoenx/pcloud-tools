@@ -36,7 +36,7 @@ RTB_WRAPPER_SCRIPT="${RTB_WRAPPER_SCRIPT:-/opt/apps/rtb/rtb_wrapper.sh}"
 FORECAST_SAFETY_GATE="${FORECAST_SAFETY_GATE:-/opt/apps/entropywatcher/main/scripts/forecast_safety_gate.sh}"
 
 # Exported: visible inside subshell command-substitution calls below
-export LIVE_SG_STATUS="N/A" LIVE_SG_DETAILS="" LIVE_SG_TS=""
+export LIVE_SG_STATUS="N/A" LIVE_SG_DETAILS="" LIVE_SG_EXPLAIN="" LIVE_SG_TS=""
 
 # Ensure output directory exists
 mkdir -p "$(dirname "$MONITORING_OUTPUT")"
@@ -193,6 +193,11 @@ check_systemd_service() {
       esc_sg=$(escape_json "${LIVE_SG_DETAILS}")
       extra_fields="${extra_fields},\"live_sg_details\":\"${esc_sg}\""
     fi
+    if [[ -n "${LIVE_SG_EXPLAIN:-}" ]]; then
+      local esc_sg_explain
+      esc_sg_explain=$(escape_json "${LIVE_SG_EXPLAIN}")
+      extra_fields="${extra_fields},\"live_sg_explain\":\"${esc_sg_explain}\""
+    fi
   fi
 
   echo "{\"status\":\"$status\",\"enabled\":\"$enabled\",\"last_start\":\"$last_start\",\"exit_code\":\"$exit_code\",\"next_run\":\"$next_run\",\"timer_stalled\":$timer_stalled,\"message\":\"$last_message\"${extra_fields}}"
@@ -332,6 +337,7 @@ check_rtb_wrapper() {
   # Live Safety-Gate: pre-computed in main and exported — no duplicate invocations.
   local live_safety_gate="${LIVE_SG_STATUS:-N/A}"
   local live_sg_details="${LIVE_SG_DETAILS:-}"
+  local live_sg_explain="${LIVE_SG_EXPLAIN:-}"
 
   # Build JSON with optional details field
   local json="{\"status\":\"$status\",\"last_run\":\"$last_run\",\"snapshot_count\":$snapshot_count,\"latest_snapshot\":\"$latest_snapshot\",\"message\":\"$message\""
@@ -346,6 +352,11 @@ check_rtb_wrapper() {
     local esc_live_sg
     esc_live_sg=$(escape_json "$live_sg_details")
     json="$json,\"live_sg_details\":\"$esc_live_sg\""
+  fi
+  if [[ -n "$live_sg_explain" ]]; then
+    local esc_live_sg_explain
+    esc_live_sg_explain=$(escape_json "$live_sg_explain")
+    json="$json,\"live_sg_explain\":\"$esc_live_sg_explain\""
   fi
   if [[ "$dry_run_result" != "unknown" ]]; then
     json="$json,\"dry_run_result\":\"$dry_run_result\""
@@ -450,6 +461,103 @@ check_pcloud() {
 # =====================================================
 # Sets+exports: LIVE_SG_STATUS (GREEN|YELLOW|RED|UNKNOWN|N/A)
 #               LIVE_SG_DETAILS ("Honeyfiles: OK | nas: GREEN | nas-av: GREEN")
+#               LIVE_SG_EXPLAIN (German human-readable summary for dashboard)
+
+sg_format_window() {
+  local w="$1"
+  if [[ -z "$w" || "$w" == "0" ]]; then
+    echo "?"
+  elif [[ "$w" -ge 120 ]] && (( w % 60 == 0 )); then
+    echo "$(( w / 60 )) h"
+  else
+    echo "${w} Min."
+  fi
+}
+
+sg_status_to_de() {
+  case "${1,,}" in
+    green)  echo "GRÜN" ;;
+    yellow) echo "GELB" ;;
+    red)    echo "ROT" ;;
+    *)      echo "$1" ;;
+  esac
+}
+
+sg_reason_to_de() {
+  local code="$1" svc="$2" flagged="$3" window="$4"
+  local win_txt
+  win_txt=$(sg_format_window "$window")
+  case "$code" in
+    no_recent_runs)
+      if [[ "$svc" == *"-av"* ]]; then
+        echo "kein ClamAV-Lauf im Zeitfenster (${win_txt})"
+      else
+        echo "kein Entropy-Scan im Zeitfenster (${win_txt})"
+      fi ;;
+    too_fresh_to_trust)
+      echo "letzter Lauf noch zu frisch (Abkühlzeit)" ;;
+    av_findings)
+      echo "ClamAV-Funde im Zeitfenster" ;;
+    flagged_files)
+      echo "geflaggte Dateien im Zeitfenster (${flagged})" ;;
+    *)
+      echo "$code" ;;
+  esac
+}
+
+build_live_sg_explain() {
+  local sg_output="$1" honeyfile="$2"
+  local -a parts=()
+
+  if [[ "$honeyfile" == "ALARM" ]]; then
+    parts+=("Honeyfiles: verdächtiger Zugriff erkannt")
+  fi
+
+  if command -v jq &>/dev/null; then
+    local idx=0
+    local svc_names=("nas" "nas-av")
+    while IFS= read -r jline; do
+      [[ -z "$jline" ]] && continue
+      local svc="${svc_names[$idx]:-unknown}"
+      idx=$((idx + 1))
+      local st flagged window reason_de=""
+      st=$(echo "$jline" | jq -r '.status // "unknown"')
+      [[ "${st,,}" == "green" ]] && continue
+      flagged=$(echo "$jline" | jq -r '.counters.flagged // 0')
+      window=$(echo "$jline" | jq -r '.window_min // 0')
+      while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        reason_de+="$(sg_reason_to_de "$r" "$svc" "$flagged" "$window"); "
+      done < <(echo "$jline" | jq -r '.reasons[]?' 2>/dev/null || true)
+      reason_de="${reason_de%; }"
+      parts+=("${svc}: $(sg_status_to_de "$st") — ${reason_de:-unbekannter Grund}")
+    done < <(echo "$sg_output" | grep '^{' || true)
+  fi
+
+  case "${LIVE_SG_STATUS}" in
+    GREEN)
+      LIVE_SG_EXPLAIN="Safety-Gate GRÜN: Alle Prüfungen bestanden (Honeyfiles, nas, nas-av)." ;;
+    YELLOW)
+      if [[ ${#parts[@]} -gt 0 ]]; then
+        local joined
+        joined=$(IFS=' · '; echo "${parts[*]}")
+        LIVE_SG_EXPLAIN="Safety-Gate GELB — ${joined}. Backup mit Warnung erlaubt (--strict blockiert)."
+      else
+        LIVE_SG_EXPLAIN="Safety-Gate GELB — Warnung ohne Detailgrund. Backup mit Warnung erlaubt (--strict blockiert)."
+      fi ;;
+    RED)
+      if [[ ${#parts[@]} -gt 0 ]]; then
+        local joined
+        joined=$(IFS=' · '; echo "${parts[*]}")
+        LIVE_SG_EXPLAIN="Safety-Gate ROT — ${joined}. Backup blockiert!"
+      else
+        LIVE_SG_EXPLAIN="Safety-Gate ROT — Backup blockiert (Ransomware-/Viren-Verdacht)."
+      fi ;;
+    *)
+      LIVE_SG_EXPLAIN="" ;;
+  esac
+}
+
 check_live_safety_gate() {
   if [[ ! -x "$ENTROPYWATCHER_SAFETY_GATE" ]]; then
     log "Live Safety-Gate: script not found at $ENTROPYWATCHER_SAFETY_GATE"
@@ -489,8 +597,10 @@ check_live_safety_gate() {
     LIVE_SG_DETAILS="Honeyfiles: ${honeyfile} | nas: ${nas:-?} | nas-av: ${nas_av:-?}"
   fi
 
-  export LIVE_SG_STATUS LIVE_SG_DETAILS LIVE_SG_TS
-  log "Live Safety-Gate: ${LIVE_SG_STATUS}${LIVE_SG_DETAILS:+ (${LIVE_SG_DETAILS})}"
+  build_live_sg_explain "$sg_output" "$honeyfile"
+
+  export LIVE_SG_STATUS LIVE_SG_DETAILS LIVE_SG_EXPLAIN LIVE_SG_TS
+  log "Live Safety-Gate: ${LIVE_SG_STATUS}${LIVE_SG_DETAILS:+ (${LIVE_SG_DETAILS})}${LIVE_SG_EXPLAIN:+ — $LIVE_SG_EXPLAIN}"
 }
 
 # =====================================================
@@ -777,6 +887,7 @@ cat > "$MONITORING_OUTPUT" <<EOF
   "exit_code": $EXIT_CODE,
   "live_safety_gate": "${LIVE_SG_STATUS:-N/A}",
   "live_sg_details": "$(escape_json "${LIVE_SG_DETAILS:-}")",
+  "live_sg_explain": "$(escape_json "${LIVE_SG_EXPLAIN:-}")",
   "services": {
 $(echo -e "$SERVICES_JSON")
   },
