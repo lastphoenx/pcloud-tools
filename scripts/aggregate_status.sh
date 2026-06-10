@@ -665,13 +665,24 @@ log "Writing output to: $MONITORING_OUTPUT"
 # Aggregate malware/entropy stats from entropywatcher services
 TOTAL_FLAGGED=0
 TOTAL_MISSING=0
+JUMP_ALERTS=0
+FLAGGED_STABLE_HIGH=0
+FLAGGED_NEW_LAST=0
+MISSING_RECENT=0
+AV_EVENTS_7D=0
 TOTAL_ACTIVE=0
 TOTAL_ERRORS=0
+SG_SUMMARY="${LIVE_SG_STATUS:-N/A}"
 
-# Read missing count from reports.json (all missing files from DB)
+# Read integrity metrics from reports.json (preferred) with legacy fallbacks
 if [[ -f "$REPORTS_JSON" ]] && command -v jq &>/dev/null; then
-  TOTAL_MISSING=$(jq -r '.entropywatcher.missing_files | length' "$REPORTS_JSON" 2>/dev/null || echo "0")
-  TOTAL_FLAGGED=$(jq -r '[.entropywatcher.flagged_files | to_entries[] | .value] | add // 0' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  TOTAL_FLAGGED=$(jq -r '.entropywatcher.integrity_summary.flagged_total // ([.entropywatcher.flagged_files | to_entries[] | .value] | add // 0)' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  TOTAL_MISSING=$(jq -r '.entropywatcher.integrity_summary.missing_total // (.entropywatcher.missing_files | length) // 0' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  JUMP_ALERTS=$(jq -r '.entropywatcher.integrity_summary.jump_alerts_window // 0' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  FLAGGED_STABLE_HIGH=$(jq -r '.entropywatcher.integrity_summary.flagged_stable_high // 0' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  FLAGGED_NEW_LAST=$(jq -r '.entropywatcher.integrity_summary.flagged_new_last_scan // 0' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  MISSING_RECENT=$(jq -r '.entropywatcher.integrity_summary.missing_recent // 0' "$REPORTS_JSON" 2>/dev/null || echo "0")
+  AV_EVENTS_7D=$(jq -r '.entropywatcher.av_events | length' "$REPORTS_JSON" 2>/dev/null || echo "0")
 fi
 
 for service in "${SYSTEMD_SERVICES[@]}"; do
@@ -707,6 +718,12 @@ $(echo -e "$SERVICES_JSON")
   },
   "malware_summary": {
     "active_monitors": $TOTAL_ACTIVE,
+    "jump_alerts_window": $JUMP_ALERTS,
+    "flagged_new_last_scan": $FLAGGED_NEW_LAST,
+    "flagged_stable_high": $FLAGGED_STABLE_HIGH,
+    "av_events_7d": $AV_EVENTS_7D,
+    "missing_recent": $MISSING_RECENT,
+    "safety_gate": "$SG_SUMMARY",
     "flagged": $TOTAL_FLAGGED,
     "missing": $TOTAL_MISSING,
     "errors": $TOTAL_ERRORS

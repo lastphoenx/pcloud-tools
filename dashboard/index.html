@@ -126,6 +126,44 @@
     .summary-box.blue .big   { color: var(--blue); }
     .summary-box.gray .big   { color: var(--muted); }
 
+    .summary-row-secondary { margin-top: -2px; }
+    .summary-row-secondary .summary-box {
+      padding: 8px 10px;
+      opacity: 0.85;
+    }
+    .summary-row-secondary .summary-box .big { font-size: 18px; }
+    .summary-row-secondary .summary-box .lbl { font-size: 10px; }
+
+    .integrity-hint {
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.45;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      border-left: 3px solid var(--border);
+    }
+    .integrity-hint strong { color: var(--text); font-weight: 600; }
+
+    .scan-mini-table {
+      width: 100%;
+      font-size: 11px;
+      border-collapse: collapse;
+    }
+    .scan-mini-table th,
+    .scan-mini-table td {
+      padding: 5px 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .scan-mini-table th {
+      color: var(--muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      font-size: 10px;
+    }
+
     .info-group { display: flex; flex-direction: column; gap: 6px; }
     .info-row {
       display: flex;
@@ -488,7 +526,7 @@
 
       document.getElementById('tiles').innerHTML =
         tileBackup(rtb, cloud, reports) +
-        tileMalware(svc, reports) +
+        tileMalware(svc, reports, rtb) +
         tileSysHealth(svc, reports);
 
       renderDetails(svc, rtb, cloud, reports, status);
@@ -578,89 +616,179 @@
       return html;
     }
 
-    // ---- Tile 2: Malware & Integritaet -------------------------
+    // ---- Tile 2: Ransomware & Virenschutz ----------------------
 
-    function tileMalware(svc, reports) {
+    function tileMalware(svc, reports, rtb) {
       const names = ['entropywatcher-nas','entropywatcher-os','entropywatcher-nas-av','entropywatcher-os-av','honeyfile-monitor'];
       const items = names.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
 
-      const anyFailed  = items.some(i => i.status === 'failed');
-      
-      // DB-Daten: flagged files + missing files + AV events
+      const anyFailed = items.some(i => i.status === 'failed');
       const ew = (reports && reports.entropywatcher) || {};
-      const flaggedFiles = ew.flagged_files || {};
-      const totalFlagged = Object.values(flaggedFiles).reduce((sum, n) => sum + n, 0);
-      const flaggedFilesDetailed = ew.flagged_files_detailed || [];
+      const sum = ew.integrity_summary || {};
+      const hasIntegritySummary = Object.keys(sum).length > 0;
       const lastScans = ew.last_scans || [];
-      // Count ALL missing files from DB (not just last scan)
-      const missingFiles = ew.missing_files || [];
-      const totalMissing = missingFiles.length;
+      const jumpAlerts = sum.jump_alerts_window || 0;
+      const jumpWindow = sum.jump_window_minutes || 75;
+      const flaggedNew = sum.flagged_new_last_scan || 0;
+      const stableHigh = sum.flagged_stable_high || 0;
+      const flaggedTotal = sum.flagged_total || Object.values(ew.flagged_files || {}).reduce((s, n) => s + n, 0);
+      const missingRecent = sum.missing_recent || 0;
+      const missingTotal = sum.missing_total || (ew.missing_files || []).length;
+      const missingDays = sum.missing_recent_days || 7;
       const avEvents = (ew.av_events || []).length;
-      
-      // Tile-Klasse: rot bei AV-Events oder failed services, gelb bei flagged/missing files
-      // inactive ist KEIN Problem (timer-basierte Services)
-      const tileCls = anyFailed || avEvents > 0 ? 'bad'
-                    : totalFlagged > 0 || totalMissing > 0 ? 'warning'
-                    : 'ok';
+      const jumpFiles = ew.flagged_jumps_detailed || [];
+      const stableFiles = ew.flagged_stable_detailed || [];
+      const missingRecentFiles = ew.missing_files_recent || [];
+      const sgLive = (rtb && rtb.live_safety_gate) || '';
+      const failedCount = items.filter(i => i.status === 'failed').length;
+      const activeCount = items.filter(i => i.status === 'active').length;
 
-      const activeCount  = items.filter(i => i.status === 'active').length;
-      const inactiveCount = items.filter(i => i.status !== 'active' && i.status !== 'failed').length;
-      const failedCount  = items.filter(i => i.status === 'failed').length;
+      const sgCls = sgLive === 'GREEN' ? 'green' : sgLive === 'YELLOW' ? 'yellow' : sgLive === 'RED' ? 'red' : 'gray';
+      let tileCls = 'ok';
+      if (anyFailed || avEvents > 0 || sgLive === 'RED' || jumpAlerts > 0) tileCls = 'bad';
+      else if (sgLive === 'YELLOW' || missingRecent > 0 || flaggedNew > 0) tileCls = 'warning';
 
       let html = '<div class="tile">'
         + '<div class="tile-header">'
         +   '<span class="tile-icon">\uD83D\uDEE1\uFE0F</span>'
-        +   '<span class="tile-title">Malware &amp; Integrit\xe4t</span>'
+        +   '<span class="tile-title">Ransomware &amp; Virenschutz</span>'
         +   '<span class="tile-status-dot ' + tileCls + '"></span>'
         + '</div>'
         + '<div class="tile-body">'
         +   '<div class="summary-row">'
-        +     '<div class="summary-box green"><div class="big">' + activeCount + '</div><div class="lbl">Aktiv</div></div>'
-        +     '<div class="summary-box ' + (totalFlagged > 0 ? 'yellow' : 'gray') + '"><div class="big">' + totalFlagged + '</div><div class="lbl">Flagged</div></div>'
-        +     '<div class="summary-box ' + (totalMissing > 0 ? 'yellow' : 'gray') + '"><div class="big">' + totalMissing + '</div><div class="lbl">Missing</div></div>'
-        +     '<div class="summary-box ' + (avEvents > 0 || failedCount > 0 ? 'red' : 'gray') + '"><div class="big">' + (avEvents || failedCount) + '</div><div class="lbl">' + (avEvents > 0 ? 'AV-Events' : 'Fehler') + '</div></div>'
+        +     '<div class="summary-box ' + (jumpAlerts > 0 ? 'red' : 'green') + '"><div class="big">' + jumpAlerts + '</div><div class="lbl">Jump (' + jumpWindow + 'm)</div></div>'
+        +     '<div class="summary-box ' + (flaggedNew > 0 ? 'yellow' : 'gray') + '"><div class="big">' + flaggedNew + '</div><div class="lbl">Neu (Scan)</div></div>'
+        +     '<div class="summary-box ' + (avEvents > 0 ? 'red' : 'green') + '"><div class="big">' + avEvents + '</div><div class="lbl">AV (7d)</div></div>'
+        +     '<div class="summary-box ' + sgCls + '"><div class="big" style="font-size:18px">' + esc(sgLive || '\u2014') + '</div><div class="lbl">Safety-Gate</div></div>'
         +   '</div>'
-        +   '<div class="service-list">' + items.map(i => svcRow(i)).join('') + '</div>';
+        +   '<div class="summary-row summary-row-secondary">'
+        +     '<div class="summary-box gray"><div class="big">' + stableHigh + '</div><div class="lbl">Stabil hoch</div></div>'
+        +     '<div class="summary-box gray"><div class="big">' + missingRecent + '</div><div class="lbl">Missing (' + missingDays + 'd)</div></div>'
+        +     '<div class="summary-box gray"><div class="big">' + flaggedTotal + '</div><div class="lbl">DB gesamt</div></div>'
+        +     '<div class="summary-box green"><div class="big">' + activeCount + '</div><div class="lbl">Aktiv</div></div>'
+        +   '</div>'
+        +   '<div class="integrity-hint">'
+        +     '<strong>Jump</strong> = Entropie stark gestiegen (Ransomware-Verdacht) &middot; '
+        +     '<strong>Stabil hoch</strong> = dauerhaft hohe Entropie (Archive/Stubs) &middot; '
+        +     '<strong>AV</strong> = ClamAV-Fund'
+        +   '</div>';
 
-      // Add flagged files table (expandable)
-      if (flaggedFilesDetailed.length > 0) {
-        html += '<button class="detail-toggle" id="btn-flagged" onclick="toggleDetail(\'flagged\')">'
-          + '<span>Flagged Dateien (' + flaggedFilesDetailed.length + ')</span><span class="arrow">\u25BC</span></button>'
-          + '<div class="tile-detail" id="detail-flagged"><div class="tile-detail-inner">'
-          + '<table class="report-table"><thead><tr>'
-          + '<th>Quelle</th><th>Pfad</th><th>Entropie</th><th>Grund</th>'
-          + '</tr></thead><tbody>'
-          + flaggedFilesDetailed.map(f =>
-              '<tr>'
-            + '<td><span class="badge ' + (f.source === 'nas' ? 'nas' : 'os') + '">' + (f.source || '\u2014') + '</span></td>'
-            + '<td style="font-family:monospace;font-size:11px" title="' + esc(f.path || '') + '">' + esc(f.path || '\u2014') + '</td>'
-            + '<td>' + (f.entropy || '\u2014') + '</td>'
-            + '<td style="font-size:11px">' + esc(f.reason || '\u2014') + '</td>'
-            + '</tr>'
-            ).join('')
-          + '</tbody></table></div></div>';
+      if (!hasIntegritySummary && flaggedTotal > 0) {
+        html += '<div class="integrity-hint" style="border-left-color:var(--yellow)">'
+          + 'reports.json noch ohne integrity_summary — bitte <code>generate_reports.sh</code> ausführen.'
+          + '</div>';
       }
 
-      // Add missing files table (expandable)
-      if (missingFiles.length > 0) {
-        html += '<button class="detail-toggle" id="btn-missing" onclick="toggleDetail(\'missing\')">'
-          + '<span>Fehlende Dateien (' + missingFiles.length + ')</span><span class="arrow">\u25BC</span></button>'
-          + '<div class="tile-detail" id="detail-missing"><div class="tile-detail-inner">'
-          + '<table class="report-table"><thead><tr>'
-          + '<th>Quelle</th><th>Pfad</th><th>Seit</th>'
-          + '</tr></thead><tbody>'
-          + missingFiles.map(f =>
-              '<tr>'
-            + '<td><span class="badge ' + (f.source === 'nas' ? 'nas' : 'os') + '">' + (f.source || '\u2014') + '</span></td>'
-            + '<td style="font-family:monospace;font-size:11px">' + esc(f.path || '\u2014') + '</td>'
-            + '<td>' + (f.missing_since || '\u2014') + '</td>'
-            + '</tr>'
-            ).join('')
-          + '</tbody></table></div></div>';
+      const scanRows = buildLastScanRows(lastScans);
+      if (scanRows) {
+        html += '<div style="margin-top:2px">'
+          + '<div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.4px">Letzte Scans</div>'
+          + scanRows
+          + '</div>';
+      }
+
+      html += '<div class="service-list">' + items.map(i => svcRow(i)).join('') + '</div>';
+
+      if (jumpFiles.length > 0) {
+        html += '<button class="detail-toggle open" id="btn-jumps" onclick="toggleDetail(\'jumps\')">'
+          + '<span>Sprung-Alarme (' + jumpFiles.length + ')</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail open" id="detail-jumps"><div class="tile-detail-inner">'
+          + buildFlaggedJumpTable(jumpFiles)
+          + '</div></div>';
+      }
+
+      if (stableFiles.length > 0) {
+        html += '<button class="detail-toggle" id="btn-stable" onclick="toggleDetail(\'stable\')">'
+          + '<span>Stabil hoch (' + stableHigh + ' gesamt, ' + stableFiles.length + ' Beispiele)</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-stable"><div class="tile-detail-inner">'
+          + buildFlaggedStableTable(stableFiles)
+          + '</div></div>';
+      }
+
+      if (missingRecentFiles.length > 0) {
+        html += '<button class="detail-toggle" id="btn-missing-recent" onclick="toggleDetail(\'missing-recent\')">'
+          + '<span>Fehlend (' + missingDays + 'd: ' + missingRecentFiles.length + ')</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-missing-recent"><div class="tile-detail-inner">'
+          + buildMissingTable(missingRecentFiles)
+          + '</div></div>';
+      } else if (missingTotal > 0) {
+        html += '<div class="integrity-hint" style="margin-top:4px">'
+          + missingTotal + ' fehlende Dateien in DB, keine in den letzten ' + missingDays + ' Tagen.'
+          + '</div>';
+      }
+
+      if (failedCount > 0) {
+        html += '<div class="integrity-hint" style="border-left-color:var(--red)">'
+          + failedCount + ' Monitor-Service(s) mit Fehlerstatus.'
+          + '</div>';
       }
 
       html += '</div></div>';
       return html;
+    }
+
+    function buildLastScanRows(lastScans) {
+      if (!lastScans.length) return '';
+      const seen = {};
+      const latest = [];
+      for (const s of lastScans) {
+        const src = s.source || 'unknown';
+        if (seen[src]) continue;
+        seen[src] = true;
+        latest.push(s);
+      }
+      if (!latest.length) return '';
+      return '<table class="scan-mini-table"><thead><tr>'
+        + '<th>Quelle</th><th>Scan</th><th>Neu</th><th>Missing</th><th>AV</th>'
+        + '</tr></thead><tbody>'
+        + latest.map(s => '<tr>'
+          + '<td><span class="badge ' + esc(s.source || '') + '">' + esc(s.source || '\u2014') + '</span></td>'
+          + '<td>' + fmtTs(s.finished_at) + '</td>'
+          + '<td>' + (s.flagged_new || 0) + '</td>'
+          + '<td>' + (s.missing_count || 0) + '</td>'
+          + '<td>' + (s.av_found || 0) + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>';
+    }
+
+    function buildFlaggedJumpTable(files) {
+      return '<table class="report-table"><thead><tr>'
+        + '<th>Quelle</th><th>Pfad</th><th>Vorher</th><th>Nachher</th><th>Grund</th><th>Zeit</th>'
+        + '</tr></thead><tbody>'
+        + files.map(f => '<tr>'
+          + '<td><span class="badge ' + esc(f.source || '') + '">' + esc(f.source || '\u2014') + '</span></td>'
+          + '<td style="font-family:monospace;font-size:11px" title="' + esc(f.path || '') + '">' + esc(f.path || '\u2014') + '</td>'
+          + '<td>' + (f.prev_entropy !== undefined ? f.prev_entropy : '\u2014') + '</td>'
+          + '<td>' + (f.entropy !== undefined ? f.entropy : '\u2014') + '</td>'
+          + '<td style="font-size:11px">' + esc(f.reason || '\u2014') + '</td>'
+          + '<td style="font-size:11px">' + esc(f.last_time || '\u2014') + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>';
+    }
+
+    function buildFlaggedStableTable(files) {
+      return '<table class="report-table"><thead><tr>'
+        + '<th>Quelle</th><th>Pfad</th><th>Entropie</th><th>Grund</th>'
+        + '</tr></thead><tbody>'
+        + files.map(f => '<tr>'
+          + '<td><span class="badge ' + esc(f.source || '') + '">' + esc(f.source || '\u2014') + '</span></td>'
+          + '<td style="font-family:monospace;font-size:11px" title="' + esc(f.path || '') + '">' + esc(f.path || '\u2014') + '</td>'
+          + '<td>' + (f.entropy !== undefined ? f.entropy : '\u2014') + '</td>'
+          + '<td style="font-size:11px;color:var(--muted)">' + esc(f.reason || '\u2014') + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>';
+    }
+
+    function buildMissingTable(files) {
+      return '<table class="report-table"><thead><tr>'
+        + '<th>Quelle</th><th>Pfad</th><th>Seit</th>'
+        + '</tr></thead><tbody>'
+        + files.map(f => '<tr>'
+          + '<td><span class="badge ' + esc(f.source || '') + '">' + esc(f.source || '\u2014') + '</span></td>'
+          + '<td style="font-family:monospace;font-size:11px" title="' + esc(f.path || '') + '">' + esc(f.path || '\u2014') + '</td>'
+          + '<td>' + esc(f.missing_since || '\u2014') + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>';
     }
 
     // ---- Tile 3: System-Gesundheit ------------------------------
@@ -735,18 +863,31 @@
         + (recent.length > 0 ? detailCardRecentBackups(recent) : '')
         + '</div></div>';
 
-      // Malware detail
+      // Malware / integrity detail
+      const ewDetail = ((reports||{}).entropywatcher||{});
       const mNames = ['entropywatcher-nas','entropywatcher-os','entropywatcher-nas-av','entropywatcher-os-av','honeyfile-monitor'];
       const mItems = mNames.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
-      const missingFiles = ((reports||{}).entropywatcher||{}).missing_files || [];
-      const flaggedFilesDetailed = ((reports||{}).entropywatcher||{}).flagged_files_detailed || [];
-      if (mItems.length > 0 || missingFiles.length > 0 || flaggedFilesDetailed.length > 0) {
+      const jumpFiles = ewDetail.flagged_jumps_detailed || [];
+      const stableFiles = ewDetail.flagged_stable_detailed || [];
+      const missingRecent = ewDetail.missing_files_recent || [];
+      const missingAll = ewDetail.missing_files || [];
+      const avEvents = ewDetail.av_events || [];
+      if (mItems.length > 0 || jumpFiles.length > 0 || stableFiles.length > 0 || missingRecent.length > 0 || avEvents.length > 0) {
         html += '<div class="detail-section">'
-          + '<div class="section-heading"><span>\uD83D\uDEE1\uFE0F Malware &amp; Integrit\xe4t \u2013 Details</span></div>'
+          + '<div class="section-heading"><span>\uD83D\uDEE1\uFE0F Ransomware &amp; Virenschutz \u2013 Details</span></div>'
           + '<div class="card-grid">'
           + mItems.map(i => detailCardService(i)).join('')
-          + (flaggedFilesDetailed.length > 0 ? detailCardFlaggedFiles(flaggedFilesDetailed) : '')
-          + (missingFiles.length > 0 ? detailCardMissingFiles(missingFiles) : '')
+          + (jumpFiles.length > 0 ? detailCardFlaggedJumps(jumpFiles) : '')
+          + (stableFiles.length > 0 ? detailCardFlaggedStable(stableFiles, (ewDetail.integrity_summary||{}).flagged_stable_high) : '')
+          + (missingRecent.length > 0 ? detailCardMissingFiles(missingRecent, 'Fehlend (letzte ' + ((ewDetail.integrity_summary||{}).missing_recent_days || 7) + ' Tage)') : '')
+          + (avEvents.length > 0 ? detailCardAvEvents(avEvents) : '')
+          + '</div></div>';
+      } else if (missingAll.length > 0) {
+        html += '<div class="detail-section">'
+          + '<div class="section-heading"><span>\uD83D\uDEE1\uFE0F Ransomware &amp; Virenschutz \u2013 Details</span></div>'
+          + '<div class="card-grid">'
+          + mItems.map(i => detailCardService(i)).join('')
+          + detailCardMissingFiles(missingAll, 'Fehlende Dateien (DB-Historie)')
           + '</div></div>';
       }
 
@@ -1012,7 +1153,8 @@
 
     // ---- Detail card: Missing Files table ----------------------
 
-    function detailCardMissingFiles(files) {
+    function detailCardMissingFiles(files, title) {
+      title = title || ('Fehlende Dateien (' + files.length + ')');
       // Group by source for better overview
       const bySource = {};
       files.forEach(f => {
@@ -1023,7 +1165,7 @@
 
       let html = '<div class="dcard" style="grid-column:1/-1">'
         + '<div class="dcard-header">'
-        + '<span>\uD83D\uDDD1\uFE0F Fehlende Dateien (' + files.length + ' Total)</span>'
+        + '<span>\uD83D\uDDD1\uFE0F ' + esc(title) + '</span>'
         + '</div>'
         + '<div class="dcard-body" style="padding:0 0 4px 0">';
 
@@ -1048,43 +1190,41 @@
       return html;
     }
 
-    // ---- Detail card: Flagged Files ----------------------------
+    // ---- Detail card: Jump alerts --------------------------------
 
-    function detailCardFlaggedFiles(files) {
-      // Group by source for better overview
-      const bySource = {};
-      files.forEach(f => {
-        const src = f.source || 'unknown';
-        if (!bySource[src]) bySource[src] = [];
-        bySource[src].push(f);
-      });
+    function detailCardFlaggedJumps(files) {
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header"><span>\uD83D\uDEA8 Sprung-Alarme (' + files.length + ')</span></div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + buildFlaggedJumpTable(files)
+        + '</div></div>';
+    }
 
-      let html = '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header">'
-        + '<span>\u26A0\uFE0F Flagged Dateien (' + files.length + ' Total)</span>'
-        + '</div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">';
+    function detailCardFlaggedStable(files, total) {
+      const totalLbl = total ? (' von ' + total + ' gesamt') : '';
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header"><span>\uD83D\uDCCA Stabil hoch (' + files.length + ' Beispiele' + totalLbl + ')</span></div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<div style="font-size:12px;color:var(--muted);padding:8px 12px 0">Erwartet bei Archiven/Stubs — kein aktiver Alarm.</div>'
+        + buildFlaggedStableTable(files)
+        + '</div></div>';
+    }
 
-      // Table per source
-      Object.keys(bySource).sort().forEach(src => {
-        const items = bySource[src];
-        html += '<div style="margin:8px 12px">'
-          + '<div style="font-size:12px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">'
-          + '<span class="badge ' + src + '">' + src + '</span> (' + items.length + ' Dateien)'
-          + '</div>'
-          + '<table class="report-table">'
-          + '<thead><tr><th>Pfad</th><th>Entropie</th><th>Grund</th></tr></thead>'
-          + '<tbody>'
-          + items.map(f => '<tr>'
-              + '<td style="font-family:monospace;font-size:11px;max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(f.path||'') + '">' + esc(f.path||'\u2014') + '</td>'
-              + '<td>' + (f.entropy||'\u2014') + '</td>'
-              + '<td style="font-size:11px">' + esc(f.reason||'\u2014') + '</td>'
-            + '</tr>').join('')
-          + '</tbody></table></div>';
-      });
-
-      html += '</div></div>';
-      return html;
+    function detailCardAvEvents(events) {
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header"><span>\uD83E\uDDA0 ClamAV-Funde (' + events.length + ')</span></div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<table class="report-table"><thead><tr>'
+        + '<th>Zeit</th><th>Quelle</th><th>Signatur</th><th>Aktion</th>'
+        + '</tr></thead><tbody>'
+        + events.map(e => '<tr>'
+          + '<td>' + fmtTs(e.detected_at) + '</td>'
+          + '<td><span class="badge ' + esc(e.source || '') + '">' + esc(e.source || '\u2014') + '</span></td>'
+          + '<td>' + esc(e.signature || '\u2014') + '</td>'
+          + '<td>' + esc(e.action || '\u2014') + '</td>'
+          + '</tr>').join('')
+        + '</tbody></table>'
+        + '</div></div>';
     }
 
     // ---- Detail card: Timer Status table -----------------------
