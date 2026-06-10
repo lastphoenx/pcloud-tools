@@ -154,7 +154,7 @@ Jeder Stub unter `_snapshots/<snap>/<relpath>.meta.json` enthält:
 }
 ```
 
-**Restore-Logik:** Nutzer nennt Pfad → Stub lesen → `pool_fileid` → `download_binaryfile_to(fileid=...)`.
+**Restore-Logik:** Nutzer nennt Pfad → Stub lesen → `pool_fileid` → `download_binaryfile_to(fileid=...)`. Implementiert in `scripts/utilities/pool_restore.py` (Index-bulk oder `--relpath` via Stub).
 
 ### Lokale Artefakte (`/srv/pcloud-archive/`)
 
