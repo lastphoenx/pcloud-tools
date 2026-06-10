@@ -74,26 +74,39 @@ def _walk_stubs(node, cur: str) -> Set[str]:
     return result
 
 
-def _load_manifests(manifests_dir: str, snapshots: List[str]) -> Dict[str, Dict[str, str]]:
+def _load_manifests(
+    manifests_dir: str,
+    snapshots: List[str],
+) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
     """
-    Laedt lokale Manifeste. Gibt {snapshot: {relpath: sha256}} zurueck.
-    Nur Snapshots fuer die ein Manifest existiert.
+    Laedt lokale Manifeste. Gibt ({snapshot: {relpath: sha256}}, corrupt_paths) zurueck.
     """
-    result = {}
+    result: Dict[str, Dict[str, str]] = {}
+    corrupt: List[str] = []
     for snap in snapshots:
         path = os.path.join(manifests_dir, f"{snap}.json")
         if not os.path.exists(path):
             print(f"[warn] Manifest fehlt lokal: {path}")
             continue
-        with open(path, "r", encoding="utf-8") as f:
-            m = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if not raw.strip():
+                print(f"[FAIL] Manifest leer: {path}")
+                corrupt.append(path)
+                continue
+            m = json.loads(raw)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[FAIL] Manifest ungueltig: {path} ({e})")
+            corrupt.append(path)
+            continue
         files = {
             it["relpath"]: (it.get("sha256") or "").lower()
             for it in m.get("items", [])
             if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
         }
         result[snap] = files
-    return result
+    return result, corrupt
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +266,24 @@ def check_stub_sample(
 def main() -> int:
     ap = argparse.ArgumentParser(description="Integritaetscheck: Source-Manifeste vs. Remote Pool + Stubs.")
     ap.add_argument("--env-file",       required=True)
-    ap.add_argument("--dest-root",      required=True)
-    ap.add_argument("--manifests-dir",  default="/srv/pcloud-archive/manifests")
+    ap.add_argument("--pool-root",      help="Remote Pool-Root auf pCloud")
+    ap.add_argument("--dest-root",      help="(deprecated) Alias fuer --pool-root")
+    _archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    ap.add_argument("--manifests-dir",
+                    default=os.path.join(_archive, "manifests"))
     ap.add_argument("--stub-sample",    type=int, default=0,
                     help="N Stubs Inhalt lesen + kreuzen (0 = aus, default 0)")
     args = ap.parse_args()
 
+    pool_root_raw = args.pool_root or args.dest_root
+    if not pool_root_raw:
+        print("[FAIL] --pool-root erforderlich (--dest-root ist deprecated)", file=sys.stderr)
+        return 2
+    if args.dest_root and not args.pool_root:
+        print("[warn] --dest-root ist deprecated, bitte --pool-root verwenden")
+
     cfg       = pc.effective_config(env_file=args.env_file)
-    dest      = pc._norm_remote_path(args.dest_root).rstrip("/")
+    dest      = pc._norm_remote_path(pool_root_raw).rstrip("/")
     pool_root = f"{dest}/_pool"
     snaps_root= f"{dest}/_snapshots"
     idx_path  = f"{snaps_root}/_index/content_index.json"
@@ -280,7 +303,11 @@ def main() -> int:
     print(f"Remote-Snapshots: {remote_snaps}")
 
     # ---- Lokale Manifeste laden ----
-    manifests = _load_manifests(args.manifests_dir, remote_snaps)
+    manifests, corrupt_manifests = _load_manifests(args.manifests_dir, remote_snaps)
+    if corrupt_manifests:
+        print(f"[FAIL] {len(corrupt_manifests)} defekte Manifest-Datei(en) — "
+              "bitte re-generieren oder loeschen")
+        return 1
     if not manifests:
         print("[FAIL] Keine lokalen Manifeste gefunden.")
         return 1
