@@ -437,7 +437,7 @@ build_and_push() {
     _log INFO "Manifest-Generierung übersprungen (bereits vorhanden)"
   fi
 
-  # Upload phase (KEIN --retention-sync: im Pool-Modell macht das spaeter der GC)
+  # Upload phase (KEIN --retention-sync; Retention: pcloud_pool_gc.py --retention-apply)
   T0=$(date +%s)
   _db_phase_log "upload" "start"
   
