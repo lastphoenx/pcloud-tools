@@ -850,13 +850,16 @@
       if (phases.length > 0) {
         html += '<div class="info-group" style="margin-top:8px">'
           + '<div style="font-size:12px;color:var(--muted);padding:4px 2px;text-transform:uppercase;letter-spacing:0.5px">\xD8 Phase-Dauer (30 Tage)</div>'
-          + phases.map(p =>
-              '<div class="info-row"><span class="lbl">' + p.phase + '</span>'
-            + '<span class="val ' + (p.failed > 0 ? 'red' : 'green') + '">'
-            + p.avg_duration_sec + 's'
-            + (p.failed > 0 ? ' (' + p.failed + '\u00d7 fail, 30d)' : '')
-            + '</span></div>'
-            ).join('')
+          + phases.map(p => {
+              const phaseCls = p.failed > 0 ? 'red' : (p.warnings > 0 ? 'yellow' : 'green');
+              let suffix = '';
+              if (p.failed > 0) suffix = ' (' + p.failed + '\u00d7 fail, 30d)';
+              else if (p.warnings > 0) suffix = ' (' + p.warnings + '\u00d7 Warn, 30d)';
+              return '<div class="info-row"><span class="lbl">' + p.phase + '</span>'
+                + '<span class="val ' + phaseCls + '">'
+                + p.avg_duration_sec + 's' + suffix
+                + '</span></div>';
+            }).join('')
           + '</div>';
       }
 

@@ -323,18 +323,22 @@ get_failed_backups() {
 # =====================================================
 get_phase_stats() {
   local result
+  # failed  = Phase fehlgeschlagen UND Lauf FAILED (echter Fehler)
+  # warnings = Phase FAILED aber Lauf SUCCESS (z.B. Delta-Verify non-critical)
   result=$(db_query "
     SELECT
-      phase_name,
+      bp.phase_name,
       COUNT(*) AS total,
-      SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS successful,
-      SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
-      ROUND(AVG(duration_sec), 1) AS avg_duration_sec,
-      ROUND(AVG(bytes_processed) / 1024 / 1024 / 1024, 2) AS avg_gb
-    FROM backup_phases
-    WHERE started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-    GROUP BY phase_name
-    ORDER BY FIELD(phase_name,
+      SUM(CASE WHEN bp.status = 'SUCCESS' THEN 1 ELSE 0 END) AS successful,
+      SUM(CASE WHEN bp.status = 'FAILED' AND br.status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+      SUM(CASE WHEN bp.status = 'FAILED' AND br.status = 'SUCCESS' THEN 1 ELSE 0 END) AS warnings,
+      ROUND(AVG(bp.duration_sec), 1) AS avg_duration_sec,
+      ROUND(AVG(bp.bytes_processed) / 1024 / 1024 / 1024, 2) AS avg_gb
+    FROM backup_phases bp
+    JOIN backup_runs br ON br.run_id = bp.run_id
+    WHERE bp.started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    GROUP BY bp.phase_name
+    ORDER BY FIELD(bp.phase_name,
       'manifest', 'upload', 'verify',
       'pool_retention', 'pool_gc',
       'folder_creation', 'retention_sync');
@@ -348,10 +352,10 @@ get_phase_stats() {
   local json="["
   local first=1
 
-  while IFS=$'\t' read -r phase_name total successful failed avg_dur_sec avg_gb; do
+  while IFS=$'\t' read -r phase_name total successful failed warnings avg_dur_sec avg_gb; do
     [[ "$first" -eq 0 ]] && json="${json},"
     first=0
-    json="${json}{\"phase\":\"${phase_name}\",\"total\":${total},\"successful\":${successful},\"failed\":${failed},\"avg_duration_sec\":${avg_dur_sec},\"avg_gb\":${avg_gb}}"
+    json="${json}{\"phase\":\"${phase_name}\",\"total\":${total},\"successful\":${successful},\"failed\":${failed},\"warnings\":${warnings},\"avg_duration_sec\":${avg_dur_sec},\"avg_gb\":${avg_gb}}"
   done <<< "$result"
 
   json="${json}]"
