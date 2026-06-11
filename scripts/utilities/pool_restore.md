@@ -62,6 +62,8 @@ pCloud (Quelle — Parameter --pool-root)          Lokal (Ziel — Parameter --o
 | `--snapshot` | Snapshot-Name, z.B. `2026-06-10-040013` |
 | `--filter` | Nur Relpaths mit diesem **Präfix** (Ordner-Restore) |
 | `--relpath` | Einzelne Datei (relativer Pfad im Snapshot, Stub-Weg) |
+| `--all-versions` | Alle Snapshot-Versionen für `--relpath` oder `--filter` (ohne `--snapshot`) |
+| `--only-changed` | Bei `--all-versions` + Download: nur Einträge mit neuem SHA laden |
 | `--download` | Download ausführen (ohne: nur Plan-Modus) |
 | `--verify` | SHA256 nach jedem Download prüfen |
 | `--allow-incomplete` | Snapshot ohne `.upload_complete` trotzdem erlauben |
@@ -78,10 +80,25 @@ pCloud (Quelle — Parameter --pool-root)          Lokal (Ziel — Parameter --o
 
 ## Ausgabepfad
 
-Dateien landen **immer** unter:
+**Einzel-Snapshot** (Standard):
 
 ```
 <out-dir>/<snapshot>/<relpath>
+```
+
+**Alle Versionen** (`--all-versions`):
+
+```
+<out-dir>/_versions/<relpath>/<snapshot>/<dateiname>
+```
+
+Beispiel: `Gemeinsam/Rest/doc.pdf` aus drei Snapshots →
+
+```
+/srv/nas/restore/_versions/Gemeinsam/Rest/doc.pdf/
+  2026-06-09-040014/doc.pdf
+  2026-06-10-040014/doc.pdf
+  2026-06-11-040014/doc.pdf
 ```
 
 **Beispiel:**
@@ -152,6 +169,44 @@ python scripts/utilities/pool_restore.py \
   --pool-root /Backup/rtb_pool \
   --snapshot 2026-06-10-040013 \
   --relpath "Gemeinsam/Rest/dokument.pdf" \
+  --out-dir /srv/nas/restore \
+  --download --verify
+```
+
+### Versions-Timeline (Stufe 1 — nur Anzeige)
+
+```bash
+MAIN_DIR=/opt/apps/pcloud-tools/main \
+python scripts/utilities/pool_restore.py \
+  --env-file .env \
+  --pool-root /Backup/rtb_pool \
+  --all-versions \
+  --relpath "Gemeinsam/Rest/dokument.pdf"
+```
+
+Zeigt pro Snapshot: SHA, Größe, `changed` / `same` (gegenüber vorherigem Snapshot).
+
+### Alle Versionen wiederherstellen (Stufe 2)
+
+```bash
+MAIN_DIR=/opt/apps/pcloud-tools/main \
+python scripts/utilities/pool_restore.py \
+  --env-file .env \
+  --pool-root /Backup/rtb_pool \
+  --all-versions \
+  --relpath "Gemeinsam/Rest/dokument.pdf" \
+  --out-dir /srv/nas/restore \
+  --download --verify --only-changed
+```
+
+Ordner (alle Dateien unter Präfix, jede Datei × jede Snapshot-Version):
+
+```bash
+python scripts/utilities/pool_restore.py \
+  --env-file .env \
+  --pool-root /Backup/rtb_pool \
+  --all-versions \
+  --filter "Gemeinsam/Rest/" \
   --out-dir /srv/nas/restore \
   --download --verify
 ```

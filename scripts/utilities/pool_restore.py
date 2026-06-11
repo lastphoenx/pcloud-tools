@@ -16,6 +16,13 @@ Aufruf:
 
   python pool_restore.py --env-file .env --pool-root /Backup/rtb_pool \\
     --snapshot 2026-05-28-120014 --out-dir /tmp/restore --download --verify
+
+  python pool_restore.py --env-file .env --pool-root /Backup/rtb_pool \\
+    --all-versions --relpath "Gemeinsam/Rest/dokument.pdf"
+
+  python pool_restore.py --env-file .env --pool-root /Backup/rtb_pool \\
+    --all-versions --relpath "Gemeinsam/Rest/dokument.pdf" \\
+    --out-dir /srv/nas/restore --download --verify --only-changed
 """
 from __future__ import annotations
 
@@ -105,6 +112,133 @@ def list_snapshots_from_index(index: dict) -> List[str]:
         if isinstance(snaps_map, dict):
             snaps.update(snaps_map.keys())
     return sorted(snaps, reverse=True)
+
+
+def _norm_relpath_prefix(value: str) -> str:
+    return (value or "").lstrip("/")
+
+
+def _version_local_relpath(relpath: str, snapshot: str) -> str:
+    """Ziel unter out-dir/_versions/<relpath>/<snapshot>/<basename>."""
+    base = os.path.basename(relpath) or relpath
+    return f"_versions/{relpath}/{snapshot}/{base}"
+
+
+def collect_version_history(
+    pool_refs: dict,
+    *,
+    relpath: str = "",
+    filter_prefix: str = "",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Alle (snapshot, sha, size) pro relpath aus pool_refs sammeln.
+    Rueckgabe: relpath -> Liste chronologisch (Snapshot-Name aufsteigend).
+    """
+    relpath = _norm_relpath_prefix(relpath)
+    filter_prefix = _norm_relpath_prefix(filter_prefix)
+    if not relpath and not filter_prefix:
+        raise PoolRestoreError("--relpath oder --filter erforderlich fuer --all-versions")
+
+    by_path: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for sha, entry in pool_refs.items():
+        if not isinstance(entry, dict):
+            continue
+        snapshots = entry.get("snapshots") or {}
+        if not isinstance(snapshots, dict):
+            continue
+        fileid = entry.get("fileid")
+        size = entry.get("size", 0)
+        sha_l = sha.lower()
+        for snap, relpaths in snapshots.items():
+            if not isinstance(relpaths, list):
+                continue
+            for rp in relpaths:
+                if relpath and rp != relpath:
+                    continue
+                if filter_prefix and not rp.startswith(filter_prefix):
+                    continue
+                by_path.setdefault(rp, {})
+                prev = by_path[rp].get(snap)
+                if prev and prev.get("sha256") != sha_l:
+                    _log(
+                        f"Mehrere SHA fuer {rp} in Snapshot {snap} — behalte letzten Eintrag",
+                        level="warn",
+                    )
+                by_path[rp][snap] = {
+                    "snapshot": snap,
+                    "relpath": rp,
+                    "sha256": sha_l,
+                    "fileid": fileid,
+                    "size": size,
+                }
+
+    history: Dict[str, List[Dict[str, Any]]] = {}
+    for rp, snap_map in by_path.items():
+        rows = [snap_map[s] for s in sorted(snap_map.keys())]
+        prev_sha: Optional[str] = None
+        for row in rows:
+            changed = prev_sha is None or row["sha256"] != prev_sha
+            row["changed"] = changed
+            prev_sha = row["sha256"]
+        history[rp] = rows
+    return history
+
+
+def version_items_for_restore(
+    history: Dict[str, List[Dict[str, Any]]],
+    *,
+    only_changed: bool = False,
+) -> List[Dict[str, Any]]:
+    """Flache Download-Liste aus Versions-Historie (mit local_relpath unter _versions/)."""
+    items: List[Dict[str, Any]] = []
+    for rp in sorted(history.keys()):
+        for row in history[rp]:
+            if only_changed and not row.get("changed"):
+                continue
+            snap = row["snapshot"]
+            items.append({
+                "type": "file",
+                "relpath": rp,
+                "snapshot": snap,
+                "sha256": row["sha256"],
+                "fileid": row.get("fileid"),
+                "size": row.get("size", 0),
+                "local_relpath": _version_local_relpath(rp, snap),
+            })
+    return items
+
+
+def print_version_history(history: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Stufe 1: menschenlesbare Timeline aller Snapshots pro Pfad."""
+    if not history:
+        _log("Keine Versionen gefunden", level="warn")
+        return
+
+    total_rows = sum(len(v) for v in history.values())
+    distinct_shas = {
+        row["sha256"]
+        for rows in history.values()
+        for row in rows
+    }
+    _log(
+        f"Versions-Historie: {len(history)} Pfad(e), {total_rows} Snapshot-Eintraege, "
+        f"{len(distinct_shas)} unterschiedliche SHA"
+    )
+    print()
+
+    for rp in sorted(history.keys()):
+        rows = history[rp]
+        path_shas = {r["sha256"] for r in rows}
+        print(f"=== {rp} ({len(rows)} Snapshots, {len(path_shas)} distinct SHA) ===")
+        print(f"{'Snapshot':<22} {'SHA':<10} {'Size':>12}  {'Status'}")
+        print("-" * 60)
+        for row in rows:
+            sha = (row.get("sha256") or "")[:8]
+            size = row.get("size", 0)
+            status = "changed" if row.get("changed") else "same"
+            print(f"{row['snapshot']:<22} {sha:<10} {size:>12,}  {status}")
+        print()
 
 
 def items_from_index(
@@ -267,7 +401,8 @@ def run_flat_restore(
         relpath = item.get("relpath", f"?_{idx}")
         sha256 = item.get("sha256")
         file_size = item.get("size", 0)
-        local_dest = os.path.join(base_out_dir, relpath)
+        dest_relpath = item.get("local_relpath") or relpath
+        local_dest = os.path.join(base_out_dir, dest_relpath)
 
         expected_prefix = os.path.join(base_out_dir) + os.sep
         if not os.path.normpath(local_dest).startswith(expected_prefix):
@@ -362,16 +497,52 @@ def run_flat_restore(
     return 0 if stats["failed"] == 0 else 1
 
 
-def print_plan(items: List[Dict[str, Any]]) -> None:
+def print_plan(items: List[Dict[str, Any]], *, all_versions: bool = False) -> None:
     _log("Plan-Modus (kein Download):")
     for it in items[:15]:
         sha = (it.get("sha256") or "")[:8]
         size = it.get("size", 0)
-        print(f"  {it.get('relpath')} [{sha}] {size:,} B")
+        snap = it.get("snapshot")
+        dest = it.get("local_relpath") or it.get("relpath")
+        if all_versions and snap:
+            print(f"  [{snap}] {it.get('relpath')} -> {dest} [{sha}] {size:,} B")
+        else:
+            print(f"  {it.get('relpath')} [{sha}] {size:,} B")
     if len(items) > 15:
         print(f"  ... ({len(items) - 15} weitere)")
     total = sum(it.get("size", 0) for it in items)
     _log(f"Gesamt: {len(items)} Dateien, ~{total / (1024**2):.1f} MB")
+
+
+def _filter_complete_snapshots(
+    cfg: dict,
+    dest: str,
+    history: Dict[str, List[Dict[str, Any]]],
+    *,
+    allow_incomplete: bool,
+) -> Dict[str, List[Dict[str, Any]]]:
+    if allow_incomplete:
+        return history
+    all_snaps = {row["snapshot"] for rows in history.values() for row in rows}
+    complete_snaps = {s for s in all_snaps if snapshot_is_complete(cfg, dest, s)}
+    skipped = all_snaps - complete_snaps
+    if skipped:
+        _log(
+            f"Ueberspringe {len(skipped)} unvollstaendige Snapshot(s) ohne .upload_complete: "
+            f"{', '.join(sorted(skipped)[:5])}"
+            + (" ..." if len(skipped) > 5 else ""),
+            level="warn",
+        )
+    filtered: Dict[str, List[Dict[str, Any]]] = {}
+    for rp, rows in history.items():
+        kept = [r for r in rows if r["snapshot"] in complete_snaps]
+        if kept:
+            prev_sha: Optional[str] = None
+            for row in kept:
+                row["changed"] = prev_sha is None or row["sha256"] != prev_sha
+                prev_sha = row["sha256"]
+            filtered[rp] = kept
+    return filtered
 
 
 def main() -> int:
@@ -388,15 +559,24 @@ Beispiele:
   %(prog)s --env-file .env --pool-root /Backup/rtb_pool \\
     --snapshot 2026-05-28-120014 --relpath "home/user/datei.txt" \\
     --out-dir /tmp/restore --download --verify
+  %(prog)s --env-file .env --pool-root /Backup/rtb_pool \\
+    --all-versions --relpath "Gemeinsam/Rest/dokument.pdf"
+  %(prog)s --env-file .env --pool-root /Backup/rtb_pool \\
+    --all-versions --relpath "Gemeinsam/Rest/dokument.pdf" \\
+    --out-dir /srv/nas/restore --download --verify --only-changed
         """,
     )
     ap.add_argument("--env-file", required=True)
     ap.add_argument("--pool-root", help="Remote Pool-Root auf pCloud (Quelle), z.B. /Backup/rtb_pool")
     ap.add_argument("--dest-root", help="(deprecated) Alias fuer --pool-root")
     ap.add_argument("--list-snapshots", action="store_true", help="Verfuegbare Snapshots anzeigen")
-    ap.add_argument("--snapshot", help="Snapshot-Name")
+    ap.add_argument("--snapshot", help="Snapshot-Name (nicht mit --all-versions)")
     ap.add_argument("--relpath", help="Einzelne Datei (Stub-Weg)")
     ap.add_argument("--filter", help="Nur Relpaths mit diesem Praefix")
+    ap.add_argument("--all-versions", action="store_true",
+                    help="Alle Snapshot-Versionen fuer --relpath/--filter (Timeline oder Restore)")
+    ap.add_argument("--only-changed", action="store_true",
+                    help="Bei --all-versions + Download: nur Eintraege mit neuem SHA laden")
     ap.add_argument("--out-dir", help="Lokales Ziel (Unterordner = Snapshot-Name)")
     ap.add_argument("--download", action="store_true", help="Download ausfuehren (sonst Plan)")
     ap.add_argument("--verify", action="store_true", help="SHA256 nach Download pruefen")
@@ -424,8 +604,54 @@ Beispiele:
             print(f"  {s}")
         return 0
 
+    if args.all_versions:
+        if args.snapshot:
+            _log("--snapshot wird mit --all-versions ignoriert", level="warn")
+        if not args.relpath and not args.filter:
+            _log("--all-versions erfordert --relpath oder --filter", level="error")
+            return 2
+        try:
+            index = load_pool_index(cfg, dest)
+            pool_refs = index.get("pool_refs") or {}
+            history = collect_version_history(
+                pool_refs,
+                relpath=args.relpath or "",
+                filter_prefix=args.filter or "",
+            )
+            history = _filter_complete_snapshots(
+                cfg, dest, history, allow_incomplete=args.allow_incomplete,
+            )
+            if not history:
+                raise PoolRestoreError("Keine Versionen gefunden (nach Filter/Completeness)")
+        except PoolRestoreError as e:
+            _log(str(e), level="error")
+            return 2
+
+        print_version_history(history)
+
+        if not args.download:
+            items = version_items_for_restore(history, only_changed=args.only_changed)
+            if items:
+                print()
+                _log(f"Download-Plan ({'nur geaenderte' if args.only_changed else 'alle'}): "
+                     f"{len(items)} Datei(en)")
+                print_plan(items, all_versions=True)
+            return 0
+
+        if not args.out_dir:
+            _log("--out-dir erforderlich fuer Download", level="error")
+            return 2
+
+        items = version_items_for_restore(history, only_changed=args.only_changed)
+        if not items:
+            _log("Nichts zu laden (leer oder --only-changed ohne Unterschiede)", level="warn")
+            return 0
+
+        _log(f"All-Versions Restore: {len(items)} Datei(en) -> {args.out_dir}/_versions/...")
+        return run_flat_restore(cfg, dest, items, args.out_dir, verify=args.verify)
+
     if not args.snapshot:
-        _log("--snapshot erforderlich (oder --list-snapshots)", level="error")
+        _log("--snapshot erforderlich (oder --list-snapshots / --all-versions)", level="error")
         return 2
     if not args.out_dir:
         _log("--out-dir erforderlich", level="error")
