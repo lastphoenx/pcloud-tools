@@ -276,7 +276,7 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/pcloud_integrity_check.py` | Tiefenprüfung: Hashes, FileIDs, Holder-Konsistenz |
 | `scripts/pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
 | `scripts/utilities/pcloud_restore.py` | Legacy 1to1-Restore (anchor_path, nicht Pool) |
-| `scripts/utilities/pool_restore.py` | Pool-Mode Restore (pool_refs / Stubs → _pool) |
+| `scripts/utilities/pool_restore.py` | Pool-Mode Restore (Einzel-Snapshot oder `--all-versions` über alle Snapshots) |
 | `scripts/utilities/pool_verify_backup.py` | Integritätscheck Manifest ↔ Pool ↔ Index |
 | `scripts/utilities/pool_audit_status.py` | Schneller Status RTB vs. Manifeste vs. pCloud vs. DB |
 | `docs/STORAGE_PATHS.md` | Lokale Pfade pi-nas (Bind-Mounts, was **nicht** Pipeline ist) |
