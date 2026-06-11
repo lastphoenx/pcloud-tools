@@ -299,9 +299,25 @@ python scripts/utilities/pool_restore.py \
   --relpath "home/user/datei.txt" \
   --out-dir /srv/restore \
   --download --verify
+
+# Versions-Timeline (alle Snapshots, nur Anzeige)
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
+  --all-versions \
+  --relpath "Gemeinsam/Rest/dokument.pdf"
+
+# Alle Versionen einer Datei laden (nur geänderte SHA)
+python scripts/utilities/pool_restore.py \
+  --env-file "$ENV_FILE" --pool-root /Backup/rtb_pool \
+  --all-versions \
+  --relpath "Gemeinsam/Rest/dokument.pdf" \
+  --out-dir /srv/restore \
+  --download --verify --only-changed
 ```
 
-Ergebnis liegt unter `/srv/restore/<snapshot>/<relpath>`. Ausführliche Doku: `scripts/utilities/pool_restore.md`.
+Einzel-Snapshot: `/srv/restore/<snapshot>/<relpath>`.  
+Alle Versionen: `/srv/restore/_versions/<relpath>/<snapshot>/<dateiname>`.  
+Ausführliche Doku: `scripts/utilities/pool_restore.md`.
 
 ---
 

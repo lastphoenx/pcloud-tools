@@ -156,6 +156,8 @@ Jeder Stub unter `_snapshots/<snap>/<relpath>.meta.json` enthält:
 
 **Restore-Logik:** Nutzer nennt Pfad → Stub lesen → `pool_fileid` → `download_binaryfile_to(fileid=...)`. Implementiert in `scripts/utilities/pool_restore.py` (Index-bulk oder `--relpath` via Stub).
 
+**Versions-Historie (`--all-versions`):** `pool_refs[sha].snapshots` quer über alle Snapshots auswerten → Timeline (`changed`/`same` pro Snapshot). Download nach `out-dir/_versions/<relpath>/<snapshot>/`. Optional `--only-changed` lädt nur Einträge mit neuem SHA. Umbenennungen/Verschiebungen: noch nicht (siehe legacy `pcloud_file_history.sh`).
+
 ### Lokale Artefakte (`/srv/pcloud-archive/`)
 
 ```
