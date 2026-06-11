@@ -182,6 +182,41 @@
     .info-row .val.red    { color: var(--red); }
     .info-row .val.blue   { color: var(--blue); }
 
+    .rtb-delta-details {
+      margin-top: 4px;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 12px;
+      border-left: 3px solid var(--yellow);
+    }
+    .rtb-delta-details summary {
+      cursor: pointer;
+      color: var(--yellow);
+      font-weight: 500;
+      list-style: none;
+    }
+    .rtb-delta-details summary::-webkit-details-marker { display: none; }
+    .rtb-delta-details summary::before {
+      content: '\25B6 ';
+      font-size: 10px;
+      opacity: 0.8;
+    }
+    .rtb-delta-details[open] summary::before { content: '\25BC '; }
+    .rtb-delta-details .muted { color: var(--muted); font-weight: 400; }
+    .rtb-delta-lines {
+      margin-top: 8px;
+      padding: 8px;
+      background: var(--bg);
+      border-radius: 6px;
+      font-family: ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      word-break: break-all;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+
     .service-list { display: flex; flex-direction: column; gap: 5px; }
     .service-item {
       display: flex;
@@ -607,6 +642,7 @@
         +     '<div class="info-row"><span class="lbl">RTB letzter Lauf</span><span class="val">' + fmtTs(rtb.last_run) + '</span></div>'
         +     '<div class="info-row"><span class="lbl">RTB Snapshots</span><span class="val">' + snapCount + '</span></div>'
         +     rtbDryRunHTML(rtb)
+        +     rtbDeltaPreviewHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
         +     (perf.total_runs ? (
@@ -1400,8 +1436,11 @@
     function rtbDryRunObj(rtb) {
       const r  = rtb.dry_run_result;
       const ts = rtb.dry_run_ts ? '  (' + fmtTs(rtb.dry_run_ts) + ')' : '';
-      if (r === 'changes_detected')
-        return { text: '\u26a1 \xc4nderungen erkannt \u2014 Backup steht bevor' + ts, cls: 'yellow' };
+      const n  = (rtb.dry_run_delta && rtb.dry_run_delta.count) ? rtb.dry_run_delta.count : null;
+      if (r === 'changes_detected') {
+        const cnt = n ? ' (' + n + ')' : '';
+        return { text: '\u26a1 \xc4nderungen erkannt' + cnt + ' \u2014 Backup steht bevor' + ts, cls: 'yellow' };
+      }
       if (r === 'no_changes')
         return { text: '\u2713 Keine \xc4nderungen \u2014 kein Backup n\xf6tig' + ts, cls: 'green' };
       return null;
@@ -1412,6 +1451,32 @@
       if (!o) return '';
       return '<div class="info-row"><span class="lbl">N\xe4chstes Backup</span>'
            + '<span class="val ' + o.cls + '">' + o.text + '</span></div>';
+    }
+
+    function rtbDeltaPreviewHTML(rtb) {
+      const d = rtb.dry_run_delta;
+      if (!d || !d.count || rtb.dry_run_result !== 'changes_detected') return '';
+      const tops = (d.top_dirs || []).map(function(t) {
+        return esc(t.dir) + ' (' + t.count + ')';
+      }).join(', ');
+      const snap = d.baseline ? d.baseline.replace(/\/+$/, '').split('/').pop() : '';
+      let lines = '';
+      if (d.samples && d.samples.length) {
+        lines = '<div class="rtb-delta-lines">'
+          + d.samples.map(function(p) { return esc(p); }).join('<br>');
+        if (d.count > d.samples.length) {
+          lines += '<br><span class="muted">\u2026 +' + (d.count - d.samples.length) + ' weitere</span>';
+        }
+        lines += '</div>';
+      }
+      return '<details class="rtb-delta-details">'
+        + '<summary>'
+        + d.count + ' Datei\u00e4nderung(en)'
+        + (tops ? ' \u2014 ' + tops : '')
+        + (snap ? ' <span class="muted">vs. ' + esc(snap) + '</span>' : '')
+        + '</summary>'
+        + lines
+        + '</details>';
     }
 
     function rtbCls(status) {

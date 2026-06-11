@@ -32,7 +32,7 @@ VERBOSE=0
 
 # Paths to companion scripts (override via env)
 ENTROPYWATCHER_SAFETY_GATE="${ENTROPYWATCHER_SAFETY_GATE:-/opt/apps/entropywatcher/main/safety_gate.sh}"
-RTB_WRAPPER_SCRIPT="${RTB_WRAPPER_SCRIPT:-/opt/apps/rtb/rtb_wrapper.sh}"
+RTB_WRAPPER_SCRIPT="${RTB_WRAPPER_SCRIPT:-/opt/apps/rtb/rtb_pool_wrapper.sh}"
 FORECAST_SAFETY_GATE="${FORECAST_SAFETY_GATE:-/opt/apps/entropywatcher/main/scripts/forecast_safety_gate.sh}"
 
 # Exported: visible inside subshell command-substitution calls below
@@ -324,6 +324,7 @@ check_rtb_wrapper() {
   #   exit 0 + "no_baseline"      → no prior snapshot yet
   local dry_run_result="unknown"
   local dry_run_ts=""
+  local dry_run_delta_json=""
   if [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
     local check_out check_rc
     set +e
@@ -336,6 +337,12 @@ check_rtb_wrapper() {
       dry_run_result="changes_detected"
     elif echo "$check_out" | grep -qE "no_changes|no_baseline"; then
       dry_run_result="no_changes"
+    fi
+    if echo "$check_out" | grep -q '^\[RTB Delta JSON\]'; then
+      dry_run_delta_json=$(echo "$check_out" | grep '^\[RTB Delta JSON\]' | sed 's/^\[RTB Delta JSON\] //' | head -1)
+      if command -v jq &>/dev/null; then
+        echo "$dry_run_delta_json" | jq empty 2>/dev/null || dry_run_delta_json=""
+      fi
     fi
   fi
 
@@ -372,6 +379,9 @@ check_rtb_wrapper() {
     if [[ -n "$dry_run_ts" ]]; then
       json="$json,\"dry_run_ts\":\"$dry_run_ts\""
     fi
+  fi
+  if [[ -n "$dry_run_delta_json" ]]; then
+    json="$json,\"dry_run_delta\":${dry_run_delta_json}"
   fi
   json="$json}"
   
