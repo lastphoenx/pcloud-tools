@@ -691,6 +691,9 @@ def _register_snap(pool_refs: dict, sha: str, snap: str, relpath: str = "",
     Formate (bare list / snapshots=list) transparent nach v2. Coords (fileid/hash/size)
     werden nur gesetzt, wenn noch nicht vorhanden - echte Werte werden nie ueberschrieben.
     Zentraler Ersatz fuer alle frueheren inline-Registrierungen (kein rohes .append mehr)."""
+    sha = (sha or "").lower()
+    if not sha:
+        return
     entry = pool_refs.get(sha)
     if not isinstance(entry, dict):
         old = entry if isinstance(entry, list) else []
@@ -1182,6 +1185,31 @@ def _get_pool_path(sha256: str) -> str:
     return f"_pool/{prefix}/{sha256.lower()}"
 
 
+def _pool_object_present(cfg: dict, pool_root: str, sha: str, pool_refs: dict) -> bool:
+    """
+    Prueft ob ein Pool-Objekt fuer sha256 existiert.
+    1) Pfad-Stat (_pool/XX/sha)
+    2) Fallback: pool_refs[sha].fileid (wie tamper-detect / pool_verify)
+    """
+    sha = (sha or "").lower()
+    if len(sha) != 64:
+        return False
+    pool_path = f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
+    st = pc.stat_file_safe(cfg, path=pool_path)
+    if st and st.get("fileid"):
+        return True
+    ref = (pool_refs or {}).get(sha)
+    if ref is None:
+        ref = next((v for k, v in pool_refs.items() if k.lower() == sha), None)
+    ref = ref or {}
+    fid = ref.get("fileid")
+    if fid:
+        st2 = pc.stat_file_safe(cfg, fileid=int(fid))
+        if st2 and st2.get("fileid"):
+            return True
+    return False
+
+
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
     Post-Upload Konsistenz-Check für Pool-Mode Snapshots (NEUE IMPLEMENTATION).
@@ -1248,7 +1276,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
             if isinstance(obj, dict):
                 if not obj.get("isfolder") and obj.get("name"):
                     filename = obj.get("name")
-                    if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
+                    if len(filename) == 64 and all(c in "0123456789abcdefABCDEF" for c in filename):
                         pool_sha256s.add(filename.lower())
                 for child in obj.get("contents", []):
                     _extract_sha256s_from_tree(child)
@@ -1269,22 +1297,26 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
         pool_scan_ok = False
 
     # === 3. DELTA-CHECK: Fehlen Files im Pool? (mit Truncation-Schutz) ===
+    pool_refs = index.get("pool_refs", {})
     missing_in_pool = manifest_sha256s - pool_sha256s
     if missing_in_pool and pool_scan_ok:
         if len(missing_in_pool) > 2000:
             # So viele "fehlende" deuten auf einen unzuverlaessigen/abgeschnittenen Bulk-Scan
             # hin, nicht auf echten Verlust -> Index als Ground-Truth, kein Truncation-Fehlalarm.
             _log(f"[validate][WARN] {len(missing_in_pool)} vermeintlich fehlend - Bulk-Scan unzuverlaessig, nutze Index")
-            missing_in_pool = manifest_sha256s - set((index.get("pool_refs") or {}).keys())
+            missing_in_pool = {
+                s for s in manifest_sha256s
+                if not _pool_object_present(cfg, pool_root, s, pool_refs)
+            }
         else:
-            # Wenige vermeintlich fehlende: einzeln per stat verifizieren (definitiv),
-            # um listfolder-Truncation-Fehlalarme auszuschliessen.
-            _log(f"[validate] {len(missing_in_pool)} nicht im Bulk-Scan - verifiziere einzeln via stat...")
+            # Wenige vermeintlich fehlende: Pfad-Stat + pool_refs.fileid (wie tamper-detect).
+            _log(f"[validate] {len(missing_in_pool)} nicht im Bulk-Scan - verifiziere einzeln (path + fileid)...")
             _really_missing = set()
             for _sha in missing_in_pool:
-                _p = f"{pool_root.rstrip('/')}/{_sha[:2]}/{_sha}"
-                if not pc.stat_file_safe(cfg, path=_p):
+                if not _pool_object_present(cfg, pool_root, _sha, pool_refs):
                     _really_missing.add(_sha)
+            if _really_missing and len(_really_missing) < len(missing_in_pool):
+                _log(f"[validate] {len(missing_in_pool) - len(_really_missing)} via fileid-Stat als vorhanden erkannt")
             missing_in_pool = _really_missing
     if missing_in_pool:
         errors.append(f"Pool: {len(missing_in_pool)} SHA256s fehlen")
@@ -1295,7 +1327,6 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     
     # === 4. POOL-REFS-CHECK (Index-Konsistenz) ===
     _log(f"[validate] Prüfe Index-Konsistenz (pool_refs)...")
-    pool_refs = index.get("pool_refs", {})
     missing_in_index = 0
     wrong_snapshot = 0
     
@@ -2032,7 +2063,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             
             file_item = current_files[relpath]
             abs_src = file_item.get("source_path", "")
-            sha256 = file_item.get("sha256", "")
+            sha256 = (file_item.get("sha256") or "").lower()
             
             if not abs_src or not sha256:
                 # Manifest-Defekt: ohne Quelle/SHA kann die Datei nicht in den Pool ->

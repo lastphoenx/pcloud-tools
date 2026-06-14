@@ -83,8 +83,17 @@ def parse_manifest_skip_globs() -> List[str]:
     return [g.strip() for g in raw.split(",") if g.strip()]
 
 
+# RTB-Snapshot-Pfade unter /srv/nas — keine Pipeline-Artefakte ins Pool-Backup
+_PIPELINE_RELPATH_PREFIXES = ("pcloud-archive/", "pcloud-temp/")
+
+
 def relpath_excluded(relpath: str, skip_globs: List[str]) -> bool:
-    if not skip_globs or not relpath:
+    if not relpath:
+        return False
+    for prefix in _PIPELINE_RELPATH_PREFIXES:
+        if relpath.startswith(prefix):
+            return True
+    if not skip_globs:
         return False
     name = relpath.rsplit("/", 1)[-1]
     for pat in skip_globs:
