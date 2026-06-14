@@ -446,7 +446,7 @@ build_and_push() {
   
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode pool --env-file "$ENV_FILE" "${EXTRA_PUSH_ARGS[@]}" || {
     _db_phase_log "upload" "end" "FAILED"
-    rm -f "$mani" "$mani_jsonl" 2>/dev/null || true
+    # Temp-Manifest behalten: Retry ueberspringt Regenerierung, Diagnose via jq moeglich
     _db_fail_and_return "upload_failed"
   }
   
