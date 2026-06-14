@@ -121,6 +121,7 @@ _dry_sampler = DryRunSampler(limit=5)
 # ---- Lib laden ----
 try:
     import pcloud_bin_lib as pc
+    import pcloud_path_compat as ppc
 except Exception as e:
     print(f"Fehler: pcloud_bin_lib konnte nicht importiert werden: {e}", file=sys.stderr)
     sys.exit(2)
@@ -1321,6 +1322,7 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
             _walk_stubs(
                 _snap_result.get("metadata", {}), cur_path=snapshot_dir.rstrip("/"))
             _log(f"[validate] Remote-Stubs vorhanden: {len(_remote_stub_paths)}")
+            _stub_lookup = ppc.build_stub_path_lookup(_remote_stub_paths)
 
             # Truncation-Schutz: Wenn API-Antwort zu wenige Stubs liefert, ist der Scan
             # unzuverlaessig. Schwelle: < 90% der erwarteten UND mehr als 100 fehlen.
@@ -1335,12 +1337,18 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
                 _log(f"[validate][WARN] Stub-Vollcheck uebersprungen – pool_verify_backup.py fuer vollstaendige Pruefung verwenden")
             else:
                 missing_stubs = []
+                path_mismatch_resolved = 0
                 for item in manifest_items:
                     relpath = item.get("relpath")
                     if relpath:
                         stub_path = f"{snapshot_dir}/{relpath}.meta.json"
-                        if stub_path not in _remote_stub_paths:
+                        if not ppc.stub_path_exists(stub_path, _stub_lookup):
                             missing_stubs.append(relpath)
+                        elif stub_path not in _remote_stub_paths:
+                            path_mismatch_resolved += 1
+                if path_mismatch_resolved:
+                    _log(f"[validate] {path_mismatch_resolved} Stub(s) via Pfad-Normalisierung "
+                         f"(Segment-Whitespace) als vorhanden erkannt")
                 if missing_stubs:
                     errors.append(f"Stubs fehlen: {len(missing_stubs)}")
                     for rp in missing_stubs[:10]:
