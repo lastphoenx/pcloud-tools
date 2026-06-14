@@ -60,6 +60,7 @@ from __future__ import annotations
 import os, sys, json, argparse, time, datetime, re
 import concurrent.futures
 import threading
+from email.utils import parsedate_to_datetime
 from typing import Set, Dict, List, Tuple, Optional
 from collections import defaultdict
 
@@ -70,6 +71,30 @@ def _log(msg: str, *, file=sys.stderr) -> None:
     """Log-Ausgabe mit Timestamp"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} {msg}", file=file, flush=True)
+
+
+def _modified_to_unix_ts(modified) -> Optional[float]:
+    """pCloud liefert modified als Unix-Zahl oder HTTP-Datum (RFC 2822)."""
+    if modified is None:
+        return None
+    if isinstance(modified, (int, float)):
+        return float(modified)
+    if isinstance(modified, str):
+        text = modified.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return float(text)
+        try:
+            return parsedate_to_datetime(text).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            pass
+    _log(f"[gc][WARN] Unparsable modified timestamp: {modified!r}")
+    return None
 
 
 # ---- Lib laden ----
@@ -830,9 +855,12 @@ def run_pool_gc(
             
             # 2. Grace-Period-Check (Race-Protection!)
             if grace_hours > 0 and pool_file.get("modified"):
-                # Unix-Timestamp zu Python-Timestamp
-                file_mtime = pool_file["modified"]
-                
+                file_mtime = _modified_to_unix_ts(pool_file["modified"])
+                if file_mtime is None:
+                    stats.inc_kept()
+                    if verbose:
+                        _log(f"[gc-grace] Keeping {sha256[:16]}... (modified unparseable)")
+                    continue
                 if file_mtime > grace_cutoff:
                     # File ist jünger als Grace Period → behalten (könnte gerade uploaded sein)
                     stats.inc_kept()
@@ -1029,6 +1057,9 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
     )
     
     # Exit Code
+    if result.get("error"):
+        _log(f"[gc] ⚠ GC abgebrochen: {result['error']}")
+        sys.exit(1)
     if result.get("errors", 0) > 0:
         _log("[gc] ⚠ GC abgeschlossen mit Fehlern")
         sys.exit(1)
