@@ -145,19 +145,28 @@ Erwarteter Ablauf:
 
 ---
 
-## 6. Catch-up: alle weiteren Snapshots hochladen
+## 6. Catch-up: fehlende Snapshots hochladen
 
 ```bash
-# Alle fehlenden Snapshots automatisch der Reihe nach hochladen:
+# Alle lokalen Snapshots ohne remote .upload_complete:
 ./wrapper_pcloud_pool_sync_1to1.sh
 
-# Der Wrapper ermittelt: remote vorhanden vs. lokal vorhanden → Differenz
-# Lädt chronologisch hoch; Scout wählt für jeden besten Basis-Snapshot
-# Scout ≥ 70% Similarity → Turbo-Delta (~2 Min/Snapshot)
-# Scout < 70% → Full-Pool-Mode (bei neu hinzugekommenen Geräten)
+# Einzelnen Snapshot (Test / Backlog gezielt):
+/opt/apps/rtb/rtb_pool_wrapper.sh --upload-only /mnt/backup/rtb_nas/2026-06-14-120015
 ```
 
-Fortschritt beobachten:
+**Reihenfolge (seit 2026-06):** `latest` zuerst, dann älteres Backlog chronologisch. Ein fehlgeschlagener Backlog-Snapshot blockiert juengere nicht mehr (`continue`). Harte Abbrüche nur bei `--upload-only` / explizitem Target.
+
+Status prüfen (RTB vs. Manifest vs. `.upload_complete`):
+
+```bash
+python3 scripts/utilities/pool_audit_status.py \
+  --env-file .env --pool-root /Backup/rtb_pool --rtb-root /mnt/backup/rtb_nas
+```
+
+**Remote-Zombie** (Ordner auf pCloud, kein lokales RTB, kein `.upload_complete`): per Retention entfernen — siehe `pcloud_pool_gc.md` § `--retention-apply` (erst `--dry-run`).
+
+Fortschritt:
 ```bash
 tail -f /var/log/backup/rtb_wrapper.log
 ```
