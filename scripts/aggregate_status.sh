@@ -270,7 +270,15 @@ check_rtb_wrapper() {
       safety_gate="YELLOW"
       details="Safety-Gate: YELLOW - Warning conditions detected"
     fi
-  # Check for success
+  # Check for successful pipeline completion ([done] — rtb_pool_wrapper uses this, not [success])
+  elif echo "$log_tail" | tail -40 | grep -qE '\[done\].*(Backup-Pipeline komplett|pCloud-Sync erfolgreich|RTB erfolgreich)'; then
+    status="success"
+    message=$(echo "$log_tail" | grep -E '\[done\].*(Backup-Pipeline komplett|pCloud-Sync erfolgreich|RTB erfolgreich)' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Backup completed")
+    safety_gate=$(echo "$log_tail" | tail -50 | grep -oP 'SAFETY-GATE: (GREEN|YELLOW|RED)' | tail -1 | grep -oP '(GREEN|YELLOW|RED)' || echo "GREEN")
+    if echo "$log_tail" | tail -40 | grep -q 'Delta-Check failed.*non-critical'; then
+      details="Upload OK; tamper-detect nur GC-Hinweis (non-critical)"
+    fi
+  # Check for success (legacy marker)
   elif echo "$log_tail" | tail -20 | grep -q '\[success\]'; then
     status="success"
     message=$(echo "$log_tail" | grep '\[success\]' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Backup completed")
@@ -292,8 +300,10 @@ check_rtb_wrapper() {
       details="$skip_line"
     fi
     message="Skipped: $details"
-  # Check for error
-  elif echo "$log_tail" | tail -20 | grep -qi '\[error\]\|fail'; then
+  # Check for error (ignore non-critical delta-verify warnings after successful upload)
+  elif echo "$log_tail" | tail -20 | grep -qiE '\[error\]|fail' \
+    && ! echo "$log_tail" | tail -40 | grep -qE '\[done\].*(Backup-Pipeline komplett|pCloud-Sync erfolgreich)' \
+    && ! echo "$log_tail" | tail -20 | grep -q 'non-critical, upload succeeded'; then
     status="failed"
     message=$(echo "$log_tail" | grep -iE '\[error\]|fail' | tail -1 | sed -E 's/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} //' || echo "Error detected")
   # Check for running
