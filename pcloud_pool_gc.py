@@ -97,6 +97,12 @@ def _modified_to_unix_ts(modified) -> Optional[float]:
     return None
 
 
+def _pool_file_remote_path(pool_root: str, sha256: str) -> str:
+    """Vollpfad zu einem Pool-Objekt (_pool/XX/<sha256>)."""
+    sha = sha256.lower()
+    return f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
+
+
 # ---- Lib laden ----
 try:
     import pcloud_bin_lib as pc
@@ -326,7 +332,7 @@ def _list_pool_files(cfg: dict, pool_root: str) -> List[dict]:
             if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
                 pool_files.append({
                     "name": filename,
-                    "path": obj.get("path", ""),
+                    "path": obj.get("path") or _pool_file_remote_path(pool_root, filename),
                     "size": obj.get("size", 0),
                     "modified": obj.get("modified"),
                 })
@@ -599,8 +605,7 @@ def _delete_pool_file(
     Worker-Funktion für ThreadPoolExecutor.
     """
     if dry:
-        if verbose:
-            _log(f"[dry] delete: {pool_file_path} ({pool_file_size} bytes)")
+        _log(f"[dry] delete: {pool_file_path} ({pool_file_size} bytes)")
         stats.inc_deleted(pool_file_size)
         return
     
@@ -822,9 +827,10 @@ def run_pool_gc(
                     
                     # Validiere: Pool-Files sind 64 Hex-Zeichen (SHA256)
                     if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
+                        sha = filename.lower()
                         pool_files_list.append({
-                            "name": filename.lower(),
-                            "path": filepath,
+                            "name": sha,
+                            "path": filepath or _pool_file_remote_path(pool_root, sha),
                             "size": filesize,
                             "modified": modified
                         })
