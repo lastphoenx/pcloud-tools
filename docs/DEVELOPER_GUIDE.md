@@ -22,6 +22,8 @@
 
 **Pipeline-Aufruf:** `rtb_pool_wrapper.sh` → `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
 
+**RTB ↔ Pipeline (Kurz):** Delta-Check ignoriert `/pcloud-archive/` und `/pcloud-temp/` unter `/srv/nas` (`rtb_check_excludes.sh`). Echtes RTB sichert sie mit. Details: [STORAGE_PATHS.md](./STORAGE_PATHS.md) § RTB vs. Pipeline.
+
 ---
 
 ## 🧱 Säule 1: Das Fundament — pcloud_bin_lib.py
@@ -248,6 +250,10 @@ for sha in manifest_sha256s:
 #    Für jeden Manifest-relpath: stub_path in remote_stub_paths?
 missing_stubs = [rp for rp in manifest_items if stub_path not in remote_stub_paths]
 ```
+
+**Pool-Objekt-Lookup (Juni 2026):** `_pool_object_present()` prüft zuerst `by_fileid` (aus `pool_refs`), dann Pfad in `by_path` — case-insensitive Bulk-Scan.
+
+**Pool-Backfill (Juni 2026):** Fehlen wenige SHA256s im Pool (z.B. nach GC), lädt `validate_pool_snapshot` die Quelldateien aus dem Manifest nach (`PCLOUD_VALIDATE_POOL_BACKFILL_MAX`, Default 50). Deaktivieren: `PCLOUD_VALIDATE_POOL_BACKFILL_MAX=0`.
 
 Der Stub-Check verwendet `listfolder(snapshot_dir)` als Set-Lookup (1 API-Call, O(n) Set-Vergleich). Stichproben waren unzuverlässig (0.5% Abdeckung hatte 9 fehlende Stubs nicht gefangen).
 

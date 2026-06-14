@@ -1210,6 +1210,77 @@ def _pool_object_present(cfg: dict, pool_root: str, sha: str, pool_refs: dict) -
     return False
 
 
+def _manifest_relpaths_for_sha(manifest: dict, sha: str) -> list[str]:
+    sha = (sha or "").lower()
+    out = []
+    for it in manifest.get("items", []):
+        if it.get("type") != "file":
+            continue
+        if (it.get("sha256") or "").lower() == sha:
+            rp = it.get("relpath")
+            if rp:
+                out.append(rp)
+    return out
+
+
+def _backfill_missing_pool_shas(
+    cfg: dict,
+    dest_root: str,
+    pool_root: str,
+    manifest: dict,
+    missing_shas: set,
+    *,
+    dry: bool = False,
+) -> tuple[int, list[str]]:
+    """
+    Laedt fehlende Pool-Objekte aus Manifest-source_path nach (z.B. nach GC-Luecken).
+    """
+    if not missing_shas:
+        return 0, []
+    filled = 0
+    errors: list[str] = []
+    by_sha: dict[str, dict] = {}
+    for it in manifest.get("items", []):
+        if it.get("type") != "file":
+            continue
+        sha = (it.get("sha256") or "").lower()
+        if sha in missing_shas and it.get("source_path"):
+            by_sha[sha] = it
+
+    for sha in sorted(missing_shas):
+        it = by_sha.get(sha)
+        relpaths = _manifest_relpaths_for_sha(manifest, sha)
+        rp = relpaths[0] if relpaths else "?"
+        if not it:
+            errors.append(f"  - Kein Manifest-Eintrag: {sha[:16]}... ({rp})")
+            continue
+        src = it.get("source_path")
+        if not src or not os.path.isfile(src):
+            errors.append(f"  - Quelle fehlt: {rp} ({src})")
+            continue
+        pool_path_abs = f"{dest_root.rstrip('/')}/{_get_pool_path(sha)}"
+        parent_abs = os.path.dirname(pool_path_abs.rstrip("/"))
+        if parent_abs:
+            pc.ensure_path_cached(cfg, parent_abs)
+        try:
+            if _pool_object_present(cfg, pool_root, sha, {}):
+                filled += 1
+                continue
+            if dry:
+                filled += 1
+                continue
+            _log(f"[validate][backfill] Nachladen: {rp} -> {pool_path_abs}")
+            _upload_file_smart(cfg, src, pool_path_abs, dry=False)
+            if _pool_object_present(cfg, pool_root, sha, {}):
+                filled += 1
+                _log(f"[validate][backfill] ✓ {rp}")
+            else:
+                errors.append(f"  - Backfill ohne Pool-Treffer: {rp}")
+        except Exception as e:
+            errors.append(f"  - Backfill {rp}: {e}")
+    return filled, errors
+
+
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
     Post-Upload Konsistenz-Check für Pool-Mode Snapshots (NEUE IMPLEMENTATION).
@@ -1318,10 +1389,28 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
             if _really_missing and len(_really_missing) < len(missing_in_pool):
                 _log(f"[validate] {len(missing_in_pool) - len(_really_missing)} via fileid-Stat als vorhanden erkannt")
             missing_in_pool = _really_missing
+    # Pool-Luecken aus Quell-Snapshot nachladen (GC / veralteter Index)
+    if missing_in_pool and not dry:
+        _repair_max = int(os.environ.get("PCLOUD_VALIDATE_POOL_BACKFILL_MAX", "50"))
+        if 0 < len(missing_in_pool) <= _repair_max:
+            dest_root = pool_root.rsplit("/_pool", 1)[0] if "/_pool" in pool_root else pool_root
+            _log(f"[validate] Pool-Backfill: {len(missing_in_pool)} fehlende SHA(s)...")
+            filled, _bf_errs = _backfill_missing_pool_shas(
+                cfg, dest_root, pool_root, manifest, missing_in_pool, dry=dry)
+            if filled:
+                pool_refs = index.get("pool_refs", {})
+                missing_in_pool = {
+                    s for s in missing_in_pool
+                    if not _pool_object_present(cfg, pool_root, s, pool_refs)
+                }
+                if not missing_in_pool:
+                    _log(f"[validate] ✓ Pool-Backfill erfolgreich ({filled} nachgeladen)")
     if missing_in_pool:
         errors.append(f"Pool: {len(missing_in_pool)} SHA256s fehlen")
         for sha in list(missing_in_pool)[:5]:
-            errors.append(f"  - Pool-File fehlt: {sha[:16]}...")
+            rels = _manifest_relpaths_for_sha(manifest, sha)
+            hint = rels[0] if rels else "?"
+            errors.append(f"  - Pool-File fehlt: {sha} ({hint})")
     else:
         _log(f"[validate] ✓ Pool: Alle {total_unique_sha256s} SHA256s vorhanden")
     

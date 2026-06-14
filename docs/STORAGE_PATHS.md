@@ -110,11 +110,29 @@ python scripts/utilities/pool_verify_backup.py \
 ## Referenz: mergerfs vs. Bind-Mount
 
 ```
-/srv/nas/          mergerfs 1:2  (ssd1 + ssd2, 3.6T)  ← Samba [nas]-Share
-/srv/pcloud-archive/  bind → sdd1 only (1.8T)         ← pCloud-Backup-Artefakte
-/srv/pcloud-temp/     bind → sdd1 only                 ← pCloud-Temp
+/srv/nas/          mergerfs 1:2  (ssd1 + ssd2, 3.6T)  ← Samba [nas]-Share, RTB-Quelle
+/srv/pcloud-archive/  bind → sdd1 only (1.8T)         ← Pipeline (kanonisch)
+/srv/pcloud-temp/     bind → sdd1 only                 ← Pipeline-Temp
 /                     mmcblk0p2 (15G)                    ← OS nur
 ```
+
+---
+
+## RTB vs. Pipeline-Artefakte (Juni 2026)
+
+**Ziel:** Reine Pipeline-Änderungen (Upload, Manifest, Temp) sollen **kein** RTB triggern. Sobald **Nutzerdaten** ein Backup auslösen, landen `pcloud-archive/` und `pcloud-temp/` unter `/srv/nas` **mit** im Snapshot.
+
+| Schicht | Datei / Mechanismus | `pcloud-archive/` `pcloud-temp/` |
+|---------|---------------------|----------------------------------|
+| Delta-Check (`rsync -ni`) | `rtb_check_excludes.sh` (Wrapper) | **excluded** |
+| Echtes RTB (`rsync_tmbackup`) | `excludes.txt` | **nicht** excluded |
+| Pool-Manifest-Scan | `PCLOUD_MANIFEST_SKIP_GLOBS` in Python | skipped (keine Pool-Userdateien) |
+
+**Kein separater Pipeline-Export:** `raspi5nas_backup.sh` kopiert **nicht** mehr nach `Backup/raspi5nas/pcloud-*`. Offsite-Manifeste/Temp kommen über RTB, wenn ein Snapshot fällig ist.
+
+**Unvollständiger pCloud-Upload:** Retry (`--upload-only`) braucht **kein** manuelles Löschen — `pcloud_push` erkennt fehlendes `.upload_complete`, verwirft den Remote-Ordner und startet sauber neu.
+
+Siehe auch: `rtb/README.md` (Excludes), `doku/Raspi/raspinas/ops/betrieb.md` §9.
 
 ---
 
