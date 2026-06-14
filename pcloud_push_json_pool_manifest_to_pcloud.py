@@ -2110,10 +2110,9 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
                                size=_it.get("size"))
 
-        # Index speichern
-        if not dry:
-            save_content_index_local(_local_index_path, index)
-            save_content_index(cfg, snapshots_root, index, dry=False)
+        # Index erst NACH erfolgreicher Validation persistieren (siehe unten).
+        # Vorher nur im RAM: sonst steht der Snapshot in pool_refs obwohl kein
+        # .upload_complete gesetzt wurde -> Retry ueberspringt Stub-Writes.
     else:
         _log("[delta-mode] Keine Änderungen - Snapshot identisch mit Basis")
         uploaded = 0
@@ -2143,8 +2142,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
                                size=_it.get("size"))
             _log(f"[delta-mode] {_reg} Snapshot-Referenzen im Index ergaenzt (geklonter Snapshot)")
-            save_content_index_local(_local_index_path, index)
-            save_content_index(cfg, snapshots_root, index, dry=False)
+            # Remote/Local-Index: erst nach Validation (siehe unten)
 
     # === POST-UPLOAD VALIDATION (wie Full-Pool-Mode!) ===
     validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
@@ -2157,13 +2155,37 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             _log("[delta-mode][ERROR] Complete-Marker wird NICHT gesetzt (inkonsistenter Snapshot)")
             for err in validation_errors[:5]:  # Erste 5 Fehler zeigen
                 _log(f"[delta-mode][ERROR]   {err}")
-            
+            # Index-Checkpoint verwerfen (duerfte ohne .upload_complete nie persistiert sein)
+            try:
+                import tempfile as _tf
+                _fail_idx = os.path.join(os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir()),
+                                         f"pcloud_pool_index_{snapshot_name}.json")
+                if os.path.exists(_fail_idx):
+                    os.remove(_fail_idx)
+            except Exception:
+                pass
             # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
             raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
         else:
             _log("[delta-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
+            # Index erst jetzt persistieren — konsistent mit .upload_complete
+            if not dry:
+                import tempfile as _tf
+                _ok_idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
+                _ok_idx_path = os.path.join(_ok_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
+                os.makedirs(_ok_idx_dir, exist_ok=True)
+                save_content_index_local(_ok_idx_path, index)
+                save_content_index(cfg, snapshots_root, index, dry=False)
+                _log("[delta-mode] ✓ content_index.json gespeichert (nach Validation)")
     elif not validation_enabled:
         _log("[delta-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
+        if not dry:
+            import tempfile as _tf
+            _ok_idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
+            _ok_idx_path = os.path.join(_ok_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
+            os.makedirs(_ok_idx_dir, exist_ok=True)
+            save_content_index_local(_ok_idx_path, index)
+            save_content_index(cfg, snapshots_root, index, dry=False)
     
     # === COMPLETE-MARKER SETZEN ===
     if not dry:
