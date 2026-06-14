@@ -745,6 +745,26 @@ def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool
     pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
     pc.write_json_to_folderid(cfg, folderid=int(fid), filename=idx_name, obj=index, minify=(not pretty))
 
+
+def _purge_snapshot_refs_from_index(index: dict, snapshot_name: str) -> int:
+    """Entfernt snapshot_name aus allen pool_refs-Eintraegen. Gibt Anzahl bereinigter SHAs zurueck."""
+    pool_refs = index.get("pool_refs", {})
+    if not isinstance(pool_refs, dict):
+        return 0
+    purged = 0
+    for _entry in pool_refs.values():
+        if not isinstance(_entry, dict):
+            continue
+        _snaps = _entry.get("snapshots")
+        if isinstance(_snaps, dict) and snapshot_name in _snaps:
+            del _snaps[snapshot_name]
+            purged += 1
+        elif isinstance(_snaps, list) and snapshot_name in _snaps:
+            _snaps.remove(snapshot_name)
+            purged += 1
+    return purged
+
+
 def list_remote_snapshot_names(cfg: dict, snapshots_root: str) -> set[str]:
     """Liest die Ordnernamen unter <snapshots_root> (außer '_index')."""
     out: set[str] = set()
@@ -1715,18 +1735,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             # -> 0 Stubs geschrieben. Indexstand muss dem Remote-Zustand entsprechen.
             try:
                 _wi_idx = load_content_index(cfg, snapshots_root)
-                _wi_refs = _wi_idx.get("pool_refs", {})
-                _wi_n = 0
-                for _entry in _wi_refs.values():
-                    if not isinstance(_entry, dict):
-                        continue
-                    _snaps = _entry.get("snapshots")
-                    if isinstance(_snaps, dict) and snapshot_name in _snaps:
-                        del _snaps[snapshot_name]
-                        _wi_n += 1
-                    elif isinstance(_snaps, list) and snapshot_name in _snaps:
-                        _snaps.remove(snapshot_name)
-                        _wi_n += 1
+                _wi_n = _purge_snapshot_refs_from_index(_wi_idx, snapshot_name)
                 if _wi_n > 0:
                     save_content_index(cfg, snapshots_root, _wi_idx, dry=False)
                     _log(f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus {_wi_n} pool_refs-Eintraegen entfernt")
@@ -1921,6 +1930,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             index = load_content_index(cfg, snapshots_root)
         
         pool_refs = index.setdefault("pool_refs", {})
+
+        # Nach manuellem Remote-Delete oder fehlgeschlagenem Lauf haengen pool_refs-Eintraege
+        # oft noch im Index, obwohl Stubs fehlen -> Phase 4 wuerde sonst 0 Stubs schreiben.
+        _purged_refs = _purge_snapshot_refs_from_index(index, snapshot_name)
+        if _purged_refs > 0 and not dry:
+            _log(f"[delta-mode] Phase 4: pool_refs bereinigt ({_purged_refs} Eintraege fuer {snapshot_name})")
+            save_content_index_local(_local_index_path, index)
+            save_content_index(cfg, snapshots_root, index, dry=False)
         
         # Stats
         uploaded = 0
@@ -2025,19 +2042,18 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
                 return
 
-            # Resume-Optimierung: (sha, relpath, snapshot) bereits vollstaendig
-            # abgeschlossen -> kein Re-Upload, kein Stub-Overwrite noetig.
-            # WICHTIG: Pruefung auf (sha, relpath) NICHT nur auf sha, denn dieselbe
-            # sha kann in einem Snapshot an mehreren Relpaths liegen (Dedup: z.B.
-            # leere Placeholder-Dateien). sha-only wuerde alle doppelten ueberspringen
-            # und deren Stubs nicht schreiben.
-            with _state_lock:
-                _e = pool_refs.get(sha256)
-                if isinstance(_e, dict):
-                    _snap_map = _e.get("snapshots")
-                    if isinstance(_snap_map, dict) and relpath in _snap_map.get(snapshot_name, []):
-                        reused += 1
+            # Resume: Remote-Stub muss existieren (Index allein reicht nicht).
+            # Geaenderte Files (changed_paths) immer neu schreiben — geklonter Stub ist veraltet.
+            if relpath not in changed_paths and not dry:
+                _stub_remote = f"{dest_snapshot_dir}/{relpath}.meta.json"
+                try:
+                    _stub_md = pc.stat_file_safe(cfg, path=_stub_remote)
+                    if _stub_md and _stub_md.get("fileid"):
+                        with _state_lock:
+                            reused += 1
                         return
+                except Exception:
+                    pass
             
             # Upload zu Pool
             try:
