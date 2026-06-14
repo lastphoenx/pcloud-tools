@@ -211,15 +211,17 @@ Kandidaten = Remote-Snapshots ∩ lokale Manifeste (ohne current). Scout wählt 
 2. **`copyfolder(basis → neu)`**: Server-seitiger Klon (ein API-Call, ~50s für 20k Dateien)
 3. **Manifest-Diff**: `current_paths - basis_paths` = added, deleted, changed
 4. **Phase 3**: veraltete Stubs aus dem Klon löschen
-5. **Phase 4**: neue/geänderte Dateien in `_pool` hochladen, Stubs schreiben
-6. **Index aktualisieren**: alle Manifest-SHAs in `pool_refs[sha].snapshots[snap]` registrieren
-7. **Post-Upload-Validation**
+5. **Phase 4**: neue/geänderte Dateien in `_pool` hochladen, Stubs schreiben (Resume nur wenn Remote-Stub existiert; `pool_refs` allein zählt nicht)
+6. **Post-Upload-Validation**
+7. **Index persistieren**: `content_index.json` erst **nach** erfolgreicher Validation (parallel zu `.upload_complete`)
 
 **Fail-fast:** Kann eine Datei nicht in den Pool geladen werden → `failed`-Liste → `RuntimeError` vor Stubs/Index/Marker.
 
-**Wipe + Bereinigung:** Beim Wipe eines unvollständigen Snapshots wird `snapshot_name` aus allen `pool_refs`-Einträgen entfernt (Stammdaten-Bereinigung), damit der Early-Return-Check in Phase 4 korrekt arbeitet.
+**Wipe + Bereinigung:** Beim Wipe eines unvollständigen Snapshots wird `snapshot_name` aus allen `pool_refs`-Einträgen entfernt. Zusätzlich bereinigt Phase 4 `pool_refs` vor dem Schreiben (wichtig nach manuellem Remote-Delete).
 
-**Early-Return-Check** ist auf `(sha, relpath, snapshot)` präzise: ein SHA kann in einem Snapshot an mehreren Relpaths liegen (Dedup) → Prüfung auf relpath-Ebene, nicht nur sha-Ebene.
+**Resume in Phase 4:** Nur wenn der Remote-Stub (`.meta.json`) existiert — nicht wenn der Eintrag nur in `pool_refs` steht. Geänderte Pfade (`changed_paths`) werden immer neu geschrieben.
+
+**Index-Timing:** Ohne `.upload_complete` wird der Snapshot nicht in den persistierten `pool_refs` geschrieben. Verhindert „Index sagt fertig, Stubs fehlen“ beim Retry.
 
 ### Full-Pool-Mode (`push_pool_mode`)
 
