@@ -33,6 +33,21 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _matrix_hint(in_rtb: bool, in_man: bool, is_ready: bool) -> str:
+    """Kurzkommentar pro Matrix-Zeile (Spalte Hinweis)."""
+    if in_rtb and not is_ready:
+        return "Catch-up: pCloud-Upload"
+    if not in_rtb and is_ready and in_man:
+        return "RTB-Retention; pCloud ok"
+    if not in_rtb and is_ready and not in_man:
+        return "Complete; Manifest fehlt lokal"
+    if not in_rtb and not is_ready:
+        return "Zombie → pool_gc --retention-apply"
+    if in_rtb and is_ready and not in_man:
+        return "Complete; Manifest archivieren"
+    return "prüfen"
+
+
 def _list_rtb_snapshots(rtb_root: str) -> List[str]:
     if not os.path.isdir(rtb_root):
         return []
@@ -294,22 +309,28 @@ def main() -> int:
     # --- Kreuzvergleiche ---
     all_snaps = sorted(rtb_set | manifest_set | remote_set)
     _log("")
-    _log("--- Snapshot-Matrix (RTB | Manifest | Remote complete) ---")
-    _log(f"{'Snapshot':<22} {'RTB':^5} {'Man':^5} {'Rdy':^5}")
+    _log("--- Snapshot-Matrix (nur Abweichungen) ---")
+    _log("Legende: RTB=lokal /mnt/backup | Man=Manifest archiviert | Rdy=.upload_complete auf pCloud")
+    _log(f"{'Snapshot':<22} {'RTB':^5} {'Man':^5} {'Rdy':^5}  Hinweis")
     issues = 0
+    ok_hidden = 0
     for snap in all_snaps:
         in_rtb = snap in rtb_set
         in_man = snap in manifest_set
         is_ready = snap in complete_set
+        if in_rtb and in_man and is_ready:
+            ok_hidden += 1
+            continue
+        issues += 1
         flags = (
             ("x" if in_rtb else "-"),
             ("x" if in_man else "-"),
             ("x" if is_ready else "-"),
         )
-        # Zeige nur Abweichungen oder mit --verbose alles? User wants triage - show mismatches + summary
-        if not (in_rtb and in_man and is_ready):
-            issues += 1
-            _log(f"{snap:<22} {flags[0]:^5} {flags[1]:^5} {flags[2]:^5}")
+        hint = _matrix_hint(in_rtb, in_man, is_ready)
+        _log(f"{snap:<22} {flags[0]:^5} {flags[1]:^5} {flags[2]:^5}  {hint}")
+    if ok_hidden:
+        _log(f"({ok_hidden} Snapshot(s) mit RTB+Man+Rdy — alles ok, nicht gezeigt)")
 
     catchup = sorted(rtb_set - complete_set)
     manifest_no_complete = sorted(manifest_set - complete_set)
