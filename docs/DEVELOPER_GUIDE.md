@@ -277,6 +277,8 @@ Pro `pool_refs[sha]`:
 - `size` == `pool_refs[sha].size`?
 - Alle Stubs aus `snapshots`-Map vorhanden?
 
+**Orphan Pool-Objekte (Juni 2026):** SHAs physisch in `_pool/`, aber nicht in `pool_refs` (z.B. nach fehlgeschlagenem Upload mit Index-Rollback) → **GC-Hinweis**, kein kritischer Backup-Fehler. Exit-Code bleibt 0; Dashboard/Wrapper werten Orphans nicht als CRITICAL.
+
 ### Vollständiger Integritätscheck (`pool_verify_backup.py`)
 
 Manifest-getriebener Check: **lokale Manifeste als Ground Truth** × Remote-Zustand.
@@ -312,13 +314,33 @@ MAIN_DIR=/opt/apps/pcloud-tools/main python scripts/utilities/pool_verify_backup
 
 ### GC (`pcloud_pool_gc.py`)
 
-Keys off `pool_refs.keys()`: alle SHAs die im Index referenziert sind. SHAs die physisch im Pool existieren, aber nicht im Index → löschen.
+Snapshot-aware: nur SHAs in `pool_refs` mit mindestens einem **existierenden** Remote-Snapshot zählen als referenziert.
 
 ```bash
-python pcloud_pool_gc.py --dest-root /Backup/rtb_pool --env-file "$ENV_FILE"
+python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file "$ENV_FILE" --dry-run
 ```
 
+| Mechanismus | Implementierung |
+|-------------|-----------------|
+| Pool-Pfad aus SHA | `pcloud_bin_lib.pool_file_remote_path()` |
+| Grace Period (`modified`) | `pcloud_bin_lib.parse_metadata_modified_ts()` |
+| Löschen | `pcloud_bin_lib.delete_file()` REST, bevorzugt `fileid`, `size_bytes` skaliert Timeout |
+| Lock | `.gc_lock` während Push |
+
 **GC-Lock:** `.gc_lock`-Datei verhindert Race-Condition zwischen laufendem Upload und GC.
+
+Siehe `pcloud_pool_gc.md` für Retention-Apply, Grace-Period-Triage und Troubleshooting.
+
+### `pcloud_bin_lib` — Pool-relevante Helfer (Juni 2026)
+
+| Funktion | Zweck |
+|----------|--------|
+| `pool_file_remote_path(pool_root, sha256)` | `_pool/XX/<sha>` wenn `listfolder` kein `path` liefert |
+| `parse_metadata_modified_ts(modified)` | Grace Period: Unix oder RFC-2822-`modified` |
+| `delete_file(..., size_bytes=N)` | REST-`deletefile`, Timeout skaliert bei großen Objekten |
+| `delete_folder(..., recursive=True)` | REST-`deletefolderrecursive` (Retention, Push-Cleanup) |
+
+Skripte sollen diese API nutzen — kein dupliziertes Binary-RPC-Delete in Einzeltools.
 
 ---
 

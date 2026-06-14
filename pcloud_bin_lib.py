@@ -6,6 +6,8 @@ pcloud_binlib.py – Gemeinsame Hilfsbibliothek für pCloud Binary-API.
 Ziele:
 - Eine Stelle für Verbindungsaufbau, Request/Response, Fehlerbehandlung.
 - Bequeme Wrapper: listfolder, createfolder, ensure_path, stat, checksumfile, upload_chunked.
+- REST-Helfer: delete_file, delete_folder (zuverlässiger als Binary bei großen Objekten).
+- Pool-Helfer: pool_file_remote_path, parse_metadata_modified_ts, scaled_timeout_for_size.
 - Keine Subprozesse zwischen eigenen Skripten nötig.
 
 Konfiguration (.env oder ENV):
@@ -2287,13 +2289,57 @@ def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int 
         raise
 
 # ---- für leichtes pcloud-Delete-CLI ----
-def delete_file(cfg: Dict[str, Any], *, fileid: int | None = None, path: str | None = None) -> Dict[str, Any]:
+def parse_metadata_modified_ts(modified) -> Optional[float]:
+    """pCloud-Metadatum ``modified``: Unix-Zahl oder HTTP-Datum (RFC 2822)."""
+    if modified is None:
+        return None
+    if isinstance(modified, (int, float)):
+        return float(modified)
+    if isinstance(modified, str):
+        text = modified.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return float(text)
+        try:
+            from email.utils import parsedate_to_datetime
+            return parsedate_to_datetime(text).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            import datetime as _dt
+            return _dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def pool_file_remote_path(pool_root: str, sha256: str) -> str:
+    """Vollpfad zu einem deduplizierten Pool-Objekt (_pool/XX/<sha256>)."""
+    sha = sha256.lower()
+    return f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
+
+
+def scaled_timeout_for_size(cfg: dict, size_bytes: int = 0, *, cap: int = 600) -> int:
+    """REST-Timeout für Datei-Operationen; skaliert bei grossen Pool-Objekten."""
+    base = int(cfg.get("timeout", 30))
+    if size_bytes <= 50 * 1024 * 1024:
+        return base
+    needed = max(base, 120, size_bytes // (10 * 1024 * 1024))
+    return min(int(needed), cap)
+
+
+def delete_file(cfg: Dict[str, Any], *, fileid: int | None = None, path: str | None = None,
+                size_bytes: int = 0) -> Dict[str, Any]:
     """
     Löscht eine Datei (REST-API deletefile).
     Genau eines von fileid oder path angeben.
+    ``size_bytes`` skaliert den Request-Timeout für grosse Objekte.
     """
     if (fileid is None) == (path is None):
         raise ValueError("delete_file: genau eines von fileid oder path angeben.")
+    if size_bytes > 0:
+        cfg = {**cfg, "timeout": scaled_timeout_for_size(cfg, size_bytes)}
     params = {"device": cfg["device"]}
     if fileid is not None:
         params["fileid"] = int(fileid)
