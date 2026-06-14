@@ -103,6 +103,15 @@ def _pool_file_remote_path(pool_root: str, sha256: str) -> str:
     return f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
 
 
+def _gc_delete_cfg(cfg: dict, size_bytes: int) -> dict:
+    """Laengere REST-Timeouts fuer grosse Pool-Deletes (pCloud kann >30s brauchen)."""
+    base = int(cfg.get("timeout", 30))
+    if size_bytes <= 50 * 1024 * 1024:
+        return cfg
+    needed = max(base, 120, size_bytes // (10 * 1024 * 1024))
+    return {**cfg, "timeout": min(int(needed), 600)}
+
+
 # ---- Lib laden ----
 try:
     import pcloud_bin_lib as pc
@@ -335,6 +344,7 @@ def _list_pool_files(cfg: dict, pool_root: str) -> List[dict]:
                     "path": obj.get("path") or _pool_file_remote_path(pool_root, filename),
                     "size": obj.get("size", 0),
                     "modified": obj.get("modified"),
+                    "fileid": obj.get("fileid"),
                 })
             return
         for child in obj.get("contents", []) or []:
@@ -597,28 +607,39 @@ def _delete_pool_file(
     pool_file_size: int,
     stats: _GCStats,
     dry: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    fileid: Optional[int] = None,
 ) -> None:
     """
     Löscht ein Pool-File.
     
     Worker-Funktion für ThreadPoolExecutor.
     """
+    label = pool_file_path or (f"fileid={fileid}" if fileid else "?")
     if dry:
-        _log(f"[dry] delete: {pool_file_path} ({pool_file_size} bytes)")
+        _log(f"[dry] delete: {label} ({pool_file_size} bytes)")
         stats.inc_deleted(pool_file_size)
         return
     
     try:
-        # Delete mit Backoff (robust gegen transiente Fehler)
-        pc.call_with_backoff(pc.delete_file, cfg, path=pool_file_path, attempts=5, max_sleep=30.0)
+        del_cfg = _gc_delete_cfg(cfg, pool_file_size)
+        if fileid:
+            pc.call_with_backoff(
+                pc.delete_file, del_cfg, fileid=int(fileid),
+                attempts=5, max_sleep=30.0,
+            )
+        else:
+            pc.call_with_backoff(
+                pc.delete_file, del_cfg, path=pool_file_path,
+                attempts=5, max_sleep=30.0,
+            )
         stats.inc_deleted(pool_file_size)
         
         if verbose:
-            _log(f"[gc-delete] ✓ {pool_file_path} ({pool_file_size} bytes)")
+            _log(f"[gc-delete] ✓ {label} ({pool_file_size} bytes)")
     
     except Exception as e:
-        _log(f"[gc-delete][ERROR] Failed to delete {pool_file_path}: {e}")
+        _log(f"[gc-delete][ERROR] Failed to delete {label}: {e}")
         stats.inc_errors()
 
 
@@ -832,7 +853,8 @@ def run_pool_gc(
                             "name": sha,
                             "path": filepath or _pool_file_remote_path(pool_root, sha),
                             "size": filesize,
-                            "modified": modified
+                            "modified": modified,
+                            "fileid": obj.get("fileid"),
                         })
                 
                 # Ordner: Rekursiv durchlaufen
@@ -893,29 +915,16 @@ def run_pool_gc(
         _log(f"[gc] PHASE 3: Deleting {len(pool_files_to_delete)} unreferenced pool files...")
         t_delete_start = time.time()
         
-        max_workers = int(os.environ.get("PCLOUD_GC_WORKERS", "8"))
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for pool_file in pool_files_to_delete:
-                future = executor.submit(
-                    _delete_pool_file,
-                    cfg,
-                    pool_file["path"],
-                    pool_file["size"],
-                    stats,
-                    dry,
-                    verbose
-                )
-                futures.append(future)
-            
-            # Warte auf alle Deleter
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    _log(f"[gc][ERROR] Deleter failed: {e}")
-                    stats.inc_errors()
+        for pool_file in pool_files_to_delete:
+            _delete_pool_file(
+                cfg,
+                pool_file["path"],
+                pool_file["size"],
+                stats,
+                dry,
+                verbose,
+                fileid=pool_file.get("fileid"),
+            )
         
         delete_duration = time.time() - t_delete_start
         delete_stats = stats.get_stats()
