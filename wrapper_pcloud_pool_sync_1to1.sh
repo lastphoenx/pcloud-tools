@@ -686,11 +686,13 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
 fi
 
 # === Sync-Check (Pool-Modell): jeden lokalen Snapshot ohne remote .upload_complete laden ===
-# Keine Gap-/Chain-Logik noetig - Pool-Snapshots sind eigenstaendig (Stubs -> Pool):
-# ein fehlender Nachbar-Snapshot beschaedigt keine anderen. "Verpasste" Snapshots
-# werden einfach nachgeholt, Reihenfolge egal. Platzfreigabe macht spaeter der Pool-GC.
+# Pool-Snapshots sind eigenstaendig (keine Ketten-Abhaengigkeit). Catch-up:
+# - latest zuerst (frisch erstellter Snapshot hat Prioritaet)
+# - bei Fehler eines Backlog-Snapshots weitermachen (kein Blockieren juengerer)
+# - TARGET_SNAPSHOT / --upload-only: nur diesen einen, Fehler = harter Abbruch
 _log INFO "Checking for missing snapshots..."
 uploaded_count=0
+catchup_failed=0
 
 mapfile -t local_snaps < <(local_snapshot_names)
 mapfile -t remote_snaps < <(remote_snapshot_names)   # nur Snapshots MIT .upload_complete
@@ -702,24 +704,68 @@ if [[ -n "$TARGET_SNAPSHOT" ]]; then
   fi
 fi
 
+missing_snaps=()
 for s in "${local_snaps[@]}"; do
   [[ -n "$TARGET_SNAPSHOT" && "$s" != "$TARGET_SNAPSHOT" ]] && continue
   [[ "$(is_remote_cached "$s")" == "YES" ]] && continue
+  missing_snaps+=("$s")
+done
+
+# Ohne explizites Target: latest vor restlichem Backlog (chronologisch)
+if [[ -z "$TARGET_SNAPSHOT" && ${#missing_snaps[@]} -gt 1 ]]; then
+  _latest_name=""
+  _latest_dir="$(readlink -f "${RTB}/latest" 2>/dev/null || true)"
+  if [[ -n "$_latest_dir" && -d "$_latest_dir" ]]; then
+    _latest_name="$(basename "$_latest_dir")"
+  fi
+  if [[ -n "$_latest_name" ]]; then
+    _ordered=()
+    for s in "${missing_snaps[@]}"; do
+      [[ "$s" == "$_latest_name" ]] && _ordered+=("$s")
+    done
+    for s in "${missing_snaps[@]}"; do
+      [[ "$s" == "$_latest_name" ]] && continue
+      _ordered+=("$s")
+    done
+    if [[ ${#_ordered[@]} -eq ${#missing_snaps[@]} ]]; then
+      missing_snaps=("${_ordered[@]}")
+      _log INFO "Catch-up order: latest-first ($_latest_name), dann ${#missing_snaps[@]} Snapshot(s)"
+    fi
+  fi
+fi
+
+for s in "${missing_snaps[@]}"; do
   _log INFO "Uploading missing snapshot: $s"
-  build_and_push "$RTB/$s" || exit 1
+  if ! build_and_push "$RTB/$s"; then
+    _log ERROR "Upload von $s fehlgeschlagen"
+    if [[ -n "$TARGET_SNAPSHOT" ]]; then
+      exit 1
+    fi
+    catchup_failed=1
+    continue
+  fi
   # Im Dry-Run wird nichts hochgeladen -> kein .upload_complete -> Verify ueberspringen
   if [[ "$DRY_RUN" != "1" && "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud! Markiere als FAILED."
-    exit 1
+    _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud!"
+    if [[ -n "$TARGET_SNAPSHOT" ]]; then
+      exit 1
+    fi
+    catchup_failed=1
+    continue
   fi
   uploaded_count=$((uploaded_count + 1))
 done
 
-if [[ $uploaded_count -eq 0 ]]; then
+if [[ $uploaded_count -eq 0 && $catchup_failed -eq 0 ]]; then
   _log INFO "All snapshots already on pCloud"
-else
+elif [[ $uploaded_count -gt 0 ]]; then
   _log INFO "Successfully uploaded $uploaded_count snapshot(s)"
   _db_update_metrics "new_snapshots = $uploaded_count"
+fi
+
+if [[ $catchup_failed -eq 1 ]]; then
+  _log ERROR "Catch-up mit Fehlern beendet ($uploaded_count erfolgreich, $(( ${#missing_snaps[@]} - uploaded_count )) fehlgeschlagen/inkomplett)"
+  exit 1
 fi
 
 # Cleanup: Alte Temp-Dateien löschen (>7 Tage)
