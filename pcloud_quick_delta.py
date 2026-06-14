@@ -26,6 +26,7 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 
 try:
     import pcloud_bin_lib as pc
+    import pcloud_path_compat as ppc
 except Exception:
     print("Fehler: pcloud_bin_lib nicht gefunden", file=sys.stderr)
     sys.exit(2)
@@ -139,6 +140,7 @@ def compare_pool_index_vs_remote(
 
     index_fileids: Set[int] = set()
     index_known_paths: Set[str] = set()
+    stub_path_lookup = ppc.build_stub_path_lookup(by_path.keys())
 
     def _pool_obj_path(sha: str) -> str:
         return f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
@@ -197,7 +199,7 @@ def compare_pool_index_vs_remote(
                 for rp in (relpaths or []):
                     stub_path = f"{snaps_root}/{snap}/{rp}.meta.json"
                     index_known_paths.add(stub_path)
-                    if stub_path not in by_path:
+                    if not ppc.stub_path_exists(stub_path, stub_path_lookup):
                         missing_stubs.append({"sha256": sha[:16], "snap": snap, "relpath": rp,
                                               "stub_path": stub_path})
 

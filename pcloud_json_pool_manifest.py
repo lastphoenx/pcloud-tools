@@ -38,6 +38,8 @@ from __future__ import annotations
 import os, sys, json, argparse, hashlib, time, datetime
 from typing import Dict, Any, List, Tuple, Optional
 
+import pcloud_path_compat as ppc
+
 # ---- Logging mit Timestamp (RTB-Stil) ----
 def _log(msg: str, *, file=sys.stderr) -> None:
     """Log-Ausgabe mit Timestamp"""
@@ -175,6 +177,11 @@ def walk(root: str,
 
     base = os.path.abspath(root)
 
+    skip_globs = ppc.parse_manifest_skip_globs()
+    skipped_files = 0
+    risky_path_count = 0
+    risky_samples: List[str] = []
+
     # === 1. Sortierte File-Liste erstellen (deterministisch!) ===
     _log("[scan] Erstelle sortierte File-Liste...")
     all_paths = []
@@ -185,12 +192,26 @@ def walk(root: str,
         if rel_cur == ".": rel_cur = ""
         
         # Verzeichnis als Item
-        all_paths.append(("dir", rel_cur, None, 0))
+        if not (rel_cur and ppc.relpath_excluded(rel_cur, skip_globs)):
+            all_paths.append(("dir", rel_cur, None, 0))
+            if rel_cur and ppc.manifest_warn_risky_paths_enabled() and ppc.relpath_has_risky_segments(rel_cur):
+                risky_path_count += 1
+                if len(risky_samples) < 3:
+                    risky_samples.append(rel_cur)
         
         # Dateien/Symlinks
         for name in files:
             ab = os.path.join(cur, name)
             rel = (os.path.join(rel_cur, name) if rel_cur else name).replace("\\", "/")
+
+            if ppc.relpath_excluded(rel, skip_globs):
+                skipped_files += 1
+                continue
+
+            if ppc.manifest_warn_risky_paths_enabled() and ppc.relpath_has_risky_segments(rel):
+                risky_path_count += 1
+                if len(risky_samples) < 3:
+                    risky_samples.append(rel)
             
             try:
                 st = os.lstat(ab)
@@ -204,6 +225,13 @@ def walk(root: str,
     # Sortieren (garantiert identische Reihenfolge bei Resume)
     all_paths.sort(key=lambda x: x[1])  # Nach relpath sortieren
     total_files = sum(1 for t, _, _, _ in all_paths if t == "file")
+    
+    if skipped_files:
+        _log(f"[scan] Übersprungen (PCLOUD_MANIFEST_SKIP_GLOBS): {skipped_files} Dateien")
+    if risky_path_count:
+        examples = ", ".join(repr(s) for s in risky_samples)
+        _log(f"[scan][WARN] {risky_path_count} Pfad(e) mit Segment-Whitespace "
+             f"(pCloud kann anders normalisieren) — z.B. {examples}")
     
     _log(f"[manifest] Starte: {total_files} Dateien, {_fmt_bytes(total_bytes)}")
     
