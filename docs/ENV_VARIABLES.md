@@ -171,10 +171,12 @@ PCLOUD_RESUME_CLEANUP_DAYS=7
 ## 🌐 Connection & Timeouts
 
 ### `PCLOUD_TIMEOUT`
-**Beschreibung:** API-Timeout in Sekunden (einzelner Request).  
-**Default:** `60` s  
+**Beschreibung:** API-Timeout in Sekunden (einzelner REST/Binary-Request).  
+**Default:** `30` s (Lib), oft `60` in `.env`  
 **Empfohlen:** `60-120` s (höher bei großen Operationen)  
 **Verwendet in:** `pcloud_bin_lib.py`, `pcloud_push_json_manifest_to_pcloud.py`
+
+`delete_file(..., size_bytes=N)` skaliert den Timeout für große Löschungen automatisch (bis 600s) — kein separates GC-Tuning nötig.
 
 ```bash
 PCLOUD_TIMEOUT=60

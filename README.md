@@ -247,7 +247,7 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 | `pcloud_json_manifest.py` | Manifest-Erstellung (Smart-Hashing via inode/mtime) |
 | `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication, **Chunked-Upload**, **Parallel Uploads** |
 | `pcloud_quick_delta.py` | Post-Upload-Verifikation (Delta-Check) |
-| `pcloud_bin_lib.py` | pCloud Binary-API-Bibliothek (Connection, Retry, **Chunked Upload with Resume**) |
+| `pcloud_bin_lib.py` | pCloud API-Bibliothek (Connection, Retry, Chunked Upload, **REST delete_file/delete_folder**, Pool-Pfad-Helfer) |
 | `create_folder_template.py` | Einmaliges Setup des `_folder_template`-Cache (SAFE-MODE Beschleunigung) |
 | `pcloud_health_check.sh` | Backup-Status, Quota, Alter — Nagios/Zabbix-kompatibel |
 | `pcloud_status.sh` | Interaktives Status-Dashboard aus MariaDB |

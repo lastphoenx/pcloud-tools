@@ -69,11 +69,12 @@ Lädt `_snapshots/_index/content_index.json` und ermittelt **aktive** SHAs: nur 
 Beispiel-Log:
 
 ```
-[gc] PHASE 1 DONE: 100904 unique SHA256s, 1852385 total refs (8.80s)
+[gc] PHASE 1 DONE: 101159 active SHA256s (49 remote snaps, 0 stale index keys) (11.80s)
 ```
 
-- **100904 unique SHA256s** — verschiedene Dateiinhalte im Index referenziert
-- **1852385 total refs** — Summe aller Snapshot-Pfad-Zuordnungen (eine SHA kann in vielen Snapshots/Pfaden vorkommen)
+- **active SHA256s** — SHAs in `pool_refs`, die mindestens einen noch existierenden Remote-Snapshot referenzieren
+- **remote snaps** — Snapshot-Ordner unter `_snapshots/` (ohne `_index`)
+- **stale index keys** — Index-Einträge ohne Remote-Snapshot (blockieren GC nicht)
 
 ### Phase 2: Pool scannen (~5s)
 
@@ -87,9 +88,15 @@ Ein rekursiver `listfolder` über `_pool/` — findet alle physischen Pool-Datei
 
 Vergleicht Pool-Set mit Referenz-Set. Dateien die im Index fehlen **und** älter als `--grace-hours` sind → löschen.
 
+- **Pfad:** `pcloud_bin_lib.pool_file_remote_path()` wenn `listfolder` kein `path` liefert (rekursiv ohne `showpath`)
+- **Delete:** `pcloud_bin_lib.delete_file()` per **REST** (nicht Binary-RPC), bevorzugt per **`fileid`** aus `listfolder`
+- **Timeout:** `delete_file(..., size_bytes=N)` skaliert REST-Timeout für große Pool-Objekte (bis 600s)
+- **Ablauf:** sequentiell (keine parallelen Deletes — stabiler bei wenigen großen Kandidaten)
+
 ```
-[gc] Check complete: 0 to delete, 100904 to keep
-[gc] PHASE 3 SKIPPED: No unreferenced files found
+[gc] Check complete: 4 to delete, 101159 to keep
+[dry] delete: /Backup/rtb_pool/_pool/29/29b2b100... (343898684 bytes)
+[gc] PHASE 3 DONE: 4 files deleted, 0.43 GB freed (0.1s)
 ```
 
 ---
@@ -97,15 +104,15 @@ Vergleicht Pool-Set mit Referenz-Set. Dateien die im Index fehlen **und** älter
 ## Dein Dry-Run (gesundes System)
 
 ```
-Unique SHA256 refs: 100904
-Pool files found:   100904
-Pool files kept:    100904
+Unique SHA256 refs: 101159
+Pool files found:   101159
+Pool files kept:    101159
 Pool files deleted: 0
 ```
 
 **Interpretation:** Jede physische Pool-Datei ist im Index referenziert. Kein Speicherleck, nichts zu löschen. Das ist der **Idealfall**.
 
-Wenn nach Retention-Löschungen Zahlen divergieren (z.B. 100904 refs, 101200 pool files), würde GC die 296 Differenz-Dateien nach Ablauf der Grace Period entfernen.
+Wenn `pool files found` > `unique refs` (z.B. 101163 vs. 101159), gibt es **4 Kandidaten** — mit Default `--grace-hours 24` werden sie oft noch **behalten** (Race-Protection). Zum Anzeigen: `--dry-run --grace-hours 0`.
 
 ---
 
@@ -130,7 +137,9 @@ Wenn nach Retention-Löschungen Zahlen divergieren (z.B. 100904 refs, 101200 poo
 | Variable | Default | Bedeutung |
 |----------|---------|-----------|
 | `PCLOUD_GC_STALE_LOCK_HOURS` | `48` | Ab wann ein `.gc_lock` als veraltet gilt |
-| `PCLOUD_GC_WORKERS` | `8` | Parallele Delete-Threads |
+| `PCLOUD_TIMEOUT` | `30`–`60` | Basis-REST-Timeout; `delete_file(size_bytes=…)` skaliert für große Objekte |
+
+`PCLOUD_GC_WORKERS` wird nicht mehr verwendet (Deletes sequentiell).
 
 ---
 
@@ -147,7 +156,22 @@ python pcloud_pool_gc.py \
   --dry-run --verbose
 ```
 
-### Produktions-GC
+### Orphans nach fehlgeschlagenem Upload (typisch Juni 2026)
+
+Wenn Pool-Upload validiert, aber Index zurückgerollt wurde, bleiben physische `_pool/`-Objekte ohne `pool_refs`-Eintrag (~450 MB). **tamper-detect** meldet sie als Hinweis, kein Backup-Defekt.
+
+```bash
+# Kandidaten sofort anzeigen (kein Backup laufen lassen):
+python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env \
+  --dry-run --grace-hours 0
+
+# Aufräumen:
+python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file .env --grace-hours 0
+```
+
+Mit Default `--grace-hours 24` erscheinen frische Orphans als `0 to delete` — das ist **korrekt**, nicht ein Bug.
+
+### Produktions-GC (Standard, Grace 24h)
 
 ```bash
 python pcloud_pool_gc.py \
@@ -265,10 +289,10 @@ python scripts/utilities/pool_verify_backup.py \
 ## Sicherheitsmechanismen
 
 1. **Index-basiert** — nur SHAs die nicht in `pool_refs` stehen, sind Kandidaten
-2. **Grace Period** — frisch erstellte Pool-Dateien (z.B. während parallelem Upload) werden nicht sofort gelöscht
+2. **Grace Period** — frisch erstellte Pool-Dateien (z.B. während parallelem Upload) werden nicht sofort gelöscht; `modified` wird als Unix-Zahl oder HTTP-Datum geparst (`pcloud_bin_lib.parse_metadata_modified_ts`)
 3. **GC-Lock** — laufende Backups werden erkannt und respektiert
 4. **Dry-Run** — jederzeit testbar ohne Datenverlust
-5. **Parallel-Delete mit Backoff** — robust gegen transiente pCloud-API-Fehler
+5. **REST-Delete mit Backoff** — `pcloud_bin_lib.delete_file()` (wie `delete_folder`), robust gegen Timeouts bei großen Objekten
 
 ---
 
@@ -277,7 +301,8 @@ python scripts/utilities/pool_verify_backup.py \
 | Code | Bedeutung |
 |------|-----------|
 | `0` | Erfolg (auch Dry-Run mit 0 Löschungen) |
-| `1` | Fehler beim Löschen (`errors > 0`) oder Backup-Lock-Abbruch |
+| `1` | Fehler beim Löschen (`errors > 0`) oder interner Abbruch (`result["error"]`) |
+| `2` | Abbruch wegen GC-Lock (Backup läuft) |
 
 Bei Lock-Abbruch (`backup_in_progress`) erscheint:
 
@@ -295,13 +320,25 @@ Bei Lock-Abbruch (`backup_in_progress`) erscheint:
 
 → Index leer oder falscher Pfad. Prüfen: `/Backup/rtb_pool/_snapshots/_index/content_index.json` existiert?
 
+### `pool files found` > refs, aber `0 to delete`
+
+→ Orphans innerhalb der **Grace Period** (Default 24h). `--dry-run --grace-hours 0` zum Anzeigen.
+
 ### Viele `to delete` im Dry-Run unerwartet
 
-→ Erst `--verbose --dry-run`, dann mit `pool_verify_backup.py` Index vs. Pool prüfen. Nicht blind löschen.
+→ Erst `--dry-run --grace-hours 0 --verbose`, dann mit `pool_verify_backup.py` Index vs. Pool prüfen. Nicht blind löschen.
+
+### `[dry] delete:  (bytes)` oder `API error 2010: Invalid path`
+
+→ Veraltete Version: Pfad muss aus SHA256 konstruiert werden (`pool_file_remote_path`). `git pull` in `pcloud-tools`.
+
+### `TimeoutError` beim Löschen
+
+→ Veraltete Binary-`deletefile`-API oder parallele Deletes. Aktuell: REST-`delete_file` mit `size_bytes`-Timeout-Skalierung.
 
 ### GC löscht nichts trotz Retention
 
-→ Grace Period noch nicht abgelaufen. `--grace-hours 0` nur mit Vorsicht (Race-Risiko während Uploads).
+→ Grace Period noch nicht abgelaufen. `--grace-hours 0` nur wenn kein Upload läuft und Dry-Run geprüft.
 
 ### `--dest-root` Warnung
 
@@ -313,12 +350,13 @@ Bei Lock-Abbruch (`backup_in_progress`) erscheint:
 
 | Phase | Dauer |
 |-------|-------|
-| Index laden | ~8s |
-| Pool scannen | ~6s |
+| Index laden | ~11s |
+| Pool scannen | ~5s |
 | Vergleich + Dry-Run | <1s |
-| **Gesamt Dry-Run** | **~15s** |
+| **Gesamt Dry-Run** | **~17s** |
+| **4 Deletes (Orphans)** | **<1s** (REST, sequentiell) |
 
-Löschungen hängen von der Anzahl der Kandidaten ab (parallel, 8 Workers).
+Löschungen hängen von der Anzahl und Größe der Kandidaten ab; große Objekte (>50 MB) nutzen längere REST-Timeouts automatisch.
 
 ---
 

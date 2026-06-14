@@ -61,7 +61,7 @@ Wählt automatisch den effizientesten Upload-Modus:
 Nach dem Upload: Post-Upload-Validation (100% Stub-Coverage-Check via listfolder, Pool-SHA-Check, Index-Konsistenz). Nur bei erfolgreicher Validation wird `.upload_complete` gesetzt.
 
 ### Phase 4 — tamper-detect (`pcloud_quick_delta.py`)
-Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Prüft pro SHA256: fileid, pcloud_hash, size, Stub-Existenz. Erkennt fehlende Pool-Objekte, Abweichungen oder verwaiste Objekte.
+Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Prüft pro SHA256: fileid, pcloud_hash, size, Stub-Existenz. Erkennt fehlende Pool-Objekte und Abweichungen. **Verwaiste Pool-Objekte** (physisch in `_pool/`, nicht in `pool_refs`) sind GC-Hinweise — kein kritischer Pipeline-Fehler (Juni 2026).
 
 ---
 
@@ -71,12 +71,12 @@ Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Pr
 
 | Tool | Zweck |
 |---|---|
-| `pcloud_bin_lib.py` | Zentrale API-Bibliothek: Verbindung, Error-Handling, `copyfolder`, chunked Upload |
+| `pcloud_bin_lib.py` | Zentrale API-Bibliothek: Verbindung, Error-Handling, `copyfolder`, chunked Upload, REST `delete_file`/`delete_folder`, Pool-Pfad- und Metadaten-Helfer |
 | `wrapper_pcloud_pool_sync_1to1.sh` | Orchestrator: Lock, Logging, MariaDB-Tracking, Catch-up-Loop |
 | `pcloud_json_pool_manifest.py` | Manifest-Erstellung (Schema v4): SHA256, Smart-Mode, inode-Cache |
 | `pcloud_push_json_pool_manifest_to_pcloud.py` | Pool-Upload: Scout, Turbo-Delta, Full-Pool, Validation, Index-Management |
 | `pcloud_quick_delta.py` | tamper-detect: v2-Index (pool_refs), Pool-Objekte, Stubs |
-| `pcloud_pool_gc.py` | Garbage Collection: entfernt Pool-Objekte ohne Index-Referenz |
+| `pcloud_pool_gc.py` | Garbage Collection: entfernt Pool-Objekte ohne Index-Referenz (REST-Delete via Lib, Grace Period) |
 
 ### Wartung & Diagnose (Manuell)
 

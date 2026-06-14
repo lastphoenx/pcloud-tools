@@ -248,6 +248,12 @@ python pcloud_pool_gc.py \
   --pool-root /Backup/rtb_pool \
   --grace-hours 24
 
+# Orphans sofort prüfen (nach fehlgeschlagenem Upload, kein laufendes Backup):
+python pcloud_pool_gc.py \
+  --env-file "$ENV_FILE" \
+  --pool-root /Backup/rtb_pool \
+  --dry-run --grace-hours 0
+
 # Wöchentlich per Cron (Sonntag 03:00):
 # 0 3 * * 0 cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py \
 #   --env-file .env --pool-root /Backup/rtb_pool >> /var/log/backup/pool_gc.log 2>&1

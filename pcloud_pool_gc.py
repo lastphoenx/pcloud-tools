@@ -60,7 +60,6 @@ from __future__ import annotations
 import os, sys, json, argparse, time, datetime, re
 import concurrent.futures
 import threading
-from email.utils import parsedate_to_datetime
 from typing import Set, Dict, List, Tuple, Optional
 from collections import defaultdict
 
@@ -71,45 +70,6 @@ def _log(msg: str, *, file=sys.stderr) -> None:
     """Log-Ausgabe mit Timestamp"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} {msg}", file=file, flush=True)
-
-
-def _modified_to_unix_ts(modified) -> Optional[float]:
-    """pCloud liefert modified als Unix-Zahl oder HTTP-Datum (RFC 2822)."""
-    if modified is None:
-        return None
-    if isinstance(modified, (int, float)):
-        return float(modified)
-    if isinstance(modified, str):
-        text = modified.strip()
-        if not text:
-            return None
-        if text.isdigit():
-            return float(text)
-        try:
-            return parsedate_to_datetime(text).timestamp()
-        except (TypeError, ValueError, OverflowError):
-            pass
-        try:
-            return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-        except (TypeError, ValueError):
-            pass
-    _log(f"[gc][WARN] Unparsable modified timestamp: {modified!r}")
-    return None
-
-
-def _pool_file_remote_path(pool_root: str, sha256: str) -> str:
-    """Vollpfad zu einem Pool-Objekt (_pool/XX/<sha256>)."""
-    sha = sha256.lower()
-    return f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
-
-
-def _gc_delete_cfg(cfg: dict, size_bytes: int) -> dict:
-    """Laengere REST-Timeouts fuer grosse Pool-Deletes (pCloud kann >30s brauchen)."""
-    base = int(cfg.get("timeout", 30))
-    if size_bytes <= 50 * 1024 * 1024:
-        return cfg
-    needed = max(base, 120, size_bytes // (10 * 1024 * 1024))
-    return {**cfg, "timeout": min(int(needed), 600)}
 
 
 # ---- Lib laden ----
@@ -341,7 +301,7 @@ def _list_pool_files(cfg: dict, pool_root: str) -> List[dict]:
             if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
                 pool_files.append({
                     "name": filename,
-                    "path": obj.get("path") or _pool_file_remote_path(pool_root, filename),
+                    "path": obj.get("path") or pc.pool_file_remote_path(pool_root, filename),
                     "size": obj.get("size", 0),
                     "modified": obj.get("modified"),
                     "fileid": obj.get("fileid"),
@@ -622,17 +582,13 @@ def _delete_pool_file(
         return
     
     try:
-        del_cfg = _gc_delete_cfg(cfg, pool_file_size)
+        del_cfg = cfg
+        kwargs: dict = {"size_bytes": pool_file_size}
         if fileid:
-            pc.call_with_backoff(
-                pc.delete_file, del_cfg, fileid=int(fileid),
-                attempts=5, max_sleep=30.0,
-            )
+            kwargs["fileid"] = int(fileid)
         else:
-            pc.call_with_backoff(
-                pc.delete_file, del_cfg, path=pool_file_path,
-                attempts=5, max_sleep=30.0,
-            )
+            kwargs["path"] = pool_file_path
+        pc.call_with_backoff(pc.delete_file, del_cfg, **kwargs, attempts=5, max_sleep=30.0)
         stats.inc_deleted(pool_file_size)
         
         if verbose:
@@ -851,7 +807,7 @@ def run_pool_gc(
                         sha = filename.lower()
                         pool_files_list.append({
                             "name": sha,
-                            "path": filepath or _pool_file_remote_path(pool_root, sha),
+                            "path": filepath or pc.pool_file_remote_path(pool_root, sha),
                             "size": filesize,
                             "modified": modified,
                             "fileid": obj.get("fileid"),
@@ -883,7 +839,7 @@ def run_pool_gc(
             
             # 2. Grace-Period-Check (Race-Protection!)
             if grace_hours > 0 and pool_file.get("modified"):
-                file_mtime = _modified_to_unix_ts(pool_file["modified"])
+                file_mtime = pc.parse_metadata_modified_ts(pool_file["modified"])
                 if file_mtime is None:
                     stats.inc_kept()
                     if verbose:
