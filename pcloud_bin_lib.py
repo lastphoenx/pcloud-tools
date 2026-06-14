@@ -1798,17 +1798,8 @@ def put_textfile(cfg: dict, *, path: str, text: str, encoding: str = "utf-8") ->
 
 
 def deletefile(cfg: dict, *, path: str | None = None, fileid: int | None = None) -> dict:
-    """Datei löschen (Binary API)."""
-    if (path is None) == (fileid is None):
-        raise ValueError("deletefile: genau eines von path oder fileid angeben.")
-    params = {"access_token": cfg["token"], "device": cfg["device"]}
-    if path is not None:
-        params["path"] = _norm_remote_path(path)
-    else:
-        params["fileid"] = int(fileid)
-    top, _ = _rpc(cfg["host"], int(cfg["port"]), int(cfg["timeout"]), "deletefile", params)
-    _expect_ok(top)
-    return top
+    """Datei löschen (REST-API, zuverlässiger als Binary bei grossen Objekten)."""
+    return delete_file(cfg, path=path, fileid=fileid)
 
 
 # ======== REST-Mini-Client & High-Level Helpers (add to end of file) ========
@@ -2298,18 +2289,20 @@ def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int 
 # ---- für leichtes pcloud-Delete-CLI ----
 def delete_file(cfg: Dict[str, Any], *, fileid: int | None = None, path: str | None = None) -> Dict[str, Any]:
     """
-    Löscht eine Datei (Binary-API deletefile).
+    Löscht eine Datei (REST-API deletefile).
     Genau eines von fileid oder path angeben.
     """
     if (fileid is None) == (path is None):
         raise ValueError("delete_file: genau eines von fileid oder path angeben.")
-    params = {"access_token": cfg["token"], "device": cfg["device"]}
+    params = {"device": cfg["device"]}
     if fileid is not None:
         params["fileid"] = int(fileid)
     else:
         params["path"] = _norm_remote_path(path)
-    top, _ = _rpc(cfg["host"], cfg["port"], cfg["timeout"], "deletefile", params)
-    _expect_ok(top)
+    # REST statt Binary: kein Socket-Blocking bei grossen Pool-Objekten
+    top = _rest_get(cfg, "deletefile", params)
+    if int(top.get("result", -1)) != 0:
+        raise RuntimeError(f"API error {top.get('result')}: {top.get('error', 'unknown')}")
     return top
 
 
