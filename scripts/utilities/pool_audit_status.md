@@ -38,6 +38,8 @@ Das Skript zeigt am Anfang `Storage:`-Zeilen (`df`) — erwartet `/dev/sdd1` fü
 
 Nur **Abweichungen** werden einzeln gelistet; Zeile **Hinweis** erklärt die Aktion.
 
+Vollständiger Triage-Workflow: [integrity-checks.md](../../../doku/Raspi/raspinas/ops/integrity-checks.md) (pi-nas Ops-Doku).
+
 ## Typische Befunde
 
 | Befund | Bedeutung | Aktion |
