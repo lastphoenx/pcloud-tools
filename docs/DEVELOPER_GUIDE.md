@@ -342,6 +342,8 @@ Siehe `pcloud_pool_gc.md` für Retention-Apply, Grace-Period-Triage und Troubles
 
 Skripte sollen diese API nutzen — kein dupliziertes Binary-RPC-Delete in Einzeltools.
 
+**Backlog (vorbereitet, noch offen):** Pool-Pfad-Duplikate in Push/Delta/Restore → `docs/backlog_pool_lib_consolidation.md`
+
 ---
 
 ## 🔧 Konfiguration (`.env`)
