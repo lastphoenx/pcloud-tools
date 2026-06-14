@@ -6,7 +6,10 @@ Schneller Triage-Report ohne rekursives `find`. Vergleicht drei direkte Listen:
 |--------|----------------|
 | RTB-Snapshots | `/mnt/backup/rtb_nas/<snap>/` |
 | Archiv-Manifeste | `/srv/pcloud-archive/manifests/<snap>.json` |
-| pCloud complete | `--pool-root` + `.upload_complete` |
+| pCloud-Ordner | `listfolder` auf `--pool-root/_snapshots/<snap>/` |
+| pCloud complete | `stat` auf `…/<snap>/.upload_complete` |
+
+MariaDB und `content_index.json` werden **nicht** für die Matrix gelesen (DB nur am Ende als Historie).
 
 Pfade kommen aus `.env` (`PCLOUD_ARCHIVE_DIR`, `RTB`). **Nicht** `/srv/nas/pcloud-archive` — siehe `docs/STORAGE_PATHS.md`.
 
@@ -18,7 +21,8 @@ cd /opt/apps/pcloud-tools/main
 MAIN_DIR=/opt/apps/pcloud-tools/main \
 python scripts/utilities/pool_audit_status.py \
   --env-file .env \
-  --pool-root /Backup/rtb_pool
+  --pool-root /Backup/rtb_pool \
+  --rtb-root /mnt/backup/rtb_nas
 ```
 
 Das Skript zeigt am Anfang `Storage:`-Zeilen (`df`) — erwartet `/dev/sdd1` für Archiv/Temp, nicht `mmcblk0`.
@@ -29,18 +33,20 @@ Das Skript zeigt am Anfang `Storage:`-Zeilen (`df`) — erwartet `/dev/sdd1` fü
 |--------|-----------|
 | RTB | Snapshot-Ordner lokal unter RTB |
 | Man | Archiv-Manifest unter `manifests/<snap>.json` |
-| Rdy | `.upload_complete` auf pCloud |
+| Pcl | Snapshot-Ordner existiert auf pCloud (`_snapshots/<snap>/`) |
+| Cmp | `.upload_complete` gesetzt (Upload validiert & fertig) |
 
-Nur **Abweichungen** werden einzeln gelistet.
+Nur **Abweichungen** werden einzeln gelistet; Zeile **Hinweis** erklärt die Aktion.
 
 ## Typische Befunde
 
 | Befund | Bedeutung | Aktion |
 |--------|-----------|--------|
-| RTB ja, Rdy nein | Catch-up nötig | `./wrapper_pcloud_pool_sync_1to1.sh <snap>` |
-| Man ja, Rdy nein | Anomalie (selten) | Log prüfen, Re-Upload |
-| Rdy ja, Man nein | Upload OK, Manifest fehlt/defekt | Manifest regenerieren oder leere Datei löschen |
-| Rdy ja, RTB nein | Lokal per Retention gelöscht | Normal, Backup auf pCloud bleibt |
+| RTB ja, Pcl nein, Cmp nein | Noch nie hochgeladen | Catch-up / Wrapper |
+| RTB ja, Pcl ja, Cmp nein | Unvollständiger Remote-Snapshot | Upload erneut (Pipeline wipet & neu) |
+| RTB nein, Pcl ja, Cmp nein | Zombie (hängender Remote-Ordner) | `pcloud_pool_gc.py --retention-apply` |
+| Cmp ja, Man nein | Upload OK, Manifest fehlt lokal | Re-Upload oder Manifest archivieren |
+| Cmp ja, RTB nein | Lokal per RTB-Retention gelöscht | Normal, Backup auf pCloud bleibt |
 | DB FAILED → COMPLETE | Alter Fehler, inzwischen nachgeholt | Keine Aktion |
 
 ## Danach: Vollständiger Integritätscheck
