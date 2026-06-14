@@ -218,42 +218,54 @@ def compare_pool_index_vs_remote(
 
 
 def print_pool_report(report: dict, unknown_files: List[dict]) -> int:
-    """Pool-Tamper-Detect Report. Gibt Anzahl Issues zurueck."""
-    issues = 0
+    """Pool-Tamper-Detect Report. Gibt Anzahl kritischer Issues zurueck (Exit-Code)."""
+    critical = 0
     print("\n" + "=" * 70)
     print("=== ERGEBNIS: tamper-detect (Pool-Modus) ===")
     print("=" * 70)
     print(f"\n  Geprueft (pool_refs):    {report['checked']}")
     print(f"  Davon OK:                {report['ok']}")
 
-    def _section(label, items, key=None, n=10):
-        nonlocal issues
+    def _section_critical(label, items, n=10):
+        nonlocal critical
         print(f"\n  {label:<28} {len(items)}")
-        issues += len(items)
+        critical += len(items)
         for it in items[:n]:
             print(f"    {it.get('pool_path') or it.get('stub_path') or str(it)[:80]}")
         if len(items) > n:
             print(f"    ... und {len(items)-n} weitere")
 
-    _section("Pool-Objekte fehlen:", report["missing_pool"])
-    _section("FileID-Abweichungen:", report["fileid_mismatch"])
-    _section("Hash-Abweichungen:", report["hash_mismatch"])
-    _section("Size-Abweichungen:", report["size_mismatch"])
+    _section_critical("Pool-Objekte fehlen:", report["missing_pool"])
+    _section_critical("FileID-Abweichungen:", report["fileid_mismatch"])
+    _section_critical("Hash-Abweichungen:", report["hash_mismatch"])
+    _section_critical("Size-Abweichungen:", report["size_mismatch"])
 
     h_miss = report["hash_missing_in_index"]
     print(f"\n  pcloud_hash Luecken:     {len(h_miss)}")
-    # Luecken sind keine Issues (kein Hash im Index != Tamper)
+    if h_miss:
+        print("    (Index ohne pcloud_hash — kein Tamper, ggf. Backfill-Upload)")
 
-    _section("Fehlende Stubs:", report["missing_stubs"])
-    _section("Unbekannte Pool-Objekte:", unknown_files)
+    _section_critical("Fehlende Stubs:", report["missing_stubs"])
+
+    # Verwaiste Pool-Objekte = GC-Kandidaten, kein Backup-Risiko (z.B. abgebrochener Upload)
+    print(f"\n  Unbekannte Pool-Objekte: {len(unknown_files)}  (GC-Kandidaten, kein Tamper)")
+    if unknown_files:
+        print("    → Aufräumen: pcloud_pool_gc.py --dest-root <pool> (optional --dry-run)")
+        for u in unknown_files[:10]:
+            print(f"    {u.get('path', str(u))[:80]}")
+        if len(unknown_files) > 10:
+            print(f"    ... und {len(unknown_files)-10} weitere")
 
     print(f"\n{'=' * 70}")
-    if issues == 0:
-        print("  ✓ KEINE ABWEICHUNGEN — Pool konsistent mit Index")
+    if critical == 0:
+        if unknown_files:
+            print("  ✓ Backup konsistent — nur GC-Kandidaten offen (kein kritischer Befund)")
+        else:
+            print("  ✓ KEINE ABWEICHUNGEN — Pool konsistent mit Index")
     else:
-        print(f"  ✗ {issues} ABWEICHUNG(EN) — manuelle Pruefung empfohlen")
+        print(f"  ✗ {critical} KRITISCHE ABWEICHUNG(EN) — manuelle Pruefung empfohlen")
     print("=" * 70)
-    return issues
+    return critical
 
 
 def extract_snapshots_from_index(index: dict) -> Set[str]:
@@ -941,6 +953,8 @@ Beispiele:
                 "remote_files": len(by_fileid),
                 "duration_sec": round(dt_total, 2),
                 "issues": issues,
+                "critical_issues": issues,
+                "orphan_pool_objects": len(unknown),
                 "missing_pool": report["missing_pool"],
                 "fileid_mismatch": report["fileid_mismatch"],
                 "hash_mismatch": report["hash_mismatch"],

@@ -499,8 +499,27 @@ build_and_push() {
     fi
   else
     local verify_duration=$(( $(date +%s) - T0 ))
-    _db_phase_log "verify" "end" "FAILED"
-    _log WARN "Delta-Check failed nach $_delta_max_attempts Versuch(en) (non-critical, upload succeeded)"
+    local _verify_note=""
+    if [[ -f "$delta_report" ]] && command -v jq &>/dev/null; then
+      local _crit _orph
+      _crit=$(jq -r '.critical_issues // .issues // 1' "$delta_report" 2>/dev/null || echo "1")
+      _orph=$(jq -r '.orphan_pool_objects // 0' "$delta_report" 2>/dev/null || echo "0")
+      if [[ "${_crit:-1}" -eq 0 ]]; then
+        _delta_ok=1
+        _verify_note="nur GC-Kandidaten (${_orph})"
+      fi
+    fi
+    if [[ $_delta_ok -eq 1 ]]; then
+      _db_phase_log "verify" "end" "SUCCESS"
+      _db_update_metrics "verify_duration_sec = $verify_duration"
+      _log INFO "Delta-Check OK (${_verify_note:-keine kritischen Befunde})"
+      if [[ -f "$delta_report" ]]; then
+        mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
+      fi
+    else
+      _db_phase_log "verify" "end" "FAILED"
+      _log WARN "Delta-Check failed nach $_delta_max_attempts Versuch(en) (non-critical, upload succeeded)"
+    fi
   fi
   fi
   # === Ende Delta-Check ===
