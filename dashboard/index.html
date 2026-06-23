@@ -534,7 +534,14 @@
       if (!status) {
         renderError(statusRes.reason);
       } else {
-        render(status, reports);
+        try {
+          render(status, reports);
+        } catch (e) {
+          console.error('Dashboard render failed:', e);
+          document.getElementById('tiles').innerHTML =
+            '<div class="err-box" style="grid-column:1/-1">\u274C Dashboard-Renderfehler: '
+            + esc(String(e.message || e)) + '</div>';
+        }
       }
       resetCountdown();
     }
@@ -596,9 +603,9 @@
       const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
       const rtbOk   = rtb.status === 'success' || rtb.status === 'idle';
       const cloudOk = cloudCode === 0;
-      const tileCls = (rtbOk && cloudOk) ? 'ok'
-                    : (rtb.status === 'failed' || cloudCode >= 2) ? 'bad'
-                    : 'warning';
+      let tileCls = (rtbOk && cloudOk) ? 'ok'
+                  : (rtb.status === 'failed' || cloudCode >= 2) ? 'bad'
+                  : 'warning';
 
       const snapCount = rtb.snapshot_count
         || ((cloud.checks || {}).backup_age || {}).snapshot_count
