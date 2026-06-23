@@ -87,11 +87,15 @@ def _save_to_backup_run(
     if backup_run_id:
         where = f"run_id = '{_sql_escape(backup_run_id)}'"
     else:
+        # Letzter Lauf je Snapshot (SUCCESS bevorzugt, sonst neuester RUNNING/FAILED)
         where = f"""run_id = (
             SELECT run_id FROM (
                 SELECT run_id FROM backup_runs
-                WHERE snapshot_name = '{_sql_escape(snapshot)}' AND status = 'SUCCESS'
-                ORDER BY started_at DESC LIMIT 1
+                WHERE snapshot_name = '{_sql_escape(snapshot)}'
+                ORDER BY
+                  CASE status WHEN 'SUCCESS' THEN 0 WHEN 'RUNNING' THEN 1 ELSE 2 END,
+                  started_at DESC
+                LIMIT 1
             ) _r
         )"""
     sql = f"""
