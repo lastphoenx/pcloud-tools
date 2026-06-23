@@ -389,56 +389,33 @@ get_pool_integrity_summary() {
 
 get_pool_integrity_snapshots() {
   local result
-  # Neueste zuerst; FAILED/STALE priorisieren in Sortierung
   result=$(db_query "
-    SELECT
-      snapshot_name,
-      COALESCE(post_upload_status, ''),
-      COALESCE(DATE_FORMAT(post_upload_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
-      COALESCE(post_upload_issues, 0),
-      COALESCE(post_upload_summary, ''),
-      COALESCE(monthly_audit_status, ''),
-      COALESCE(DATE_FORMAT(monthly_audit_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
-      COALESCE(monthly_audit_issues, 0),
-      COALESCE(monthly_audit_summary, ''),
-      COALESCE(audit_freshness, 'UNKNOWN')
-    FROM v_snapshot_integrity_status
-    ORDER BY
-      FIELD(audit_freshness, 'FAILED', 'STALE', 'UNKNOWN', 'OK'),
-      snapshot_name DESC
-    LIMIT 40;
-  " 2>/dev/null || echo "")
+    SELECT COALESCE(JSON_ARRAYAGG(j), JSON_ARRAY())
+    FROM (
+      SELECT JSON_OBJECT(
+        'snapshot', snapshot_name,
+        'backup_status', COALESCE(backup_status, ''),
+        'post_upload_status', COALESCE(post_upload_status, ''),
+        'post_upload_at', COALESCE(DATE_FORMAT(post_upload_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
+        'post_upload_issues', COALESCE(post_upload_issues, 0),
+        'monthly_audit_status', COALESCE(monthly_audit_status, ''),
+        'monthly_audit_at', COALESCE(DATE_FORMAT(monthly_audit_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
+        'monthly_audit_issues', COALESCE(monthly_audit_issues, 0),
+        'audit_freshness', COALESCE(audit_freshness, 'UNKNOWN')
+      ) AS j
+      FROM v_snapshot_integrity_status
+      ORDER BY
+        FIELD(audit_freshness, 'FAILED', 'STALE', 'UNKNOWN', 'OK'),
+        snapshot_name DESC
+      LIMIT 40
+    ) sub;
+  " 2>/dev/null || echo "[]")
 
-  if [[ -z "$result" ]]; then
+  if [[ -z "$result" || "$result" == "NULL" ]]; then
     echo "[]"
     return
   fi
-
-  local json="["
-  local first=1
-
-  while IFS=$'\t' read -r snap pu_st pu_at pu_issues pu_sum ma_st ma_at ma_issues ma_sum freshness; do
-    [[ "$first" -eq 0 ]] && json="${json},"
-    first=0
-    local pu_sum_e ma_sum_e
-    pu_sum_e=$(escape_json "$pu_sum")
-    ma_sum_e=$(escape_json "$ma_sum")
-    json="${json}{"
-    json="${json}\"snapshot\":\"${snap}\","
-    json="${json}\"post_upload_status\":\"${pu_st}\","
-    json="${json}\"post_upload_at\":\"${pu_at}\","
-    json="${json}\"post_upload_issues\":${pu_issues},"
-    json="${json}\"post_upload_summary\":\"${pu_sum_e}\","
-    json="${json}\"monthly_audit_status\":\"${ma_st}\","
-    json="${json}\"monthly_audit_at\":\"${ma_at}\","
-    json="${json}\"monthly_audit_issues\":${ma_issues},"
-    json="${json}\"monthly_audit_summary\":\"${ma_sum_e}\","
-    json="${json}\"audit_freshness\":\"${freshness}\""
-    json="${json}}"
-  done <<< "$result"
-
-  json="${json}]"
-  echo "$json"
+  echo "$result"
 }
 
 # =====================================================

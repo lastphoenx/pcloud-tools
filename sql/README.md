@@ -25,9 +25,10 @@ These scripts manage the **pcloud_backup** database, which tracks backup runs, p
 
 ```bash
 mysql -u pcloud_backup -p pcloud_backup < sql/migrate_integrity_checks.sql
+mysql -u pcloud_backup -p pcloud_backup < sql/migrate_integrity_v2.sql
 ```
 
-Creates `snapshot_integrity_checks`, `v_snapshot_integrity_latest`, `v_snapshot_integrity_status`.
+Creates integrity columns on `backup_runs` + `snapshot_integrity_checks` (monthly audit only, 1 row/snapshot).
 
 Post-upload integrity runs automatically via `wrapper_pcloud_pool_sync_1to1.sh` → `pool_integrity_run.py`.
 
