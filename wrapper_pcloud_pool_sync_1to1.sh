@@ -18,7 +18,7 @@ PCLOUD_DEST=${PCLOUD_DEST:-/Backup/rtb_pool}
 
 MANI=${MANI:-${MAIN_DIR}/pcloud_json_pool_manifest.py}
 PUSH=${PUSH:-${MAIN_DIR}/pcloud_push_json_pool_manifest_to_pcloud.py}
-DELTA_CHECK=${DELTA_CHECK:-${MAIN_DIR}/pcloud_quick_delta.py}
+INTEGRITY_RUN=${INTEGRITY_RUN:-${MAIN_DIR}/scripts/utilities/pool_integrity_run.py}
 
 # Python-Interpreter (dedizierte pcloud-venv bevorzugt)
 if [[ -x "/opt/apps/pcloud-tools/venv/bin/python" ]]; then
@@ -458,71 +458,58 @@ build_and_push() {
   # Manifest-Archivierung wird bereits vom Push-Tool erledigt
   # (nach /srv/pcloud-archive/manifests/)
   
-  # === Delta-Check nach erfolgreichem Upload (im Dry-Run uebersprungen) ===
+  # === Integritaetscheck nach erfolgreichem Upload (im Dry-Run uebersprungen) ===
   if [[ "$DRY_RUN" == "1" ]]; then
-    _log INFO "Delta verification uebersprungen (--dry-run)"
+    _log INFO "Integrity verification uebersprungen (--dry-run)"
   else
-  _log INFO "Starting delta verification..."
-  local delta_report="${PCLOUD_TEMP_DIR}/delta_verify_${SNAPNAME}.json"
-  
+  _integrity_mode="${PCLOUD_POST_UPLOAD_INTEGRITY:-1}"
+  case "${_integrity_mode,,}" in
+    0|skip|off|false|no)
+      _integrity_mode=skip
+      ;;
+    *)
+      _integrity_mode=run
+      ;;
+  esac
+
+  if [[ "$_integrity_mode" == "skip" ]]; then
+    _log INFO "Post-upload integrity uebersprungen (PCLOUD_POST_UPLOAD_INTEGRITY=skip)"
+  else
+  _log INFO "Starting integrity verification (snapshot=$SNAPNAME)..."
+  local integrity_report="${PCLOUD_ARCHIVE_DIR}/integrity/integrity_${SNAPNAME}_pending.json"
+
   T0=$(date +%s)
   _db_phase_log "verify" "start"
-  
-  local _delta_ok=0
-  local _delta_attempt=0
-  local _delta_max_attempts=2
-  local _delta_retry_wait=${PCLOUD_DELTA_RETRY_WAIT:-120}   # Wartezeit bei API 5000 (default 120s)
 
-  while [[ $_delta_attempt -lt $_delta_max_attempts && $_delta_ok -eq 0 ]]; do
-    _delta_attempt=$(( _delta_attempt + 1 ))
-    if [[ $_delta_attempt -gt 1 ]]; then
-      _log WARN "Delta-Check Retry $_delta_attempt/$_delta_max_attempts nach API-Fehler (warte ${_delta_retry_wait}s...)"
-      sleep "$_delta_retry_wait"
-    fi
+  local _integrity_ok=0
+  local _integrity_args=(
+    --env-file "$ENV_FILE"
+    --pool-root "$PCLOUD_DEST"
+    --snapshot "$SNAPNAME"
+    --check-type post_upload
+    --json-out "$integrity_report"
+  )
+  if [[ -n "${RUN_ID:-}" ]]; then
+    _integrity_args+=(--backup-run-id "$RUN_ID")
+  fi
 
-    if "${PY}" "$DELTA_CHECK" \
-      --dest-root "$PCLOUD_DEST" \
-      --env-file "$ENV_FILE" \
-      --json-out "$delta_report" 2>&1 | tee -a "$PCLOUD_LOG"; then
-      _delta_ok=1
-    fi
-  done
+  if "${PY}" "$INTEGRITY_RUN" "${_integrity_args[@]}" 2>&1 | tee -a "$PCLOUD_LOG"; then
+    _integrity_ok=1
+  fi
 
-  if [[ $_delta_ok -eq 1 ]]; then
-    local verify_duration=$(( $(date +%s) - T0 ))
+  local verify_duration=$(( $(date +%s) - T0 ))
+  if [[ $_integrity_ok -eq 1 ]]; then
     _db_phase_log "verify" "end" "SUCCESS"
     _db_update_metrics "verify_duration_sec = $verify_duration"
-    _log INFO "Delta-Check successful (${verify_duration}s)"
-    if [[ -f "$delta_report" ]]; then
-      mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
-      _log INFO "Delta report archived: delta_verify_${SNAPNAME}.json"
-    fi
+    _log INFO "Integrity check OK (${verify_duration}s)"
   else
-    local verify_duration=$(( $(date +%s) - T0 ))
-    local _verify_note=""
-    if [[ -f "$delta_report" ]] && command -v jq &>/dev/null; then
-      local _crit _orph
-      _crit=$(jq -r '.critical_issues // .issues // 1' "$delta_report" 2>/dev/null || echo "1")
-      _orph=$(jq -r '.orphan_pool_objects // 0' "$delta_report" 2>/dev/null || echo "0")
-      if [[ "${_crit:-1}" -eq 0 ]]; then
-        _delta_ok=1
-        _verify_note="nur GC-Kandidaten (${_orph})"
-      fi
-    fi
-    if [[ $_delta_ok -eq 1 ]]; then
-      _db_phase_log "verify" "end" "SUCCESS"
-      _db_update_metrics "verify_duration_sec = $verify_duration"
-      _log INFO "Delta-Check OK (${_verify_note:-keine kritischen Befunde})"
-      if [[ -f "$delta_report" ]]; then
-        mv "$delta_report" "${PCLOUD_ARCHIVE_DIR}/deltas/" 2>/dev/null || true
-      fi
-    else
-      _db_phase_log "verify" "end" "FAILED"
-      _log WARN "Delta-Check failed nach $_delta_max_attempts Versuch(en) (non-critical, upload succeeded)"
-    fi
+    _db_phase_log "verify" "end" "FAILED"
+    _db_update_metrics "verify_duration_sec = $verify_duration"
+    _log WARN "Integrity check FAILED (non-critical, upload succeeded) — siehe snapshot_integrity_checks / $integrity_report"
   fi
   fi
-  # === Ende Delta-Check ===
+  fi
+  # === Ende Integritaetscheck ===
   
   # Explizites Cleanup (statt trap RETURN)
   rm -f "$mani" "$mani_jsonl" 2>/dev/null || true

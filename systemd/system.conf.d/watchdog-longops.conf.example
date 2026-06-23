@@ -1,0 +1,17 @@
+# /etc/systemd/system.conf.d/watchdog-longops.conf
+#
+# Globaler Hardware-Watchdog (BCM2835, default 1min auf Raspberry Pi OS).
+# Wenn copyfolder/API-Wartezeiten das System verlangsamen, kann systemd[1]
+# den Watchdog nicht rechtzeitig fuettern → Hard-Reboot ohne OOM/Panic.
+#
+# RuntimeWatchdogSec=0 auf backup-pipeline.service betrifft nur die Unit,
+# NICHT den globalen Manager-Watchdog. Dieses Drop-in erhoeht das Limit.
+#
+# Install:
+#   sudo cp systemd/system.conf.d/watchdog-longops.conf.example \
+#     /etc/systemd/system.conf.d/watchdog-longops.conf
+#   sudo systemctl daemon-reexec
+
+[Manager]
+RuntimeWatchdogSec=10min
+RebootWatchdogSec=15min

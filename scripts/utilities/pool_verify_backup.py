@@ -263,6 +263,192 @@ def check_stub_sample(
 # Main
 # ---------------------------------------------------------------------------
 
+def run_verify(
+    cfg: dict,
+    *,
+    pool_root_raw: str,
+    manifests_dir: str,
+    snapshot_filter: List[str] | None = None,
+    stub_sample: int = 0,
+    verbose: bool = True,
+) -> dict:
+    """
+    Fuehrt Integritaetscheck aus. Gibt strukturiertes Ergebnis-Dict zurueck.
+    snapshot_filter: nur diese Snapshots pruefen (RAM-schonend, ein Snap nach Upload).
+    """
+    def _out(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    dest = pc._norm_remote_path(pool_root_raw).rstrip("/")
+    pool_root = f"{dest}/_pool"
+    snaps_root = f"{dest}/_snapshots"
+    idx_path = f"{snaps_root}/_index/content_index.json"
+
+    t0 = time.time()
+    _out("=== pool_verify_backup ===")
+    _out(f"Dest:      {dest}")
+    _out(f"Manifeste: {manifests_dir}")
+    if snapshot_filter:
+        _out(f"Snapshots: {', '.join(snapshot_filter)} (gefiltert)")
+    _out("")
+
+    top = pc.listfolder(cfg, path=snaps_root, recursive=False, nofiles=True)
+    remote_snaps_all = sorted(
+        c["name"] for c in (top.get("metadata", {}) or {}).get("contents", []) or []
+        if c.get("isfolder") and c.get("name") and c.get("name") != "_index"
+    )
+    if snapshot_filter:
+        unknown = set(snapshot_filter) - set(remote_snaps_all)
+        if unknown:
+            _out(f"[warn] Snapshots nicht remote: {', '.join(sorted(unknown))}")
+        remote_snaps = [s for s in snapshot_filter if s in remote_snaps_all]
+        if not remote_snaps:
+            return {
+                "ok": False,
+                "issues": 1,
+                "error": "no_valid_snapshots",
+                "duration_sec": round(time.time() - t0, 2),
+            }
+    else:
+        remote_snaps = remote_snaps_all
+
+    _out(f"Remote-Snapshots: {remote_snaps}")
+
+    manifests, corrupt_manifests = _load_manifests(manifests_dir, remote_snaps)
+    if corrupt_manifests:
+        _out(f"[FAIL] {len(corrupt_manifests)} defekte Manifest-Datei(en)")
+        return {
+            "ok": False,
+            "issues": len(corrupt_manifests),
+            "error": "corrupt_manifests",
+            "corrupt_manifests": corrupt_manifests,
+            "duration_sec": round(time.time() - t0, 2),
+        }
+    if not manifests:
+        _out("[FAIL] Keine lokalen Manifeste gefunden.")
+        return {
+            "ok": False,
+            "issues": 1,
+            "error": "no_manifests",
+            "duration_sec": round(time.time() - t0, 2),
+        }
+    total_manifest_files = sum(len(v) for v in manifests.values())
+    _out(f"Lokale Manifeste: {len(manifests)}/{len(remote_snaps)} ({total_manifest_files} Dateien total)")
+    _out("")
+
+    _out("[fetch] Lade remote Daten (parallel)...")
+    t_fetch = time.time()
+    pool_shas: Set[str] = set()
+    stub_paths: Set[str] = set()
+    pool_refs: dict = {}
+
+    def _fetch_pool():
+        res = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False)
+        return _walk_pool(res.get("metadata", {}))
+
+    def _fetch_snap_stubs(snap):
+        snap_path = f"{snaps_root}/{snap}"
+        res = pc.call_with_backoff(pc.listfolder, cfg, path=snap_path, recursive=True, nofiles=False)
+        paths: Set[str] = set()
+
+        def _walk(node, cur):
+            for child in node.get("contents", []) or []:
+                name = child.get("name", "")
+                p = f"{cur}/{name}"
+                if child.get("isfolder"):
+                    _walk(child, p)
+                elif name.endswith(".meta.json"):
+                    paths.add(p)
+
+        _walk(res.get("metadata", {}), snap_path)
+        return paths
+
+    def _fetch_index():
+        txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
+        idx = json.loads(txt or "{}")
+        return idx.get("pool_refs") or {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        f_pool = ex.submit(_fetch_pool)
+        f_index = ex.submit(_fetch_index)
+        pool_refs = f_index.result()
+        pool_shas = f_pool.result()
+        snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
+        done = 0
+        for snap, fut in snap_futures.items():
+            try:
+                snap_stubs = fut.result()
+                stub_paths |= snap_stubs
+                done += 1
+                _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
+            except Exception as e:
+                done += 1
+                _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
+
+    dt_fetch = time.time() - t_fetch
+    _out(f"[fetch] Pool: {len(pool_shas)} SHA256s | "
+         f"Stubs: {len(stub_paths)} | "
+         f"Index: {len(pool_refs)} pool_refs | "
+         f"{dt_fetch:.1f}s")
+    _out("")
+
+    issues = 0
+
+    _out("=== A) Manifest vs Pool ===")
+    t_a = time.time()
+    res_a = check_manifest_vs_pool(manifests, pool_shas, set(pool_refs.keys()))
+    for snap, r in res_a["per_snapshot"].items():
+        status = "✓" if r["missing_count"] == 0 else "✗"
+        _out(f"  {status} {snap}: {r['total_files']} Dateien, "
+             f"{r['unique_shas']} unique SHAs, "
+             f"{r['missing_count']} fehlen im Pool")
+        if r["missing_count"] > 0:
+            issues += r["missing_count"]
+
+    if res_a["index_not_in_pool_count"] > 0:
+        issues += res_a["index_not_in_pool_count"]
+    _out(f"  ({time.time()-t_a:.2f}s)")
+    _out("")
+
+    _out("=== B) Stubs vs Index vs Pool ===")
+    t_b = time.time()
+    res_b = check_stubs_vs_index(pool_refs, stub_paths, snaps_root, manifests)
+    if res_b["manifest_missing_total"] > 0:
+        issues += res_b["manifest_missing_total"]
+    _out(f"  ({time.time()-t_b:.2f}s)")
+    _out("")
+
+    res_c = None
+    if stub_sample > 0:
+        _out(f"=== C) Stub-Sample ({stub_sample}) ===")
+        res_c = check_stub_sample(cfg, pool_refs, manifests, snaps_root, stub_sample)
+        if res_c.get("errors"):
+            issues += len(res_c["errors"])
+        _out("")
+
+    dt_total = time.time() - t0
+    summary_parts = []
+    if res_a["index_not_in_pool_count"] > 0:
+        summary_parts.append(f"{res_a['index_not_in_pool_count']} pool missing")
+    if res_b["manifest_missing_total"] > 0:
+        summary_parts.append(f"{res_b['manifest_missing_total']} stubs missing")
+    for snap, r in res_a["per_snapshot"].items():
+        if r["missing_count"] > 0:
+            summary_parts.append(f"{snap}: {r['missing_count']} manifest pool gaps")
+
+    return {
+        "ok": issues == 0,
+        "issues": issues,
+        "duration_sec": round(dt_total, 2),
+        "snapshots": remote_snaps,
+        "manifest_vs_pool": res_a,
+        "stubs_vs_index": res_b,
+        "stub_sample": res_c,
+        "error_summary": "; ".join(summary_parts) if summary_parts else None,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Integritaetscheck: Source-Manifeste vs. Remote Pool + Stubs.")
     ap.add_argument("--env-file",       required=True)
@@ -273,7 +459,20 @@ def main() -> int:
                     default=os.path.join(_archive, "manifests"))
     ap.add_argument("--stub-sample",    type=int, default=0,
                     help="N Stubs Inhalt lesen + kreuzen (0 = aus, default 0)")
+    ap.add_argument(
+        "--snapshots",
+        metavar="SNAP",
+        help="Nur diese Snapshot(s) pruefen (kommagetrennt). RAM-schonend fuer Post-Upload.",
+    )
+    ap.add_argument("--json-out", help="Ergebnis als JSON schreiben")
     args = ap.parse_args()
+
+    snapshot_filter: List[str] | None = None
+    if args.snapshots:
+        snapshot_filter = [
+            s.strip() for part in args.snapshots.split(",")
+            for s in part.split() if s.strip()
+        ]
 
     pool_root_raw = args.pool_root or args.dest_root
     if not pool_root_raw:
@@ -282,178 +481,30 @@ def main() -> int:
     if args.dest_root and not args.pool_root:
         print("[warn] --dest-root ist deprecated, bitte --pool-root verwenden")
 
-    cfg       = pc.effective_config(env_file=args.env_file)
-    dest      = pc._norm_remote_path(pool_root_raw).rstrip("/")
-    pool_root = f"{dest}/_pool"
-    snaps_root= f"{dest}/_snapshots"
-    idx_path  = f"{snaps_root}/_index/content_index.json"
-
-    t0 = time.time()
-    print("=== pool_verify_backup ===")
-    print(f"Dest:      {dest}")
-    print(f"Manifeste: {args.manifests_dir}")
-    print()
-
-    # ---- Remote-Snapshots ermitteln ----
-    top = pc.listfolder(cfg, path=snaps_root, recursive=False, nofiles=True)
-    remote_snaps = sorted(
-        c["name"] for c in (top.get("metadata", {}) or {}).get("contents", []) or []
-        if c.get("isfolder") and c.get("name") and c.get("name") != "_index"
+    cfg = pc.effective_config(env_file=args.env_file)
+    result = run_verify(
+        cfg,
+        pool_root_raw=pool_root_raw,
+        manifests_dir=args.manifests_dir,
+        snapshot_filter=snapshot_filter,
+        stub_sample=args.stub_sample,
+        verbose=True,
     )
-    print(f"Remote-Snapshots: {remote_snaps}")
 
-    # ---- Lokale Manifeste laden ----
-    manifests, corrupt_manifests = _load_manifests(args.manifests_dir, remote_snaps)
-    if corrupt_manifests:
-        print(f"[FAIL] {len(corrupt_manifests)} defekte Manifest-Datei(en) — "
-              "bitte re-generieren oder loeschen")
-        return 1
-    if not manifests:
-        print("[FAIL] Keine lokalen Manifeste gefunden.")
-        return 1
-    total_manifest_files = sum(len(v) for v in manifests.values())
-    print(f"Lokale Manifeste: {len(manifests)}/{len(remote_snaps)} ({total_manifest_files} Dateien total)")
-    print()
+    if args.json_out:
+        os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
 
-    # ---- Phase 0: 3 parallele Remote-Ladevorgaenge ----
-    print("[fetch] Lade remote Daten (parallel)...")
-    t_fetch = time.time()
-    pool_shas:  Set[str] = set()
-    stub_paths: Set[str] = set()
-    pool_refs:  dict     = {}
-
-    # _fetch_stubs: listfolder(_snapshots, recursive=True) scheitert bei ~1M Stubs
-    # mit pCloud API 5000. Loesung: jeden Snapshot einzeln listen (parallel).
-    def _fetch_pool():
-        res = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False)
-        return _walk_pool(res.get("metadata", {}))
-
-    def _fetch_snap_stubs(snap):
-        snap_path = f"{snaps_root}/{snap}"
-        res = pc.call_with_backoff(pc.listfolder, cfg, path=snap_path, recursive=True, nofiles=False)
-        paths: Set[str] = set()
-        def _walk(node, cur):
-            for child in node.get("contents", []) or []:
-                name = child.get("name", "")
-                p = f"{cur}/{name}"
-                if child.get("isfolder"):
-                    _walk(child, p)
-                elif name.endswith(".meta.json"):
-                    paths.add(p)
-        _walk(res.get("metadata", {}), snap_path)
-        return paths
-
-    def _fetch_index():
-        txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
-        idx = json.loads(txt or "{}")
-        return idx.get("pool_refs") or {}
-
-    # Pool + Index parallel, dann Snapshots mit 8 Threads
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        f_pool  = ex.submit(_fetch_pool)
-        f_index = ex.submit(_fetch_index)
-        pool_refs = f_index.result()
-        pool_shas = f_pool.result()
-        # Stubs: alle Snapshots parallel
-        snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
-        done = 0
-        for snap, fut in snap_futures.items():
-            try:
-                snap_stubs = fut.result()
-                stub_paths |= snap_stubs
-                done += 1
-                print(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs", flush=True)
-            except Exception as e:
-                done += 1
-                print(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
-
-    dt_fetch = time.time() - t_fetch
-    print(f"[fetch] Pool: {len(pool_shas)} SHA256s | "
-          f"Stubs: {len(stub_paths)} | "
-          f"Index: {len(pool_refs)} pool_refs | "
-          f"{dt_fetch:.1f}s")
-    print()
-
-    issues = 0
-
-    # ---- Check A: Manifest vs Pool ----
-    print("=== A) Manifest vs Pool ===")
-    t_a = time.time()
-    res_a = check_manifest_vs_pool(manifests, pool_shas, set(pool_refs.keys()))
-    for snap, r in res_a["per_snapshot"].items():
-        status = "✓" if r["missing_count"] == 0 else "✗"
-        print(f"  {status} {snap}: {r['total_files']} Dateien, "
-              f"{r['unique_shas']} unique SHAs, "
-              f"{r['missing_count']} fehlen im Pool")
-        if r["missing_count"] > 0:
-            issues += r["missing_count"]
-            for s in r["missing_from_pool"][:5]:
-                print(f"    [FEHLT] sha={s[:16]}...")
-
-    print(f"  Manifest-SHA-Union: {res_a['manifest_sha_union']} | "
-          f"Pool: {res_a['pool_sha_count']}")
-
-    if res_a["gc_candidates"] > 0:
-        print(f"  [GC-Hinweis] {res_a['gc_candidates']} Pool-Objekte "
-              f"nicht in Manifesten (GC-Kandidaten)")
-    if res_a["index_not_in_pool_count"] > 0:
-        print(f"  [FEHLER] Index referenziert {res_a['index_not_in_pool_count']} "
-              f"SHAs die im Pool FEHLEN")
-        issues += res_a["index_not_in_pool_count"]
-    if res_a["pool_not_in_index_count"] > 0:
-        print(f"  [warn] {res_a['pool_not_in_index_count']} Pool-Objekte "
-              f"nicht im Index (Waise, GC bereinigt)")
-    print(f"  ({time.time()-t_a:.2f}s)")
-    print()
-
-    # ---- Check B: Stubs vs Index vs Pool ----
-    print("=== B) Stubs vs Index vs Pool ===")
-    t_b = time.time()
-    res_b = check_stubs_vs_index(pool_refs, stub_paths, snaps_root, manifests)
-
-    if res_b["manifest_missing_total"] == 0:
-        print(f"  ✓ Manifest-Stub-Check: alle Stubs vorhanden "
-              f"({res_b['actual_stubs']} remote)")
-    else:
-        issues += res_b["manifest_missing_total"]
-        print(f"  ✗ Manifest-Stub-Check: {res_b['manifest_missing_total']} Stubs fehlen")
-        for snap, missing in res_b["manifest_missing_stubs"].items():
-            print(f"    {snap}: {len(missing)} fehlend (z.B. {missing[0]})")
-
-    if res_b["missing_from_index"] > 0:
-        print(f"  [warn] {res_b['missing_from_index']} Index-Stubs remote nicht gefunden")
-    if res_b["extra_not_in_index"] > 0:
-        print(f"  [info] {res_b['extra_not_in_index']} Stubs remote ohne Index-Eintrag")
-    print(f"  ({time.time()-t_b:.2f}s)")
-    print()
-
-    # ---- Check C: Stub-Sample (optional) ----
-    if args.stub_sample > 0:
-        print(f"=== C) Stub-Sample ({args.stub_sample} Stubs, Inhalt lesen) ===")
-        t_c = time.time()
-        res_c = check_stub_sample(cfg, pool_refs, manifests, snaps_root,
-                                  args.stub_sample)
-        if not res_c["errors"]:
-            print(f"  ✓ {res_c['ok']}/{res_c['sampled']} Stubs: "
-                  f"sha256 + fileid korrekt")
-        else:
-            issues += len(res_c["errors"])
-            print(f"  ✗ {res_c['ok']}/{res_c['sampled']} OK, "
-                  f"{len(res_c['errors'])} Fehler:")
-            for e in res_c["errors"][:5]:
-                print(f"    {e}")
-        print(f"  ({time.time()-t_c:.2f}s)")
-        print()
-
-    # ---- Ergebnis ----
-    dt_total = time.time() - t0
+    dt_total = result.get("duration_sec", 0)
     print("=" * 60)
-    if issues == 0:
+    if result.get("ok"):
         print(f"✓ ALLE CHECKS OK — Backup vollstaendig integr ({dt_total:.1f}s)")
     else:
-        print(f"✗ {issues} PROBLEM(E) gefunden ({dt_total:.1f}s)")
+        err = result.get("error") or f"{result.get('issues', 0)} PROBLEM(E)"
+        print(f"✗ {err} ({dt_total:.1f}s)")
     print("=" * 60)
-    return 0 if issues == 0 else 1
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

@@ -116,6 +116,7 @@ def compare_pool_index_vs_remote(
     snaps_root: str,
     by_fileid: Dict[int, dict],
     by_path: Dict[str, dict],
+    snapshot_filter: Optional[Set[str]] = None,
 ) -> dict:
     """
     Pool-Tamper-Detect: prueft pro sha256 in pool_refs das _pool/XX/<sha>-Objekt
@@ -148,6 +149,10 @@ def compare_pool_index_vs_remote(
     for sha, entry in pool_refs.items():
         if not isinstance(entry, dict):
             continue
+        entry_snaps = entry.get("snapshots", {})
+        if snapshot_filter and isinstance(entry_snaps, dict):
+            if not any(s in snapshot_filter for s in entry_snaps):
+                continue
         pool_path = _pool_obj_path(sha)
         index_known_paths.add(pool_path)
 
@@ -193,9 +198,11 @@ def compare_pool_index_vs_remote(
         ok.append(sha)
 
         # Stub-Existenz: fuer jeden (snap, relpath) den Stub-Pfad als bekannt markieren
-        snaps = entry.get("snapshots", {})
+        snaps = entry_snaps if isinstance(entry_snaps, dict) else {}
         if isinstance(snaps, dict):
             for snap, relpaths in snaps.items():
+                if snapshot_filter and snap not in snapshot_filter:
+                    continue
                 for rp in (relpaths or []):
                     stub_path = f"{snaps_root}/{snap}/{rp}.meta.json"
                     index_known_paths.add(stub_path)
@@ -753,6 +760,9 @@ Beispiele:
   
   # Master-Index im Archiv prüfen:
   python pcloud_quick_delta.py --dest-root /backup-nas --index-file content_index_master.json
+
+  # RAM-schonend: nur ein Snapshot (z.B. nach Upload auf 8GB-Pi):
+  python pcloud_quick_delta.py --dest-root /Backup/rtb_pool --snapshots 2026-06-23-052212
 """)
     ap.add_argument("--dest-root", required=True,
                     help="pCloud-Basispfad (z.B. /Backup/rtb_1to1)")
@@ -768,8 +778,21 @@ Beispiele:
                     help="Stichprobe für Backfill-Check (0 = alle)")
     ap.add_argument("--json-out",
                     help="Report als JSON in Datei schreiben")
+    ap.add_argument(
+        "--snapshots",
+        metavar="SNAP",
+        help="Nur diese Snapshot(s) laden/pruefen (kommagetrennt). "
+             "Spart RAM: _pool + nur angegebene Snaps statt aller ~80+ Snapshots.",
+    )
 
     args = ap.parse_args()
+
+    cli_snapshot_filter: Optional[Set[str]] = None
+    if args.snapshots:
+        cli_snapshot_filter = {
+            s.strip() for part in args.snapshots.split(",") for s in part.split()
+            if s.strip()
+        }
 
     cfg = pc.effective_config(env_file=args.env_file, profile=args.profile)
     dest_root = pc._norm_remote_path(args.dest_root)
@@ -826,12 +849,21 @@ Beispiele:
         # Loesung: _pool einmal + jeden Snapshot einzeln (parallel).
         import concurrent.futures as _cf
 
-        # Snapshot-Liste aus pool_refs
+        # Snapshot-Liste aus pool_refs (optional auf --snapshots beschraenken)
         snap_names = set()
         for _e in index.get("pool_refs", {}).values():
             if isinstance(_e, dict):
                 _s = _e.get("snapshots")
                 snap_names.update(_s.keys() if isinstance(_s, dict) else (_s or []))
+        if cli_snapshot_filter:
+            unknown = cli_snapshot_filter - snap_names
+            if unknown:
+                print(f"[warn] --snapshots nicht im Index: {', '.join(sorted(unknown))}")
+            snap_names = snap_names & cli_snapshot_filter
+            if not snap_names:
+                print("[error] Keine gueltigen Snapshots nach --snapshots-Filter", file=sys.stderr)
+                sys.exit(2)
+            print(f"[fetch] RAM-Modus: nur {len(snap_names)} Snapshot(s): {', '.join(sorted(snap_names))}")
 
         print(f"[fetch] Lade _pool + {len(snap_names)} Snapshots einzeln (parallel)...")
         t0 = time.time()
@@ -875,6 +907,7 @@ Beispiele:
                 by_fileid[int(fid)] = f
             if fp:
                 by_path[fp] = f
+        del all_flat
         n_pool = sum(1 for p in by_path if "/_pool/" in p)
         n_stubs = sum(1 for p in by_path if p.endswith(".meta.json"))
         print(f"[fetch] {len(by_fileid)} Dateien ({n_pool} pool, {n_stubs} stubs) in {time.time()-t0:.1f}s")
@@ -886,7 +919,10 @@ Beispiele:
         print()
         print("[phase 3] Vergleiche Pool-Index vs. Remote...")
         t0 = time.time()
-        report = compare_pool_index_vs_remote(index, pool_root, snaps_root, by_fileid, by_path)
+        report = compare_pool_index_vs_remote(
+            index, pool_root, snaps_root, by_fileid, by_path,
+            snapshot_filter=cli_snapshot_filter,
+        )
         print(f"[phase 3] Vergleich abgeschlossen ({time.time()-t0:.1f}s)")
 
         print()

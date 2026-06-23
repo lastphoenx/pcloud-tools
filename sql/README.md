@@ -16,7 +16,46 @@ These scripts manage the **pcloud_backup** database, which tracks backup runs, p
   - `backup_runs`: Main run tracking (one row per backup execution)
   - `backup_phases`: Phase-level tracking (Pool: manifest, upload, verify; GC separat: pool_retention, pool_gc)
   - `gap_backfills`: Tracks backfilled gaps (missing snapshots)
+  - `snapshot_integrity_checks`: Per-snapshot integrity (post_upload, monthly_audit, manual)
 - **Views**: Analytics views for dashboards and monitoring
+
+---
+
+## Migration: Integrity Checks
+
+```bash
+mysql -u pcloud_backup -p pcloud_backup < sql/migrate_integrity_checks.sql
+```
+
+Creates `snapshot_integrity_checks`, `v_snapshot_integrity_latest`, `v_snapshot_integrity_status`.
+
+Post-upload integrity runs automatically via `wrapper_pcloud_pool_sync_1to1.sh` → `pool_integrity_run.py`.
+
+Monthly/daily audit (one snapshot per run):
+
+```bash
+sudo cp systemd/integrity-audit.service.example /etc/systemd/system/integrity-audit.service
+sudo cp systemd/integrity-audit.timer.example /etc/systemd/system/integrity-audit.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now integrity-audit.timer
+```
+
+RAM limit for backup pipeline (8GB Pi):
+
+```bash
+sudo mkdir -p /etc/systemd/system/backup-pipeline.service.d
+sudo cp systemd/backup-pipeline.service.d/memory-limit.conf.example \
+  /etc/systemd/system/backup-pipeline.service.d/memory-limit.conf
+sudo systemctl daemon-reload
+```
+
+Global hardware watchdog (1min default on Pi — can cause hard reboot during long `copyfolder`):
+
+```bash
+sudo cp systemd/system.conf.d/watchdog-longops.conf.example \
+  /etc/systemd/system.conf.d/watchdog-longops.conf
+sudo systemctl daemon-reexec
+```
 
 ---
 

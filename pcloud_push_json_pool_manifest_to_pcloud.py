@@ -749,6 +749,17 @@ def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool
     pc.write_json_to_folderid(cfg, folderid=int(fid), filename=idx_name, obj=index, minify=(not pretty))
 
 
+def _upload_complete_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
+    """True nur wenn .upload_complete existiert und snapshot-Feld passt."""
+    if not pc.stat_file_safe(cfg, path=marker_path):
+        return False
+    try:
+        data = json.loads(pc.get_textfile(cfg, path=marker_path))
+        return str(data.get("snapshot", "")) == str(snapshot_name)
+    except Exception:
+        return False
+
+
 def _purge_snapshot_refs_from_index(index: dict, snapshot_name: str) -> int:
     """Entfernt snapshot_name aus allen pool_refs-Eintraegen. Gibt Anzahl bereinigter SHAs zurueck."""
     pool_refs = index.get("pool_refs", {})
@@ -1839,10 +1850,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     if not dry:
         existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
         if existing_fid:
-            if pc.stat_file_safe(cfg, path=marker_complete):
+            if _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
                 _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
                 return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
-            _log(f"[delta-mode] Ziel existiert, aber unvollständig (kein .upload_complete) → verwerfe und starte sauber neu")
+            if pc.stat_file_safe(cfg, path=marker_complete):
+                _log(f"[delta-mode] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
+                     f"(erwartet {snapshot_name}) → verwerfe und starte sauber neu")
+            else:
+                _log(f"[delta-mode] Ziel existiert, aber unvollständig (kein .upload_complete) → verwerfe und starte sauber neu")
             try:
                 pc.deletefolder_recursive(cfg, folderid=int(existing_fid))
             except Exception as e:
