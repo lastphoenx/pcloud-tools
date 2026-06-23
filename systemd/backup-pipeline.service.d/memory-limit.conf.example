@@ -3,6 +3,5 @@
 MemoryMax=5G
 MemorySwapMax=1G
 OOMScoreAdjust=500
-# Lange copyfolder/API-Wartezeiten: keine Unit-Watchdog-Supervision fuer diesen Job
-# (globaler Hardware-Watchdog: siehe systemd/system.conf.d/watchdog-longops.conf.example)
-RuntimeWatchdogSec=0
+# Globaler Hardware-Watchdog (1min->10min): systemd/system.conf.d/watchdog-longops.conf
+# RuntimeWatchdogSec gehoert NICHT in [Service] — systemd ignoriert/ warnt.

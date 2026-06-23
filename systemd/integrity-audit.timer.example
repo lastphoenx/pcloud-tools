@@ -3,11 +3,10 @@ Description=Daily pCloud integrity audit (one snapshot per day)
 Documentation=file:///opt/apps/pcloud-tools/main/systemd/README.md
 
 [Timer]
-# Taeglich 03:30 — bei ~86 Snapshots voller Zyklus in ~3 Monaten;
-# bei Bedarf OnCalendar=*-*-* 03:30,06:30,21:30 fuer 3x/Tag (~1 Monat Zyklus)
-OnCalendar=*-*-* 03:30:00
+# Taeglich 04:30 — nach 04:00-Backup, vor morgendlichem Traffic (wenig Last)
+OnCalendar=*-*-* 04:30:00
 Persistent=true
-RandomizedDelaySec=300
+RandomizedDelaySec=600
 
 [Install]
 WantedBy=timers.target

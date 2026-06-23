@@ -50,6 +50,19 @@ sudo cp systemd/backup-pipeline.service.d/memory-limit.conf.example \
 sudo systemctl daemon-reload
 ```
 
+### Stale RUNNING-Zombies bereinigen
+
+Nach Crash/Abbruch bleiben oft `backup_runs.status=RUNNING` haengen → Dashboard rot.
+
+```bash
+systemctl is-active backup-pipeline.service   # muss inactive sein
+sudo mysql pcloud_backup < sql/fix_stale_running_backup_runs.sql
+sudo mysql pcloud_backup < sql/migrate_integrity_v3_view.sql
+sudo /opt/apps/pcloud-tools/main/scripts/generate_reports.sh
+```
+
+`memory-limit.conf`: **kein** `RuntimeWatchdogSec` in `[Service]` (ungueltig). Nur `MemoryMax`/`MemorySwapMax`.
+
 Global hardware watchdog (1min default on Pi — can cause hard reboot during long `copyfolder`):
 
 ```bash
