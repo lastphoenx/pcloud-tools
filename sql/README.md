@@ -63,6 +63,17 @@ sudo /opt/apps/pcloud-tools/main/scripts/generate_reports.sh
 
 `memory-limit.conf`: **kein** `RuntimeWatchdogSec` in `[Service]` (ungueltig). Nur `MemoryMax`/`MemorySwapMax`.
 
+### Dashboard einmalig bereinigen (stale-Meldungen, Reconcile)
+
+```bash
+systemctl is-active backup-pipeline.service   # inactive
+sudo mysql pcloud_backup < sql/cleanup_dashboard_oneoff.sql
+sudo scripts/generate_reports.sh
+sudo systemctl restart monitoring-dashboard.service
+```
+
+Setzt `FAILED`+`integrity_status=OK` auf `SUCCESS` und entfernt `stale RUNNING bereinigt` aus `error_message`.
+
 Global hardware watchdog (1min default on Pi — can cause hard reboot during long `copyfolder`):
 
 ```bash
