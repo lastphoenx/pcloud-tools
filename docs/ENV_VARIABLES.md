@@ -11,6 +11,7 @@ Vollständige Dokumentation aller ENV-Variablen zur Performance-Optimierung und 
 - [Chunking & Resume](#chunking--resume)
 - [Connection & Timeouts](#connection--timeouts)
 - [Caching & Pfade](#caching--pfade)
+- [RAM & Integritaet](#-ram--integritaet)
 - [Debugging & Features](#debugging--features)
 - [Empfohlene Konfigurationen](#empfohlene-konfigurationen)
 
@@ -296,6 +297,31 @@ PCLOUD_FOLDERID_CACHE=/tmp/pcloud_folderid_cache.json
 
 ```bash
 PCLOUD_FIDCACHE_TTL=3600
+```
+
+---
+
+## 🧠 RAM & Integritaet
+
+### `PCLOUD_POST_UPLOAD_INTEGRITY`
+**Beschreibung:** Post-Upload-Integritaetscheck via `pool_integrity_run.py` (ein Snapshot, DB-Tracking).  
+**Default:** `1` (aktiv)  
+**Werte:** `1` / `skip` / `0` / `off`  
+**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`
+
+Ersetzt den früheren `pcloud_quick_delta`-Lauf nach Upload (OOM-Risiko auf 8GB-Pi).
+
+```bash
+PCLOUD_POST_UPLOAD_INTEGRITY=1
+# Notfall:
+# PCLOUD_POST_UPLOAD_INTEGRITY=skip
+```
+
+### `PCLOUD_POST_UPLOAD_DELTA` (deprecated)
+Nicht mehr vom Wrapper verwendet. Tamper-Detect nur noch manuell:
+
+```bash
+python pcloud_quick_delta.py --dest-root /Backup/rtb_pool --snapshots SNAP
 ```
 
 ---

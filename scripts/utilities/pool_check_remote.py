@@ -91,8 +91,17 @@ def main():
     # 3. Snapshot-spezifisch
     if args.snapshot:
         snap_dir = f"{snaps_root}/{args.snapshot}"
-        if pc.stat_file_safe(cfg, path=f"{snap_dir}/.upload_complete"):
-            ok(f"{args.snapshot}: .upload_complete vorhanden")
+        marker_path = f"{snap_dir}/.upload_complete"
+        if pc.stat_file_safe(cfg, path=marker_path):
+            try:
+                marker = json.loads(pc.get_textfile(cfg, path=marker_path))
+                if str(marker.get("snapshot", "")) == str(args.snapshot):
+                    ok(f"{args.snapshot}: .upload_complete vorhanden (snapshot-Feld ok)")
+                else:
+                    bad(f"{args.snapshot}: .upload_complete snapshot-Feld passt nicht "
+                        f"(erwartet {args.snapshot}, ist {marker.get('snapshot')!r})")
+            except Exception as e:
+                bad(f"{args.snapshot}: .upload_complete nicht lesbar: {e}")
         else:
             bad(f"{args.snapshot}: .upload_complete FEHLT (unvollstaendig)")
         try:
