@@ -52,6 +52,7 @@ sudo systemctl daemon-reload
 Global hardware watchdog (1min default on Pi — can cause hard reboot during long `copyfolder`):
 
 ```bash
+sudo mkdir -p /etc/systemd/system.conf.d
 sudo cp systemd/system.conf.d/watchdog-longops.conf.example \
   /etc/systemd/system.conf.d/watchdog-longops.conf
 sudo systemctl daemon-reexec
