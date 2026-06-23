@@ -74,6 +74,12 @@ sudo systemctl restart monitoring-dashboard.service
 
 Setzt `FAILED`+`integrity_status=OK` auf `SUCCESS` und entfernt `stale RUNNING bereinigt` aus `error_message`.
 
+Danach View-Update (Dashboard „Letzte Fehler“ ohne leere Zombie-Eintraege):
+
+```bash
+sudo mysql pcloud_backup < sql/migrate_failed_backups_view_v4.sql
+```
+
 Global hardware watchdog (1min default on Pi — can cause hard reboot during long `copyfolder`):
 
 ```bash

@@ -132,6 +132,8 @@ SELECT
 FROM backup_runs
 WHERE status = 'FAILED'
   AND started_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+  AND error_message IS NOT NULL
+  AND TRIM(error_message) != ''
 ORDER BY started_at DESC;
 
 -- Performance statistics (last 30 days)
