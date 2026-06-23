@@ -15,8 +15,7 @@ ExecStart=/opt/apps/pcloud-tools/main/scripts/integrity-audit-next.sh
 MemoryMax=4G
 MemorySwapMax=512M
 OOMScoreAdjust=500
-# copyfolder/integrity kann lange dauern — Hardware-Watchdog nicht triggern
-RuntimeWatchdogSec=0
+# Hardware-Watchdog: global via /etc/systemd/system.conf.d/watchdog-longops.conf
 
 [Install]
 WantedBy=multi-user.target
