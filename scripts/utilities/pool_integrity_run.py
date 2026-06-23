@@ -3,16 +3,11 @@
 """
 pool_integrity_run.py — Integritaetscheck pro Snapshot mit DB-Tracking.
 
-Wrappt pool_verify_backup.run_verify(), schreibt Ergebnis nach MariaDB
-(snapshot_integrity_checks) und JSON unter PCLOUD_ARCHIVE_DIR/integrity/.
+Speichert:
+  post_upload / manual  -> backup_runs.integrity_* (am Upload-Lauf, kein Log-Muell)
+  monthly_audit         -> snapshot_integrity_checks (1 Zeile pro Snapshot, UPSERT)
 
-Aufruf:
-  python pool_integrity_run.py \\
-    --env-file .env --pool-root /Backup/rtb_pool \\
-    --snapshot 2026-06-23-130737 --check-type post_upload
-
-  # Monatlicher Audit (ein Snapshot):
-  python pool_integrity_run.py ... --check-type monthly_audit --snapshot SNAP
+JSON-Reports bleiben unter PCLOUD_ARCHIVE_DIR/integrity/ (Dateisystem, nicht DB-Historie).
 """
 from __future__ import annotations
 
@@ -29,7 +24,6 @@ from typing import Any, Dict, Optional
 sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 
-# pool_verify_backup im gleichen Verzeichnis
 _UTIL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _UTIL_DIR not in sys.path:
     sys.path.insert(0, _UTIL_DIR)
@@ -76,72 +70,100 @@ def _mysql(env: Dict[str, str], sql: str) -> tuple[int, str, str]:
 def _db_enabled(env: Dict[str, str]) -> bool:
     if env.get("PCLOUD_ENABLE_DB", "0") != "1":
         return False
-    rc, _, _ = _mysql(env, "SELECT 1 FROM snapshot_integrity_checks LIMIT 0;")
+    rc, _, _ = _mysql(env, "SELECT integrity_status FROM backup_runs LIMIT 0;")
     return rc == 0
 
 
-def _db_insert_running(
+def _save_to_backup_run(
     env: Dict[str, str],
-    check_id: str,
     snapshot: str,
-    check_type: str,
     backup_run_id: Optional[str],
-) -> bool:
-    br = f"'{_sql_escape(backup_run_id)}'" if backup_run_id else "NULL"
-    sql = (
-        f"INSERT INTO snapshot_integrity_checks "
-        f"(check_id, snapshot_name, check_type, status, started_at, backup_run_id) "
-        f"VALUES ('{_sql_escape(check_id)}', '{_sql_escape(snapshot)}', "
-        f"'{_sql_escape(check_type)}', 'RUNNING', NOW(), {br});"
-    )
+    status: str,
+    issues: int,
+    report_path: str,
+) -> None:
+    st = "OK" if status == "OK" else "FAILED"
+    rp = f"'{_sql_escape(report_path)}'" if report_path else "NULL"
+    if backup_run_id:
+        where = f"run_id = '{_sql_escape(backup_run_id)}'"
+    else:
+        where = f"""run_id = (
+            SELECT run_id FROM (
+                SELECT run_id FROM backup_runs
+                WHERE snapshot_name = '{_sql_escape(snapshot)}' AND status = 'SUCCESS'
+                ORDER BY started_at DESC LIMIT 1
+            ) _r
+        )"""
+    sql = f"""
+        UPDATE backup_runs SET
+            integrity_status = '{st}',
+            integrity_issues_count = {int(issues)},
+            integrity_checked_at = NOW(),
+            integrity_report_path = {rp}
+        WHERE {where};
+    """
     rc, _, err = _mysql(env, sql)
     if rc != 0:
-        print(f"[warn] DB insert failed: {err.strip()}", file=sys.stderr)
-    return rc == 0
+        print(f"[warn] backup_runs integrity update failed: {err.strip()}", file=sys.stderr)
+    else:
+        print(f"[db] backup_runs.integrity_status={st} ({snapshot})")
 
 
-def _db_finish(
+def _upsert_monthly_audit(
     env: Dict[str, str],
-    check_id: str,
+    snapshot: str,
     status: str,
     issues: int,
     report_path: str,
     error_summary: Optional[str],
     duration_sec: float,
 ) -> None:
-    summary_sql = (
-        f"'{_sql_escape(error_summary[:2000])}'" if error_summary else "NULL"
-    )
-    report_sql = f"'{_sql_escape(report_path)}'" if report_path else "NULL"
-    sql = (
-        f"UPDATE snapshot_integrity_checks SET "
-        f"status='{status}', finished_at=NOW(), "
-        f"duration_sec={int(round(duration_sec))}, "
-        f"issues_count={int(issues)}, "
-        f"report_path={report_sql}, "
-        f"error_summary={summary_sql} "
-        f"WHERE check_id='{_sql_escape(check_id)}';"
-    )
+    check_id = str(uuid.uuid4())
+    st = "OK" if status == "OK" else "FAILED"
+    summary_sql = f"'{_sql_escape((error_summary or '')[:2000])}'" if error_summary else "NULL"
+    rp = f"'{_sql_escape(report_path)}'" if report_path else "NULL"
+    sql = f"""
+        INSERT INTO snapshot_integrity_checks (
+            check_id, snapshot_name, check_type, status,
+            started_at, finished_at, duration_sec,
+            issues_count, report_path, error_summary
+        ) VALUES (
+            '{_sql_escape(check_id)}', '{_sql_escape(snapshot)}', 'monthly_audit', '{st}',
+            NOW(), NOW(), {int(round(duration_sec))},
+            {int(issues)}, {rp}, {summary_sql}
+        )
+        ON DUPLICATE KEY UPDATE
+            check_id = VALUES(check_id),
+            status = VALUES(status),
+            started_at = NOW(),
+            finished_at = NOW(),
+            duration_sec = VALUES(duration_sec),
+            issues_count = VALUES(issues_count),
+            report_path = VALUES(report_path),
+            error_summary = VALUES(error_summary);
+    """
     rc, _, err = _mysql(env, sql)
     if rc != 0:
-        print(f"[warn] DB update failed: {err.strip()}", file=sys.stderr)
+        print(f"[warn] monthly_audit upsert failed: {err.strip()}", file=sys.stderr)
+    else:
+        print(f"[db] monthly_audit={st} ({snapshot})")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Per-snapshot integrity check + DB tracking")
     ap.add_argument("--env-file", required=True)
-    ap.add_argument("--pool-root", help="Remote pool root (z.B. /Backup/rtb_pool)")
+    ap.add_argument("--pool-root", help="Remote pool root")
     ap.add_argument("--dest-root", help="Deprecated alias for --pool-root")
-    ap.add_argument("--snapshot", required=True, help="Snapshot name to verify")
+    ap.add_argument("--snapshot", required=True)
     ap.add_argument(
         "--check-type",
         choices=("post_upload", "monthly_audit", "manual"),
         default="manual",
     )
-    ap.add_argument("--backup-run-id", help="Link to backup_runs.run_id (post_upload)")
+    ap.add_argument("--backup-run-id", help="backup_runs.run_id (post_upload)")
     ap.add_argument("--stub-sample", type=int, default=0)
-    ap.add_argument("--json-out", help="JSON report path (default: archive/integrity/)")
-    ap.add_argument("--no-db", action="store_true", help="Skip MariaDB writes")
+    ap.add_argument("--json-out", help="JSON report path")
+    ap.add_argument("--no-db", action="store_true")
     args = ap.parse_args()
 
     pool_root = args.pool_root or args.dest_root
@@ -161,21 +183,15 @@ def main() -> int:
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_path = args.json_out or os.path.join(
-        integrity_dir,
-        f"{args.snapshot}_{args.check_type}_{ts}.json",
+        integrity_dir, f"{args.snapshot}_{args.check_type}_{ts}.json"
     )
 
-    check_id = str(uuid.uuid4())
     use_db = not args.no_db and _db_enabled(env)
 
-    print(f"=== pool_integrity_run ===")
+    print("=== pool_integrity_run ===")
     print(f"Snapshot:   {args.snapshot}")
     print(f"Check type: {args.check_type}")
-    print(f"Check ID:   {check_id}")
     print()
-
-    if use_db:
-        _db_insert_running(env, check_id, args.snapshot, args.check_type, args.backup_run_id)
 
     cfg = pc.effective_config(env_file=args.env_file)
     t0 = time.time()
@@ -198,7 +214,6 @@ def main() -> int:
         }
         print(f"[FAIL] verify exception: {e}", file=sys.stderr)
 
-    result["check_id"] = check_id
     result["check_type"] = args.check_type
     result["snapshot"] = args.snapshot
     result["timestamp_iso"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -211,17 +226,20 @@ def main() -> int:
     issues = int(result.get("issues") or 0)
     summary = result.get("error_summary") or result.get("error")
     duration = float(result.get("duration_sec") or (time.time() - t0))
+    db_status = "OK" if ok else "FAILED"
 
     if use_db:
-        _db_finish(
-            env,
-            check_id,
-            "OK" if ok else "FAILED",
-            issues,
-            report_path,
-            str(summary) if summary else None,
-            duration,
-        )
+        if args.check_type == "monthly_audit":
+            _upsert_monthly_audit(
+                env, args.snapshot, db_status, issues, report_path,
+                str(summary) if summary else None, duration,
+            )
+        else:
+            # post_upload und manual -> gleicher Speicherort: backup_runs
+            _save_to_backup_run(
+                env, args.snapshot, args.backup_run_id,
+                db_status, issues, report_path,
+            )
 
     print("=" * 60)
     print("RESULT:", "OK" if ok else f"FAILED ({issues} issues)")
