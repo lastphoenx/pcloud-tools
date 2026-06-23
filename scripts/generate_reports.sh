@@ -363,6 +363,85 @@ get_phase_stats() {
 }
 
 # =====================================================
+# Query: Pool backup integrity (snapshot_integrity_checks)
+# =====================================================
+get_pool_integrity_summary() {
+  local result
+  result=$(db_query "
+    SELECT
+      SUM(CASE WHEN audit_freshness = 'OK' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN audit_freshness = 'FAILED' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN audit_freshness = 'STALE' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN audit_freshness = 'UNKNOWN' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN post_upload_status = 'FAILED' THEN 1 ELSE 0 END),
+      COUNT(*)
+    FROM v_snapshot_integrity_status;
+  " 2>/dev/null || echo "")
+
+  if [[ -z "$result" ]]; then
+    echo "{\"audit_ok\":0,\"audit_failed\":0,\"audit_stale\":0,\"audit_unknown\":0,\"post_upload_failed\":0,\"total\":0}"
+    return
+  fi
+
+  IFS=$'\t' read -r audit_ok audit_failed audit_stale audit_unknown post_failed total <<< "$result"
+  echo "{\"audit_ok\":${audit_ok:-0},\"audit_failed\":${audit_failed:-0},\"audit_stale\":${audit_stale:-0},\"audit_unknown\":${audit_unknown:-0},\"post_upload_failed\":${post_failed:-0},\"total\":${total:-0}}"
+}
+
+get_pool_integrity_snapshots() {
+  local result
+  # Neueste zuerst; FAILED/STALE priorisieren in Sortierung
+  result=$(db_query "
+    SELECT
+      snapshot_name,
+      COALESCE(post_upload_status, ''),
+      COALESCE(DATE_FORMAT(post_upload_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
+      COALESCE(post_upload_issues, 0),
+      COALESCE(post_upload_summary, ''),
+      COALESCE(monthly_audit_status, ''),
+      COALESCE(DATE_FORMAT(monthly_audit_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
+      COALESCE(monthly_audit_issues, 0),
+      COALESCE(monthly_audit_summary, ''),
+      COALESCE(audit_freshness, 'UNKNOWN')
+    FROM v_snapshot_integrity_status
+    ORDER BY
+      FIELD(audit_freshness, 'FAILED', 'STALE', 'UNKNOWN', 'OK'),
+      snapshot_name DESC
+    LIMIT 40;
+  " 2>/dev/null || echo "")
+
+  if [[ -z "$result" ]]; then
+    echo "[]"
+    return
+  fi
+
+  local json="["
+  local first=1
+
+  while IFS=$'\t' read -r snap pu_st pu_at pu_issues pu_sum ma_st ma_at ma_issues ma_sum freshness; do
+    [[ "$first" -eq 0 ]] && json="${json},"
+    first=0
+    local pu_sum_e ma_sum_e
+    pu_sum_e=$(escape_json "$pu_sum")
+    ma_sum_e=$(escape_json "$ma_sum")
+    json="${json}{"
+    json="${json}\"snapshot\":\"${snap}\","
+    json="${json}\"post_upload_status\":\"${pu_st}\","
+    json="${json}\"post_upload_at\":\"${pu_at}\","
+    json="${json}\"post_upload_issues\":${pu_issues},"
+    json="${json}\"post_upload_summary\":\"${pu_sum_e}\","
+    json="${json}\"monthly_audit_status\":\"${ma_st}\","
+    json="${json}\"monthly_audit_at\":\"${ma_at}\","
+    json="${json}\"monthly_audit_issues\":${ma_issues},"
+    json="${json}\"monthly_audit_summary\":\"${ma_sum_e}\","
+    json="${json}\"audit_freshness\":\"${freshness}\""
+    json="${json}}"
+  done <<< "$result"
+
+  json="${json}]"
+  echo "$json"
+}
+
+# =====================================================
 # Query: EntropyWatcher - Last Scans (per source)
 # =====================================================
 get_ew_last_scans() {
@@ -741,8 +820,12 @@ if ! check_db &>/dev/null; then
   "recent_backups": [],
   "performance_stats": {},
   "failed_backups": [],
-  "phase_stats": [],
-  "entropywatcher": {
+    "phase_stats": [],
+    "pool_integrity": {
+      "summary": {},
+      "snapshots": []
+    },
+    "entropywatcher": {
     "last_scans": [],
     "integrity_summary": {},
     "flagged_files": {},
@@ -809,6 +892,14 @@ log "Querying EntropyWatcher missing files (recent)..."
 EW_MISSING_RECENT=$(get_ew_missing_files_recent)
 [[ -z "$EW_MISSING_RECENT" || "$EW_MISSING_RECENT" == "" ]] && EW_MISSING_RECENT="[]"
 
+log "Querying pool integrity snapshots..."
+POOL_INTEGRITY_SNAPSHOTS=$(get_pool_integrity_snapshots)
+[[ -z "$POOL_INTEGRITY_SNAPSHOTS" ]] && POOL_INTEGRITY_SNAPSHOTS="[]"
+
+log "Querying pool integrity summary..."
+POOL_INTEGRITY_SUMMARY=$(get_pool_integrity_summary)
+[[ -z "$POOL_INTEGRITY_SUMMARY" ]] && POOL_INTEGRITY_SUMMARY="{}"
+
 log "Writing output to: $REPORTS_OUTPUT"
 
 # Debug: Show variable lengths in verbose mode
@@ -827,6 +918,10 @@ cat > "$REPORTS_OUTPUT" <<EOF
   "performance_stats": ${PERF_STATS},
   "failed_backups": ${FAILED_BACKUPS},
   "phase_stats": ${PHASE_STATS},
+  "pool_integrity": {
+    "summary": ${POOL_INTEGRITY_SUMMARY},
+    "snapshots": ${POOL_INTEGRITY_SNAPSHOTS}
+  },
   "entropywatcher": {
     "last_scans": ${EW_LAST_SCANS},
     "integrity_summary": ${EW_INTEGRITY_SUMMARY},

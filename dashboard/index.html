@@ -616,6 +616,13 @@
         : null;
 
       const recent = ((reports || {}).recent_backups || []).slice(0, 7);
+      const poolInt  = ((reports || {}).pool_integrity) || {};
+      const intSum   = poolInt.summary || {};
+      const intSnaps = poolInt.snapshots || [];
+      const intFailed = (intSum.post_upload_failed || 0) + (intSum.audit_failed || 0);
+      const intStale  = intSum.audit_stale || 0;
+      if (intFailed > 0 && tileCls === 'ok') tileCls = 'bad';
+      else if ((intStale > 0 || intSum.audit_unknown > 0) && tileCls === 'ok') tileCls = 'warning';
 
       let html = '<div class="tile">'
         + '<div class="tile-header">'
@@ -654,8 +661,23 @@
                 '<div class="info-row"><span class="lbl">RTB-Quelle</span><span class="val yellow" title="rtb_wrapper.log leer — Status aus MariaDB">DB-Fallback</span></div>'
               ) : '')
         +     renderSgExplainBox(sgExplain, sgLive)
-        +   '</div>'
-        + '</div>';
+        +   '</div>';
+
+      if (intSum.total > 0 || intSnaps.length > 0) {
+        html += '<div class="summary-row summary-row-secondary" style="margin-top:8px">'
+          + '<div class="summary-box ' + (intFailed > 0 ? 'red' : 'green') + '"><div class="big">' + intFailed + '</div><div class="lbl">Integr. FAIL</div></div>'
+          + '<div class="summary-box ' + (intStale > 0 ? 'yellow' : 'gray') + '"><div class="big">' + intStale + '</div><div class="lbl">Audit STALE</div></div>'
+          + '<div class="summary-box gray"><div class="big">' + (intSum.audit_ok || 0) + '</div><div class="lbl">Audit OK</div></div>'
+          + '<div class="summary-box gray"><div class="big">' + (intSum.total || intSnaps.length) + '</div><div class="lbl">Snapshots</div></div>'
+          + '</div>';
+        html += '<div class="integrity-hint"><strong>Post-Upload</strong> = nach Backup &middot; '
+          + '<strong>Audit</strong> = periodischer Re-Check (STALE &gt;35d)</div>';
+      } else {
+        html += '<div class="integrity-hint" style="margin-top:6px">'
+          + 'Pool-Integrit&auml;t: noch keine DB-Eintr&auml;ge — <code>generate_reports.sh</code> nach Migration.</div>';
+      }
+
+      html += '</div>';
 
       if (recent.length > 0) {
         html += '<button class="detail-toggle" id="btn-backup" onclick="toggleDetail(\'backup\')">'
@@ -673,6 +695,35 @@
             + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
             + '</tr>'
             ).join('')
+          + '</tbody></table></div></div>';
+      }
+
+      if (intSnaps.length > 0) {
+        html += '<button class="detail-toggle" id="btn-integrity" onclick="toggleDetail(\'integrity\')">'
+          + '<span>Pool-Integrit&auml;t (' + intSnaps.length + ' Snapshots)</span><span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-integrity"><div class="tile-detail-inner">'
+          + '<table class="report-table"><thead><tr>'
+          + '<th>Snapshot</th><th>Post-Upload</th><th>Audit</th><th>Frische</th><th>Issues</th>'
+          + '</tr></thead><tbody>'
+          + intSnaps.map(r => {
+              const pu = r.post_upload_status || '\u2014';
+              const ma = r.monthly_audit_status || '\u2014';
+              const fr = r.audit_freshness || 'UNKNOWN';
+              const issues = Math.max(r.post_upload_issues || 0, r.monthly_audit_issues || 0);
+              const frCls = fr === 'OK' ? 'success' : fr === 'FAILED' ? 'failed' : fr === 'STALE' ? 'running' : '';
+              const tip = [r.post_upload_summary, r.monthly_audit_summary].filter(Boolean).join(' | ');
+              return '<tr title="' + esc(tip) + '">'
+                + '<td>' + esc(r.snapshot || '\u2014') + '</td>'
+                + '<td><span class="badge ' + pu.toLowerCase() + '">' + esc(pu) + '</span>'
+                + (r.post_upload_at ? '<div style="font-size:10px;color:var(--muted)">' + fmtTs(r.post_upload_at) + '</div>' : '')
+                + '</td>'
+                + '<td><span class="badge ' + ma.toLowerCase() + '">' + esc(ma) + '</span>'
+                + (r.monthly_audit_at ? '<div style="font-size:10px;color:var(--muted)">' + fmtTs(r.monthly_audit_at) + '</div>' : '')
+                + '</td>'
+                + '<td><span class="badge ' + frCls + '">' + esc(fr) + '</span></td>'
+                + '<td>' + (issues > 0 ? '<span class="val red">' + issues + '</span>' : '0') + '</td>'
+                + '</tr>';
+            }).join('')
           + '</tbody></table></div></div>';
       }
 
