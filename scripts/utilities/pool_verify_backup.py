@@ -609,9 +609,8 @@ def run_verify(
             f"({actual} remote, {expected} im Manifest)"
         )
         _out(
-            "         Typisch nach Turbo-Delta: Basis-Snapshot wird geklont, "
-            "alte Stub-Pfade bleiben erhalten obwohl sie nicht mehr im "
-            "aktuellen Manifest stehen — harmlos, kein Integritätsfehler."
+            "         Nach Turbo-Delta sollten diese in Phase 3 entfernt sein — "
+            "falls noch vorhanden: Delta-Bereinigung prüfen oder manuell bereinigen."
         )
         for ex in res_b.get("extra_stub_examples") or []:
             _out(f"      {ex}")

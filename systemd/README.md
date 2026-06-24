@@ -195,6 +195,12 @@ entropywatcher-nas.service completes → monitoring-status-update.service runs
 backup-pipeline.service completes    → monitoring-status-update.service runs
 ```
 
+**Sofort nach Backup (reports.json):** In `backup-pipeline.service` unter `[Unit]`:
+```ini
+OnSuccess=monitoring-reports.service
+```
+(Siehe `entropy-watcher-und-clamav-scanner/systemd/backup-pipeline.service.example`)
+
 **Benefits:**
 - Dashboard shows fresh data seconds after key operations
 - Reduced overhead (no polling)
