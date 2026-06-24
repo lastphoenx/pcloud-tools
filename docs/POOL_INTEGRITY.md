@@ -58,8 +58,13 @@ python scripts/utilities/pool_integrity_run.py \
 | `integrity-audit.timer` | 3× täglich **05:45, 13:45, 21:45** (+5 min Random) — 105 min nach Backup |
 
 ```bash
-sudo cp systemd/integrity-audit.{service,timer}.example /etc/systemd/system/
-# Pruefen: drei OnCalendar-Zeilen (05:45, 13:45, 21:45) — nicht 05:15!
+cd /opt/apps/pcloud-tools/main
+# Wichtig: Ziel OHNE .example — sonst laedt systemd die Units nicht!
+sudo cp systemd/integrity-audit.service.example /etc/systemd/system/integrity-audit.service
+sudo cp systemd/integrity-audit.timer.example   /etc/systemd/system/integrity-audit.timer
+# Alte Fehlkopien entfernen (falls vorhanden):
+sudo rm -f /etc/systemd/system/integrity-audit.service.example \
+           /etc/systemd/system/integrity-audit.timer.example
 grep OnCalendar /etc/systemd/system/integrity-audit.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now integrity-audit.timer
