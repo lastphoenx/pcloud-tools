@@ -212,6 +212,16 @@ def check_manifest_vs_pool(
     }
 
 
+def _manifest_stub_path(snaps_root: str, snap: str, relpath: str) -> str:
+    """Einheitlicher Stub-Pfad (Manifest-relpath -> pCloud-Pfad)."""
+    rp = (relpath or "").replace("\\", "/").lstrip("/")
+    return pc._norm_remote_path(f"{snaps_root}/{snap}/{rp}.meta.json")
+
+
+def _norm_stub_path_set(paths: Set[str]) -> Set[str]:
+    return {pc._norm_remote_path(p) for p in paths}
+
+
 def check_stubs_vs_index(
     pool_refs: dict,
     stub_paths: Set[str],
@@ -228,33 +238,37 @@ def check_stubs_vs_index(
     gesamter pool_refs×alle Snapshots (O(~106k×Snaps) — war ~25s Flaschenhals).
     """
     filter_set = snapshot_filter if snapshot_filter else None
+    norm_stubs = _norm_stub_path_set(stub_paths)
+    snaps_root = pc._norm_remote_path(snaps_root)
 
     manifest_missing: Dict[str, List[str]] = {}
+    manifest_missing_total = 0
     for snap, files in manifests.items():
         m_missing = []
         for rp in files:
-            stub_path = f"{snaps_root}/{snap}/{rp}.meta.json"
-            if stub_path not in stub_paths:
+            stub_path = _manifest_stub_path(snaps_root, snap, rp)
+            if stub_path not in norm_stubs:
                 m_missing.append(rp)
+        manifest_missing_total += len(m_missing)
         if m_missing:
             manifest_missing[snap] = m_missing[:20]
 
     if filter_set is not None:
         expected = {
-            f"{snaps_root}/{snap}/{rp}.meta.json"
+            _manifest_stub_path(snaps_root, snap, rp)
             for snap, files in manifests.items()
             for rp in files
         }
-        missing_stubs = expected - stub_paths
-        extra_stubs = stub_paths - expected
+        missing_stubs = expected - norm_stubs
+        extra_stubs = norm_stubs - expected
         return {
             "expected_stubs": len(expected),
-            "actual_stubs": len(stub_paths),
+            "actual_stubs": len(norm_stubs),
             "missing_from_index": len(missing_stubs),
             "missing_from_index_examples": sorted(missing_stubs)[:5],
             "extra_not_in_index": len(extra_stubs),
             "manifest_missing_stubs": manifest_missing,
-            "manifest_missing_total": sum(len(v) for v in manifest_missing.values()),
+            "manifest_missing_total": manifest_missing_total,
             "mode": "manifest_scoped",
         }
 
@@ -267,19 +281,19 @@ def check_stubs_vs_index(
             continue
         for snap, relpaths in snaps_map.items():
             for rp in (relpaths or []):
-                expected.add(f"{snaps_root}/{snap}/{rp}.meta.json")
+                expected.add(_manifest_stub_path(snaps_root, snap, rp))
 
-    missing_stubs = expected - stub_paths
-    extra_stubs = stub_paths - expected
+    missing_stubs = expected - norm_stubs
+    extra_stubs = norm_stubs - expected
 
     return {
         "expected_stubs": len(expected),
-        "actual_stubs": len(stub_paths),
+        "actual_stubs": len(norm_stubs),
         "missing_from_index": len(missing_stubs),
         "missing_from_index_examples": sorted(missing_stubs)[:5],
         "extra_not_in_index": len(extra_stubs),
         "manifest_missing_stubs": manifest_missing,
-        "manifest_missing_total": sum(len(v) for v in manifest_missing.values()),
+        "manifest_missing_total": manifest_missing_total,
         "mode": "full_index",
     }
 
@@ -454,7 +468,7 @@ def run_verify(
                 if child.get("isfolder"):
                     _walk(child, p)
                 elif name.endswith(".meta.json"):
-                    paths.add(p)
+                    paths.add(pc._norm_remote_path(p))
 
         _walk(res.get("metadata", {}), snap_path)
         return paths
@@ -533,10 +547,21 @@ def run_verify(
     res_b = check_stubs_vs_index(
         pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
     )
-    if res_b["manifest_missing_total"] > 0:
-        issues += res_b["manifest_missing_total"]
-    elif stub_scope is not None and res_b.get("missing_from_index", 0) > 0:
-        issues += res_b["missing_from_index"]
+    mm = int(res_b.get("manifest_missing_total") or 0)
+    if mm > 0:
+        issues += mm
+        _out(f"  ✗ {mm} Stub(s) fehlen (Manifest vs. remote)")
+        for snap, paths in (res_b.get("manifest_missing_stubs") or {}).items():
+            for rp in paths[:5]:
+                _out(f"      {snap}: {rp}")
+    elif stub_scope is not None and int(res_b.get("missing_from_index") or 0) > 0:
+        mi = int(res_b["missing_from_index"])
+        issues += mi
+        _out(f"  ✗ {mi} Stub-Pfad(e) fehlen")
+        for ex in res_b.get("missing_from_index_examples") or []:
+            _out(f"      {ex}")
+    elif mm == 0 and int(res_b.get("extra_not_in_index") or 0) > 0:
+        _out(f"  [info] {res_b['extra_not_in_index']} Extra-Stub(s) (nicht im Manifest)")
     mode = res_b.get("mode", "full_index")
     _out(f"  ({time.time()-t_b:.2f}s, {mode})")
     _out("")
