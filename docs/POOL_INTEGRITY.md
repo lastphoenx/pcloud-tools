@@ -7,7 +7,7 @@ Stand: Juni 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 | Spalte | DB-Quelle | Wann befüllt |
 |--------|-----------|--------------|
 | **Post-Upload** | `backup_runs.integrity_*` | Automatisch nach jedem **erfolgreichen** Upload (`check_type=post_upload`) |
-| **Audit** | `snapshot_integrity_checks` (`monthly_audit`) | Täglich **1 Snapshot** via `integrity-audit.timer` |
+| **Audit** | `snapshot_integrity_checks` (`monthly_audit`) | 3×/Tag **05:45, 13:45, 21:45** — je **10 Snapshots** (`INTEGRITY_AUDIT_MAX`) |
 | **Frische** | berechnet aus `monthly_audit_at` | `OK` / `STALE` (>35 Tage) / `FAILED` / `UNKNOWN` |
 
 View: `v_snapshot_integrity_status` → `generate_reports.sh` → `reports.json` → Dashboard.
@@ -54,8 +54,8 @@ python scripts/utilities/pool_integrity_run.py \
 
 | Unit | Rolle |
 |------|--------|
-| `integrity-audit.service` | oneshot: **1 Snapshot** pro Lauf |
-| `integrity-audit.timer` | täglich **05:15** (+ bis 10 min Random) |
+| `integrity-audit.service` | oneshot: **INTEGRITY_AUDIT_MAX** Snapshots/Lauf (default 10), Pool-Index-Cache |
+| `integrity-audit.timer` | 3× täglich **05:45, 13:45, 21:45** (+5 min Random) — 105 min nach Backup |
 
 ```bash
 sudo cp systemd/integrity-audit.{service,timer}.example /etc/systemd/system/
@@ -73,11 +73,19 @@ Priorität für den **nächsten** Snapshot:
 3. Letzter Audit **≥ 35 Tage** alt → STALE, bevorzugt
 4. Sonst ältester Audit-Zeitstempel
 
-**Häufigkeit:** 1 Snapshot **pro Tag** → bei ~87 Snapshots ≈ **87 Tage** bis alle einmal auditiert, danach Rollierend (STALE nach 35 Tagen).
+**Häufigkeit:** 3×10 = **30 Audits/Tag** → ~87 Snapshots in **~3 Tage** rotiert. Pool+Index wird **einmal pro Batch** geladen (`PoolRemoteCache`).
+
+`integrity-backfill.py` nutzt denselben Cache pro `--max`-Batch.
 
 > Dashboard-Hinweis sagt „STALE >35d“ (nicht 30). STALE-Alarm im Summary erst nach 35 Tagen ohne Re-Audit.
 
-### Einmalig alle Audits (Spalte 2 schnell füllen)
+### Snapshot-Größen (ohne `du`)
+
+`du` auf `/mnt/backup/rtb_nas` hängt Stunden (Hardlinks + mergerfs). Stattdessen:
+
+```bash
+python scripts/utilities/snapshot_sizing.py --env-file .env --last 15
+```
 
 ```bash
 python scripts/integrity-backfill.py --env-file .env --dry-run

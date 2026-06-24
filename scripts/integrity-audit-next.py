@@ -3,9 +3,9 @@
 """Pick next snapshot for monthly integrity audit and run pool_integrity_run."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -19,6 +19,9 @@ import pcloud_bin_lib as pc  # noqa: E402
 _UTIL = os.path.join(MAIN_DIR, "scripts", "utilities")
 if _UTIL not in sys.path:
     sys.path.insert(0, _UTIL)
+
+from pool_integrity_run import run_integrity_for_snapshot  # noqa: E402
+from pool_verify_backup import PoolRemoteCache  # noqa: E402
 
 
 def _load_env(path: str) -> Dict[str, str]:
@@ -119,7 +122,29 @@ def _pick_next(remote: List[str], state: Dict[str, Tuple[Optional[str], Optional
     return sorted(remote, key=sort_key)[0]
 
 
+def _pick_many(
+    remote: List[str],
+    state: Dict[str, Tuple[Optional[str], Optional[str]]],
+    n: int,
+) -> List[str]:
+    """N verschiedene Snapshots nach gleicher Prioritaet wie _pick_next."""
+    todo: List[str] = []
+    picked: set[str] = set()
+    for _ in range(max(1, n)):
+        remaining = [s for s in remote if s not in picked]
+        snap = _pick_next(remaining, state)
+        if not snap:
+            break
+        todo.append(snap)
+        picked.add(snap)
+    return todo
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Monthly integrity audit (one or batch)")
+    ap.add_argument("--max", type=int, default=1, help="Snapshots pro Lauf (Batch mit Pool-Cache)")
+    args = ap.parse_args()
+
     env = _load_env(ENV_FILE)
     for k, v in os.environ.items():
         if k.startswith("PCLOUD_"):
@@ -137,30 +162,35 @@ def main() -> int:
         return 0
 
     state = _audit_state(env)
-    snap = _pick_next(remote, state)
-    if not snap:
+    batch_size = max(1, args.max)
+    todo = _pick_many(remote, state, batch_size)
+
+    if not todo:
         print("[integrity-audit] Kein Snapshot gewaehlt")
         return 0
 
-    print(f"[integrity-audit] Pruefe: {snap} ({len(remote)} remote complete)")
+    print(f"[integrity-audit] Batch: {len(todo)} Snapshot(s) ({len(remote)} remote complete)")
 
-    py = (
-        "/opt/apps/pcloud-tools/venv/bin/python"
-        if os.path.isfile("/opt/apps/pcloud-tools/venv/bin/python")
-        else sys.executable
-    )
-    integrity_run = os.path.join(MAIN_DIR, "scripts", "utilities", "pool_integrity_run.py")
-    proc = subprocess.run(
-        [
-            py, integrity_run,
-            "--env-file", ENV_FILE,
-            "--pool-root", dest,
-            "--snapshot", snap,
-            "--check-type", "monthly_audit",
-        ],
-        check=False,
-    )
-    return proc.returncode
+    cache: Optional[PoolRemoteCache] = None
+    if len(todo) > 1:
+        cache = PoolRemoteCache.fetch(cfg, dest, verbose=True)
+
+    errors = 0
+    for i, snap in enumerate(todo, 1):
+        print(f"\n[integrity-audit] [{i}/{len(todo)}] {snap}")
+        ok, _ = run_integrity_for_snapshot(
+            env=env,
+            cfg=cfg,
+            pool_root=dest,
+            snapshot=snap,
+            check_type="monthly_audit",
+            remote_cache=cache,
+            verbose=True,
+        )
+        if not ok:
+            errors += 1
+
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

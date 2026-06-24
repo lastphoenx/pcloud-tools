@@ -5,18 +5,12 @@
 Spalte 1 (Dashboard Post-Upload): check_type=manual -> backup_runs.integrity_*
 Spalte 2 (Dashboard Audit):       check_type=monthly_audit -> snapshot_integrity_checks
 
+Pool+Index wird einmal pro Batch gecacht (siehe PoolRemoteCache).
+
 Beispiele:
-  # Nur anzeigen was fehlt:
   python scripts/integrity-backfill.py --env-file .env --dry-run
-
-  # Post-Upload fuer alle ohne Eintrag (~1-2 min/Snapshot):
-  python scripts/integrity-backfill.py --env-file .env --post-upload
-
-  # Monthly-Audit einmalig fuer alle (~1-2 min/Snapshot, Pi nicht belasten):
+  python scripts/integrity-backfill.py --env-file .env --post-upload --max 10
   python scripts/integrity-backfill.py --env-file .env --audit --max 5
-
-  # Beides, max 3 Snapshots diesmal:
-  python scripts/integrity-backfill.py --env-file .env --post-upload --audit --max 3
 """
 from __future__ import annotations
 
@@ -29,8 +23,13 @@ from typing import Dict, List, Set, Tuple
 
 MAIN_DIR = os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main")
 sys.path.insert(0, MAIN_DIR)
+_UTIL = os.path.join(MAIN_DIR, "scripts", "utilities")
+if _UTIL not in sys.path:
+    sys.path.insert(0, _UTIL)
 
 import pcloud_bin_lib as pc  # noqa: E402
+from pool_integrity_run import run_integrity_for_snapshot  # noqa: E402
+from pool_verify_backup import PoolRemoteCache  # noqa: E402
 
 ENV_FILE = os.environ.get("ENV_FILE", f"{MAIN_DIR}/.env")
 
@@ -123,31 +122,39 @@ def _post_upload_done(env: Dict[str, str]) -> Set[str]:
     return set(rows)
 
 
-def _run_integrity(env: Dict[str, str], snap: str, check_type: str) -> int:
-    dest = env.get("PCLOUD_DEST", "/Backup/rtb_pool")
-    py = (
-        "/opt/apps/pcloud-tools/venv/bin/python"
-        if os.path.isfile("/opt/apps/pcloud-tools/venv/bin/python")
-        else sys.executable
-    )
-    script = os.path.join(MAIN_DIR, "scripts", "utilities", "pool_integrity_run.py")
-    return subprocess.run(
-        [
-            py, script,
-            "--env-file", env.get("_env_file", ENV_FILE),
-            "--pool-root", dest,
-            "--snapshot", snap,
-            "--check-type", check_type,
-        ],
-        check=False,
-    ).returncode
+def _run_batch(
+    env: Dict[str, str],
+    cfg: dict,
+    dest: str,
+    snaps: List[str],
+    check_type: str,
+) -> int:
+    if not snaps:
+        return 0
+    print(f"\n[batch] Pool+Index Cache laden ({len(snaps)} Snapshot(s))...")
+    cache = PoolRemoteCache.fetch(cfg, dest, verbose=True)
+    errors = 0
+    for i, snap in enumerate(snaps, 1):
+        print(f"\n[{i}/{len(snaps)}] {snap}")
+        ok, _ = run_integrity_for_snapshot(
+            env=env,
+            cfg=cfg,
+            pool_root=dest,
+            snapshot=snap,
+            check_type=check_type,
+            remote_cache=cache,
+            verbose=True,
+        )
+        if not ok:
+            errors += 1
+    return errors
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Backfill pool integrity DB columns")
     ap.add_argument("--env-file", default=ENV_FILE)
     ap.add_argument("--post-upload", action="store_true", help="Spalte 1: manual -> backup_runs")
-    ap.add_argument("--audit", action="store_true", help="Spalte 2: monthly_audit -> snapshot_integrity_checks")
+    ap.add_argument("--audit", action="store_true", help="Spalte 2: monthly_audit")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max", type=int, default=0, help="Max Snapshots pro Modus (0=alle)")
     ap.add_argument("--oldest-first", action="store_true", help="Aelteste zuerst (default: neueste)")
@@ -193,25 +200,19 @@ def main() -> int:
         est = (len(need_pu) if args.post_upload else 0) + (len(need_audit) if args.audit else 0)
         if not args.post_upload and not args.audit:
             est = len(need_pu) + len(need_audit)
-        print(f"\nGeschaetzt ~{est * 2} min bei sequentiellen Laeufen")
+        print(f"\nGeschaetzt ~{est * 1.5} min mit Cache (~1.5 min/Snapshot statt ~2)")
         return 0
 
     errors = 0
     if args.post_upload:
         todo = need_pu[: args.max] if args.max > 0 else need_pu
         print(f"\n=== Post-Upload Backfill ({len(todo)} Snapshot(s)) ===")
-        for i, snap in enumerate(todo, 1):
-            print(f"[{i}/{len(todo)}] {snap}")
-            if _run_integrity(env, snap, "manual") != 0:
-                errors += 1
+        errors += _run_batch(env, cfg, dest, todo, "manual")
 
     if args.audit:
         todo = need_audit[: args.max] if args.max > 0 else need_audit
         print(f"\n=== Monthly-Audit Backfill ({len(todo)} Snapshot(s)) ===")
-        for i, snap in enumerate(todo, 1):
-            print(f"[{i}/{len(todo)}] {snap}")
-            if _run_integrity(env, snap, "monthly_audit") != 0:
-                errors += 1
+        errors += _run_batch(env, cfg, dest, todo, "monthly_audit")
 
     print(f"\nFertig. Fehler: {errors}")
     print("Dashboard: sudo scripts/generate_reports.sh && sudo systemctl restart monitoring-dashboard.service")

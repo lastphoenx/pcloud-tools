@@ -1,6 +1,6 @@
 [Unit]
-Description=pCloud Pool Integrity Audit (one snapshot per run)
-Documentation=file:///opt/apps/pcloud-tools/main/systemd/README.md
+Description=pCloud Pool Integrity Audit (batch, shared pool cache)
+Documentation=file:///opt/apps/pcloud-tools/main/docs/POOL_INTEGRITY.md
 After=network-online.target mariadb.service
 Wants=network-online.target
 
@@ -10,12 +10,12 @@ User=root
 WorkingDirectory=/opt/apps/pcloud-tools/main
 Environment=MAIN_DIR=/opt/apps/pcloud-tools/main
 Environment=ENV_FILE=/opt/apps/pcloud-tools/main/.env
+Environment=INTEGRITY_AUDIT_MAX=10
 ExecStart=/opt/apps/pcloud-tools/main/scripts/integrity-audit-next.sh
-# RAM-Schutz auf 8GB-Pi: ein Snapshot + Pool-Index
+# RAM-Schutz: ein Snapshot + gecachter Pool-Index (~18k SHAs)
 MemoryMax=4G
 MemorySwapMax=512M
 OOMScoreAdjust=500
-# Hardware-Watchdog: global via /etc/systemd/system.conf.d/watchdog-longops.conf
 
 [Install]
 WantedBy=multi-user.target

@@ -38,10 +38,69 @@ Aufruf:
 from __future__ import annotations
 import os, sys, json, argparse, time
 import concurrent.futures
-from typing import Dict, Set, List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Set, List, Tuple, Optional
 
 sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
+
+
+# ---------------------------------------------------------------------------
+# Remote Pool+Index Cache (einmal pro Batch, Stubs weiter pro Snapshot)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PoolRemoteCache:
+    """Gecachter _pool-SHA-Set + content_index pool_refs fuer mehrere Verify-Laeufe."""
+
+    dest: str
+    pool_shas: Set[str]
+    pool_refs: dict
+    fetched_at: float = field(default_factory=time.time)
+
+    def matches(self, pool_root_raw: str) -> bool:
+        return self.dest == pc._norm_remote_path(pool_root_raw).rstrip("/")
+
+    @classmethod
+    def fetch(
+        cls,
+        cfg: dict,
+        pool_root_raw: str,
+        *,
+        verbose: bool = False,
+    ) -> "PoolRemoteCache":
+        def _out(msg: str) -> None:
+            if verbose:
+                print(msg, flush=True)
+
+        dest = pc._norm_remote_path(pool_root_raw).rstrip("/")
+        pool_root = f"{dest}/_pool"
+        idx_path = f"{dest}/_snapshots/_index/content_index.json"
+        t0 = time.time()
+
+        def _fetch_pool() -> Set[str]:
+            res = pc.call_with_backoff(
+                pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False,
+            )
+            return _walk_pool(res.get("metadata", {}))
+
+        def _fetch_index() -> dict:
+            txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
+            idx = json.loads(txt or "{}")
+            return idx.get("pool_refs") or {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f_pool = ex.submit(_fetch_pool)
+            f_index = ex.submit(_fetch_index)
+            pool_shas = f_pool.result()
+            pool_refs = f_index.result()
+
+        dt = time.time() - t0
+        _out(
+            f"[cache] Pool+Index geladen: {len(pool_shas)} SHA256s, "
+            f"{len(pool_refs)} pool_refs ({dt:.1f}s)"
+        )
+        return cls(dest=dest, pool_shas=pool_shas, pool_refs=pool_refs)
 
 
 # ---------------------------------------------------------------------------
@@ -271,10 +330,12 @@ def run_verify(
     snapshot_filter: List[str] | None = None,
     stub_sample: int = 0,
     verbose: bool = True,
+    remote_cache: Optional[PoolRemoteCache] = None,
 ) -> dict:
     """
     Fuehrt Integritaetscheck aus. Gibt strukturiertes Ergebnis-Dict zurueck.
     snapshot_filter: nur diese Snapshots pruefen (RAM-schonend, ein Snap nach Upload).
+    remote_cache: Pool+Index einmal pro Batch laden, Stubs weiter pro Snapshot.
     """
     def _out(msg: str) -> None:
         if verbose:
@@ -337,11 +398,20 @@ def run_verify(
     _out(f"Lokale Manifeste: {len(manifests)}/{len(remote_snaps)} ({total_manifest_files} Dateien total)")
     _out("")
 
-    _out("[fetch] Lade remote Daten (parallel)...")
+    _out("[fetch] Lade remote Daten...")
     t_fetch = time.time()
     pool_shas: Set[str] = set()
     stub_paths: Set[str] = set()
     pool_refs: dict = {}
+
+    use_cache = remote_cache is not None and remote_cache.matches(dest)
+    if use_cache:
+        pool_shas = remote_cache.pool_shas  # type: ignore[union-attr]
+        pool_refs = remote_cache.pool_refs  # type: ignore[union-attr]
+        _out(
+            f"[fetch] Pool+Index aus Cache ({len(pool_shas)} SHA256s, "
+            f"{len(pool_refs)} pool_refs)"
+        )
 
     def _fetch_pool():
         res = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False)
@@ -369,22 +439,36 @@ def run_verify(
         idx = json.loads(txt or "{}")
         return idx.get("pool_refs") or {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        f_pool = ex.submit(_fetch_pool)
-        f_index = ex.submit(_fetch_index)
-        pool_refs = f_index.result()
-        pool_shas = f_pool.result()
-        snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
-        done = 0
-        for snap, fut in snap_futures.items():
-            try:
-                snap_stubs = fut.result()
-                stub_paths |= snap_stubs
-                done += 1
-                _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
-            except Exception as e:
-                done += 1
-                _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
+    if use_cache:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(remote_snaps) or 1) as ex:
+            snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
+            done = 0
+            for snap, fut in snap_futures.items():
+                try:
+                    snap_stubs = fut.result()
+                    stub_paths |= snap_stubs
+                    done += 1
+                    _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
+                except Exception as e:
+                    done += 1
+                    _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            f_pool = ex.submit(_fetch_pool)
+            f_index = ex.submit(_fetch_index)
+            pool_refs = f_index.result()
+            pool_shas = f_pool.result()
+            snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
+            done = 0
+            for snap, fut in snap_futures.items():
+                try:
+                    snap_stubs = fut.result()
+                    stub_paths |= snap_stubs
+                    done += 1
+                    _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
+                except Exception as e:
+                    done += 1
+                    _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
 
     dt_fetch = time.time() - t_fetch
     _out(f"[fetch] Pool: {len(pool_shas)} SHA256s | "
