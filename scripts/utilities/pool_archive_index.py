@@ -30,6 +30,12 @@ import os, sys, json, argparse
 sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 
+# Gefiltertes Archiv wie beim Upload (pool_archive_index.py Logik)
+from pcloud_push_json_pool_manifest_to_pcloud import (  # noqa: E402
+    archive_snapshot_index_remote,
+    filter_index_for_snapshot,
+)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Gefilterte per-Snapshot v2-Archive nachziehen.")
@@ -56,33 +62,11 @@ def main():
 
     problems = 0
     for snap in args.snapshot:
-        # Gefiltert: nur SHAs die diesen Snapshot referenzieren, nur dessen relpaths
-        filtered = {}
-        for sha, entry in all_refs.items():
-            if not isinstance(entry, dict):
-                continue
-            snaps_map = entry.get("snapshots")
-            if not isinstance(snaps_map, dict) or snap not in snaps_map:
-                continue
-            filtered[sha] = {
-                "fileid": entry.get("fileid"),
-                "hash":   entry.get("hash"),
-                "size":   entry.get("size"),
-                "snapshots": {snap: snaps_map[snap]}
-            }
-
-        snap_idx = {"version": 2, "pool_refs": filtered}
-        archive_path = f"{snaps_root}/_index/archive/{snap}_index.json"
+        filtered = filter_index_for_snapshot(master, snap)
+        n = len(filtered.get("pool_refs") or {})
         try:
-            # Zielordner sicherstellen, dann schreiben
-            archive_dir = os.path.dirname(archive_path)
-            fid = pc.stat_folderid_fast(cfg, archive_dir)
-            if not fid:
-                fid = pc.ensure_path(cfg, archive_dir)
-            fname = os.path.basename(archive_path)
-            pc.write_json_to_folderid(cfg, folderid=int(fid), filename=fname,
-                                      obj=snap_idx, minify=False)
-            print(f"[ok]   {snap}: {len(filtered)} SHAs -> {archive_path}")
+            archive_snapshot_index_remote(cfg, snaps_root, master, snap, dry=False)
+            print(f"[ok]   {snap}: {n} SHAs archiviert")
         except Exception as e:
             problems += 1
             print(f"[FAIL] {snap}: {e}")
