@@ -75,9 +75,9 @@ Priorität für den **nächsten** Snapshot:
 3. Letzter Audit **≥ 35 Tage** alt → STALE, bevorzugt
 4. Sonst ältester Audit-Zeitstempel
 
-**Häufigkeit:** 3×10 = **30 Audits/Tag** → ~87 Snapshots in **~3 Tage** rotiert. Pool+Index wird **einmal pro Batch** geladen (`PoolRemoteCache`).
+**Häufigkeit:** 3×10 = **30 Audits/Tag** → ~87 Snapshots in **~3 Tage** rotiert.
 
-`integrity-backfill.py` nutzt denselben Cache pro `--max`-Batch.
+**Performance (gefiltert):** ~8s Stub-API + ~0.2s Checks. Cache = einmaliges `_pool`-listfolder pro Batch; Hauptgewinn = `manifest_scoped` (Check B war ~22s).
 
 > Dashboard-Hinweis sagt „STALE >35d“ (nicht 30). STALE-Alarm im Summary erst nach 35 Tagen ohne Re-Audit.
 
