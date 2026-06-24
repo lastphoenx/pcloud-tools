@@ -36,7 +36,8 @@ Monthly/daily audit (one snapshot per run):
 
 ```bash
 sudo cp systemd/integrity-audit.service.example /etc/systemd/system/integrity-audit.service
-sudo cp systemd/integrity-audit.timer.example /etc/systemd/system/integrity-audit.timer
+sudo cp systemd/integrity-audit.timer.example   /etc/systemd/system/integrity-audit.timer
+sudo rm -f /etc/systemd/system/integrity-audit.{service,timer}.example
 sudo systemctl daemon-reload
 sudo systemctl enable --now integrity-audit.timer
 ```
