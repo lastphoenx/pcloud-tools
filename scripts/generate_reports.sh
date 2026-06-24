@@ -405,6 +405,7 @@ get_pool_integrity_snapshots() {
       ) AS j
       FROM v_snapshot_integrity_status
       ORDER BY
+        FIELD(COALESCE(post_upload_status, ''), 'FAILED', 'OK', ''),
         FIELD(audit_freshness, 'FAILED', 'STALE', 'UNKNOWN', 'OK'),
         snapshot_name DESC
       LIMIT 40
