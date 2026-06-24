@@ -515,8 +515,15 @@ def run_verify(
         if r["missing_count"] > 0:
             issues += r["missing_count"]
 
-    if res_a["index_not_in_pool_count"] > 0:
+    # Globaler Index/Pool-Drift nur bei Voll-Pool-Check — nicht pro Snapshot bewerten
+    if not snapshot_filter and res_a["index_not_in_pool_count"] > 0:
         issues += res_a["index_not_in_pool_count"]
+        _out(f"  [warn] Index ohne Pool-Datei (global): {res_a['index_not_in_pool_count']}")
+    elif snapshot_filter and res_a["index_not_in_pool_count"] > 0:
+        _out(
+            f"  [info] Index ohne Pool-Datei (global, ignoriert): "
+            f"{res_a['index_not_in_pool_count']}"
+        )
     _out(f"  ({time.time()-t_a:.2f}s)")
     _out("")
 
@@ -544,7 +551,7 @@ def run_verify(
 
     dt_total = time.time() - t0
     summary_parts = []
-    if res_a["index_not_in_pool_count"] > 0:
+    if not snapshot_filter and res_a["index_not_in_pool_count"] > 0:
         summary_parts.append(f"{res_a['index_not_in_pool_count']} pool missing")
     if res_b["manifest_missing_total"] > 0:
         summary_parts.append(f"{res_b['manifest_missing_total']} stubs missing")

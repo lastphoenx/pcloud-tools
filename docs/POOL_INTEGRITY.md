@@ -59,6 +59,8 @@ python scripts/utilities/pool_integrity_run.py \
 
 ```bash
 sudo cp systemd/integrity-audit.{service,timer}.example /etc/systemd/system/
+# Pruefen: drei OnCalendar-Zeilen (05:45, 13:45, 21:45) — nicht 05:15!
+grep OnCalendar /etc/systemd/system/integrity-audit.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now integrity-audit.timer
 systemctl list-timers integrity-audit.timer
