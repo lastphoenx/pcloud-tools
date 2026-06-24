@@ -133,6 +133,16 @@
     }
     .summary-row-secondary .summary-box .big { font-size: 18px; }
     .summary-row-secondary .summary-box .lbl { font-size: 10px; }
+    .summary-box.clickable {
+      cursor: pointer;
+      transition: border-color 0.15s, opacity 0.15s;
+    }
+    .summary-box.clickable:hover {
+      border-color: var(--blue);
+      opacity: 1;
+    }
+    tr.integrity-row-dim { opacity: 0.35; }
+    tr.integrity-row-hit { background: rgba(96, 165, 250, 0.08); }
 
     .integrity-hint {
       font-size: 11px;
@@ -675,11 +685,16 @@
 
       if (intSum.total > 0 || intSnaps.length > 0) {
         html += '<div class="summary-row summary-row-secondary" style="margin-top:8px">'
-          + '<div class="summary-box ' + (intPuFail > 0 ? 'red' : 'green') + '"><div class="big">' + intPuFail + '</div><div class="lbl">Post-Upload FAIL</div></div>'
-          + '<div class="summary-box ' + (intAuFail > 0 ? 'red' : 'green') + '"><div class="big">' + intAuFail + '</div><div class="lbl">Audit FAIL</div></div>'
-          + '<div class="summary-box ' + (intStale > 0 ? 'yellow' : 'gray') + '"><div class="big">' + intStale + '</div><div class="lbl">Audit STALE</div></div>'
-          + '<div class="summary-box gray"><div class="big">' + (intSum.audit_ok || 0) + '</div><div class="lbl">Audit OK</div></div>'
-          + '<div class="summary-box gray"><div class="big">' + intTotal + '</div><div class="lbl">Snapshots (DB)</div></div>'
+          + '<div class="summary-box clickable ' + (intPuFail > 0 ? 'red' : 'green') + '" onclick="openIntegrityDetail(\'pu_fail\')" title="Klicken: betroffene Snapshots in der Tabelle">'
+          + '<div class="big">' + intPuFail + '</div><div class="lbl">Post-Upload FAIL</div></div>'
+          + '<div class="summary-box clickable ' + (intAuFail > 0 ? 'red' : 'green') + '" onclick="openIntegrityDetail(\'au_fail\')" title="Klicken: Audit-FAIL in der Tabelle">'
+          + '<div class="big">' + intAuFail + '</div><div class="lbl">Audit FAIL</div></div>'
+          + '<div class="summary-box clickable ' + (intStale > 0 ? 'yellow' : 'gray') + '" onclick="openIntegrityDetail(\'stale\')" title="Klicken: veraltete Audits (&gt;35d)">'
+          + '<div class="big">' + intStale + '</div><div class="lbl">Audit STALE</div></div>'
+          + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'au_ok\')" title="Klicken: Snapshots mit aktuellem Audit OK">'
+          + '<div class="big">' + (intSum.audit_ok || 0) + '</div><div class="lbl">Audit OK</div></div>'
+          + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'all\')" title="Klicken: alle Snapshots in der Tabelle">'
+          + '<div class="big">' + intTotal + '</div><div class="lbl">Snapshots (DB)</div></div>'
           + '</div>';
         html += '<div class="integrity-hint"><strong>Post-Upload</strong> = nach Backup &middot; '
           + '<strong>Audit</strong> = periodischer Re-Check (STALE &gt;35d)'
@@ -725,7 +740,7 @@
               const issues = Math.max(r.post_upload_issues || 0, r.monthly_audit_issues || 0);
               const frCls = fr === 'OK' ? 'success' : fr === 'FAILED' ? 'failed' : fr === 'STALE' ? 'running' : '';
               const tip = [r.post_upload_summary, r.monthly_audit_summary].filter(Boolean).join(' | ');
-              return '<tr title="' + esc(tip) + '">'
+              return '<tr class="integrity-row" data-pu="' + esc(pu) + '" data-au="' + esc(ma) + '" data-fr="' + esc(fr) + '" title="' + esc(tip) + '">'
                 + '<td>' + esc(r.snapshot || '\u2014') + '</td>'
                 + '<td><span class="badge ' + pu.toLowerCase() + '">' + esc(pu) + '</span>'
                 + (r.post_upload_at ? '<div style="font-size:10px;color:var(--muted)">' + fmtTs(r.post_upload_at) + '</div>' : '')
@@ -1432,6 +1447,35 @@
       if (!panel) return;
       const isOpen = panel.classList.toggle('open');
       if (btn) btn.classList.toggle('open', isOpen);
+    }
+
+    function openIntegrityDetail(filter) {
+      const panel = document.getElementById('detail-integrity');
+      const btn   = document.getElementById('btn-integrity');
+      if (!panel) return;
+      if (!panel.classList.contains('open')) {
+        panel.classList.add('open');
+        if (btn) btn.classList.add('open');
+      }
+      const rows = panel.querySelectorAll('tbody tr.integrity-row');
+      let firstHit = null;
+      rows.forEach(tr => {
+        tr.classList.remove('integrity-row-dim', 'integrity-row-hit');
+        const pu = tr.getAttribute('data-pu') || '';
+        const au = tr.getAttribute('data-au') || '';
+        const fr = tr.getAttribute('data-fr') || '';
+        let hit = true;
+        if (filter === 'pu_fail') hit = pu === 'FAILED';
+        else if (filter === 'au_fail') hit = au === 'FAILED' || fr === 'FAILED';
+        else if (filter === 'stale') hit = fr === 'STALE';
+        else if (filter === 'au_ok') hit = fr === 'OK';
+        if (filter && filter !== 'all' && !hit) tr.classList.add('integrity-row-dim');
+        else if (filter && filter !== 'all' && hit) {
+          tr.classList.add('integrity-row-hit');
+          if (!firstHit) firstHit = tr;
+        }
+      });
+      (firstHit || panel).scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
     // ---- Helpers -----------------------------------------------

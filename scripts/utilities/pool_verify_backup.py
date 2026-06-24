@@ -601,7 +601,18 @@ def run_verify(
         for ex in res_b.get("missing_from_index_examples") or []:
             _out(f"      {ex}")
     elif mm == 0 and int(res_b.get("extra_not_in_index") or 0) > 0:
-        _out(f"  [info] {res_b['extra_not_in_index']} Extra-Stub(s) (nicht im Manifest)")
+        extra = int(res_b["extra_not_in_index"])
+        actual = int(res_b.get("actual_stubs") or 0)
+        expected = int(res_b.get("expected_stubs") or 0)
+        _out(
+            f"  [info] {extra} überschüssige Stub(s) im Snapshot-Ordner "
+            f"({actual} remote, {expected} im Manifest)"
+        )
+        _out(
+            "         Typisch nach Turbo-Delta: Basis-Snapshot wird geklont, "
+            "alte Stub-Pfade bleiben erhalten obwohl sie nicht mehr im "
+            "aktuellen Manifest stehen — harmlos, kein Integritätsfehler."
+        )
         for ex in res_b.get("extra_stub_examples") or []:
             _out(f"      {ex}")
     pc_resolved = int(res_b.get("path_compat_resolved") or 0)
