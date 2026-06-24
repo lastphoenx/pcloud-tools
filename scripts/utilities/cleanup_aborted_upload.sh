@@ -73,7 +73,14 @@ fi
 
 RTB_BASE="/mnt/backup/rtb_nas"
 ARCHIVE_BASE="/srv/pcloud-archive"
-PCLOUD_DEST="/Backup/rtb_1to1/_snapshots"
+# Pool-Mode: PCLOUD_DEST aus .env (Default /Backup/rtb_pool)
+ENV_FILE="${ENV_FILE:-/opt/apps/pcloud-tools/main/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  _dest=$(grep -E '^PCLOUD_DEST=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d "\"'" | tr -d ' ')
+  [[ -n "$_dest" ]] && PCLOUD_DEST="$_dest"
+fi
+PCLOUD_DEST="${PCLOUD_DEST:-/Backup/rtb_pool}"
+PCLOUD_SNAPS="${PCLOUD_DEST%/}/_snapshots"
 
 echo "═══════════════════════════════════════════════════════════"
 if [ "$DRY_RUN" = true ]; then
@@ -150,34 +157,36 @@ fi
 if [ "$DO_REMOTE_DELETE" = true ]; then
     echo "[5/6] Lösche pCloud-Snapshot (remote)"
     if [ "$DRY_RUN" = true ]; then
-        echo "  [dry-run] Würde löschen: $PCLOUD_DEST/$SNAPSHOT_NAME (remote via API)"
+        echo "  [dry-run] Würde löschen: $PCLOUD_SNAPS/$SNAPSHOT_NAME (remote via API)"
     else
         python3 -c "
 import sys
 import os
 
-# KRITISCH: sys.path für pcloud_bin_lib setzen
 script_dir = os.environ.get('SCRIPT_DIR', '/opt/apps/pcloud-tools/main')
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 import pcloud_bin_lib as pc
 
-cfg = pc.effective_config()
+env_file = os.environ.get('ENV_FILE', '$ENV_FILE')
+cfg = pc.effective_config(env_file=env_file)
+snap_path = '$PCLOUD_SNAPS/$SNAPSHOT_NAME'
 try:
-    pc.delete_folder(cfg, path='$PCLOUD_DEST/$SNAPSHOT_NAME', recursive=True)
-    print('  ✓ pCloud-Snapshot gelöscht')
+    pc.delete_folder(cfg, path=snap_path, recursive=True)
+    print('  ✓ pCloud-Snapshot gelöscht:', snap_path)
 except Exception as e:
     if '2005' in str(e) or 'not found' in str(e).lower():
         print('  ○ pCloud-Snapshot bereits gelöscht')
     else:
         print(f'  ⚠ Fehler: {e}')
+        raise
 "
     fi
 else
     echo "[5/6] pCloud-Snapshot (remote) NICHT gelöscht (--remote Flag nicht gesetzt)"
     echo "  ℹ️  Bitte manuell via pCloud Web-UI prüfen und löschen:"
-    echo "  ℹ️  https://my.pcloud.com → $PCLOUD_DEST/$SNAPSHOT_NAME"
+    echo "  ℹ️  https://my.pcloud.com → $PCLOUD_SNAPS/$SNAPSHOT_NAME"
     echo "  ℹ️  Vorteil: Du siehst, was wirklich hochgeladen wurde"
 fi
 
