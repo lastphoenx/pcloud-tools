@@ -719,6 +719,62 @@ def _register_snap(pool_refs: dict, sha: str, snap: str, relpath: str = "",
         entry["size"] = size
 
 
+def filter_index_for_snapshot(index: dict, snapshot_name: str) -> dict:
+    """Snapshot-isolierte pool_refs fuer Recovery (ohne kumulativen Ballast)."""
+    all_refs = index.get("pool_refs") or {}
+    filtered = {}
+    for sha, entry in all_refs.items():
+        if not isinstance(entry, dict):
+            continue
+        snaps_map = entry.get("snapshots")
+        if not isinstance(snaps_map, dict) or snapshot_name not in snaps_map:
+            continue
+        filtered[sha] = {
+            "fileid": entry.get("fileid"),
+            "hash": entry.get("hash"),
+            "size": entry.get("size"),
+            "snapshots": {snapshot_name: snaps_map[snapshot_name]},
+        }
+    return {"version": 2, "pool_refs": filtered}
+
+
+def _backup_remote_master_index_before_write(cfg: dict, snapshots_root: str) -> None:
+    """Eine Prev-Kopie des Masters (_index/archive/content_index_prev.json), rotierend."""
+    if os.environ.get("PCLOUD_INDEX_MASTER_BACKUP", "1") == "0":
+        return
+    root = snapshots_root.rstrip("/")
+    idx_path = f"{root}/_index/content_index.json"
+    prev_path = f"{root}/_index/archive/content_index_prev.json"
+    if not pc.stat_file_safe(cfg, path=idx_path):
+        return
+    try:
+        pc.ensure_parent_dirs(cfg, prev_path)
+        pc.copyfile(cfg, from_path=idx_path, to_path=prev_path)
+    except Exception as e:
+        _log(f"[index][warn] Master-Prev-Backup fehlgeschlagen: {e}")
+
+
+def archive_snapshot_index_remote(
+    cfg: dict, snapshots_root: str, index: dict, snapshot_name: str, *, dry: bool = False,
+) -> None:
+    """Gefiltertes Snapshot-Archiv unter _index/archive/<snap>_index.json."""
+    root = snapshots_root.rstrip("/")
+    archive_path = f"{root}/_index/archive/{snapshot_name}_index.json"
+    snap_idx = filter_index_for_snapshot(index, snapshot_name)
+    n = len(snap_idx.get("pool_refs") or {})
+    if dry:
+        _log(f"[dry] archive index: {archive_path} ({n} pool_refs)")
+        return
+    pc.ensure_parent_dirs(cfg, archive_path)
+    archive_dir = os.path.dirname(archive_path)
+    fid = pc.stat_folderid_fast(cfg, archive_dir) or pc.ensure_path(cfg, archive_dir)
+    pc.write_json_to_folderid(
+        cfg, folderid=int(fid), filename=os.path.basename(archive_path),
+        obj=snap_idx, minify=False,
+    )
+    _log(f"[index] ✓ Snapshot-Index archiviert: {archive_path} ({n} pool_refs)")
+
+
 def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool=False) -> None:
     """
     content_index.json effizient schreiben:
@@ -737,6 +793,8 @@ def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool
     if dry:
         print(f"[dry] write index: {idx_dir}/{idx_name} (pool_refs={len(index.get('pool_refs',{}))})")
         return
+
+    _backup_remote_master_index_before_write(cfg, snapshots_root)
 
     # Ordner muss existieren (wurde vorher per Batch-Ensure angelegt)
     fid = pc.stat_folderid_fast(cfg, idx_dir)
@@ -2384,11 +2442,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     # Index-Kopie unter _index/archive/. Hier 1:1 nachgezogen.
     if not dry:
         try:
-            idx_path = f"{snapshots_root}/_index/content_index.json"
-            archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
-            pc.ensure_parent_dirs(cfg, archive_path)
-            pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-            _log(f"[index] ✓ Content-Index remote archiviert: {archive_path}")
+            archive_snapshot_index_remote(cfg, snapshots_root, index, snapshot_name, dry=False)
         except Exception as e:
             _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
         try:
@@ -3332,13 +3386,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 write_ms += dt_ms
                 print(f"[timing] index_write_ms={int(dt_ms)}")
                 
-                # Remote archivieren (Paranoia-Modus: Snapshot-isolierter Index für Recovery)
+                # Remote archivieren: gefilterter Snapshot-Index (nicht voller Master-Klon)
                 try:
-                    idx_path = f"{snapshots_root}/_index/content_index.json"
-                    archive_path = f"{snapshots_root}/_index/archive/{snapshot_name}_index.json"
-                    pc.ensure_parent_dirs(cfg, archive_path)
-                    pc.copyfile(cfg, from_path=idx_path, to_path=archive_path)
-                    _log(f"[index] ✓ Content-Index remote archiviert: {archive_path}")
+                    archive_snapshot_index_remote(cfg, snapshots_root, index, snapshot_name, dry=False)
                 except Exception as e:
                     _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
                 
