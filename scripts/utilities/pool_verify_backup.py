@@ -217,12 +217,47 @@ def check_stubs_vs_index(
     stub_paths: Set[str],
     snaps_root: str,
     manifests: Dict[str, Dict[str, str]],
+    snapshot_filter: Optional[Set[str]] = None,
 ) -> dict:
     """
     B) Index vs Stubs vs Pool.
     Erwartete Stubs aus pool_refs vs tatsaechliche Stubs aus listfolder.
     Zusatz: manifest-getriebener Stub-Check (jeder Manifest-relpath hat einen Stub?).
+
+    Bei snapshot_filter: erwartete Stubs nur aus Manifesten (O(~80k)), nicht
+    gesamter pool_refs×alle Snapshots (O(~106k×Snaps) — war ~25s Flaschenhals).
     """
+    filter_set = snapshot_filter if snapshot_filter else None
+
+    manifest_missing: Dict[str, List[str]] = {}
+    for snap, files in manifests.items():
+        m_missing = []
+        for rp in files:
+            stub_path = f"{snaps_root}/{snap}/{rp}.meta.json"
+            if stub_path not in stub_paths:
+                m_missing.append(rp)
+        if m_missing:
+            manifest_missing[snap] = m_missing[:20]
+
+    if filter_set is not None:
+        expected = {
+            f"{snaps_root}/{snap}/{rp}.meta.json"
+            for snap, files in manifests.items()
+            for rp in files
+        }
+        missing_stubs = expected - stub_paths
+        extra_stubs = stub_paths - expected
+        return {
+            "expected_stubs": len(expected),
+            "actual_stubs": len(stub_paths),
+            "missing_from_index": len(missing_stubs),
+            "missing_from_index_examples": sorted(missing_stubs)[:5],
+            "extra_not_in_index": len(extra_stubs),
+            "manifest_missing_stubs": manifest_missing,
+            "manifest_missing_total": sum(len(v) for v in manifest_missing.values()),
+            "mode": "manifest_scoped",
+        }
+
     expected: Set[str] = set()
     for sha, entry in pool_refs.items():
         if not isinstance(entry, dict):
@@ -234,19 +269,8 @@ def check_stubs_vs_index(
             for rp in (relpaths or []):
                 expected.add(f"{snaps_root}/{snap}/{rp}.meta.json")
 
-    missing_stubs = expected - stub_paths       # Index sagt: da, aber nicht remote
-    extra_stubs   = stub_paths - expected        # remote da, aber nicht im Index
-
-    # Manifest-getriebener Stub-Check (ground truth)
-    manifest_missing: Dict[str, List[str]] = {}
-    for snap, files in manifests.items():
-        m_missing = []
-        for rp in files:
-            stub_path = f"{snaps_root}/{snap}/{rp}.meta.json"
-            if stub_path not in stub_paths:
-                m_missing.append(rp)
-        if m_missing:
-            manifest_missing[snap] = m_missing[:20]
+    missing_stubs = expected - stub_paths
+    extra_stubs = stub_paths - expected
 
     return {
         "expected_stubs": len(expected),
@@ -256,6 +280,7 @@ def check_stubs_vs_index(
         "extra_not_in_index": len(extra_stubs),
         "manifest_missing_stubs": manifest_missing,
         "manifest_missing_total": sum(len(v) for v in manifest_missing.values()),
+        "mode": "full_index",
     }
 
 
@@ -497,10 +522,16 @@ def run_verify(
 
     _out("=== B) Stubs vs Index vs Pool ===")
     t_b = time.time()
-    res_b = check_stubs_vs_index(pool_refs, stub_paths, snaps_root, manifests)
+    stub_scope = set(snapshot_filter) if snapshot_filter else None
+    res_b = check_stubs_vs_index(
+        pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
+    )
     if res_b["manifest_missing_total"] > 0:
         issues += res_b["manifest_missing_total"]
-    _out(f"  ({time.time()-t_b:.2f}s)")
+    elif stub_scope is not None and res_b.get("missing_from_index", 0) > 0:
+        issues += res_b["missing_from_index"]
+    mode = res_b.get("mode", "full_index")
+    _out(f"  ({time.time()-t_b:.2f}s, {mode})")
     _out("")
 
     res_c = None

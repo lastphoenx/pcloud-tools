@@ -117,7 +117,7 @@ def _upload_stats(env: Dict[str, str]) -> Dict[str, Tuple[int, int]]:
         """
         SELECT snapshot_name, bytes_uploaded, files_uploaded
         FROM backup_runs
-        WHERE status = 'SUCCESS' AND bytes_uploaded IS NOT NULL
+        WHERE status = 'SUCCESS'
         ORDER BY finished_at DESC;
         """,
     )
@@ -179,7 +179,7 @@ def main() -> int:
     print()
     print("Hinweise:")
     print("  LOGICAL_GB  = Summe Dateigroessen im Manifest (logische Groesse, nicht du)")
-    print("  UPLOAD_GB   = Neuer Pool-Traffic bei diesem Upload (dedupliziert, aus DB)")
+    print("  UPLOAD_GB   = bytes_uploaded aus backup_runs (0 = Spalte nicht befuellt / Legacy-Lauf)")
     print("  RTB physisch ≪ LOGICAL wegen Hardlinks — du nicht verwenden auf rtb_nas")
     print("  Remote Pool-Gesamt: pcloud_pool_gc.py --retention-forecast")
     return 0
