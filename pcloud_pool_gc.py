@@ -204,6 +204,81 @@ def _list_remote_snapshot_names(cfg: dict, snapshots_root: str) -> Set[str]:
     }
 
 
+def _parse_snapshot_dt(name: str) -> Optional[datetime.datetime]:
+    if not _SNAP_RE.match(name):
+        return None
+    try:
+        return datetime.datetime.strptime(name, "%Y-%m-%d-%H%M%S")
+    except ValueError:
+        return None
+
+
+def _time_retention_params() -> Tuple[int, int]:
+    days_full = int(os.environ.get("PCLOUD_REMOTE_RETENTION_DAYS_FULL", "0") or 0)
+    weekly_weeks = int(os.environ.get("PCLOUD_REMOTE_RETENTION_WEEKLY_WEEKS", "54") or 54)
+    return days_full, weekly_weeks
+
+
+def _time_retention_enabled() -> bool:
+    return _time_retention_params()[0] > 0
+
+
+def compute_time_retention_keep(remote_snaps: Set[str]) -> Tuple[Set[str], Set[str]]:
+    """
+    Remote-Retention: alle Snapshots der letzten N Tage + aelter nur 1 pro ISO-Woche,
+    maximal W Wochen in der Wochen-Tier.
+
+    Env: PCLOUD_REMOTE_RETENTION_DAYS_FULL, PCLOUD_REMOTE_RETENTION_WEEKLY_WEEKS
+    """
+    days_full, weekly_weeks = _time_retention_params()
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days_full)
+
+    keep: Set[str] = set()
+    weekly_candidates: List[Tuple[Tuple[int, int], str, datetime.datetime]] = []
+
+    for name in remote_snaps:
+        dt = _parse_snapshot_dt(name)
+        if dt is None:
+            keep.add(name)
+            continue
+        if dt >= cutoff:
+            keep.add(name)
+        else:
+            wy, wk, _ = dt.isocalendar()
+            weekly_candidates.append(((wy, wk), name, dt))
+
+    by_week: Dict[Tuple[int, int], List[Tuple[str, datetime.datetime]]] = defaultdict(list)
+    for week_key, name, dt in weekly_candidates:
+        by_week[week_key].append((name, dt))
+
+    week_keepers: List[Tuple[datetime.datetime, str]] = []
+    for items in by_week.values():
+        name, dt = max(items, key=lambda x: x[1])
+        week_keepers.append((dt, name))
+
+    week_keepers.sort(key=lambda x: x[0])
+    if weekly_weeks > 0 and len(week_keepers) > weekly_weeks:
+        week_keepers = week_keepers[-weekly_weeks:]
+
+    for _, name in week_keepers:
+        keep.add(name)
+
+    return keep, remote_snaps - keep
+
+
+def _resolve_retention_deletes(
+    remote_snaps: Set[str],
+    local_snaps: Set[str],
+) -> Tuple[Set[str], str]:
+    if _time_retention_enabled():
+        days_full, weekly_weeks = _time_retention_params()
+        keep, to_delete = compute_time_retention_keep(remote_snaps)
+        mode = f"zeit:{days_full}d+{weekly_weeks}w (behalten {len(keep)})"
+        return to_delete, mode
+    to_delete = remote_snaps - local_snaps
+    return to_delete, f"rtb-spiegel (remote ohne lokales RTB, del {len(to_delete)})"
+
+
 def _load_index(cfg: dict, snapshots_root: str) -> Tuple[dict, dict]:
     index_path = f"{snapshots_root}/_index/content_index.json"
     index_content = pc.get_textfile(cfg, path=index_path)
@@ -328,18 +403,23 @@ def run_retention_forecast(
     _log("[retention-forecast] ===== START =====")
     local_snaps = _list_local_rtb_snaps(rtb_root)
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
-    to_delete = sorted(remote_snaps - local_snaps)
-    keep_remote = remote_snaps & local_snaps
+    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps)
+    to_delete = sorted(to_delete_set)
+    keep_remote = remote_snaps - to_delete_set
 
+    _log(f"[retention-forecast] Modus: {mode}")
     _log(f"[retention-forecast] RTB lokal:     {len(local_snaps)}")
     _log(f"[retention-forecast] Remote:        {len(remote_snaps)}")
+    _log(f"[retention-forecast] Behalten:      {len(keep_remote)}")
     _log(f"[retention-forecast] Nachzug (del): {len(to_delete)} Snapshots")
 
     if to_delete:
-        for snap in to_delete:
+        for snap in to_delete[:20]:
             _log(f"  - {snap}")
+        if len(to_delete) > 20:
+            _log(f"  ... und {len(to_delete) - 20} weitere")
     else:
-        _log("[retention-forecast] Kein Remote-Snapshot ohne lokales RTB-Pendant")
+        _log("[retention-forecast] Nichts zu loeschen")
 
     index, pool_refs = _load_index(cfg, snapshots_root)
     refs_now = _referenced_shas(pool_refs, remote_snaps)
@@ -381,6 +461,48 @@ def run_retention_forecast(
     }
 
 
+def _remote_snapshot_folder_exists(cfg: dict, snap_path: str) -> bool:
+    """True wenn der Snapshot-Ordner auf pCloud noch existiert."""
+    try:
+        pc.listfolder(cfg, path=snap_path, recursive=False, nofiles=True)
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        if "2005" in str(e) or "not found" in err or "does not exist" in err:
+            return False
+        # Unklarer Fehler — vorsichtshalber als „noch da“ behandeln
+        return True
+
+
+def _wait_until_snapshot_gone(
+    cfg: dict,
+    snap_path: str,
+    snap: str,
+    *,
+    poll_sec: int,
+    timeout_sec: int,
+) -> bool:
+    """
+    pCloud deletefolderrecursive kann sofort OK liefern, Löschung läuft aber asynchron
+    (große Stub-Bäume). Polling per listfolder bis Ordner weg oder Timeout.
+    """
+    t0 = time.time()
+    while True:
+        elapsed = time.time() - t0
+        if not _remote_snapshot_folder_exists(cfg, snap_path):
+            _log(f"[retention] ✓ {snap} remote entfernt ({elapsed:.0f}s)")
+            return True
+        if elapsed >= timeout_sec:
+            _log(f"[retention][ERROR] Timeout {timeout_sec}s — {snap} existiert noch")
+            return False
+        remaining = int(timeout_sec - elapsed)
+        _log(
+            f"[retention] … {snap} noch auf pCloud, warte {poll_sec}s "
+            f"({elapsed:.0f}s vergangen, max {timeout_sec}s)"
+        )
+        time.sleep(poll_sec)
+
+
 def run_retention_apply(
     cfg: dict,
     dest_root: str,
@@ -401,9 +523,13 @@ def run_retention_apply(
 
     local_snaps = _list_local_rtb_snaps(rtb_root)
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
-    to_delete = sorted(remote_snaps - local_snaps)
+    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps)
+    to_delete = sorted(to_delete_set)
 
+    _log(f"[retention] Modus: {mode}")
     _log(f"[retention] Zu loeschen: {len(to_delete)} Remote-Snapshots")
+    poll_sec = int(os.environ.get("PCLOUD_RETENTION_DELETE_POLL_SEC", "60"))
+    timeout_sec = int(os.environ.get("PCLOUD_RETENTION_DELETE_TIMEOUT_SEC", "1200"))
     errors = 0
     deleted = 0
     deleted_snaps: Set[str] = set()
@@ -415,15 +541,21 @@ def run_retention_apply(
             deleted += 1
             deleted_snaps.add(snap)
             continue
+        _log(f"[retention] Loesche Snapshot ({deleted + errors + 1}/{len(to_delete)}): {snap_path}")
         try:
-            _log(f"[retention] Loesche Snapshot: {snap_path}")
             pc.delete_folder(cfg, path=snap_path, recursive=True)
+            _log(f"[retention] API deletefolderrecursive angenommen — prüfe Entfernung …")
+        except Exception as e:
+            _log(f"[retention][warn] API delete {snap}: {e} — prüfe per Polling ob weg")
+        if _wait_until_snapshot_gone(
+            cfg, snap_path, snap, poll_sec=poll_sec, timeout_sec=timeout_sec,
+        ):
             deleted += 1
             deleted_snaps.add(snap)
-            _log(f"[retention] ✓ {snap}")
-        except Exception as e:
-            _log(f"[retention][ERROR] {snap}: {e}")
+        else:
             errors += 1
+            _log(f"[retention][ERROR] Abbruch Kette bei {snap} — Index wird nicht bereinigt")
+            break
 
     if deleted_snaps:
         index, _ = _load_index(cfg, snapshots_root)
