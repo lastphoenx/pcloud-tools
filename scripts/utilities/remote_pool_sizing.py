@@ -159,6 +159,9 @@ def main() -> int:
             print(f"Konto (userinfo):  {_fmt_gb(used)} / {_fmt_gb(quota)} GB genutzt ({pct})")
             print("  → gesamtes pCloud-Konto, nicht nur rtb_pool")
             print()
+        except Exception as e:
+            print(f"  (userinfo nicht verfügbar: {e})")
+            print()
 
     print(f"Lade {idx_path} ...", flush=True)
     t0 = time.time()
