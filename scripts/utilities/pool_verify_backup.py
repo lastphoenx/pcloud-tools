@@ -223,6 +223,34 @@ def _norm_stub_path_set(paths: Set[str]) -> Set[str]:
     return {pc._norm_remote_path(p) for p in paths}
 
 
+def _expected_norm_keys(manifests: Dict[str, Dict[str, str]], snaps_root: str) -> Set[str]:
+    """Normalisierte Stub-Pfade aus Manifest (fuer Abgleich mit remote)."""
+    keys: Set[str] = set()
+    for snap, files in manifests.items():
+        for rp in files:
+            ep = _manifest_stub_path(snaps_root, snap, rp)
+            keys.add(ep)
+            keys.add(ppc.normalize_path_segments(ep))
+    return keys
+
+
+def _orphan_stubs(
+    norm_stubs: Set[str],
+    manifests: Dict[str, Dict[str, str]],
+    snaps_root: str,
+) -> List[str]:
+    """Remote-Stubs ohne Manifest-Pendant (nach Segment-Normalisierung)."""
+    expected_keys = _expected_norm_keys(manifests, snaps_root)
+    orphans: List[str] = []
+    for sp in norm_stubs:
+        if sp in expected_keys:
+            continue
+        if ppc.normalize_path_segments(sp) in expected_keys:
+            continue
+        orphans.append(sp)
+    return orphans
+
+
 def check_stubs_vs_index(
     pool_refs: dict,
     stub_paths: Set[str],
@@ -268,14 +296,14 @@ def check_stubs_vs_index(
         missing_stubs = {
             p for p in expected if not ppc.stub_path_exists(p, stub_lookup)
         }
-        expected_norm = {ppc.normalize_path_segments(p) for p in expected}
-        stub_norm = {ppc.normalize_path_segments(p) for p in norm_stubs}
+        orphans = _orphan_stubs(norm_stubs, manifests, snaps_root)
         return {
             "expected_stubs": len(expected),
             "actual_stubs": len(norm_stubs),
             "missing_from_index": len(missing_stubs),
             "missing_from_index_examples": sorted(missing_stubs)[:5],
-            "extra_not_in_index": len(stub_norm - expected_norm),
+            "extra_not_in_index": len(orphans),
+            "extra_stub_examples": orphans[:5],
             "manifest_missing_stubs": manifest_missing,
             "manifest_missing_total": manifest_missing_total,
             "path_compat_resolved": path_compat_resolved,
@@ -294,14 +322,15 @@ def check_stubs_vs_index(
                 expected.add(_manifest_stub_path(snaps_root, snap, rp))
 
     missing_stubs = {p for p in expected if not ppc.stub_path_exists(p, stub_lookup)}
-    extra_stubs = norm_stubs - expected
+    orphans = _orphan_stubs(norm_stubs, manifests, snaps_root)
 
     return {
         "expected_stubs": len(expected),
         "actual_stubs": len(norm_stubs),
         "missing_from_index": len(missing_stubs),
         "missing_from_index_examples": sorted(missing_stubs)[:5],
-        "extra_not_in_index": len(extra_stubs),
+        "extra_not_in_index": len(orphans),
+        "extra_stub_examples": orphans[:5],
         "manifest_missing_stubs": manifest_missing,
         "manifest_missing_total": manifest_missing_total,
         "path_compat_resolved": path_compat_resolved,
@@ -573,6 +602,8 @@ def run_verify(
             _out(f"      {ex}")
     elif mm == 0 and int(res_b.get("extra_not_in_index") or 0) > 0:
         _out(f"  [info] {res_b['extra_not_in_index']} Extra-Stub(s) (nicht im Manifest)")
+        for ex in res_b.get("extra_stub_examples") or []:
+            _out(f"      {ex}")
     pc_resolved = int(res_b.get("path_compat_resolved") or 0)
     if pc_resolved > 0:
         _out(f"  [info] {pc_resolved} Stub(s) per Segment-Normalisierung (z.B. trailing space)")
