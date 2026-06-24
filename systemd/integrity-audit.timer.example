@@ -1,12 +1,15 @@
 [Unit]
-Description=Daily pCloud integrity audit (one snapshot per day)
-Documentation=file:///opt/apps/pcloud-tools/main/systemd/README.md
+Description=pCloud integrity audit after backup (+105min, 10 snapshots)
+Documentation=file:///opt/apps/pcloud-tools/main/docs/POOL_INTEGRITY.md
 
 [Timer]
-# Taeglich 05:15 — nach 04:00-Backup + RTB, vor morgendlichem Traffic (wenig Last)
-OnCalendar=*-*-* 05:15:00
+# Backup 04:00 / 12:00 / 20:00 → Audit +105min
+OnCalendar=*-*-* 05:45:00
+OnCalendar=*-*-* 13:45:00
+OnCalendar=*-*-* 21:45:00
 Persistent=true
-RandomizedDelaySec=600
+RandomizedDelaySec=300
+Unit=integrity-audit.service
 
 [Install]
 WantedBy=timers.target

@@ -27,7 +27,95 @@ import pcloud_bin_lib as pc
 _UTIL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _UTIL_DIR not in sys.path:
     sys.path.insert(0, _UTIL_DIR)
-from pool_verify_backup import run_verify  # noqa: E402
+from pool_verify_backup import PoolRemoteCache, run_verify  # noqa: E402
+
+
+def run_integrity_for_snapshot(
+    *,
+    env: Dict[str, str],
+    cfg: dict,
+    pool_root: str,
+    snapshot: str,
+    check_type: str,
+    backup_run_id: Optional[str] = None,
+    stub_sample: int = 0,
+    remote_cache: Optional[PoolRemoteCache] = None,
+    verbose: bool = True,
+    no_db: bool = False,
+    json_out: Optional[str] = None,
+) -> tuple[bool, Dict[str, Any]]:
+    """Einzel-Snapshot-Integrity inkl. Report + DB. Fuer Batch mit remote_cache."""
+    archive = env.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    manifests_dir = os.path.join(archive, "manifests")
+    integrity_dir = os.path.join(archive, "integrity")
+    os.makedirs(integrity_dir, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_path = json_out or os.path.join(
+        integrity_dir, f"{snapshot}_{check_type}_{ts}.json"
+    )
+
+    use_db = not no_db and _db_enabled(env)
+
+    if verbose:
+        print("=== pool_integrity_run ===")
+        print(f"Snapshot:   {snapshot}")
+        print(f"Check type: {check_type}")
+        print()
+
+    t0 = time.time()
+    try:
+        result: Dict[str, Any] = run_verify(
+            cfg,
+            pool_root_raw=pool_root,
+            manifests_dir=manifests_dir,
+            snapshot_filter=[snapshot],
+            stub_sample=stub_sample,
+            verbose=verbose,
+            remote_cache=remote_cache,
+        )
+    except Exception as e:
+        result = {
+            "ok": False,
+            "issues": 1,
+            "error": str(e),
+            "error_summary": str(e),
+            "duration_sec": round(time.time() - t0, 2),
+        }
+        print(f"[FAIL] verify exception: {e}", file=sys.stderr)
+
+    result["check_type"] = check_type
+    result["snapshot"] = snapshot
+    result["timestamp_iso"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    if verbose:
+        print(f"\n[report] {report_path}")
+
+    ok = bool(result.get("ok"))
+    issues = int(result.get("issues") or 0)
+    summary = result.get("error_summary") or result.get("error")
+    duration = float(result.get("duration_sec") or (time.time() - t0))
+    db_status = "OK" if ok else "FAILED"
+
+    if use_db:
+        if check_type == "monthly_audit":
+            _upsert_monthly_audit(
+                env, snapshot, db_status, issues, report_path,
+                str(summary) if summary else None, duration,
+            )
+        else:
+            _save_to_backup_run(
+                env, snapshot, backup_run_id, db_status, issues, report_path,
+            )
+
+    if verbose:
+        print("=" * 60)
+        print("RESULT:", "OK" if ok else f"FAILED ({issues} issues)")
+        print("=" * 60)
+
+    return ok, result
 
 
 def _load_env_file(path: str) -> Dict[str, str]:
@@ -180,74 +268,21 @@ def main() -> int:
         if k.startswith("PCLOUD_"):
             env.setdefault(k, v)
 
-    archive = env.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
-    manifests_dir = os.path.join(archive, "manifests")
-    integrity_dir = os.path.join(archive, "integrity")
-    os.makedirs(integrity_dir, exist_ok=True)
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    report_path = args.json_out or os.path.join(
-        integrity_dir, f"{args.snapshot}_{args.check_type}_{ts}.json"
-    )
-
     use_db = not args.no_db and _db_enabled(env)
 
-    print("=== pool_integrity_run ===")
-    print(f"Snapshot:   {args.snapshot}")
-    print(f"Check type: {args.check_type}")
-    print()
-
     cfg = pc.effective_config(env_file=args.env_file)
-    t0 = time.time()
-    try:
-        result: Dict[str, Any] = run_verify(
-            cfg,
-            pool_root_raw=pool_root,
-            manifests_dir=manifests_dir,
-            snapshot_filter=[args.snapshot],
-            stub_sample=args.stub_sample,
-            verbose=True,
-        )
-    except Exception as e:
-        result = {
-            "ok": False,
-            "issues": 1,
-            "error": str(e),
-            "error_summary": str(e),
-            "duration_sec": round(time.time() - t0, 2),
-        }
-        print(f"[FAIL] verify exception: {e}", file=sys.stderr)
-
-    result["check_type"] = args.check_type
-    result["snapshot"] = args.snapshot
-    result["timestamp_iso"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-    print(f"\n[report] {report_path}")
-
-    ok = bool(result.get("ok"))
-    issues = int(result.get("issues") or 0)
-    summary = result.get("error_summary") or result.get("error")
-    duration = float(result.get("duration_sec") or (time.time() - t0))
-    db_status = "OK" if ok else "FAILED"
-
-    if use_db:
-        if args.check_type == "monthly_audit":
-            _upsert_monthly_audit(
-                env, args.snapshot, db_status, issues, report_path,
-                str(summary) if summary else None, duration,
-            )
-        else:
-            # post_upload und manual -> gleicher Speicherort: backup_runs
-            _save_to_backup_run(
-                env, args.snapshot, args.backup_run_id,
-                db_status, issues, report_path,
-            )
-
-    print("=" * 60)
-    print("RESULT:", "OK" if ok else f"FAILED ({issues} issues)")
-    print("=" * 60)
+    ok, _ = run_integrity_for_snapshot(
+        env=env,
+        cfg=cfg,
+        pool_root=pool_root,
+        snapshot=args.snapshot,
+        check_type=args.check_type,
+        backup_run_id=args.backup_run_id,
+        stub_sample=args.stub_sample,
+        no_db=not use_db,
+        json_out=args.json_out,
+        verbose=True,
+    )
     return 0 if ok else 1
 
 
