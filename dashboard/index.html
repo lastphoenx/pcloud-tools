@@ -627,7 +627,10 @@
       const intSum   = poolInt.summary || {};
       const intSnaps = poolInt.snapshots || [];
       const intFailed = (intSum.post_upload_failed || 0) + (intSum.audit_failed || 0);
+      const intPuFail = intSum.post_upload_failed || 0;
+      const intAuFail = intSum.audit_failed || 0;
       const intStale  = intSum.audit_stale || 0;
+      const intTotal  = intSum.total || intSnaps.length;
       if (intFailed > 0 && tileCls === 'ok') tileCls = 'bad';
       else if ((intStale > 0 || intSum.audit_unknown > 0) && tileCls === 'ok') tileCls = 'warning';
 
@@ -672,13 +675,16 @@
 
       if (intSum.total > 0 || intSnaps.length > 0) {
         html += '<div class="summary-row summary-row-secondary" style="margin-top:8px">'
-          + '<div class="summary-box ' + (intFailed > 0 ? 'red' : 'green') + '"><div class="big">' + intFailed + '</div><div class="lbl">Integr. FAIL</div></div>'
+          + '<div class="summary-box ' + (intPuFail > 0 ? 'red' : 'green') + '"><div class="big">' + intPuFail + '</div><div class="lbl">Post-Upload FAIL</div></div>'
+          + '<div class="summary-box ' + (intAuFail > 0 ? 'red' : 'green') + '"><div class="big">' + intAuFail + '</div><div class="lbl">Audit FAIL</div></div>'
           + '<div class="summary-box ' + (intStale > 0 ? 'yellow' : 'gray') + '"><div class="big">' + intStale + '</div><div class="lbl">Audit STALE</div></div>'
           + '<div class="summary-box gray"><div class="big">' + (intSum.audit_ok || 0) + '</div><div class="lbl">Audit OK</div></div>'
-          + '<div class="summary-box gray"><div class="big">' + (intSum.total || intSnaps.length) + '</div><div class="lbl">Snapshots</div></div>'
+          + '<div class="summary-box gray"><div class="big">' + intTotal + '</div><div class="lbl">Snapshots (DB)</div></div>'
           + '</div>';
         html += '<div class="integrity-hint"><strong>Post-Upload</strong> = nach Backup &middot; '
-          + '<strong>Audit</strong> = periodischer Re-Check (STALE &gt;35d)</div>';
+          + '<strong>Audit</strong> = periodischer Re-Check (STALE &gt;35d)'
+          + (intSnaps.length < intTotal ? ' &middot; Tabelle: ' + intSnaps.length + ' von ' + intTotal : '')
+          + '</div>';
       } else {
         html += '<div class="integrity-hint" style="margin-top:6px">'
           + 'Pool-Integrit&auml;t: noch keine DB-Eintr&auml;ge — <code>generate_reports.sh</code> nach Migration.</div>';
@@ -707,7 +713,7 @@
 
       if (intSnaps.length > 0) {
         html += '<button class="detail-toggle" id="btn-integrity" onclick="toggleDetail(\'integrity\')">'
-          + '<span>Pool-Integrit&auml;t (' + intSnaps.length + ' Snapshots)</span><span class="arrow">\u25BC</span></button>'
+          + '<span>Pool-Integrit&auml;t (' + intSnaps.length + (intTotal > intSnaps.length ? ' / ' + intTotal : '') + ' Snapshots)</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-integrity"><div class="tile-detail-inner">'
           + '<table class="report-table"><thead><tr>'
           + '<th>Snapshot</th><th>Post-Upload</th><th>Audit</th><th>Frische</th><th>Issues</th>'
