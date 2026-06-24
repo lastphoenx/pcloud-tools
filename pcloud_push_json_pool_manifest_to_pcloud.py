@@ -1788,6 +1788,30 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots
     return best_snap, best_score
 
 
+def _snapshot_stub_relpaths(cfg: dict, snapshot_dir: str) -> set:
+    """Relpaths aller .meta.json-Stubs unter snapshot_dir (nach Server-Klon)."""
+    snapshot_dir = pc._norm_remote_path(snapshot_dir).rstrip("/")
+    result = pc.call_with_backoff(
+        pc.listfolder, cfg, path=snapshot_dir, recursive=True, nofiles=False,
+    ) or {}
+    relpaths: set = set()
+    suffix = ".meta.json"
+
+    def _walk(node: dict, cur_path: str) -> None:
+        for child in node.get("contents", []) or []:
+            name = child.get("name", "")
+            child_path = f"{cur_path}/{name}"
+            if child.get("isfolder"):
+                _walk(child, child_path)
+            elif name.endswith(suffix):
+                rel = child_path[len(snapshot_dir) + 1 : -len(suffix)]
+                if rel:
+                    relpaths.add(rel)
+
+    _walk(result.get("metadata", {}) or {}, snapshot_dir)
+    return relpaths
+
+
 def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapshot_name: str,
                          *, dry: bool = False, verbose: bool = False) -> dict:
     """
@@ -1796,7 +1820,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     Workflow:
     1. copyfolder(basis_snapshot) → neuer Snapshot (5 Sek statt 73 Min!)
     2. Diff berechnen (Added, Changed, Removed)
-    3. Bereinigung: Veraltete Stubs entfernen
+    3. Bereinigung: Remote-Stubs ohne Pendant im aktuellen Manifest entfernen
     4. Update: Neue/Geänderte Stubs parallel verarbeiten
     5. Marker & Manifest finalisieren
     
@@ -1986,9 +2010,24 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     diff_duration = time.time() - t_diff_start
     _log(f"[delta-mode] Diff: +{len(added_paths)} -{len(deleted_paths)} Δ{len(changed_paths)} (={len(common_paths)-len(changed_paths)} unverändert) in {diff_duration:.1f}s")
     
-    # === PHASE 3: BEREINIGUNG (Veraltete Stubs/Ordner löschen) ===
-    if deleted_paths and not dry:
-        _log(f"[delta-mode] Phase 3: Entferne {len(deleted_paths)} veraltete Einträge...")
+    # === PHASE 3: BEREINIGUNG (Remote-Stubs ohne Pendant im aktuellen Manifest) ===
+    paths_to_remove = set(deleted_paths)
+    if not dry:
+        t_stublist = time.time()
+        remote_stub_relpaths = _snapshot_stub_relpaths(cfg, dest_snapshot_dir)
+        clone_orphans = remote_stub_relpaths - current_paths
+        if clone_orphans:
+            n_from_diff = len(deleted_paths)
+            n_clone_only = len(clone_orphans - deleted_paths)
+            paths_to_remove |= clone_orphans
+            _log(
+                f"[delta-mode] Klon-Abgleich: {len(clone_orphans)} Remote-Stubs nicht im "
+                f"aktuellen Manifest ({n_from_diff} aus Diff, {n_clone_only} historischer Überhang) "
+                f"in {time.time() - t_stublist:.1f}s"
+            )
+
+    if paths_to_remove and not dry:
+        _log(f"[delta-mode] Phase 3: Entferne {len(paths_to_remove)} veraltete Einträge...")
         t_cleanup_start = time.time()
 
         # Lebende Ordner: jeder Ordner, unter dem noch ein aktueller File liegt.
@@ -2001,14 +2040,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
 
         # Komplett tote Teilbäume (höchster toter Ancestor) → 1 deletefolderrecursive
         # statt N Einzel-Deletes; Stubs in noch lebenden Ordnern → einzeln per deletefile.
-        # pCloud kennt keinen Multi-File-Delete - deletefolderrecursive ist das einzige
-        # Batch-Primitiv, daher diese Gruppierung.
         dead_top_dirs = set()
         single_stubs = []
-        for rp in deleted_paths:
+        for rp in paths_to_remove:
             parent = os.path.dirname(rp)
             if parent and parent not in kept_dirs:
-                # Ordner ist tot → höchsten toten Ancestor finden
                 top = parent
                 while True:
                     gp = os.path.dirname(top)
@@ -2018,7 +2054,6 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                         break
                 dead_top_dirs.add(top)
             else:
-                # Ordner lebt (kept Siblings) oder Datei liegt im Snapshot-Root
                 single_stubs.append(rp)
 
         folders_removed = 0
@@ -2044,8 +2079,8 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
 
         cleanup_duration = time.time() - t_cleanup_start
         _log(f"[delta-mode] ✓ Bereinigt: {folders_removed} tote Ordner rekursiv, {deleted_count} Einzel-Stubs in {cleanup_duration:.1f}s")
-    elif deleted_paths:
-        _log(f"[dry] Würde {len(deleted_paths)} veraltete Einträge entfernen (tote Ordner rekursiv + Einzel-Stubs)")
+    elif paths_to_remove:
+        _log(f"[dry] Würde {len(paths_to_remove)} veraltete Einträge entfernen (tote Ordner rekursiv + Einzel-Stubs)")
     
     # === PHASE 4: UPDATE (Neue/Geänderte Files verarbeiten) ===
     tasks = list(added_paths | changed_paths)

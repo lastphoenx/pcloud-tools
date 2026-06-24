@@ -109,8 +109,42 @@ def _list_remote_snaps(cfg: dict, snaps_root: str) -> List[str]:
 
 def _userinfo_quota(cfg: dict) -> Tuple[int, int]:
     top = pc._rest_get(cfg, "userinfo", {"getauth": 1})
-    info = (top.get("userinfo") or {})
-    return int(info.get("usedquota") or 0), int(info.get("quota") or 0)
+    ui = top.get("userinfo") or top
+    used = int(ui.get("usedquota") or top.get("usedquota") or 0)
+    quota = int(ui.get("quota") or top.get("quota") or 0)
+    return used, quota
+
+
+def _walk_pool_sharded(cfg: dict, pool_root: str) -> Tuple[int, int, int, float]:
+    """Summiert _pool/ in 256 Hex-Shard-Unterordnern (robuster als ein Riesen-listfolder)."""
+    pool_root = pool_root.rstrip("/")
+    print(f"[walk] _pool: summiere file.size in 256 Hex-Shards ...", flush=True)
+    t0 = time.time()
+    total_b = total_f = total_d = 0
+    shards = 0
+    for i in range(256):
+        sub = f"{pool_root}/{i:02x}"
+        try:
+            top = pc.call_with_backoff(
+                pc.listfolder, cfg, path=sub, recursive=True, nofiles=False, showpath=False,
+            ) or {}
+        except Exception:
+            continue
+        md = top.get("metadata") or {}
+        if not md.get("contents"):
+            continue
+        shards += 1
+        b, f, d = _sum_tree(md)
+        total_b += b
+        total_f += f
+        total_d += d
+    dt = time.time() - t0
+    print(
+        f"       → {_fmt_gb(total_b)} GB physikalisch dedupliziert "
+        f"({_fmt_n(total_f)} Pool-Objekte, {shards} Shards) in {dt:.1f}s",
+        flush=True,
+    )
+    return total_b, total_f, total_d, dt
 
 
 def _walk_remote(cfg: dict, path: str, label: str) -> Tuple[int, int, int, float]:
@@ -135,11 +169,16 @@ def main() -> int:
     ap.add_argument("--env-file", default=f"{MAIN_DIR}/.env")
     ap.add_argument("--dest-root", help="default: PCLOUD_DEST aus .env")
     ap.add_argument("--snap", action="append", help="Snapshot(s); default: letzte 2 remote")
-    ap.add_argument("--walk-pool", action="store_true", help="Physisches _pool/ per API summieren")
+    ap.add_argument("--walk-pool", action="store_true", help="Physisches _pool/ summieren (256 Shards)")
+    ap.add_argument("--walk-pool-mono", action="store_true", help="_pool/ in einem listfolder (langsam)")
+    ap.add_argument("--physical", action="store_true", help="Kurzform: --walk-pool --walk-snapshots")
     ap.add_argument("--walk-snapshots", action="store_true", help="Gesamtes _snapshots/ summieren (Stubs)")
     ap.add_argument("--walk-root", action="store_true", help="Gesamtes dest-root (langsam)")
     ap.add_argument("--no-quota", action="store_true", help="userinfo ueberspringen")
     args = ap.parse_args()
+    if args.physical:
+        args.walk_pool = True
+        args.walk_snapshots = True
 
     cfg = pc.effective_config(env_file=args.env_file)
     dest = pc._norm_remote_path(
@@ -199,28 +238,31 @@ def main() -> int:
             f"{_fmt_n(uniq):>10}",
         )
     print()
-    print("Hinweis: LOGICAL = wiederherstellbare Dateigroesse (Hardlinks zaehlen mehrfach).")
-    print("         Remote-Ordner _snapshots/<name>/ ist nur Stubs (typisch wenige MB).")
+    print("LOGICAL ≈ wiederherstellbare Größe pro Snapshot (wie Manifest, ~150 GB ist plausibel).")
+    print("Physische Bytes auf pCloud (dedupliziert):  python ... --physical")
+    print("Remote _snapshots/<name>/ enthält nur Stubs (wenige MB), nicht die 150 GB.")
     print()
 
     if args.walk_pool or args.walk_snapshots or args.walk_root:
-        print("--- Physische Groessen (API listfolder recursive) ---")
+        print("--- Physische Größen (Summe file.size aus listfolder) ---")
         if args.walk_root:
             _walk_remote(cfg, dest, "dest-root gesamt")
         else:
             if args.walk_pool:
-                _walk_remote(cfg, pool_root, "_pool (deduplizierte Bloecke)")
+                if args.walk_pool_mono:
+                    _walk_remote(cfg, pool_root, "_pool (ein listfolder)")
+                else:
+                    _walk_pool_sharded(cfg, pool_root)
             if args.walk_snapshots:
                 _walk_remote(cfg, snaps_root, "_snapshots (alle Stubs)")
         print()
-        print("Physisches rtb_pool ≈ _pool + _snapshots (+ manifests/index falls mitgezaehlt).")
-        print("Zwei Snapshots teilen sich _pool-Objekte — nicht 2× LOGICAL summieren!")
+        print("Physisches rtb_pool ≈ _pool + _snapshots. Snapshots teilen _pool — nicht 2× LOGICAL!")
 
     elif not (args.walk_pool or args.walk_snapshots or args.walk_root):
-        print("Optional (langsamer, echte Bytes auf pCloud):")
-        print(f"  --walk-pool          summiert {pool_root}")
-        print(f"  --walk-snapshots     summiert {snaps_root}")
-        print(f"  --walk-root          summiert ganz {dest}")
+        print("Physische Bytes:")
+        print(f"  --physical           _pool (Shards) + _snapshots")
+        print(f"  --walk-pool          nur {pool_root}")
+        print(f"  --walk-pool-mono     ein großer listfolder auf _pool")
 
     return 0
 
