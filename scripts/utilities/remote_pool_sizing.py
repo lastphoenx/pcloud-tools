@@ -11,8 +11,9 @@ Pool-Mode:
 
 Beispiele (pi-nas):
   python scripts/utilities/remote_pool_sizing.py --env-file .env
-  python scripts/utilities/remote_pool_sizing.py --env-file .env --physical
-  python scripts/utilities/remote_pool_sizing.py --env-file .env --logical
+  python scripts/utilities/remote_pool_sizing.py --env-file .env --snap 2026-06-24-120041
+  python scripts/utilities/remote_pool_sizing.py --env-file .env --walk-pool
+  python scripts/utilities/remote_pool_sizing.py --env-file .env --walk-pool --logical
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict, List, Set, Tuple
+from typing import List, Set, Tuple
 
 MAIN_DIR = os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main")
 sys.path.insert(0, MAIN_DIR)
@@ -178,19 +179,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="pCloud Remote-Groessen (Pool-Mode)")
     ap.add_argument("--env-file", default=f"{MAIN_DIR}/.env")
     ap.add_argument("--dest-root", help="default: PCLOUD_DEST aus .env")
-    ap.add_argument("--snap", action="append", help="Snapshot(s); default: letzte 2 remote")
-    ap.add_argument("--logical", action="store_true", help="Logische Groesse aus Index (wie Manifest)")
-    ap.add_argument("--walk-pool", action="store_true", help="Physisches _pool/ summieren")
+    ap.add_argument("--snap", action="append", help="Snapshot(s); default: letzte --last remote")
+    ap.add_argument("--last", type=int, default=2, metavar="N",
+                    help="Letzte N Remote-Snapshots messen (default: 2, 0=alle)")
+    ap.add_argument("--logical", action="store_true",
+                    help="Zusaetzlich logische Groesse aus Index (langsam, ~20s)")
+    ap.add_argument("--walk-pool", action="store_true",
+                    help="Zusaetzlich physisches _pool/ summieren (~40s)")
     ap.add_argument("--walk-pool-mono", action="store_true", help="_pool/ in einem listfolder")
-    ap.add_argument("--physical", action="store_true", help="--walk-pool + Stub-Summe der angezeigten Snapshots")
     ap.add_argument("--walk-snapshots", action="append", nargs="*", metavar="SNAP",
-                    help="Stub-Summe: ohne Namen = angezeigte Snapshots; 'all' = alle remote")
+                    help="Stub-Summe mehrerer Ordner; 'all' = alle remote")
     ap.add_argument("--no-quota", action="store_true")
     args = ap.parse_args()
-    if args.physical:
-        args.walk_pool = True
-        if args.walk_snapshots is None:
-            args.walk_snapshots = []
 
     cfg = pc.effective_config(env_file=args.env_file)
     dest = pc._norm_remote_path(
@@ -216,6 +216,10 @@ def main() -> int:
     remote = _list_remote_snaps(cfg, snaps_root)
     if args.snap:
         snaps = args.snap
+    elif args.last == 0:
+        snaps = remote
+    elif args.last > 0:
+        snaps = remote[-args.last:]
     else:
         snaps = remote[-2:] if len(remote) >= 2 else remote
 
@@ -223,27 +227,30 @@ def main() -> int:
         print("Keine Snapshots.")
         return 1
 
-    print(f"Remote-Snapshots: {len(remote)} (messe {len(snaps)})")
+    print(f"Remote-Snapshots gesamt: {len(remote)}  |  messe: {len(snaps)}")
     print()
 
-    # Standard: physische Stub-Groesse pro Snapshot auf pCloud
-    print(f"{'SNAPSHOT':<22} {'STUB_MB':>8} {'STUB_FILES':>11}  (remote Ordner)")
-    print("-" * 48)
-    stub_sizes: Dict[str, Tuple[int, int]] = {}
+    # Standard: nur physische Groesse der Snapshot-Ordner (Stubs), kein _pool
+    print(f"{'SNAPSHOT':<22} {'REMOTE_MB':>10} {'FILES':>11}")
+    print("-" * 46)
+    total_stub_b = 0
     for snap in snaps:
         try:
             b, f, dt = _walk_one_snapshot(cfg, snaps_root, snap)
-            stub_sizes[snap] = (b, f)
-            print(f"{snap:<22} {_fmt_mb(b):>8} {_fmt_n(f):>11}  ({dt:.1f}s)")
+            total_stub_b += b
+            print(f"{snap:<22} {_fmt_mb(b):>10} {_fmt_n(f):>11}  ({dt:.1f}s)")
         except Exception as e:
-            print(f"{snap:<22} {'ERROR':>8} {'—':>11}  ({e})")
+            print(f"{snap:<22} {'ERROR':>10} {'—':>11}  ({e})")
+    if len(snaps) > 1:
+        print("-" * 46)
+        print(f"{'Summe (angezeigt)':<22} {_fmt_mb(total_stub_b):>10}")
     print()
-    print("STUB_MB = echte Bytes auf pCloud im Snapshot-Ordner (fast nur .meta.json).")
-    print("Die ~150 GB Daten liegen dedupliziert in _pool/, nicht im Snapshot-Ordner.")
+    print("REMOTE_MB = Bytes auf pCloud im Snapshot-Ordner (Stubs, nicht die Pool-Daten).")
+    print("Pool gesamt:  --walk-pool   |   Wiederherstellbar:  --logical")
     print()
 
     pool_refs: dict = {}
-    if args.logical or args.walk_pool or args.physical:
+    if args.logical or args.walk_pool:
         print(f"Lade {idx_path} ...", flush=True)
         t0 = time.time()
         try:
@@ -263,8 +270,8 @@ def main() -> int:
         print("  LOGICAL = wiederherstellbare Groesse, nicht pCloud-Platz pro Snapshot-Ordner.")
         print()
 
-    if args.walk_pool or args.physical:
-        print("--- Physisches _pool (dedupliziert, alle Snapshots) ---")
+    if args.walk_pool:
+        print("--- _pool (dedupliziert, alle Snapshots gemeinsam) ---")
         if args.walk_pool_mono:
             top = pc.call_with_backoff(
                 pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False,
@@ -286,11 +293,12 @@ def main() -> int:
         _walk_snapshots_list(cfg, snaps_root, walk_list)
         print()
 
-    if not (args.walk_pool or args.physical or args.logical or args.walk_snapshots is not None):
-        print("Optionen:")
-        print("  --physical     _pool GB + Stub-Summe der angezeigten Snapshots")
-        print("  --logical      zusaetzlich logische Groesse aus Index")
-        print("  --walk-snapshots all   alle Snapshot-Ordner summieren (langsam)")
+    if not (args.walk_pool or args.logical or args.walk_snapshots is not None):
+        print("Mehr:")
+        print("  --snap NAME ...     bestimmte Snapshot(s)")
+        print("  --last 1            nur letzter Snapshot")
+        print("  --walk-pool         dedupliziertes _pool/ in GB")
+        print("  --logical           wiederherstellbare Groesse aus Index")
 
     return 0
 
