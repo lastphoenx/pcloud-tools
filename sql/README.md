@@ -41,6 +41,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now integrity-audit.timer
 ```
 
+View v3 (Dashboard zeigt Post-Upload auch ohne SUCCESS-Zeile):
+
+```bash
+mysql -u pcloud_backup -p pcloud_backup < sql/migrate_integrity_v3_view.sql
+```
+
+**Backfill** historischer Dashboard-Spalten (Post-Upload + Audit):
+
+```bash
+python scripts/integrity-backfill.py --env-file .env --dry-run
+python scripts/integrity-backfill.py --env-file .env --post-upload --max 10
+python scripts/integrity-backfill.py --env-file .env --audit --max 5
+sudo scripts/generate_reports.sh
+```
+
+Siehe `docs/POOL_INTEGRITY.md`.
+
 RAM limit for backup pipeline (8GB Pi):
 
 ```bash
