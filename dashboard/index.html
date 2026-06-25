@@ -720,6 +720,7 @@
         +     '<div class="info-row"><span class="lbl">RTB Snapshots</span><span class="val">' + snapCount + '</span></div>'
         +     rtbDryRunHTML(rtb)
         +     rtbDeltaPreviewHTML(rtb)
+        +     rtbPipelineOnlyHTML(rtb)
         +     rtbBackupScopeHTML(rtb)
         +     rtbExcludePolicyHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
@@ -1629,7 +1630,24 @@
     }
 
     function rtbBackupScopeHTML(rtb) {
+      if (rtb.dry_run_pipeline_only && rtb.dry_run_pipeline_only.count
+          && rtb.dry_run_result !== 'changes_detected') {
+        return '';
+      }
       return rtbDeltaPreviewHTML(rtb, 'scope');
+    }
+
+    function rtbPipelineOnlyHTML(rtb) {
+      const d = rtb.dry_run_pipeline_only;
+      if (!d || !d.count) return '';
+      if (rtb.dry_run_result === 'changes_detected') return '';
+      return rtbDeltaDetailsBlock(
+        d,
+        'Pipeline (triggert nicht)',
+        'rtb-policy-details scope',
+        true,
+        rtb.dry_run_result
+      );
     }
 
     function rtbDeltaDetailsBlock(d, title, cls, isScope, dryRunResult) {
@@ -1647,7 +1665,9 @@
         lines += '</div>';
       }
       const hint = isScope && dryRunResult !== 'changes_detected'
-        ? '<div class="rtb-policy-hint">Triggert allein kein Backup \u2014 wird mitgesichert wenn z.B. Paperless ein Delta ausl\u00f6st.</div>'
+        ? '<div class="rtb-policy-hint">Triggert kein Backup allein'
+        + (title.indexOf('Pipeline') >= 0 ? ' (nur Check-Exclude).' : '')
+        + ' \u2014 landet im RTB wenn z.B. Paperless ein echtes Delta ausl\u00f6st.</div>'
         : '';
       return '<details class="' + cls + '">'
         + '<summary>'

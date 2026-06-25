@@ -336,6 +336,7 @@ check_rtb_wrapper() {
   local dry_run_ts=""
   local dry_run_delta_json=""
   local dry_run_backup_scope_json=""
+  local dry_run_pipeline_only_json=""
   local rtb_exclude_policy_json=""
   if [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
     local check_out check_rc
@@ -347,7 +348,7 @@ check_rtb_wrapper() {
     # Parse output - robust against formatted/prefixed messages
     if echo "$check_out" | grep -q "changes_detected"; then
       dry_run_result="changes_detected"
-    elif echo "$check_out" | grep -qE "no_changes|no_baseline"; then
+    elif echo "$check_out" | grep -qE "no_changes|only pipeline"; then
       dry_run_result="no_changes"
     fi
     if echo "$check_out" | grep -q '^\[RTB Delta JSON\]'; then
@@ -360,6 +361,12 @@ check_rtb_wrapper() {
       dry_run_backup_scope_json=$(echo "$check_out" | grep '^\[RTB BackupScope JSON\]' | sed 's/^\[RTB BackupScope JSON\] //' | head -1)
       if command -v jq &>/dev/null; then
         echo "$dry_run_backup_scope_json" | jq empty 2>/dev/null || dry_run_backup_scope_json=""
+      fi
+    fi
+    if echo "$check_out" | grep -q '^\[RTB PipelineOnly JSON\]'; then
+      dry_run_pipeline_only_json=$(echo "$check_out" | grep '^\[RTB PipelineOnly JSON\]' | sed 's/^\[RTB PipelineOnly JSON\] //' | head -1)
+      if command -v jq &>/dev/null; then
+        echo "$dry_run_pipeline_only_json" | jq empty 2>/dev/null || dry_run_pipeline_only_json=""
       fi
     fi
     if echo "$check_out" | grep -q '^\[RTB ExcludePolicy JSON\]'; then
@@ -409,6 +416,9 @@ check_rtb_wrapper() {
   fi
   if [[ -n "$dry_run_backup_scope_json" ]]; then
     json="$json,\"dry_run_backup_scope\":${dry_run_backup_scope_json}"
+  fi
+  if [[ -n "$dry_run_pipeline_only_json" ]]; then
+    json="$json,\"dry_run_pipeline_only\":${dry_run_pipeline_only_json}"
   fi
   if [[ -n "$rtb_exclude_policy_json" ]]; then
     json="$json,\"exclude_policy\":${rtb_exclude_policy_json}"
