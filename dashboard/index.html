@@ -267,6 +267,9 @@
       font-family: ui-monospace, 'Cascadia Code', 'Consolas', monospace;
       font-size: 10px;
     }
+    .rtb-policy-table .pol-nein { color: var(--muted); }
+    .rtb-policy-table .pol-mit { color: var(--blue); }
+    .rtb-policy-table .pol-nie { color: var(--yellow); }
     .rtb-policy-hint {
       margin-top: 6px;
       font-size: 11px;
@@ -1661,27 +1664,39 @@
     function rtbExcludePolicyHTML(rtb) {
       const pol = rtb.exclude_policy;
       if (!pol) return '';
-      const trigger = (pol.trigger_only || []).slice(0, 6);
-      const never = (pol.never_backup || []).slice(0, 8);
+      const trigger = pol.trigger_only || [];
+      const never = pol.never_backup || [];
       if (!trigger.length && !never.length) return '';
       let rows = '';
       trigger.forEach(function(p) {
-        rows += '<tr><td><code>' + esc(p) + '</code></td><td>nein</td><td>mit</td></tr>';
+        rows += '<tr>'
+          + '<td><code>' + esc(p) + '</code></td>'
+          + '<td class="muted">nur Check</td>'
+          + '<td class="pol-nein">nein</td>'
+          + '<td class="pol-mit">mit</td>'
+          + '</tr>';
       });
       never.forEach(function(p) {
-        rows += '<tr><td><code>' + esc(p) + '</code></td><td>\u2014</td><td>nie</td></tr>';
+        rows += '<tr>'
+          + '<td><code>' + esc(p) + '</code></td>'
+          + '<td class="muted">excludes.txt</td>'
+          + '<td class="pol-nein">nein</td>'
+          + '<td class="pol-nie">nie</td>'
+          + '</tr>';
       });
-      const more = (pol.never_backup || []).length > 8
-        ? '<div class="rtb-policy-hint">+' + ((pol.never_backup || []).length - 8) + ' weitere in excludes.txt</div>'
-        : '';
+      const n = trigger.length + never.length;
       return '<details class="rtb-policy-details">'
-        + '<summary>Exclude-Policy (Trigger vs. Snapshot)</summary>'
+        + '<summary>Exclude-Policy (' + n + ' Pattern) \u2014 Trigger vs. Snapshot</summary>'
         + '<table class="rtb-policy-table">'
-        + '<tr><th>Pattern</th><th>Trigger</th><th>Snapshot</th></tr>'
+        + '<tr><th>Pattern</th><th>Quelle</th><th>Trigger</th><th>Snapshot</th></tr>'
         + rows
         + '</table>'
-        + '<div class="rtb-policy-hint">Trigger=nein: \u00c4nderung startet kein Backup. Snapshot=mit: landet im RTB wenn ein anderes Delta das Backup startet. Snapshot=nie: excludes.txt.</div>'
-        + more
+        + '<div class="rtb-policy-hint">'
+        + '<strong>Trigger</strong> = startet Backup bei \u00c4nderung? '
+        + '<strong>ja</strong> normale Pfade &middot; <strong>nein</strong> ignoriert im Delta-Check. '
+        + '<strong>Snapshot</strong> = im RTB wenn Backup l\u00e4uft? '
+        + '<strong>mit</strong> Mitbackup &middot; <strong>nie</strong> excludes.txt.'
+        + '</div>'
         + '</details>';
     }
 
