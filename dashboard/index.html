@@ -227,6 +227,53 @@
       overflow-y: auto;
     }
 
+    .rtb-policy-details {
+      margin-top: 6px;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 12px;
+      border-left: 3px solid var(--blue);
+    }
+    .rtb-policy-details.scope { border-left-color: var(--muted); }
+    .rtb-policy-details summary {
+      cursor: pointer;
+      font-weight: 500;
+      list-style: none;
+      color: var(--text);
+    }
+    .rtb-policy-details summary::-webkit-details-marker { display: none; }
+    .rtb-policy-details summary::before {
+      content: '\25B6 ';
+      font-size: 10px;
+      opacity: 0.8;
+    }
+    .rtb-policy-details[open] summary::before { content: '\25BC '; }
+    .rtb-policy-table {
+      width: 100%;
+      margin-top: 8px;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    .rtb-policy-table th,
+    .rtb-policy-table td {
+      text-align: left;
+      padding: 4px 6px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .rtb-policy-table th { color: var(--muted); font-weight: 500; }
+    .rtb-policy-table code {
+      font-family: ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+      font-size: 10px;
+    }
+    .rtb-policy-hint {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
     .service-list { display: flex; flex-direction: column; gap: 5px; }
     .service-item {
       display: flex;
@@ -670,6 +717,8 @@
         +     '<div class="info-row"><span class="lbl">RTB Snapshots</span><span class="val">' + snapCount + '</span></div>'
         +     rtbDryRunHTML(rtb)
         +     rtbDeltaPreviewHTML(rtb)
+        +     rtbBackupScopeHTML(rtb)
+        +     rtbExcludePolicyHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
         +     (perf.total_runs ? (
@@ -1144,6 +1193,9 @@
         + drow('Snapshots', String(rtb.snapshot_count || 0));
       const drObj = rtbDryRunObj(rtb);
       if (drObj) rows += drow('N\xe4chstes Backup', drObj.text, drObj.cls);
+      rows += rtbExcludePolicyDetailHTML(rtb);
+      rows += rtbDeltaDetailHTML(rtb, 'trigger');
+      rows += rtbDeltaDetailHTML(rtb, 'scope');
       // ── Histor. Safety-Gate + Erklärung zum letzten Lauf ──────
       if (rtb.safety_gate)
         rows += drow('Safety-Gate (letzter Lauf)', rtb.safety_gate, sgValCls(rtb.safety_gate));
@@ -1561,9 +1613,23 @@
            + '<span class="val ' + o.cls + '">' + o.text + '</span></div>';
     }
 
-    function rtbDeltaPreviewHTML(rtb) {
-      const d = rtb.dry_run_delta;
-      if (!d || !d.count || rtb.dry_run_result !== 'changes_detected') return '';
+    function rtbDeltaPreviewHTML(rtb, kind) {
+      kind = kind || 'trigger';
+      const d = kind === 'scope' ? rtb.dry_run_backup_scope : rtb.dry_run_delta;
+      if (!d || !d.count) return '';
+      if (kind === 'trigger' && rtb.dry_run_result !== 'changes_detected') return '';
+      const title = kind === 'scope'
+        ? 'Mitgesichert bei Backup'
+        : 'Backup-Trigger';
+      const cls = kind === 'scope' ? 'rtb-policy-details scope' : 'rtb-delta-details';
+      return rtbDeltaDetailsBlock(d, title, cls, kind === 'scope', rtb.dry_run_result);
+    }
+
+    function rtbBackupScopeHTML(rtb) {
+      return rtbDeltaPreviewHTML(rtb, 'scope');
+    }
+
+    function rtbDeltaDetailsBlock(d, title, cls, isScope, dryRunResult) {
       const tops = (d.top_dirs || []).map(function(t) {
         return esc(t.dir) + ' (' + t.count + ')';
       }).join(', ');
@@ -1577,14 +1643,66 @@
         }
         lines += '</div>';
       }
-      return '<details class="rtb-delta-details">'
+      const hint = isScope && dryRunResult !== 'changes_detected'
+        ? '<div class="rtb-policy-hint">Triggert allein kein Backup \u2014 wird mitgesichert wenn z.B. Paperless ein Delta ausl\u00f6st.</div>'
+        : '';
+      return '<details class="' + cls + '">'
         + '<summary>'
-        + d.count + ' Datei\u00e4nderung(en)'
+        + esc(title) + ': '
+        + d.count + ' \u00c4nderung(en)'
         + (tops ? ' \u2014 ' + tops : '')
         + (snap ? ' <span class="muted">vs. ' + esc(snap) + '</span>' : '')
         + '</summary>'
+        + hint
         + lines
         + '</details>';
+    }
+
+    function rtbExcludePolicyHTML(rtb) {
+      const pol = rtb.exclude_policy;
+      if (!pol) return '';
+      const trigger = (pol.trigger_only || []).slice(0, 6);
+      const never = (pol.never_backup || []).slice(0, 8);
+      if (!trigger.length && !never.length) return '';
+      let rows = '';
+      trigger.forEach(function(p) {
+        rows += '<tr><td><code>' + esc(p) + '</code></td><td>nein</td><td>mit</td></tr>';
+      });
+      never.forEach(function(p) {
+        rows += '<tr><td><code>' + esc(p) + '</code></td><td>\u2014</td><td>nie</td></tr>';
+      });
+      const more = (pol.never_backup || []).length > 8
+        ? '<div class="rtb-policy-hint">+' + ((pol.never_backup || []).length - 8) + ' weitere in excludes.txt</div>'
+        : '';
+      return '<details class="rtb-policy-details">'
+        + '<summary>Exclude-Policy (Trigger vs. Snapshot)</summary>'
+        + '<table class="rtb-policy-table">'
+        + '<tr><th>Pattern</th><th>Trigger</th><th>Snapshot</th></tr>'
+        + rows
+        + '</table>'
+        + '<div class="rtb-policy-hint">Trigger=nein: \u00c4nderung startet kein Backup. Snapshot=mit: landet im RTB wenn ein anderes Delta das Backup startet. Snapshot=nie: excludes.txt.</div>'
+        + more
+        + '</details>';
+    }
+
+    function rtbExcludePolicyDetailHTML(rtb) {
+      const pol = rtb.exclude_policy;
+      if (!pol) return '';
+      const trig = (pol.trigger_only || []).join(', ') || '\u2014';
+      const neverN = (pol.never_backup || []).length;
+      return drow('Exclude trigger-only', trig, '', 200)
+        + drow('Exclude nie (excludes.txt)', neverN + ' Pattern(s)', '', 120);
+    }
+
+    function rtbDeltaDetailHTML(rtb, kind) {
+      const d = kind === 'scope' ? rtb.dry_run_backup_scope : rtb.dry_run_delta;
+      if (!d || !d.count) return '';
+      if (kind === 'trigger' && rtb.dry_run_result !== 'changes_detected') return '';
+      const label = kind === 'scope' ? 'Mitgesichert (Scope)' : 'Backup-Trigger';
+      const tops = (d.top_dirs || []).map(function(t) { return t.dir + '(' + t.count + ')'; }).join(', ');
+      const samples = (d.samples || []).slice(0, 5).join('; ');
+      return drow(label, d.count + ' \u2014 ' + tops, kind === 'trigger' ? 'yellow' : '', 220)
+        + (samples ? drow('\u2514 Beispiele', samples, '', 240) : '');
     }
 
     function rtbCls(status) {

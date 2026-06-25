@@ -335,6 +335,8 @@ check_rtb_wrapper() {
   local dry_run_result="unknown"
   local dry_run_ts=""
   local dry_run_delta_json=""
+  local dry_run_backup_scope_json=""
+  local rtb_exclude_policy_json=""
   if [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
     local check_out check_rc
     set +e
@@ -352,6 +354,18 @@ check_rtb_wrapper() {
       dry_run_delta_json=$(echo "$check_out" | grep '^\[RTB Delta JSON\]' | sed 's/^\[RTB Delta JSON\] //' | head -1)
       if command -v jq &>/dev/null; then
         echo "$dry_run_delta_json" | jq empty 2>/dev/null || dry_run_delta_json=""
+      fi
+    fi
+    if echo "$check_out" | grep -q '^\[RTB BackupScope JSON\]'; then
+      dry_run_backup_scope_json=$(echo "$check_out" | grep '^\[RTB BackupScope JSON\]' | sed 's/^\[RTB BackupScope JSON\] //' | head -1)
+      if command -v jq &>/dev/null; then
+        echo "$dry_run_backup_scope_json" | jq empty 2>/dev/null || dry_run_backup_scope_json=""
+      fi
+    fi
+    if echo "$check_out" | grep -q '^\[RTB ExcludePolicy JSON\]'; then
+      rtb_exclude_policy_json=$(echo "$check_out" | grep '^\[RTB ExcludePolicy JSON\]' | sed 's/^\[RTB ExcludePolicy JSON\] //' | head -1)
+      if command -v jq &>/dev/null; then
+        echo "$rtb_exclude_policy_json" | jq empty 2>/dev/null || rtb_exclude_policy_json=""
       fi
     fi
   fi
@@ -392,6 +406,12 @@ check_rtb_wrapper() {
   fi
   if [[ -n "$dry_run_delta_json" ]]; then
     json="$json,\"dry_run_delta\":${dry_run_delta_json}"
+  fi
+  if [[ -n "$dry_run_backup_scope_json" ]]; then
+    json="$json,\"dry_run_backup_scope\":${dry_run_backup_scope_json}"
+  fi
+  if [[ -n "$rtb_exclude_policy_json" ]]; then
+    json="$json,\"exclude_policy\":${rtb_exclude_policy_json}"
   fi
   json="$json}"
   
