@@ -361,6 +361,29 @@ Das Dashboard liest zwei JSON-Dateien:
 
 **Expandierbar:** Klick auf "▼ Letzte Backup-Läufe" zeigt Tabelle mit letzten 7 Backups
 
+**RTB Delta & Exclude-Policy (Juni 2026):**
+
+| UI-Block | `status.json` Feld | Wann sichtbar |
+|----------|-------------------|---------------|
+| Nächstes Backup | `dry_run_result` | immer (grün/gelb) |
+| **Backup-Trigger** | `dry_run_delta` | nur bei `changes_detected` — echte Nutzerdaten |
+| **Pipeline (triggert nicht)** | `dry_run_pipeline_only` | nur bei `no_changes` + Pipeline-Diff |
+| **Mitgesichert bei Backup** | `dry_run_backup_scope` | wenn Scope-Diff (ohne Duplikat zu Pipeline-Block) |
+| **Exclude-Policy** | `exclude_policy` | Tabelle: Pattern × Trigger × Snapshot |
+
+Quelle: `aggregate_status.sh` ruft `rtb_pool_wrapper.sh --check-only` auf und parst JSON-Zeilen:
+`[RTB Delta JSON]`, `[RTB PipelineOnly JSON]`, `[RTB BackupScope JSON]`, `[RTB ExcludePolicy JSON]`.
+
+**Exclude-Matrix (Spalten):**
+
+| Trigger | Snapshot | Beispiel |
+|---------|----------|----------|
+| nein | nie | `__pycache__/` (excludes.txt) |
+| nein | mit | `/pcloud-temp/` (nur Check-Exclude) |
+| ja | ja | `Backup/Paperless/data/…` (normale Pfade) |
+
+Details: `rtb/README.md` § Excludes, `docs/STORAGE_PATHS.md` § RTB vs. Pipeline.
+
 ---
 
 ### Tile 2: Malware & Integrität

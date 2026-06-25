@@ -122,11 +122,17 @@ python scripts/utilities/pool_verify_backup.py \
 
 **Ziel:** Reine Pipeline-Änderungen (Upload, Manifest, Temp) sollen **kein** RTB triggern. Sobald **Nutzerdaten** ein Backup auslösen, landen `pcloud-archive/` und `pcloud-temp/` unter `/srv/nas` **mit** im Snapshot.
 
-| Schicht | Datei / Mechanismus | `pcloud-archive/` `pcloud-temp/` |
-|---------|---------------------|----------------------------------|
-| Delta-Check (`rsync -ni`) | `rtb_check_excludes.sh` (Wrapper) | **excluded** |
-| Echtes RTB (`rsync_tmbackup`) | `excludes.txt` | **nicht** excluded |
-| Pool-Manifest-Scan | `PCLOUD_MANIFEST_SKIP_GLOBS` in Python | skipped (keine Pool-Userdateien) |
+| Schicht | Datei / Mechanismus | `pcloud-archive/` `pcloud-temp/` | `__pycache__/` etc. |
+|---------|---------------------|----------------------------------|---------------------|
+| Delta-Check (`rsync -ni`) | `rtb_check_excludes.sh` + Post-Filter | **triggert nicht** | excluded (via excludes.txt in Check-Liste) |
+| Echtes RTB (`rsync_tmbackup`) | `excludes.txt` | **mitgesichert** wenn Backup läuft | **nie** im Snapshot |
+| Pool-Manifest-Scan | `PCLOUD_MANIFEST_SKIP_GLOBS` in Python | skipped (keine Pool-Userdateien) | optional in `.env` |
+
+**Post-Filter:** `rtb_check_only_delta.py --analyze` trennt echte Trigger-Deltas von reinen Pipeline-Pfaden (rsync-Exclude ist nicht immer 100 % zuverlässig). Pre-Backup-Check im Wrapper nutzt dieselbe Logik.
+
+**Dashboard:** `aggregate_status.sh` parst `[RTB Delta JSON]`, `[RTB PipelineOnly JSON]`, `[RTB BackupScope JSON]`, `[RTB ExcludePolicy JSON]` → siehe `docs/DASHBOARD.md`.
+
+**Deploy excludes.txt:** Änderungen nur im Repo `rtb`, auf pi-nas `git pull` — nicht `/opt/apps/rtb/excludes.txt` per Hand editieren (blockiert sonst `git pull`).
 
 **Kein separater Pipeline-Export:** `raspi5nas_backup.sh` kopiert **nicht** mehr nach `Backup/raspi5nas/pcloud-*`. Offsite-Manifeste/Temp kommen über RTB, wenn ein Snapshot fällig ist.
 
