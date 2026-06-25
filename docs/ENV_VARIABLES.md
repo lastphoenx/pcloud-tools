@@ -279,6 +279,18 @@ PCLOUD_DEST=/Backup/rtb_pool
 PCLOUD_TEMP_DIR=/srv/pcloud-temp
 ```
 
+### `PCLOUD_MANIFEST_SKIP_GLOBS`
+**Beschreibung:** Komma-getrennte Glob-Patterns — beim Pool-Manifest-Scan (`pcloud_json_pool_manifest.py`) werden passende Dateien übersprungen (nicht in Manifest/Index).  
+**Default:** `**/._*` (AppleDouble)  
+**Optional pi-nas:** `**/__pycache__/**,**/*.pyc` — analog `rtb/excludes.txt`, reduziert Manifest-Größe  
+**Verwendet in:** `pcloud_path_compat.py`, `pcloud_json_pool_manifest.py`
+
+```bash
+# PCLOUD_MANIFEST_SKIP_GLOBS=**/__pycache__/**,**/*.pyc
+```
+
+Siehe `docs/STORAGE_PATHS.md` § RTB vs. Pipeline (Manifest-Scan-Zeile).
+
 ### `PCLOUD_FOLDERID_CACHE`
 **Beschreibung:** Cache-Datei für FolderID-Lookups (beschleunigt `ensure_parent_dirs`).  
 **Default:** `/tmp/pcloud_folderid_cache.json`  

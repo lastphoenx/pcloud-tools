@@ -373,6 +373,13 @@ Nach jedem EntropyWatcher-Scan wechselt der Status für **10 Minuten** auf YELLO
       "status": "success",
       "last_run": "2026-04-15 14:00:00",
       "snapshot_count": 12,
+      "dry_run_result": "no_changes",
+      "dry_run_pipeline_only": { "kind": "pipeline_only", "count": 2, "samples": ["pcloud-temp/..."] },
+      "dry_run_backup_scope": { "kind": "backup_scope", "count": 2 },
+      "exclude_policy": {
+        "trigger_only": ["/pcloud-archive/", "/pcloud-temp/"],
+        "never_backup": ["__pycache__/", "/restore/", "..."]
+      },
       "message": "[success] Backup complete"
     },
     "pcloud_backup": {
