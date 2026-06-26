@@ -326,24 +326,32 @@ cmd_cleanup_dupes() {
     esac
     shift
   done
-  local dup ssd p canon_archive="/srv/pcloud-archive"
+  local dup p canon_archive="/srv/pcloud-archive"
+  echo "Pipeline (NICHT löschen): $SSD2/pcloud-archive, $SSD2/pcloud-temp -> bind /srv/pcloud-*"
+  echo "Nur mergerfs-Streuer auf SSD1 sind löschbar (falls vorhanden)."
   for dup in "${LEGACY_MERGERFS_DUPES[@]}"; do
-    for ssd in "$SSD1" "$SSD2"; do
-      p="$ssd/$dup"
-      [[ -d "$p" ]] || continue
-      echo "=== $p ($(dir_size "$p")) ==="
-      if [[ "$dup" == "pcloud-archive" && -d "$canon_archive/manifests" ]]; then
-        diff -rq "$p/manifests" "$canon_archive/manifests" 2>/dev/null | head -5 || true
+    p="$SSD1/$dup"
+    [[ -d "$p" ]] || { echo "=== $p: (nicht vorhanden) ==="; continue; }
+    echo "=== $p ($(dir_size "$p")) — mergerfs-Streuer, löschbar wenn diff ok ==="
+    if [[ "$dup" == "pcloud-archive" && -d "$canon_archive/manifests" ]]; then
+      diff -rq "$p/manifests" "$canon_archive/manifests" 2>/dev/null | head -5 || echo "(manifests identisch oder nicht vergleichbar)"
+    fi
+    if [[ "$delete" -eq 1 ]]; then
+      if [[ "$yes" -ne 1 ]]; then
+        read -r -p "Delete $p? Type YES: " confirm
+        [[ "$confirm" == "YES" ]] || continue
       fi
-      if [[ "$delete" -eq 1 ]]; then
-        if [[ "$yes" -ne 1 ]]; then
-          read -r -p "Delete $p? Type YES: " confirm
-          [[ "$confirm" == "YES" ]] || continue
-        fi
-        log "rm -rf $p"
-        rm -rf "$p"
-      fi
-    done
+      log "rm -rf $p"
+      rm -rf "$p"
+    fi
+  done
+  for dup in "${LEGACY_MERGERFS_DUPES[@]}"; do
+    p="$SSD2/$dup"
+    [[ -d "$p" ]] || continue
+    echo "=== $p ($(dir_size "$p")) — Pipeline-Bind-Quelle, NICHT löschen ==="
+    if [[ "$dup" == "pcloud-archive" && -d "$canon_archive/manifests" ]]; then
+      diff -rq "$p/manifests" "$canon_archive/manifests" 2>/dev/null | head -3 || echo "(identisch mit /srv/pcloud-archive — erwartet)"
+    fi
   done
 }
 
