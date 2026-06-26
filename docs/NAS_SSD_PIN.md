@@ -18,7 +18,7 @@
 | Pfad | SSD |
 |------|-----|
 | `/srv/pcloud-archive`, `/srv/pcloud-temp` | SSD2 (Pipeline-Bind-Mounts) |
-| `/srv/nas/pcloud-*` | mergerfs-Doppel → löschen (`cleanup-dupes`) |
+| `/srv/nas/pcloud-*` | dieselben Daten wie Bind-Mount (über mergerfs sichtbar); **SSD2 nicht löschen** |
 
 **Paperless:** Live-Media und NFS-Export liegen bewusst auf **`/mnt/ssd1/Paperless/media`** (kein mergerfs-Split). Backups laufen über **`/mnt/ssd2/Backup/Paperless/`** — das ist „Paperless auf SSD2“ im Sinne von Backup, nicht die PDFs.
 
@@ -79,7 +79,7 @@ systemctl stop smbd nmbd   # empfohlen
 ./scripts/nas-ssd-pin.sh verify
 ./scripts/nas-ssd-pin.sh purge --yes
 
-./scripts/nas-ssd-pin.sh cleanup-dupes --delete --yes   # wenn ok
+./scripts/nas-ssd-pin.sh cleanup-dupes   # nur Streuer auf SSD1 löschbar; /mnt/ssd2/pcloud-* = Pipeline
 
 ./scripts/nas-ssd-pin.sh apply-fstab
 umount /srv/nas && mount /srv/nas
