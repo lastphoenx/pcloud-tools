@@ -110,7 +110,9 @@ python scripts/utilities/pool_verify_backup.py \
 ## Referenz: mergerfs vs. Bind-Mount
 
 ```
-/srv/nas/          mergerfs 1:2  (ssd1 + ssd2, 3.6T)  ← Samba [nas]-Share, RTB-Quelle
+/srv/nas/          mergerfs 1:2  (ssd1 + ssd2)  ← Samba, RTB
+                     Pin-Map: SSD1 = User-Shares + Paperless/media; SSD2 = Fotos, Videos, Backup
+                     Policy nach Bereinigung: category.create=epmfs — docs/NAS_SSD_PIN.md
 /srv/pcloud-archive/  bind → sdd1 only (1.8T)         ← Pipeline (kanonisch)
 /srv/pcloud-temp/     bind → sdd1 only                 ← Pipeline-Temp
 /                     mmcblk0p2 (15G)                    ← OS nur
