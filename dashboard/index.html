@@ -42,6 +42,7 @@
     .header h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
     .header .meta { font-size: 13px; color: var(--muted); text-align: right; }
     .header .meta span { display: block; }
+    .header .meta .tz-hint { font-size: 11px; opacity: 0.85; }
 
     .overall-bar {
       display: flex;
@@ -501,6 +502,7 @@
     <div class="meta">
       <span id="hostname">&#x2014;</span>
       <span id="data-timestamp">&#x2014;</span>
+      <span id="server-timezone" class="tz-hint" title="Zeitzone pi-nas / MariaDB">&#x2014;</span>
     </div>
   </div>
 
@@ -614,6 +616,9 @@
     function render(status, reports) {
       document.getElementById('hostname').textContent = status.hostname || '\u2014';
       document.getElementById('data-timestamp').textContent = fmtTs(status.timestamp);
+      const tz = (reports && reports.server_timezone) || status.server_timezone || 'Europe/Berlin';
+      const tzEl = document.getElementById('server-timezone');
+      if (tzEl) tzEl.textContent = tz;
       document.getElementById('last-update').textContent = 'Letztes Update: ' + new Date().toLocaleTimeString('de-DE');
 
       const overall = (status.overall_status || 'UNKNOWN').toUpperCase();
@@ -1806,14 +1811,26 @@
         + '</div>';
     }
 
+    const DISPLAY_TZ = 'Europe/Berlin';
+
     function fmtTs(ts) {
       if (!ts || ts === 'never' || ts === 'unknown' || ts === 'N/A') return ts || '\u2014';
+      const s = String(ts).trim();
+      // Legacy: MariaDB local wall clock wrongly exported with trailing Z (pre-fix)
+      const legacyLocalZ = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})(?::\d{2})?Z$/);
+      if (legacyLocalZ) {
+        const p = legacyLocalZ[1].split('-');
+        return p[2] + '.' + p[1] + '.' + p[0] + ', ' + legacyLocalZ[4];
+      }
       try {
-        return new Date(ts).toLocaleString('de-DE', {
+        const d = new Date(s);
+        if (isNaN(d.getTime())) return s;
+        return d.toLocaleString('de-DE', {
           day:'2-digit', month:'2-digit', year:'numeric',
-          hour:'2-digit', minute:'2-digit'
+          hour:'2-digit', minute:'2-digit',
+          timeZone: DISPLAY_TZ
         });
-      } catch(e) { return ts; }
+      } catch(e) { return s; }
     }
 
     function trunc(str, n) {
