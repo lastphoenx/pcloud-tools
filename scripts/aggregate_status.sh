@@ -128,7 +128,7 @@ check_systemd_service() {
   if [[ -n "$ts_raw" && "$ts_raw" != "n/a" ]]; then
     # Convert to ISO 8601 (fmtTs in dashboard expects parseable date string)
     local ts_iso
-    ts_iso=$(date -d "$ts_raw" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo "")
+    ts_iso=$(date -d "$ts_raw" -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
     [[ -n "$ts_iso" ]] && last_start="$ts_iso"
   fi
 
@@ -832,6 +832,7 @@ SYSTEMD_SERVICES=(
 # Start building JSON
 TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 HOSTNAME=$(hostname)
+SERVER_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "Europe/Berlin")
 
 log "Checking systemd services..."
 
@@ -945,6 +946,7 @@ cat > "$MONITORING_OUTPUT" <<EOF
 {
   "timestamp": "$TIMESTAMP",
   "hostname": "$HOSTNAME",
+  "server_timezone": "$SERVER_TZ",
   "dashboard_url": "$ESC_DASHBOARD_URL",
   "overall_status": "$OVERALL_STATUS",
   "exit_code": $EXIT_CODE,

@@ -183,6 +183,34 @@ escape_json() {
   echo "$str"
 }
 
+# MariaDB DATETIME = naive pi-nas wall clock (NOW()). Export as UTC ISO-8601 for dashboard JS.
+MDB_TZ="${MDB_TZ:-Europe/Berlin}"
+MDB_TS_MODE="${MDB_TS_MODE:-utc}"
+
+init_mdb_timezone() {
+  local detected test
+  detected=$(db_query "SELECT IF(@@global.time_zone IN ('SYSTEM',''), @@system_time_zone, @@global.time_zone)" 2>/dev/null | tr -d '[:space:]' || true)
+  [[ -n "$detected" ]] && MDB_TZ="$detected"
+  test=$(db_query "SELECT CONVERT_TZ('2026-01-01 12:00:00', '${MDB_TZ}', '+00:00')" 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$test" || "$test" == "NULL" ]]; then
+    MDB_TS_MODE="naive"
+    log "WARN: CONVERT_TZ unavailable — exporting naive local timestamps (no Z suffix)"
+  else
+    MDB_TS_MODE="utc"
+    log "DB timestamps: ${MDB_TZ} → UTC (ISO-8601 Z)"
+  fi
+}
+
+# SQL expression: naive DATETIME column → JSON timestamp string
+mdb_ts_sql() {
+  local col="$1"
+  if [[ "$MDB_TS_MODE" == "naive" ]]; then
+    echo "DATE_FORMAT(${col}, '%Y-%m-%dT%H:%i:%s')"
+  else
+    echo "DATE_FORMAT(CONVERT_TZ(${col}, '${MDB_TZ}', '+00:00'), '%Y-%m-%dT%H:%i:%sZ')"
+  fi
+}
+
 # =====================================================
 # Check DB connectivity
 # =====================================================
@@ -209,8 +237,8 @@ get_recent_backups() {
     SELECT
       snapshot_name,
       status,
-      DATE_FORMAT(started_at, '%Y-%m-%dT%H:%i:%SZ') AS started_at,
-      DATE_FORMAT(finished_at, '%Y-%m-%dT%H:%i:%SZ') AS finished_at,
+      $(mdb_ts_sql started_at) AS started_at,
+      $(mdb_ts_sql finished_at) AS finished_at,
       COALESCE(duration_sec, 0) AS duration_sec,
       COALESCE(files_uploaded, 0) AS files_uploaded,
       COALESCE(ROUND(bytes_uploaded / 1024 / 1024 / 1024, 2), 0) AS gb_uploaded,
@@ -288,7 +316,7 @@ get_failed_backups() {
   result=$(db_query "
     SELECT
       snapshot_name,
-      DATE_FORMAT(started_at, '%Y-%m-%dT%H:%i:%SZ') AS started_at,
+      $(mdb_ts_sql started_at) AS started_at,
       COALESCE(duration_sec, 0) AS duration_sec,
       COALESCE(error_message, '') AS error_message
     FROM v_failed_backups
@@ -396,10 +424,10 @@ get_pool_integrity_snapshots() {
         'snapshot', snapshot_name,
         'backup_status', COALESCE(backup_status, ''),
         'post_upload_status', COALESCE(post_upload_status, ''),
-        'post_upload_at', COALESCE(DATE_FORMAT(post_upload_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
+        'post_upload_at', COALESCE($(mdb_ts_sql post_upload_at), ''),
         'post_upload_issues', COALESCE(post_upload_issues, 0),
         'monthly_audit_status', COALESCE(monthly_audit_status, ''),
-        'monthly_audit_at', COALESCE(DATE_FORMAT(monthly_audit_at, '%Y-%m-%dT%H:%i:%SZ'), ''),
+        'monthly_audit_at', COALESCE($(mdb_ts_sql monthly_audit_at), ''),
         'monthly_audit_issues', COALESCE(monthly_audit_issues, 0),
         'audit_freshness', COALESCE(audit_freshness, 'UNKNOWN')
       ) AS j
@@ -427,7 +455,7 @@ get_ew_last_scans() {
   result=$(ew_db_query "
     SELECT
       source,
-      DATE_FORMAT(finished_at, '%Y-%m-%dT%H:%i:%SZ') AS finished_at,
+      $(mdb_ts_sql finished_at) AS finished_at,
       COALESCE(files_processed, 0) AS files_processed,
       COALESCE(flagged_new_count, 0) AS flagged_new,
       COALESCE(missing_count, 0) AS missing_count,
@@ -496,7 +524,7 @@ get_ew_av_events() {
   local result
   result=$(ew_db_query "
     SELECT
-      DATE_FORMAT(detected_at, '%Y-%m-%dT%H:%i:%SZ') AS detected_at,
+      $(mdb_ts_sql detected_at) AS detected_at,
       COALESCE(source, 'unknown') AS source,
       signature,
       action
@@ -818,6 +846,8 @@ ERREOF
   exit 0
 fi
 
+init_mdb_timezone
+
 log "Querying recent backups..."
 RECENT_BACKUPS=$(get_recent_backups)
 [[ -z "$RECENT_BACKUPS" ]] && RECENT_BACKUPS="[]"
@@ -892,6 +922,8 @@ fi
 cat > "$REPORTS_OUTPUT" <<EOF
 {
   "timestamp": "${TIMESTAMP}",
+  "server_timezone": "${MDB_TZ}",
+  "timestamps_utc": $([ "$MDB_TS_MODE" = "utc" ] && echo "true" || echo "false"),
   "recent_backups": ${RECENT_BACKUPS},
   "performance_stats": ${PERF_STATS},
   "failed_backups": ${FAILED_BACKUPS},
