@@ -1816,11 +1816,10 @@
     function fmtTs(ts) {
       if (!ts || ts === 'never' || ts === 'unknown' || ts === 'N/A') return ts || '\u2014';
       const s = String(ts).trim();
-      // Legacy: MariaDB local wall clock wrongly exported with trailing Z (pre-fix)
-      const legacyLocalZ = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})(?::\d{2})?Z$/);
-      if (legacyLocalZ) {
-        const p = legacyLocalZ[1].split('-');
-        return p[2] + '.' + p[1] + '.' + p[0] + ', ' + legacyLocalZ[4];
+      // Naive ISO ohne Offset = Server-Wanduhr (timestamps_utc=false), Ziffern 1:1 anzeigen
+      const naive = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+      if (naive && !/[Zz]|[+-]\d{2}:?\d{2}$/.test(s)) {
+        return naive[3] + '.' + naive[2] + '.' + naive[1] + ', ' + naive[4] + ':' + naive[5];
       }
       try {
         const d = new Date(s);
