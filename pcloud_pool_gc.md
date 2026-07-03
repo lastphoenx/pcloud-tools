@@ -235,7 +235,9 @@ python pcloud_pool_gc.py \
 
 Der Wrapper ruft **kein** `--retention-sync` mehr auf — Retention gehört ins GC-Skript.
 
-### Cron (wöchentlich, Sonntag 03:00)
+### Cron (wöchentlich / monatlich)
+
+Siehe auch pi-nas-Übersicht: [Doku/cron-jobs.md](https://github.com/lastphoenx/Doku/blob/main/Raspi/raspinas/ops/cron-jobs.md) (falls Doku-Repo verfügbar).
 
 ```cron
 # Nur Pool-GC (wenn Retention separat)
