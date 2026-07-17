@@ -239,23 +239,24 @@ Kandidaten = Remote-Snapshots ∩ lokale Manifeste (ohne current). Scout wählt 
 Läuft nach **jedem** Modus. Ohne erfolgreiche Validation kein `.upload_complete`:
 
 ```python
-# 1. Pool-SHA-Check: alle Manifest-SHAs physisch im Pool?
-missing_in_pool = manifest_sha256s - pool_sha256s
+# 1. Pool-SHA-Check (batch): stat() pro Manifest-SHA via _pool_object_present()
+missing_in_pool = _validate_pool_shas_batched(...)
 
 # 2. Index-Konsistenz: alle SHAs in pool_refs mit korrektem Snapshot?
 for sha in manifest_sha256s:
     assert snapshot_name in pool_refs[sha]['snapshots']
 
-# 3. Stub-Vollcheck (100%): listfolder(snapshot_dir) → Set aller Stub-Pfade
-#    Für jeden Manifest-relpath: stub_path in remote_stub_paths?
-missing_stubs = [rp for rp in manifest_items if stub_path not in remote_stub_paths]
+# 3. Stub-Vollcheck (batch, 100%): stat() pro Manifest-relpath (.meta.json)
+missing_stubs = _validate_stubs_batched(...)
 ```
 
-**Pool-Objekt-Lookup (Juni 2026):** `_pool_object_present()` prüft zuerst `by_fileid` (aus `pool_refs`), dann Pfad in `by_path` — case-insensitive Bulk-Scan.
+**RAM-Strategie (Juli 2026):** Statt `listfolder(_pool)` + `listfolder(snapshot_dir)` (Millionen-Knoten-Bäume, OOM auf pi-nas) werden Pool-SHAs und Stubs in Batches mit parallelem `stat()` geprüft. Konfiguration: `PCLOUD_VALIDATE_BATCH_SIZE` (Default 5000), `PCLOUD_VALIDATE_THREADS` (Default 8). Siehe [ENV_VARIABLES.md](ENV_VARIABLES.md#pool-finalize-ram-sparend).
 
-**Pool-Backfill (Juni 2026):** Fehlen wenige SHA256s im Pool (z.B. nach GC), lädt `validate_pool_snapshot` die Quelldateien aus dem Manifest nach (`PCLOUD_VALIDATE_POOL_BACKFILL_MAX`, Default 50). Deaktivieren: `PCLOUD_VALIDATE_POOL_BACKFILL_MAX=0`.
+**Pool-Objekt-Lookup:** `_pool_object_present()` prüft zuerst `by_fileid` (aus `pool_refs`), dann Pfad in `by_path`.
 
-Der Stub-Check verwendet `listfolder(snapshot_dir)` als Set-Lookup (1 API-Call, O(n) Set-Vergleich). Stichproben waren unzuverlässig (0.5% Abdeckung hatte 9 fehlende Stubs nicht gefangen).
+**Pool-Backfill:** Fehlen wenige SHA256s im Pool (z.B. nach GC), lädt `validate_pool_snapshot` die Quelldateien aus dem Manifest nach (`PCLOUD_VALIDATE_POOL_BACKFILL_MAX`, Default 50). Deaktivieren: `PCLOUD_VALIDATE_POOL_BACKFILL_MAX=0`.
+
+**Finalize-Reihenfolge (Delta):** `gc.collect()` → `.upload_complete` → Index-Upload (lokal + resumable) → Manifest archivieren.
 
 ---
 

@@ -2482,22 +2482,395 @@ def ensure_many_parent_dirs(cfg: dict, paths: list[str]) -> None:
     for d in sorted(dirs):
         ensure_dir_cached(cfg, d)
 
+
+def _format_byte_size(num_bytes: int) -> str:
+    """Menschenlesbare Groesse fuer Logs."""
+    n = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{num_bytes} B"
+
+
+def get_resume_state_dir() -> str:
+    """
+    State-Verzeichnis fuer resumable Uploads (SSD bevorzugt, nicht microSD).
+
+    Prioritaet:
+      1. PCLOUD_RESUME_DIR
+      2. $PCLOUD_ARCHIVE_DIR/resume/  (Default: /srv/pcloud-archive/resume)
+      3. ~/.pcloud_resume/
+      4. /tmp/pcloud_resume/
+    """
+    if "PCLOUD_RESUME_DIR" in os.environ:
+        state_dir = os.environ["PCLOUD_RESUME_DIR"]
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            return state_dir
+        except Exception:
+            pass
+
+    production_dir = os.path.join(
+        os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "resume"
+    )
+    if os.path.exists("/srv"):
+        try:
+            os.makedirs(production_dir, exist_ok=True)
+            test_file = os.path.join(production_dir, ".write_test")
+            with open(test_file, "w", encoding="utf-8") as f:
+                f.write("test")
+            os.remove(test_file)
+            return production_dir
+        except Exception:
+            pass
+
+    home_dir = os.path.expanduser("~/.pcloud_resume")
+    try:
+        os.makedirs(home_dir, exist_ok=True)
+        return home_dir
+    except Exception:
+        pass
+
+    tmp_dir = "/tmp/pcloud_resume"
+    os.makedirs(tmp_dir, exist_ok=True)
+    return tmp_dir
+
+
+def write_json_local_atomic(local_path: str, obj: dict, *, minify: bool = True) -> int:
+    """
+    Schreibt JSON atomar auf lokale Platte (Staging auf SSD, kein RAM-String-Zwischenpuffer).
+    Returns: Dateigroesse in Bytes.
+    """
+    parent = os.path.dirname(local_path) or "."
+    os.makedirs(parent, exist_ok=True)
+    with _tempfile.NamedTemporaryFile(
+        mode="w", dir=parent, delete=False, suffix=".tmp", encoding="utf-8"
+    ) as f:
+        if minify:
+            _json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+        else:
+            _json.dump(obj, f, ensure_ascii=False, indent=2)
+        temp_path = f.name
+    os.replace(temp_path, local_path)
+    try:
+        os.chmod(local_path, 0o644)
+    except OSError:
+        pass
+    return os.path.getsize(local_path)
+
+
+def upload_local_file_resumable(
+    cfg: Dict[str, Any],
+    local_path: str,
+    *,
+    remote_path: Optional[str] = None,
+    folderid: Optional[int] = None,
+    filename: Optional[str] = None,
+    state_key: Optional[str] = None,
+    log_prefix: str = "[chunked]",
+    log: Optional[Callable[[str], None]] = None,
+    log_every_chunks: Optional[int] = None,
+    chunk_size: Optional[int] = None,
+    verify_sha256: bool = True,
+    snapshot_name: Optional[str] = None,
+    dry: bool = False,
+) -> Dict[str, Any]:
+    """
+    Resumable Chunked-Upload einer lokalen Datei (upload_create / upload_write / upload_save).
+
+    - Liest Chunks von Disk (kein Voll-Load in RAM)
+    - Persistiert State nach jedem Chunk (Resume bei Abbruch/Timeout)
+    - Fortschritts-Logs konfigurierbar (log_every_chunks)
+
+    Ziel: entweder remote_path ODER folderid + filename.
+    """
+    def _emit(msg: str) -> None:
+        if log:
+            log(msg)
+        else:
+            print(msg, flush=True)
+
+    if dry:
+        sz = os.path.getsize(local_path)
+        dest = remote_path or f"folderid:{folderid}/{filename}"
+        _emit(f"{log_prefix} [dry] upload {local_path} ({_format_byte_size(sz)}) -> {dest}")
+        return {"metadata": {"fileid": None, "hash": None, "size": sz}}
+
+    if remote_path:
+        remote_path = _norm_remote_path(remote_path)
+        dest_filename = filename or os.path.basename(remote_path)
+    elif folderid is not None and filename:
+        dest_filename = filename
+        remote_path = None
+    else:
+        raise ValueError("upload_local_file_resumable: remote_path ODER folderid+filename erforderlich")
+
+    file_size = os.path.getsize(local_path)
+    if chunk_size is None:
+        chunk_mb = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128"))
+        chunk_size = max(1, chunk_mb) * 1024 * 1024
+    if log_every_chunks is None:
+        log_every_chunks = int(os.environ.get("PCLOUD_UPLOAD_LOG_EVERY_CHUNKS", "10"))
+
+    state_dir = get_resume_state_dir()
+    if state_key:
+        sk = state_key
+    elif remote_path:
+        sk = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
+    else:
+        sk = hashlib.sha256(f"{folderid}:{dest_filename}".encode()).hexdigest()[:16]
+    safe_base = "".join(
+        c if c.isalnum() or c in "._-" else "_" for c in os.path.basename(local_path)
+    )
+    state_file = os.path.join(state_dir, f"{safe_base}_{sk}.state.json")
+
+    uploadid: Optional[int] = None
+    upload_offset = 0
+    chunks_uploaded = 0
+    file_hash: Optional[str] = None
+
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = _json.load(f)
+            file_hash = state.get("file_hash")
+            state_remote = state.get("remote_path")
+            state_folder = state.get("folderid")
+            state_name = state.get("filename")
+            dest_ok = (
+                (remote_path and state_remote == remote_path)
+                or (folderid is not None and state_folder == int(folderid) and state_name == dest_filename)
+            )
+            if not dest_ok:
+                _emit(f"{log_prefix} State ungueltig (Ziel geaendert) - neu")
+                os.remove(state_file)
+                file_hash = None
+            elif state.get("file_size") != file_size:
+                _emit(f"{log_prefix} State ungueltig (file_size geaendert) - neu")
+                os.remove(state_file)
+                file_hash = None
+            elif snapshot_name and state.get("snapshot_name") not in (None, snapshot_name):
+                _emit(f"{log_prefix} State ungueltig (Snapshot) - neu")
+                os.remove(state_file)
+                file_hash = None
+            else:
+                uploadid = state.get("uploadid")
+                upload_offset = int(state.get("offset", 0))
+                chunks_uploaded = int(state.get("chunks_uploaded", 0))
+                _emit(
+                    f"{log_prefix} Resume @ {_format_byte_size(upload_offset)} / "
+                    f"{_format_byte_size(file_size)} "
+                    f"({upload_offset / file_size * 100:.1f}%)"
+                )
+                try:
+                    server_info = upload_info(cfg, int(uploadid))
+                    server_offset = int(server_info.get("size", 0))
+                    if server_offset != upload_offset:
+                        _emit(
+                            f"{log_prefix} Offset-Korrektur: lokal={upload_offset:,} "
+                            f"server={server_offset:,}"
+                        )
+                        upload_offset = server_offset
+                        chunks_uploaded = server_offset // chunk_size
+                except Exception as e:
+                    _emit(f"{log_prefix} upload_info fehlgeschlagen ({e}) - neu")
+                    os.remove(state_file)
+                    uploadid = None
+                    upload_offset = 0
+                    chunks_uploaded = 0
+                    file_hash = None
+        except Exception as e:
+            _emit(f"{log_prefix} State-Load fehlgeschlagen ({e}) - neu")
+            try:
+                os.remove(state_file)
+            except OSError:
+                pass
+            uploadid = None
+            file_hash = None
+
+    if verify_sha256 and not file_hash:
+        _emit(f"{log_prefix} SHA256 {os.path.basename(local_path)} ({_format_byte_size(file_size)})...")
+        h = hashlib.sha256()
+        with open(local_path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(block)
+        file_hash = h.hexdigest()
+
+    if not uploadid:
+        _emit(f"{log_prefix} Neue Upload-Session...")
+        resp = upload_create(cfg)
+        uploadid = int(resp.get("uploadid"))
+        _emit(f"{log_prefix} uploadid={uploadid}")
+
+    total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
+    _emit(
+        f"{log_prefix} Start: {_format_byte_size(file_size)}, "
+        f"Chunk={chunk_size // (1024 * 1024)} MiB, ~{total_chunks} Chunks"
+    )
+
+    def _write_state(*, status: str, error: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {
+            "uploadid": uploadid,
+            "offset": upload_offset,
+            "chunks_uploaded": chunks_uploaded,
+            "file_hash": file_hash,
+            "file_size": file_size,
+            "remote_path": remote_path,
+            "folderid": int(folderid) if folderid is not None else None,
+            "filename": dest_filename,
+            "snapshot_name": snapshot_name,
+            "status": status,
+            "updated_at": time.time(),
+        }
+        if error:
+            payload["error"] = error
+        with open(state_file, "w", encoding="utf-8") as f:
+            _json.dump(payload, f)
+
+    with open(local_path, "rb") as fh:
+        fh.seek(upload_offset)
+        chunk_number = chunks_uploaded
+        while upload_offset < file_size:
+            chunk_data = fh.read(chunk_size)
+            if not chunk_data:
+                break
+            chunk_number += 1
+            chunk_uploaded = False
+            for retry in range(1, 6):
+                try:
+                    upload_write(cfg, int(uploadid), upload_offset, chunk_data)
+                    chunk_uploaded = True
+                    break
+                except Exception as e:
+                    if retry == 5:
+                        _emit(f"{log_prefix} Chunk {chunk_number}/{total_chunks} FEHLER: {e}")
+                        _write_state(status="error", error=str(e))
+                        raise
+                    wait_time = 2 ** retry
+                    _emit(
+                        f"{log_prefix} Chunk {chunk_number} Retry {retry}/5 "
+                        f"nach {wait_time}s: {e}"
+                    )
+                    time.sleep(wait_time)
+            if not chunk_uploaded:
+                raise RuntimeError(f"Chunk {chunk_number} konnte nicht hochgeladen werden")
+
+            upload_offset += len(chunk_data)
+            chunks_uploaded = chunk_number
+            _write_state(status="in_progress")
+
+            if log_every_chunks > 0 and (
+                chunk_number % log_every_chunks == 0 or upload_offset >= file_size
+            ):
+                pct = upload_offset / file_size * 100.0
+                _emit(
+                    f"{log_prefix} Chunk {chunk_number}/{total_chunks} OK "
+                    f"({_format_byte_size(upload_offset)}/{_format_byte_size(file_size)}, "
+                    f"{pct:.1f}%)"
+                )
+
+    _emit(f"{log_prefix} Finalisiere (upload_save)...")
+    result = None
+    for retry in range(1, 6):
+        try:
+            if remote_path:
+                result = upload_save(cfg, int(uploadid), path=remote_path)
+            else:
+                result = upload_save(
+                    cfg, int(uploadid), folderid=int(folderid), name=dest_filename
+                )
+            break
+        except Exception as e:
+            if retry == 5:
+                _emit(f"{log_prefix} upload_save FEHLER: {e}")
+                raise
+            wait_time = 2 ** retry
+            _emit(f"{log_prefix} upload_save Retry {retry}/5 nach {wait_time}s: {e}")
+            time.sleep(wait_time)
+
+    if not result:
+        raise RuntimeError("upload_save ohne Ergebnis")
+
+    metadata = result.get("metadata", {})
+    if isinstance(metadata, list):
+        metadata = metadata[0] if metadata else {}
+
+    _emit(f"{log_prefix} ✓ Fertig FileID={metadata.get('fileid')}")
+
+    if verify_sha256 and file_hash:
+        remote_fileid = metadata.get("fileid")
+        if remote_fileid:
+            try:
+                checksum_data = checksumfile(cfg, fileid=int(remote_fileid))
+                remote_sha256 = (checksum_data.get("sha256") or "").lower()
+                if file_hash.lower() == remote_sha256:
+                    _emit(f"{log_prefix} ✓ SHA256 verifiziert")
+                else:
+                    _emit(
+                        f"{log_prefix} ✗ SHA256 MISMATCH "
+                        f"lokal={file_hash[:16]}... remote={remote_sha256[:16]}..."
+                    )
+            except Exception as e:
+                _emit(f"{log_prefix} SHA256-Verifikation uebersprungen: {e}")
+
+    try:
+        os.remove(state_file)
+    except OSError:
+        pass
+
+    return result
+
+
 def write_json_to_folderid(cfg: dict, *, folderid: int, filename: str, obj: dict, minify: bool = True) -> dict:
     """
-    JSON direkt in einen bekannten Zielordner (folderid) hochladen – ohne ensure().
-    REST API statt Binary für Zuverlässigkeit (kein Socket-Blocking).
+    JSON in einen bekannten Zielordner (folderid) hochladen.
+
+    Staging auf lokaler SSD (PCLOUD_ARCHIVE_DIR/staging/json), dann:
+    - kleine Dateien: upload_streaming (liest von Disk)
+    - grosse Dateien: upload_local_file_resumable (Resume pro Chunk)
+
+    Vermeidet json.dumps()+BytesIO im RAM (OOM bei grossem content_index).
     """
-    import json as _json
-    text = (_json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-            if minify else _json.dumps(obj, ensure_ascii=False, indent=2))
-    
-    # REST API uploadfile mit multipart/form-data
-    # WICHTIG: Binary upload_streaming kann bei großen Files (260MB Index) 5+ Min blockieren!
-    import io
-    files = {"file": (filename, io.BytesIO(text.encode("utf-8")), "application/json")}
-    params = {"folderid": int(folderid), "filename": filename}
-    
-    return _rest_post(cfg, "uploadfile", data=params, files=files)
+    staging_dir = os.environ.get("PCLOUD_JSON_STAGING_DIR") or os.path.join(
+        os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "staging", "json"
+    )
+    os.makedirs(staging_dir, exist_ok=True)
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
+    local_path = os.path.join(staging_dir, f"{safe_name}.upload.tmp")
+
+    file_size = write_json_local_atomic(local_path, obj, minify=minify)
+    print(
+        f"[json-staging] {filename}: {_format_byte_size(file_size)} -> {local_path}",
+        flush=True,
+    )
+
+    threshold = int(os.environ.get("PCLOUD_RESUMABLE_UPLOAD_MIN_BYTES", str(4 * 1024 * 1024)))
+    log_every = int(os.environ.get("PCLOUD_UPLOAD_LOG_EVERY_CHUNKS", "10"))
+    state_key = f"json:folderid:{folderid}/{filename}"
+
+    try:
+        if file_size >= threshold:
+            return upload_local_file_resumable(
+                cfg,
+                local_path,
+                folderid=int(folderid),
+                filename=filename,
+                state_key=state_key,
+                log_prefix=f"[json-upload:{filename}]",
+                log_every_chunks=log_every,
+            )
+        return upload_streaming(
+            cfg, local_path, dest_folderid=int(folderid), filename=filename
+        )
+    finally:
+        if os.environ.get("PCLOUD_JSON_STAGING_KEEP", "0") != "1":
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
 
 
 def stat_folderid_fast(cfg: dict, path: str) -> int | None:

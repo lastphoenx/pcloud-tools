@@ -49,7 +49,7 @@ Benötigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
 """
 
 from __future__ import annotations
-import os, sys, json, argparse, time, datetime
+import os, sys, json, argparse, time, datetime, hashlib, gc
 import concurrent.futures
 import threading
 from typing import Dict, Any, Optional, Tuple
@@ -290,266 +290,30 @@ def _cleanup_orphaned_resume_states(state_dir: str, *, max_age_days: int = 7, ve
 def _upload_file_resumable(cfg: dict, local_path: str, remote_path: str,
                           *, dry: bool = False) -> dict:
     """
-    Chunked Upload mit automatischem Resume (basierend auf poc_chunked_resume.py).
-    
-    Features:
-    - State-Persistenz nach jedem Chunk
-    - upload_info() Server-Sync vor Resume
-    - Automatische Offset-Korrektur
-    - SHA256-Verifikation nach Upload
-    - Snapshot-Validierung (State gehört zu aktuellem Snapshot)
-    - Automatisches Cleanup ungültiger/alter State-Files
-    
-    Returns:
-        Dict mit 'metadata' (kompatibel mit pc.upload_file)
+    Chunked Upload mit automatischem Resume — delegiert an pcloud_bin_lib.
     """
-    import hashlib
     import re
-    
-    if dry:
-        _log(f"[dry] chunked upload: {remote_path} <- {local_path}")
-        return {"metadata": {"fileid": None, "hash": None, "size": os.path.getsize(local_path)}}
-    
-    state_dir = _get_resume_state_dir()
-    file_size = os.path.getsize(local_path)
-    
-    # Einmalige Cleanup-Routine (pro Prozess)
-    global _resume_cleanup_done
-    try:
-        _resume_cleanup_done
-    except NameError:
-        _resume_cleanup_done = False
-    
-    if not _resume_cleanup_done and os.environ.get("PCLOUD_RESUME_CLEANUP", "1") != "0":
-        max_age = int(os.environ.get("PCLOUD_RESUME_CLEANUP_DAYS", "7"))
-        verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
-        _cleanup_orphaned_resume_states(state_dir, max_age_days=max_age, verbose=verbose)
-        _resume_cleanup_done = True
-    
-    # Snapshot-Name aus remote_path extrahieren (wichtig für Validierung!)
-    # Format: /_snapshots/<snapshot_name>/...
+
     snapshot_name = None
     match = re.search(r'/_snapshots/([^/]+)/', remote_path)
     if match:
         snapshot_name = match.group(1)
-    
-    # State-File basierend auf remote_path (eindeutig!)
+
     state_key = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
-    filename_base = os.path.basename(local_path)
-    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename_base)
-    state_file = os.path.join(state_dir, f"{safe_name}_{state_key}.state.json")
-    
-    # State laden (falls vorhanden) - VOR SHA256-Berechnung!
-    uploadid = None
-    upload_offset = 0
-    chunks_uploaded = 0
-    file_hash = None
-    is_resume = False
-    
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r") as f:
-                state = json.load(f)
-            
-            # Hash aus State übernehmen (falls vorhanden)
-            file_hash = state.get("file_hash")
-            
-            # Validierung 1: Pfad & Größe müssen matchen
-            if state.get("remote_path") != remote_path:
-                _log(f"[chunked] State ungültig (remote_path geändert) - lösche State")
-                os.remove(state_file)
-                file_hash = None
-            elif state.get("file_size") != file_size:
-                _log(f"[chunked] State ungültig (file_size geändert) - lösche State")
-                os.remove(state_file)
-                file_hash = None
-            # Validierung 2: Snapshot-Name muss matchen (wenn vorhanden)
-            elif snapshot_name and state.get("snapshot_name") != snapshot_name:
-                _log(f"[chunked] State ungültig (Snapshot geändert: {state.get('snapshot_name')} -> {snapshot_name}) - lösche State")
-                os.remove(state_file)
-                file_hash = None
-            else:
-                # State ist valide - versuche Resume
-                uploadid = state.get("uploadid")
-                upload_offset = state.get("offset", 0)
-                chunks_uploaded = state.get("chunks_uploaded", 0)
-                is_resume = True
-                
-                _log(f"[chunked] Lade State: {os.path.basename(state_file)}")
-                _log(f"[chunked] Resume @ {upload_offset:,} Bytes ({upload_offset/file_size*100:.1f}%)")
-                
-                # Metrik hochzählen
-                try:
-                    with _metrics_lock:
-                        globals()["MET_RESUMED_FILES"] += 1
-                except Exception:
-                    pass
-                
-                # Server-Sync via upload_info()
-                try:
-                    server_info = pc.upload_info(cfg, uploadid)
-                    server_offset = server_info.get("size", 0)
-                    
-                    if server_offset != upload_offset:
-                        _log(f"[chunked] Offset-Korrektur: Lokal={upload_offset:,} Server={server_offset:,}")
-                        upload_offset = server_offset
-                        chunks_uploaded = server_offset // RESUME_CHUNK_SIZE
-                except Exception as e:
-                    _log(f"[chunked] upload_info fehlgeschlagen: {e} - lösche State und starte neu")
-                    # Wichtig: State-File löschen, nicht überschreiben!
-                    try:
-                        os.remove(state_file)
-                    except Exception:
-                        pass
-                    uploadid = None
-                    upload_offset = 0
-                    chunks_uploaded = 0
-                    is_resume = False
-                    file_hash = None  # SHA256 neu berechnen
-        except Exception as e:
-            _log(f"[chunked] State-Load fehlgeschlagen: {e} - starte neu")
-            try:
-                os.remove(state_file)
-            except Exception:
-                pass
-            uploadid = None
-            file_hash = None
-    
-    # FIX 3: SHA256 nur berechnen wenn nicht aus State geladen
-    if not file_hash:
-        _log(f"[chunked] Berechne SHA256 für {filename_base} ({file_size/1024**3:.2f} GB)...")
-        h = hashlib.sha256()
-        with open(local_path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024**2), b""):
-                h.update(chunk)
-        file_hash = h.hexdigest()
-    
-    # Upload-Session erstellen (falls nötig)
-    if not uploadid:
-        _log(f"[chunked] Erstelle Upload-Session...")
-        resp = pc.upload_create(cfg)
-        uploadid = resp.get("uploadid")
-        _log(f"[chunked] uploadid: {uploadid}")
-    
-    # Chunks hochladen
-    _log(f"[chunked] Starte Upload: {file_size/1024**3:.2f} GB @ {RESUME_CHUNK_SIZE/1024**2:.0f} MB Chunks")
-    
-    with open(local_path, "rb") as fh:
-        fh.seek(upload_offset)
-        chunk_number = chunks_uploaded
-        
-        while upload_offset < file_size:
-            chunk_data = fh.read(RESUME_CHUNK_SIZE)
-            if not chunk_data:
-                break
-            
-            chunk_number += 1
-            
-            # FIX 2: Retry-Logik für Chunk-Upload (transiente Netzwerkfehler)
-            chunk_uploaded = False
-            for retry in range(1, 6):  # 5 Versuche pro Chunk
-                try:
-                    pc.upload_write(cfg, uploadid, upload_offset, chunk_data)
-                    chunk_uploaded = True
-                    break
-                except Exception as e:
-                    if retry == 5:
-                        _log(f"[chunked] Chunk {chunk_number} fehlgeschlagen nach 5 Versuchen: {e}")
-                        # State speichern vor Exit
-                        with open(state_file, "w") as f:
-                            json.dump({
-                                "uploadid": uploadid,
-                                "offset": upload_offset,
-                                "chunks_uploaded": chunk_number - 1,
-                                "file_hash": file_hash,
-                                "file_size": file_size,
-                                "remote_path": remote_path,
-                                "snapshot_name": snapshot_name,
-                                "status": "error",
-                                "error": str(e),
-                                "updated_at": time.time()
-                            }, f)
-                        raise
-                    else:
-                        wait_time = 2 ** retry  # Exponential backoff: 2, 4, 8, 16 Sekunden
-                        _log(f"[chunked] Chunk {chunk_number} Retry {retry}/5 nach {wait_time}s: {e}")
-                        time.sleep(wait_time)
-            
-            if not chunk_uploaded:
-                raise RuntimeError(f"Chunk {chunk_number} konnte nicht hochgeladen werden")
-            
-            upload_offset += len(chunk_data)
-            
-            # State speichern nach jedem Chunk
-            with open(state_file, "w") as f:
-                json.dump({
-                    "uploadid": uploadid,
-                    "offset": upload_offset,
-                    "chunks_uploaded": chunk_number,
-                    "file_hash": file_hash,
-                    "file_size": file_size,
-                    "remote_path": remote_path,
-                    "snapshot_name": snapshot_name,
-                    "status": "in_progress",
-                    "updated_at": time.time()
-                }, f)
-            
-            # Progress Log (alle 10 Chunks)
-            if chunk_number % 10 == 0:
-                progress_pct = upload_offset / file_size * 100
-                _log(f"[chunked] Progress: {upload_offset:,}/{file_size:,} Bytes ({progress_pct:.1f}%)")
-    
-    # Finalisierung mit Retry-Logik
-    _log(f"[chunked] Finalisiere Upload...")
-    dest_dir = os.path.dirname(remote_path.rstrip("/")) or "/"
-    dest_filename = os.path.basename(remote_path)
-    dest_folderid = pc.ensure_path(cfg, dest_dir)
-    
-    # FIX 2: Retry-Logik auch für upload_save (kritisch!)
-    result = None
-    for retry in range(1, 6):  # 5 Versuche für Finalisierung
-        try:
-            result = pc.upload_save(cfg, uploadid, folderid=dest_folderid, name=dest_filename)
-            break
-        except Exception as e:
-            if retry == 5:
-                _log(f"[chunked] upload_save fehlgeschlagen nach 5 Versuchen: {e}")
-                raise
-            else:
-                wait_time = 2 ** retry
-                _log(f"[chunked] upload_save Retry {retry}/5 nach {wait_time}s: {e}")
-                time.sleep(wait_time)
-    
-    if not result:
-        raise RuntimeError("upload_save konnte nicht abgeschlossen werden")
-    
-    metadata = result.get("metadata", {})
-    if isinstance(metadata, list):
-        metadata = metadata[0] if metadata else {}
-    
-    _log(f"[chunked] Upload abgeschlossen: FileID={metadata.get('fileid')}")
-    
-    # SHA256-Verifikation
-    remote_fileid = metadata.get('fileid')
-    if remote_fileid:
-        try:
-            checksum_data = pc.checksumfile(cfg, fileid=int(remote_fileid))
-            remote_sha256 = checksum_data.get("sha256", "").lower()
-            
-            if file_hash.lower() == remote_sha256:
-                _log(f"[chunked] ✓ SHA256 verifiziert")
-            else:
-                _log(f"[chunked] ✗ SHA256 MISMATCH! Lokal={file_hash[:16]}... Remote={remote_sha256[:16]}...")
-        except Exception as e:
-            _log(f"[chunked] SHA256-Verifikation fehlgeschlagen: {e}")
-    
-    # State aufräumen
+
     try:
-        os.remove(state_file)
+        return pc.upload_local_file_resumable(
+            cfg,
+            local_path,
+            remote_path=remote_path,
+            state_key=state_key,
+            log_prefix="[chunked]",
+            log=_log,
+            snapshot_name=snapshot_name,
+            dry=dry,
+        )
     except Exception:
-        pass
-    
-    return result
+        raise
 
 
 def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
@@ -777,34 +541,112 @@ def archive_snapshot_index_remote(
 
 def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool=False) -> None:
     """
-    content_index.json effizient schreiben:
-    - ohne erneutes ensure()
-    - minified JSON
-    - v2: version=2, leeres "items" (1to1-Leiche) wird entfernt
-    """
+    content_index.json persistieren:
+    1. Lokal auf SSD (staging + master) — kanonische Kopie, Resume-Quelle
+    2. Resumable Chunk-Upload nach pCloud (kein json.dumps-RAM-Spike)
+  """
     idx_dir  = f"{snapshots_root.rstrip('/')}/_index"
     idx_name = "content_index.json"
 
-    # v2-Markierung + 1to1-Leiche entfernen (nur wenn leer, um nichts zu zerstoeren)
     index["version"] = 2
     if isinstance(index.get("items"), dict) and not index["items"]:
         index.pop("items", None)
 
+    n_refs = len(index.get("pool_refs") or {})
+
     if dry:
-        print(f"[dry] write index: {idx_dir}/{idx_name} (pool_refs={len(index.get('pool_refs',{}))})")
+        print(f"[dry] write index: {idx_dir}/{idx_name} (pool_refs={n_refs})")
         return
+
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    staging_path = os.path.join(archive_dir, "indexes", "staging", "content_index_pending.json")
+    master_path = os.path.join(archive_dir, "indexes", "content_index_master.json")
+
+    _log(f"[index] Schreibe lokal ({n_refs} pool_refs)...")
+    t_local = time.time()
+    save_content_index_local(staging_path, index)
+    save_content_index_local(master_path, index)
+    file_size = os.path.getsize(staging_path)
+    _log(
+        f"[index] ✓ Lokal {pc._format_byte_size(file_size)} in {time.time() - t_local:.1f}s "
+        f"-> {staging_path}"
+    )
+    _log(f"[index] ✓ Master -> {master_path}")
 
     _backup_remote_master_index_before_write(cfg, snapshots_root)
 
-    # Ordner muss existieren (wurde vorher per Batch-Ensure angelegt)
     fid = pc.stat_folderid_fast(cfg, idx_dir)
     if not fid:
-        # sehr selten: Fallback (legt an und holt folderid)
         fid = pc.ensure_path(cfg, idx_dir)
 
-    # Pretty-Print via ENV steuerbar
-    pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
-    pc.write_json_to_folderid(cfg, folderid=int(fid), filename=idx_name, obj=index, minify=(not pretty))
+    remote_path = f"{idx_dir}/{idx_name}"
+    log_every = int(os.environ.get("PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS", "1"))
+    verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
+
+    _log(f"[index] Upload nach pCloud: {remote_path}")
+    t_up = time.time()
+    pc.upload_local_file_resumable(
+        cfg,
+        staging_path,
+        folderid=int(fid),
+        filename=idx_name,
+        remote_path=remote_path,
+        state_key="content_index_json",
+        log_prefix="[index-upload]",
+        log=_log,
+        log_every_chunks=log_every,
+        verify_sha256=verify,
+    )
+    _log(f"[index] ✓ Remote content_index.json ({time.time() - t_up:.1f}s)")
+
+
+def _release_post_validation_memory() -> None:
+    """Speicher nach Validation freigeben (OOM-Schutz vor Index-Upload)."""
+    gc.collect()
+
+
+def _set_upload_complete_marker(
+    cfg: dict, dest_snapshot_dir: str, marker_data: dict, *, dry: bool = False
+) -> None:
+    """Setzt .upload_complete — vor Index-Upload, damit Snapshot bei OOM als fertig gilt."""
+    if dry:
+        return
+    marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+    if not marker_fid:
+        marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+    pc.write_json_to_folderid(
+        cfg, folderid=int(marker_fid), filename=".upload_complete", obj=marker_data, minify=True
+    )
+    _log(f"[info] .upload_complete gesetzt: {marker_data.get('snapshot')}")
+
+
+def _finalize_after_validation_delta(
+    cfg: dict,
+    snapshots_root: str,
+    index: dict,
+    snapshot_name: str,
+    dest_snapshot_dir: str,
+    marker_data: dict,
+    *,
+    dry: bool = False,
+) -> None:
+    """
+    Finalisierung nach Validation (Delta-Mode):
+    1. RAM freigeben
+    2. .upload_complete (klein, zuerst)
+    3. Index lokal auf SSD + resumable Upload
+    4. Snapshot-Index archivieren
+    """
+    if dry:
+        return
+    _release_post_validation_memory()
+    _set_upload_complete_marker(cfg, dest_snapshot_dir, marker_data, dry=dry)
+    save_content_index(cfg, snapshots_root, index, dry=False)
+    _log("[delta-mode] ✓ content_index.json gespeichert (nach Validation)")
+    try:
+        archive_snapshot_index_remote(cfg, snapshots_root, index, snapshot_name, dry=False)
+    except Exception as e:
+        _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
 
 
 def _upload_complete_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
@@ -1350,232 +1192,242 @@ def _backfill_missing_pool_shas(
     return filled, errors
 
 
+def _validate_batch_size() -> int:
+    """
+    Batch-Groesse fuer RAM-begrenzte Validation (Pool + Stubs).
+
+    Ziel: ~10-25 Fortschritts-Zeilen pro Phase bei pi-nas (~80-110k Items).
+    Faustformel: PCLOUD_VALIDATE_BATCH_SIZE ≈ item_count / 15
+    """
+    try:
+        return max(500, int(os.environ.get("PCLOUD_VALIDATE_BATCH_SIZE", "5000")))
+    except (TypeError, ValueError):
+        return 5000
+
+
+def _validate_threads() -> int:
+    """Parallele stat()-Calls pro Batch (API-bound, nicht RAM-bound)."""
+    for key in ("PCLOUD_VALIDATE_THREADS", "PCLOUD_FOLDER_THREADS"):
+        raw = os.environ.get(key)
+        if raw is not None:
+            try:
+                return max(1, min(32, int(raw)))
+            except (TypeError, ValueError):
+                pass
+    return 8
+
+
+def _validate_fail_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("PCLOUD_VALIDATE_FAIL_LIMIT", "50")))
+    except (TypeError, ValueError):
+        return 50
+
+
+def _run_validate_batches(
+    items: list,
+    check_fn,
+    *,
+    label: str,
+    unit: str = "items",
+) -> list:
+    """check_fn(item)->fehler|None in Batches; RAM O(batch_size), kein listfolder-Baum."""
+    batch_size = _validate_batch_size()
+    threads = _validate_threads()
+    fail_limit = _validate_fail_limit()
+    total = len(items)
+    if total == 0:
+        return []
+
+    num_batches = (total + batch_size - 1) // batch_size
+    failures: list = []
+    done = 0
+    t_all = time.time()
+
+    _log(
+        f"[validate-{label}] Start: {total} {unit}, "
+        f"batch={batch_size}, threads={threads}, ~{num_batches} batches"
+    )
+
+    for bi in range(num_batches):
+        batch = items[bi * batch_size : (bi + 1) * batch_size]
+        t0 = time.time()
+        batch_fail: list = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            futs = [ex.submit(check_fn, it) for it in batch]
+            for fut in concurrent.futures.as_completed(futs):
+                err = fut.result()
+                if err is not None:
+                    batch_fail.append(err)
+
+        failures.extend(batch_fail)
+        done += len(batch)
+        pct = done / total * 100.0
+        dur = time.time() - t0
+        _log(
+            f"[validate-{label}] Batch {bi + 1}/{num_batches}: "
+            f"{len(batch) - len(batch_fail)}/{len(batch)} OK "
+            f"({done}/{total}, {pct:.1f}%) {dur:.1f}s"
+        )
+
+        if len(failures) >= fail_limit:
+            _log(f"[validate-{label}] Abbruch: >={fail_limit} Fehler")
+            break
+        if bi % 4 == 3:
+            gc.collect()
+
+    _log(
+        f"[validate-{label}] Fertig: {total - len(failures)}/{total} OK "
+        f"({time.time() - t_all:.1f}s)"
+    )
+    return failures
+
+
+def _validate_pool_shas_batched(
+    cfg: dict,
+    pool_root: str,
+    manifest_sha256s: set[str],
+    pool_refs: dict,
+) -> list[str]:
+    def _check_sha(sha: str) -> Optional[str]:
+        if _pool_object_present(cfg, pool_root, sha, pool_refs):
+            return None
+        return sha
+
+    return _run_validate_batches(
+        sorted(manifest_sha256s), _check_sha, label="pool", unit="SHA256"
+    )
+
+
+def _validate_stubs_batched(
+    cfg: dict,
+    snapshot_dir: str,
+    manifest_items: list[dict],
+) -> list[str]:
+    snap_base = snapshot_dir.rstrip("/")
+    items = [it for it in manifest_items if it.get("relpath")]
+
+    def _check_stub(item: dict) -> Optional[str]:
+        relpath = item.get("relpath")
+        if not relpath:
+            return None
+        stub_path = f"{snap_base}/{relpath}.meta.json"
+        if pc.stat_file_safe(cfg, path=stub_path):
+            return None
+        norm_path = ppc.normalize_path_segments(stub_path)
+        if norm_path != stub_path and pc.stat_file_safe(cfg, path=norm_path):
+            return None
+        return relpath
+
+    return _run_validate_batches(items, _check_stub, label="stubs", unit="Stubs")
+
+
 def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifest: dict, index: dict, *, dry: bool = False) -> tuple[bool, list[str]]:
     """
-    Post-Upload Konsistenz-Check für Pool-Mode Snapshots (NEUE IMPLEMENTATION).
-    
-    Strategie (ULTRA-EFFIZIENT):
-    1. Pool-Full-Check: listfolder(/_pool) → ALLE SHA256s in ~2-5s (1 API-Call!)
-    2. Set-Diff: manifest_sha256s - pool_sha256s = missing_files
-    3. Pool-Refs-Check: Snapshot in index["pool_refs"] für alle SHA256s?
-    4. Optional: Stub-Stichprobe (konfigurierbar via PCLOUD_VALIDATE_STUB_SAMPLE)
-    
-    Warum besser als alte Stichproben-Methode?
-    - Alte Methode: 100× stat_file() = ~10s, nur 0.1% Coverage
-    - Neue Methode: 1× listfolder() = ~2-5s, 100% Coverage!
-    
-    Args:
-        cfg: pCloud Config
-        snapshot_dir: Remote Snapshot-Pfad (z.B. /_snapshots/2026-05-28-120014)
-        pool_root: Pool-Root (z.B. /_pool)
-        manifest: Manifest Dict
-        index: Content-Index Dict
-        dry: Dry-Run Mode
-    
-    Returns:
-        (is_valid, errors) - True wenn alles ok, sonst Liste mit Fehlern
+    Post-Upload Konsistenz-Check (RAM-begrenzt, volle Abdeckung).
+
+    Pool + Stubs: stat in Batches (kein listfolder-Gesamtbaum).
+    Index: pool_refs-Konsistenz (CPU-only).
     """
-    _log(f"[validate] Starte Full-Integritäts-Check für {snapshot_dir}...")
+    _log(f"[validate] Starte Integritaets-Check (batch) fuer {snapshot_dir}...")
     errors = []
     snapshot_name = manifest.get("snapshot", "?")
-    
+
     if dry:
-        _log("[validate] (dry-run) Simuliere Integritäts-Check...")
-        # Im Dry-Run tun wir so als waere alles ok, damit die Summary am Ende stimmt
+        _log("[validate] (dry-run) Simuliere Integritaets-Check...")
         _log(f"[validate] Manifest: {len(manifest.get('items',[]))} Files")
         _log(f"[validate] ✓ Pool: Alle SHA256s vorhanden (simuliert)")
         _log(f"[validate] ✓ Index: Alle SHA256s korrekt in pool_refs (simuliert)")
         _log(f"[validate] ✓✓✓ Snapshot vollständig konsistent (simuliert)")
         return (True, [])
-    
-    # === 1. MANIFEST-SHA256s sammeln ===
+
     manifest_items = [item for item in manifest.get("items", []) if item.get("type") == "file"]
     manifest_sha256s = {
         (item.get("sha256") or "").lower()
         for item in manifest_items
         if item.get("sha256")
     }
-    
+
     total_files = len(manifest_items)
     total_unique_sha256s = len(manifest_sha256s)
-    
+
     _log(f"[validate] Manifest: {total_files} Files, {total_unique_sha256s} unique SHA256s")
-    
-    # === 2. POOL-SHA256s via listfolder (FULL-CHECK in 1 API-Call!) ===
-    _log(f"[validate] Lade Pool-Struktur via listfolder({pool_root})...")
-    t_pool_start = time.time()
-    
-    pool_scan_ok = True
-    try:
-        # Rekursives listfolder über kompletten Pool, mit Retry (transiente API-Fehler)
-        result = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root,
-                                      recursive=True, nofiles=False, attempts=4, max_sleep=30.0)
-        pool_sha256s = set()
 
-        def _extract_sha256s_from_tree(obj):
-            if isinstance(obj, dict):
-                if not obj.get("isfolder") and obj.get("name"):
-                    filename = obj.get("name")
-                    if len(filename) == 64 and all(c in "0123456789abcdefABCDEF" for c in filename):
-                        pool_sha256s.add(filename.lower())
-                for child in obj.get("contents", []):
-                    _extract_sha256s_from_tree(child)
-
-        metadata = result.get("metadata", {})
-        _extract_sha256s_from_tree(metadata)
-
-        pool_duration = time.time() - t_pool_start
-        _log(f"[validate] Pool: {len(pool_sha256s)} SHA256s gefunden in {pool_duration:.2f}s")
-
-    except Exception as e:
-        # Scan-Fehler ist KEIN harter Validierungsfehler: bei sehr grossen Pools kann
-        # listfolder transient scheitern. Den (gerade geschriebenen) Index als Ground-Truth
-        # fuer den Coverage-Check nutzen, statt faelschlich abzubrechen.
-        _log(f"[validate][WARN] Pool-listfolder nach Retries fehlgeschlagen: {e}")
-        _log(f"[validate][WARN] → nutze Index (pool_refs) als Ground-Truth fuer Coverage-Check")
-        pool_sha256s = set((index.get("pool_refs") or {}).keys())
-        pool_scan_ok = False
-
-    # === 3. DELTA-CHECK: Fehlen Files im Pool? (mit Truncation-Schutz) ===
     pool_refs = index.get("pool_refs", {})
-    missing_in_pool = manifest_sha256s - pool_sha256s
-    if missing_in_pool and pool_scan_ok:
-        if len(missing_in_pool) > 2000:
-            # So viele "fehlende" deuten auf einen unzuverlaessigen/abgeschnittenen Bulk-Scan
-            # hin, nicht auf echten Verlust -> Index als Ground-Truth, kein Truncation-Fehlalarm.
-            _log(f"[validate][WARN] {len(missing_in_pool)} vermeintlich fehlend - Bulk-Scan unzuverlaessig, nutze Index")
-            missing_in_pool = {
-                s for s in manifest_sha256s
-                if not _pool_object_present(cfg, pool_root, s, pool_refs)
-            }
-        else:
-            # Wenige vermeintlich fehlende: Pfad-Stat + pool_refs.fileid (wie tamper-detect).
-            _log(f"[validate] {len(missing_in_pool)} nicht im Bulk-Scan - verifiziere einzeln (path + fileid)...")
-            _really_missing = set()
-            for _sha in missing_in_pool:
-                if not _pool_object_present(cfg, pool_root, _sha, pool_refs):
-                    _really_missing.add(_sha)
-            if _really_missing and len(_really_missing) < len(missing_in_pool):
-                _log(f"[validate] {len(missing_in_pool) - len(_really_missing)} via fileid-Stat als vorhanden erkannt")
-            missing_in_pool = _really_missing
-    # Pool-Luecken aus Quell-Snapshot nachladen (GC / veralteter Index)
+
+    missing_in_pool = _validate_pool_shas_batched(
+        cfg, pool_root, manifest_sha256s, pool_refs
+    )
+
     if missing_in_pool and not dry:
         _repair_max = int(os.environ.get("PCLOUD_VALIDATE_POOL_BACKFILL_MAX", "50"))
         if 0 < len(missing_in_pool) <= _repair_max:
             dest_root = pool_root.rsplit("/_pool", 1)[0] if "/_pool" in pool_root else pool_root
             _log(f"[validate] Pool-Backfill: {len(missing_in_pool)} fehlende SHA(s)...")
             filled, _bf_errs = _backfill_missing_pool_shas(
-                cfg, dest_root, pool_root, manifest, missing_in_pool, dry=dry)
+                cfg, dest_root, pool_root, manifest, set(missing_in_pool), dry=dry)
             if filled:
                 pool_refs = index.get("pool_refs", {})
-                missing_in_pool = {
-                    s for s in missing_in_pool
-                    if not _pool_object_present(cfg, pool_root, s, pool_refs)
-                }
+                missing_in_pool = _validate_pool_shas_batched(
+                    cfg, pool_root, set(missing_in_pool), pool_refs
+                )
                 if not missing_in_pool:
                     _log(f"[validate] ✓ Pool-Backfill erfolgreich ({filled} nachgeladen)")
+
     if missing_in_pool:
         errors.append(f"Pool: {len(missing_in_pool)} SHA256s fehlen")
-        for sha in list(missing_in_pool)[:5]:
+        for sha in missing_in_pool[:5]:
             rels = _manifest_relpaths_for_sha(manifest, sha)
             hint = rels[0] if rels else "?"
             errors.append(f"  - Pool-File fehlt: {sha} ({hint})")
+        if len(missing_in_pool) > 5:
+            errors.append(f"  ... und {len(missing_in_pool) - 5} weitere")
     else:
         _log(f"[validate] ✓ Pool: Alle {total_unique_sha256s} SHA256s vorhanden")
-    
-    # === 4. POOL-REFS-CHECK (Index-Konsistenz) ===
+
     _log(f"[validate] Prüfe Index-Konsistenz (pool_refs)...")
     missing_in_index = 0
     wrong_snapshot = 0
-    
+
     for sha in manifest_sha256s:
         snapshots_for_sha = _snap_names(pool_refs.get(sha))
         if not snapshots_for_sha:
             missing_in_index += 1
         elif snapshot_name not in snapshots_for_sha:
             wrong_snapshot += 1
-    
+
     if missing_in_index > 0:
         errors.append(f"Index: {missing_in_index} SHA256s fehlen in pool_refs")
     if wrong_snapshot > 0:
         errors.append(f"Index: {wrong_snapshot} SHA256s haben falschen Snapshot")
-    
+
     if missing_in_index == 0 and wrong_snapshot == 0:
         _log(f"[validate] ✓ Index: Alle {total_unique_sha256s} SHA256s korrekt in pool_refs")
-    
-    # === 5. STUB-VOLLCHECK via listfolder (100% Coverage, 1 API-Call) ===
-    # listfolder(snapshot_dir, recursive=True) kann bei grossen Snapshots (70k Ordner +
-    # 100k Stubs) von pCloud trunciert werden → False-Positive-Fehler. Truncation-Schutz:
-    # wenn remote_stubs < 90% der erwarteten Stubs, Scan als unzuverlaessig werten und
-    # uebergehen statt falsch zu melden. pool_verify_backup.py ist die Alternative fuer
-    # vollstaendige Pruefung (macht per-Snapshot-Calls, robust gegen Truncation).
-    if total_files > 0:
+
+    if os.environ.get("PCLOUD_VALIDATE_STUB_FULL", "1") == "0":
+        _log("[validate] Stub-Check übersprungen (PCLOUD_VALIDATE_STUB_FULL=0)")
+    elif total_files > 0:
         try:
-            _log(f"[validate] Lade Snapshot-Dateiliste (Stub-Vollcheck)...")
-            _snap_result = pc.call_with_backoff(
-                pc.listfolder, cfg, path=snapshot_dir, recursive=True, nofiles=False)
-
-            # Alle Stub-Pfade aus dem Baum rekonstruieren.
-            # Iteration beginnt bei den KINDERN des Root-Knotens (root hat
-            # name=snapshot-ordner-name; wuerden wir ihn selbst verarbeiten,
-            # laendet er doppelt im Pfad: snapshot_dir/snapshot_dir/...).
-            _remote_stub_paths: set = set()
-            def _walk_stubs(node, cur_path):
-                for child in node.get("contents", []) or []:
-                    name = child.get("name", "")
-                    child_path = f"{cur_path}/{name}"
-                    if child.get("isfolder"):
-                        _walk_stubs(child, child_path)
-                    elif name.endswith(".meta.json"):
-                        _remote_stub_paths.add(child_path)
-            _walk_stubs(
-                _snap_result.get("metadata", {}), cur_path=snapshot_dir.rstrip("/"))
-            _log(f"[validate] Remote-Stubs vorhanden: {len(_remote_stub_paths)}")
-            _stub_lookup = ppc.build_stub_path_lookup(_remote_stub_paths)
-
-            # Truncation-Schutz: Wenn API-Antwort zu wenige Stubs liefert, ist der Scan
-            # unzuverlaessig. Schwelle: < 90% der erwarteten UND mehr als 100 fehlen.
-            # Beides noetig, damit bei echten kleinen Differenzen (z.B. 1-2 fehlende Stubs)
-            # trotzdem Fehler gemeldet werden.
-            _truncation_suspect = (
-                len(_remote_stub_paths) < total_files * 0.9
-                and total_files - len(_remote_stub_paths) > 100
-            )
-            if _truncation_suspect:
-                _log(f"[validate][WARN] Stub-Scan trunciert: {len(_remote_stub_paths)} von ~{total_files} erwartet")
-                _log(f"[validate][WARN] Stub-Vollcheck uebersprungen – pool_verify_backup.py fuer vollstaendige Pruefung verwenden")
+            missing_stubs = _validate_stubs_batched(cfg, snapshot_dir, manifest_items)
+            if missing_stubs:
+                errors.append(f"Stubs fehlen: {len(missing_stubs)}")
+                for rp in missing_stubs[:10]:
+                    errors.append(f"  - Stub fehlt: {rp}")
+                if len(missing_stubs) > 10:
+                    errors.append(f"  ... und {len(missing_stubs) - 10} weitere")
             else:
-                missing_stubs = []
-                path_mismatch_resolved = 0
-                for item in manifest_items:
-                    relpath = item.get("relpath")
-                    if relpath:
-                        stub_path = f"{snapshot_dir}/{relpath}.meta.json"
-                        if not ppc.stub_path_exists(stub_path, _stub_lookup):
-                            missing_stubs.append(relpath)
-                        elif stub_path not in _remote_stub_paths:
-                            path_mismatch_resolved += 1
-                if path_mismatch_resolved:
-                    _log(f"[validate] {path_mismatch_resolved} Stub(s) via Pfad-Normalisierung "
-                         f"(Segment-Whitespace) als vorhanden erkannt")
-                if missing_stubs:
-                    errors.append(f"Stubs fehlen: {len(missing_stubs)}")
-                    for rp in missing_stubs[:10]:
-                        errors.append(f"  - Stub fehlt: {rp}")
-                    if len(missing_stubs) > 10:
-                        errors.append(f"  ... und {len(missing_stubs)-10} weitere")
-                else:
-                    _log(f"[validate] ✓ Stubs: Alle {total_files} vorhanden (100% Coverage)")
+                _log(f"[validate] ✓ Stubs: Alle {total_files} vorhanden (100% Coverage)")
         except Exception as e:
-            _log(f"[validate][WARN] Stub-Vollcheck fehlgeschlagen: {e} - uebersprungen")
-    
-    # === RESULT ===
+            _log(f"[validate][WARN] Stub-Batch-Check fehlgeschlagen: {e} - uebersprungen")
+
+    gc.collect()
+
     if errors:
         _log(f"[validate] ❌ {len(errors)} Fehler gefunden!")
         return (False, errors)
-    else:
-        _log(f"[validate] ✓✓✓ Snapshot vollständig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
-        return (True, [])
+    _log(f"[validate] ✓✓✓ Snapshot vollständig konsistent (100% Pool-Coverage, {total_unique_sha256s} SHA256s)")
+    return (True, [])
 
 
 # ==============================================================================
@@ -2373,6 +2225,17 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             # Remote/Local-Index: erst nach Validation (siehe unten)
 
     # === POST-UPLOAD VALIDATION (wie Full-Pool-Mode!) ===
+    marker_data = {
+        "snapshot": snapshot_name,
+        "completed_at": time.time(),
+        "uploaded": uploaded,
+        "stubs": stubs,
+        "reused": reused,
+        "duration": time.time() - t_start,
+        "mode": "delta",
+        "basis": basis_snapshot_name,
+    }
+
     validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
     if validation_enabled and not dry:
         _log("[delta-mode] Starte Post-Upload Validation...")
@@ -2392,66 +2255,19 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                     os.remove(_fail_idx)
             except Exception:
                 pass
-            # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
             raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
         else:
             _log("[delta-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
-            # Index erst jetzt persistieren — konsistent mit .upload_complete
-            if not dry:
-                import tempfile as _tf
-                _ok_idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
-                _ok_idx_path = os.path.join(_ok_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
-                os.makedirs(_ok_idx_dir, exist_ok=True)
-                save_content_index_local(_ok_idx_path, index)
-                save_content_index(cfg, snapshots_root, index, dry=False)
-                _log("[delta-mode] ✓ content_index.json gespeichert (nach Validation)")
+            _finalize_after_validation_delta(
+                cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry
+            )
     elif not validation_enabled:
         _log("[delta-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
-        if not dry:
-            import tempfile as _tf
-            _ok_idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
-            _ok_idx_path = os.path.join(_ok_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
-            os.makedirs(_ok_idx_dir, exist_ok=True)
-            save_content_index_local(_ok_idx_path, index)
-            save_content_index(cfg, snapshots_root, index, dry=False)
-    
-    # === COMPLETE-MARKER SETZEN ===
-    if not dry:
-        try:
-            marker_data = {
-                "snapshot": snapshot_name,
-                "completed_at": time.time(),
-                "uploaded": uploaded,
-                "stubs": stubs,
-                "reused": reused,
-                "duration": time.time() - t_start,
-                "mode": "delta",
-                "basis": basis_snapshot_name
-            }
-            marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
-            if not marker_fid:
-                marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-            pc.write_json_to_folderid(cfg, folderid=int(marker_fid), 
-                                     filename=".upload_complete", obj=marker_data, minify=True)
-        except Exception as e:
-            _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
+        _finalize_after_validation_delta(
+            cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry
+        )
 
-    # === REMOTE INDEX-ARCHIVE + MASTER (wie Full-Pool-Mode) ===
-    # Der Delta-Pfad kehrt frueher zurueck als der Full-Pool-Pfad und erreichte dessen
-    # Archive-Schritt nie -> fuer Delta-Snapshots fehlte die Snapshot-isolierte
-    # Index-Kopie unter _index/archive/. Hier 1:1 nachgezogen.
-    if not dry:
-        try:
-            archive_snapshot_index_remote(cfg, snapshots_root, index, snapshot_name, dry=False)
-        except Exception as e:
-            _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
-        try:
-            master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
-            os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
-            save_content_index_local(master_index_path, index)
-            _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
-        except Exception as e:
-            _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
+    # === REMOTE INDEX-ARCHIVE: in _finalize_after_validation_delta ===
 
     # === METRIK-GLOBALS synchronisieren ===
     # Der Delta-Pfad fuehrt eigene lokale Zaehler; ohne diesen Sync zeigte die globale
