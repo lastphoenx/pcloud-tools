@@ -383,6 +383,15 @@ PCLOUD_PRETTY_JSON=0
 PCLOUD_STUB_PROGRESS_INTERVAL=500
 ```
 
+### `PCLOUD_STUB_FID_PROGRESS_EVERY`
+**Beschreibung:** Fortschritts-Log beim Auflösen von Parent-FolderIDs (alle N Parents). Wichtig bei vielen Cache-Misses (Delta-Upload neuer PBS-Chunk-Ordner).  
+**Default:** `100`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_STUB_FID_PROGRESS_EVERY=100
+```
+
 ### `PCLOUD_API_RETRIES`
 **Beschreibung:** Metrik-Zähler für API-Retries (nur Logging).  
 **Default:** `0`  
