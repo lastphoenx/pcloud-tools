@@ -885,51 +885,74 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Legacy-Modus: sequential ensure_path)...")
     else:
         _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Cache-Optimiert: {len(folder_cache)} gecacht)...")
-    
+
+    _fid_progress_every = max(1, int(os.environ.get("PCLOUD_STUB_FID_PROGRESS_EVERY", "100") or "100"))
+    _parents_failed = 0
+    _stubs_skipped_no_fid = 0
+    _fid_resolve_idx = 0
+    _t_fid_resolve = time.time()
+
+    def _resolve_parent_fid(parent_path: str, normalized: str) -> Optional[int]:
+        """ensure_path mit Backoff; 2004-Fallback via stat_folderid_fast."""
+        try:
+            fid = pc.call_with_backoff(
+                pc.ensure_path, cfg, path=parent_path, attempts=5, max_sleep=30.0)
+            return int(fid)
+        except Exception as e:
+            if "2004" not in str(e):
+                raise
+            fid = pc.call_with_backoff(
+                pc.stat_folderid_fast, cfg, parent_path, attempts=5, max_sleep=30.0)
+            if fid:
+                return int(fid)
+            raise RuntimeError(f"2004 but folderid not resolvable: {e}") from e
+
     for parent in by_parent.keys():
+        _fid_resolve_idx += 1
         if dry:
-            # im Dry-Run keine REST-Lookups; fiktive fid
             parent_fids[parent] = 0
             continue
-        
-        # Normalisieren für Cache-Lookup
+
         normalized_parent = pc._norm_remote_path(parent)
-        
-        # Cache-Lookup (O(1))
+
         if normalized_parent in folder_cache:
             parent_fids[parent] = folder_cache[normalized_parent]
             _cache_hits += 1
         else:
-            # Cache-Miss: Ordner existiert noch nicht → anlegen
             try:
-                fid = pc.ensure_path(cfg, path=parent)
-                parent_fids[parent] = int(fid)
-                folder_cache[normalized_parent] = int(fid)  # Cache updaten
+                fid = _resolve_parent_fid(parent, normalized_parent)
+                parent_fids[parent] = fid
+                folder_cache[normalized_parent] = fid
                 _cache_misses += 1
-                _api_calls += 1  # Zähle ensure_path als API-Call
+                _api_calls += 1
             except Exception as e:
-                # Bei 2004 (Already exists): FolderID via stat nachziehen
-                if "2004" in str(e):
-                    try:
-                        fid = pc.stat_folderid_fast(cfg, parent)
-                        if fid:
-                            parent_fids[parent] = int(fid)
-                            folder_cache[normalized_parent] = int(fid)
-                            _cache_misses += 1
-                            _api_calls += 1
-                            if os.environ.get("PCLOUD_VERBOSE") == "1":
-                                _log(f"[info] Folder {parent} existiert bereits (2004) - FolderID via stat geholt: {fid}")
-                        else:
-                            _log(f"[warn] Folder {parent} existiert (2004), aber FolderID nicht auflösbar - Stubs werden übersprungen")
-                    except Exception as e2:
-                        _log(f"[warn] cannot resolve folderid for {parent}: {e} (fallback failed: {e2})")
-                else:
-                    _log(f"[warn] cannot resolve/ensure folderid for {parent}: {e}")
-    
+                _parents_failed += 1
+                n_skip = len(by_parent[parent])
+                _stubs_skipped_no_fid += n_skip
+                _log(
+                    f"[warn] cannot resolve/ensure folderid for {parent}: {e} "
+                    f"({n_skip} Stub(s) übersprungen)"
+                )
+
+        if not dry and (
+            _fid_resolve_idx % _fid_progress_every == 0
+            or _fid_resolve_idx == _total_parents
+        ):
+            _log(
+                f"[stubs] Parent-FIDs: {_fid_resolve_idx}/{_total_parents} "
+                f"({_cache_hits} cache, {_cache_misses} neu, {_parents_failed} fehl) "
+                f"{time.time() - _t_fid_resolve:.0f}s"
+            )
+
     # Performance-Report
     if not dry:
         _speedup = (_total_parents / _api_calls) if _api_calls > 0 else 0
         _log(f"[stubs] ✓ Parent-FIDs aufgelöst: {_cache_hits} Cache-Hits, {_cache_misses} neu angelegt")
+        if _parents_failed:
+            _log(
+                f"[stubs][WARN] {_parents_failed} Parent(s) fehlgeschlagen, "
+                f"{_stubs_skipped_no_fid} Stub(s) ohne FolderID übersprungen"
+            )
         _log(f"[stubs] ✓ API-Calls: {_api_calls} (statt {_total_parents}) → {_speedup:.0f}x Reduktion")
 
     # 3) Schreibjobs bauen (nur Parents mit bekannter fid) + Payload anreichern
