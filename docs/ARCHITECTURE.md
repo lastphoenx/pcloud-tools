@@ -58,7 +58,7 @@ Wählt automatisch den effizientesten Upload-Modus:
 - **Turbo-Delta-Mode**: Der Scout berechnet Jaccard-Similarity zwischen aktuellem Manifest und allen Remote-Snapshots. Bei ≥ 70% wird der beste Basis-Snapshot serverseitig geklont (`copyfolder`) und nur die Differenz hochgeladen. Typischer Lauf mit 50 MB Änderungen: wenige Minuten.
 - **Full-Pool-Mode**: Fallback bei < 70% Similarity (erster Snapshot eines neuen Geräts). Lädt alle nicht-im-Pool-befindlichen Dateien hoch, baut Ordnerstruktur für Stubs auf.
 
-Nach dem Upload: Post-Upload-Validation (100% Stub-Coverage-Check via listfolder, Pool-SHA-Check, Index-Konsistenz). Nur bei erfolgreicher Validation wird `.upload_complete` gesetzt.
+Nach dem Upload: Post-Upload-Validation (100% Coverage: Pool-SHAs + Stubs per Batch-`stat()`, Index-Konsistenz via `pool_refs`). RAM-begrenzt — kein rekursives `listfolder` mehr. Nur bei erfolgreicher Validation wird `.upload_complete` gesetzt; danach Index-Upload (lokal auf SSD, resumable).
 
 ### Phase 4 — tamper-detect (`pcloud_quick_delta.py`)
 Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Prüft pro SHA256: fileid, pcloud_hash, size, Stub-Existenz. Erkennt fehlende Pool-Objekte und Abweichungen. **Verwaiste Pool-Objekte** (physisch in `_pool/`, nicht in `pool_refs`) sind GC-Hinweise — kein kritischer Pipeline-Fehler (Juni 2026).

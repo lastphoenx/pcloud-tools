@@ -12,6 +12,7 @@ Vollständige Dokumentation aller ENV-Variablen zur Performance-Optimierung und 
 - [Connection & Timeouts](#connection--timeouts)
 - [Caching & Pfade](#caching--pfade)
 - [RAM & Integritaet](#-ram--integritaet)
+- [Pool-Finalize (RAM-sparend)](#pool-finalize-ram-sparend)
 - [Debugging & Features](#debugging--features)
 - [Empfohlene Konfigurationen](#empfohlene-konfigurationen)
 
@@ -118,10 +119,10 @@ PCLOUD_CHUNK_SIZE=5242880
 ```
 
 ### `PCLOUD_RESUME_CHUNK_MB`
-**Beschreibung:** Chunk-Größe (MB) für SHA256-Verifikation bei Resume.  
+**Beschreibung:** Chunk-Größe (MB) für SHA256-Verifikation bei Resume und resumable JSON-Upload.  
 **Default:** `128` MB  
 **Empfohlen:** `128` MB  
-**Verwendet in:** `pcloud_push_json_manifest_to_pcloud.py`
+**Verwendet in:** `pcloud_push_json_manifest_to_pcloud.py`, `pcloud_bin_lib.py`
 
 ```bash
 PCLOUD_RESUME_CHUNK_MB=128
@@ -323,6 +324,8 @@ PCLOUD_FIDCACHE_TTL=3600
 
 Ersetzt den früheren `pcloud_quick_delta`-Lauf nach Upload (OOM-Risiko auf 8GB-Pi).
 
+Die **inline Post-Upload-Validation** im Push-Script (`validate_pool_snapshot`) nutzt seit Juli 2026 Batch-`stat()` statt `listfolder` — siehe [Pool-Finalize](#pool-finalize-ram-sparend).
+
 ```bash
 PCLOUD_POST_UPLOAD_INTEGRITY=1
 # Notfall:
@@ -389,6 +392,70 @@ PCLOUD_STUB_PROGRESS_INTERVAL=500
 ```bash
 # Automatisch gesetzt, nicht manuell ändern
 PCLOUD_API_RETRIES=0
+```
+
+---
+
+## Pool-Finalize (RAM-sparend)
+
+Post-Upload-Validation und Index-Upload nach Delta/Finalize. Relevant auf **pi-nas** (begrenztes RAM, kein extra Swap).
+
+### `PCLOUD_VALIDATE_BATCH_SIZE`
+**Beschreibung:** Anzahl Items pro Validation-Batch (Pool-SHAs und Stubs). Kein `listfolder`-Gesamtbaum — nur `stat()` in Batches.  
+**Default:** `5000`  
+**Empfohlen (pi-nas):** `5000` — Faustformel: `≈ item_count / 15` → ca. 15–25 Fortschrittszeilen pro Phase  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+# ~80k Pool-SHAs  → ~16 Batches
+# ~110k Stubs     → ~22 Batches
+PCLOUD_VALIDATE_BATCH_SIZE=5000
+```
+
+### `PCLOUD_VALIDATE_THREADS`
+**Beschreibung:** Parallele `stat()`-Calls pro Batch (API-bound, kaum RAM). Fallback: `PCLOUD_FOLDER_THREADS`.  
+**Default:** `8`  
+**Empfohlen:** `8` (pi-nas), max sinnvoll ~16  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_VALIDATE_THREADS=8
+```
+
+### `PCLOUD_VALIDATE_FAIL_LIMIT`
+**Beschreibung:** Abbruch nach N Fehlern (verhindert endlose Logs bei Massenfehlern).  
+**Default:** `50`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_VALIDATE_FAIL_LIMIT=50
+```
+
+### `PCLOUD_VALIDATE_STUB_FULL`
+**Beschreibung:** Stub-Vollcheck per Batch-`stat()` (1 = aktiv). Nur für Notfall/Debug auf `0` setzen.  
+**Default:** `1`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_VALIDATE_STUB_FULL=1
+```
+
+### `PCLOUD_VALIDATE_POOL_BACKFILL_MAX`
+**Beschreibung:** Max. fehlende Pool-SHAs, die nach Upload noch aus dem Snapshot nachgeladen werden.  
+**Default:** `50`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_VALIDATE_POOL_BACKFILL_MAX=50
+```
+
+### `PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS`
+**Beschreibung:** Fortschritt beim resumable Index-Upload (jeder N-te Chunk). `1` = jeder Chunk.  
+**Default:** `1`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS=1
 ```
 
 ---
@@ -479,6 +546,24 @@ PCLOUD_TIMEOUT=180
 # === Resume (aktiver Cleanup) ===
 PCLOUD_RESUME_CLEANUP=1
 PCLOUD_RESUME_CLEANUP_DAYS=3
+```
+
+---
+
+### **pi-nas (Pool-Finalize, RAM-sparend)**
+Nach Upload: Batch-Validation + Index lokal/resumable. Kein extra Swap nötig.
+
+```bash
+# === Pool-Finalize ===
+PCLOUD_VALIDATE_BATCH_SIZE=5000
+PCLOUD_VALIDATE_THREADS=8
+PCLOUD_VALIDATE_STUB_FULL=1
+PCLOUD_RESUME_CHUNK_MB=128
+PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS=1
+
+# === Pfade (SSD2) ===
+PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive
+PCLOUD_TEMP_DIR=/srv/pcloud-temp
 ```
 
 ---
