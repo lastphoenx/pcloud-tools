@@ -2224,7 +2224,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _phase4_progress_tick()
         
         # Parallel verarbeiten
-        threads = int(os.environ.get("PCLOUD_PARALLEL_UPLOAD_THREADS", "4"))
+        threads = PARALLEL_UPLOAD_THREADS
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
             list(ex.map(_process_file, tasks))
 
