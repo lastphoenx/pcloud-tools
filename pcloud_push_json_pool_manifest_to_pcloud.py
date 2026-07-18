@@ -2033,12 +2033,19 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
         os.makedirs(_local_index_dir, exist_ok=True)
         
+        t_idx = time.time()
         if os.path.exists(_local_index_path):
             index = load_content_index_local(_local_index_path)
+            _idx_src = "lokal"
         else:
             index = load_content_index(cfg, snapshots_root)
+            _idx_src = "remote"
         
         pool_refs = index.setdefault("pool_refs", {})
+        _log(
+            f"[delta-mode] Phase 4: Index geladen ({len(pool_refs)} pool_refs, {_idx_src}) "
+            f"in {time.time() - t_idx:.1f}s"
+        )
 
         # Nach manuellem Remote-Delete oder fehlgeschlagenem Lauf haengen pool_refs-Eintraege
         # oft noch im Index, obwohl Stubs fehlen -> Phase 4 wuerde sonst 0 Stubs schreiben.
@@ -2057,6 +2064,38 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         stubs_to_write = []
         failed = []  # relpaths, deren Originaldatei NICHT in den Pool geladen werden konnte
         _state_lock = threading.Lock()
+        _total_tasks = len(tasks)
+        _done_tasks = 0
+        _last_progress_pct = 0
+        _phase4_start = time.time()
+        _progress_every = int(os.environ.get("PCLOUD_DELTA_PROGRESS_EVERY", "100"))
+
+        def _phase4_progress_tick() -> None:
+            nonlocal _done_tasks, _last_progress_pct
+            with _state_lock:
+                _done_tasks += 1
+                current_pct = int((_done_tasks / _total_tasks) * 100) if _total_tasks else 100
+                show_progress = (
+                    _done_tasks % _progress_every == 0
+                    or _done_tasks == _total_tasks
+                    or (current_pct % 10 == 0 and current_pct != _last_progress_pct)
+                )
+                if not show_progress:
+                    return
+                _last_progress_pct = current_pct
+                elapsed = time.time() - _phase4_start
+                if _done_tasks > 0 and elapsed > 0:
+                    rate = _done_tasks / elapsed
+                    remaining_s = (_total_tasks - _done_tasks) / rate if rate > 0 else 0
+                else:
+                    remaining_s = 0
+                eta_str = (
+                    f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s / 60)}min"
+                )
+                _log(
+                    f"[delta-mode] Phase 4: {_done_tasks}/{_total_tasks} ({current_pct}%) | "
+                    f"uploaded={uploaded} reused={reused} failed={len(failed)} | {eta_str} verbleibend"
+                )
         
         # Upload-Funktion (wie in push_pool_mode)
         def _upload_to_pool(abs_src: str, sha256: str) -> tuple:
@@ -2139,47 +2178,50 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         def _process_file(relpath: str) -> None:
             nonlocal uploaded, reused
             
-            file_item = current_files[relpath]
-            abs_src = file_item.get("source_path", "")
-            sha256 = (file_item.get("sha256") or "").lower()
-            
-            if not abs_src or not sha256:
-                # Manifest-Defekt: ohne Quelle/SHA kann die Datei nicht in den Pool ->
-                # als Fehler werten, damit der Snapshot nicht still unvollstaendig wird.
-                with _state_lock:
-                    failed.append(relpath)
-                _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
-                return
-
-            # Resume: Remote-Stub muss existieren (Index allein reicht nicht).
-            # Geaenderte Files (changed_paths) immer neu schreiben — geklonter Stub ist veraltet.
-            if relpath not in changed_paths and not dry:
-                _stub_remote = f"{dest_snapshot_dir}/{relpath}.meta.json"
-                try:
-                    _stub_md = pc.stat_file_safe(cfg, path=_stub_remote)
-                    if _stub_md and _stub_md.get("fileid"):
-                        with _state_lock:
-                            reused += 1
-                        return
-                except Exception:
-                    pass
-            
-            # Upload zu Pool
             try:
-                pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
+                file_item = current_files[relpath]
+                abs_src = file_item.get("source_path", "")
+                sha256 = (file_item.get("sha256") or "").lower()
                 
-                with _state_lock:
-                    _register_snap(pool_refs, sha256, snapshot_name, relpath,
-                                   fileid=pool_fileid, hash=pcloud_hash,
-                                   size=file_item.get("size"))
-                    uploaded += 1
+                if not abs_src or not sha256:
+                    # Manifest-Defekt: ohne Quelle/SHA kann die Datei nicht in den Pool ->
+                    # als Fehler werten, damit der Snapshot nicht still unvollstaendig wird.
+                    with _state_lock:
+                        failed.append(relpath)
+                    _log(f"[ERROR] {relpath}: kein source_path/sha256 im Manifest")
+                    return
+
+                # Resume: Remote-Stub muss existieren (Index allein reicht nicht).
+                # Geaenderte Files (changed_paths) immer neu schreiben — geklonter Stub ist veraltet.
+                if relpath not in changed_paths and not dry:
+                    _stub_remote = f"{dest_snapshot_dir}/{relpath}.meta.json"
+                    try:
+                        _stub_md = pc.stat_file_safe(cfg, path=_stub_remote)
+                        if _stub_md and _stub_md.get("fileid"):
+                            with _state_lock:
+                                reused += 1
+                            return
+                    except Exception:
+                        pass
                 
-                _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
-                
-            except Exception as e:
-                _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {e}")
-                with _state_lock:
-                    failed.append(relpath)
+                # Upload zu Pool
+                try:
+                    pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
+                    
+                    with _state_lock:
+                        _register_snap(pool_refs, sha256, snapshot_name, relpath,
+                                       fileid=pool_fileid, hash=pcloud_hash,
+                                       size=file_item.get("size"))
+                        uploaded += 1
+                    
+                    _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
+                    
+                except Exception as e:
+                    _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {e}")
+                    with _state_lock:
+                        failed.append(relpath)
+            finally:
+                _phase4_progress_tick()
         
         # Parallel verarbeiten
         threads = int(os.environ.get("PCLOUD_PARALLEL_UPLOAD_THREADS", "4"))
