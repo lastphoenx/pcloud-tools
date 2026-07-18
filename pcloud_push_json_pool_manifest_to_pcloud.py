@@ -885,6 +885,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     _stubs_skipped_no_fid = 0
     _fid_resolve_idx = 0
     _t_fid_resolve = time.time()
+    _fid_lock = threading.Lock()
 
     def _resolve_parent_fid(parent_path: str, normalized: str) -> Optional[int]:
         """ensure_path mit Backoff; 2004-Fallback via stat_folderid_fast."""
@@ -901,42 +902,92 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 return int(fid)
             raise RuntimeError(f"2004 but folderid not resolvable: {e}") from e
 
+    parents_to_resolve: list[str] = []
     for parent in by_parent.keys():
-        _fid_resolve_idx += 1
         if dry:
             parent_fids[parent] = 0
             continue
 
         normalized_parent = pc._norm_remote_path(parent)
 
-        if normalized_parent in folder_cache:
+        if not _use_legacy_mode and normalized_parent in folder_cache:
             parent_fids[parent] = folder_cache[normalized_parent]
             _cache_hits += 1
         else:
-            try:
-                fid = _resolve_parent_fid(parent, normalized_parent)
-                parent_fids[parent] = fid
-                folder_cache[normalized_parent] = fid
-                _cache_misses += 1
-                _api_calls += 1
-            except Exception as e:
-                _parents_failed += 1
-                n_skip = len(by_parent[parent])
-                _stubs_skipped_no_fid += n_skip
-                _log(
-                    f"[warn] cannot resolve/ensure folderid for {parent}: {e} "
-                    f"({n_skip} Stub(s) übersprungen)"
-                )
+            parents_to_resolve.append(parent)
 
-        if not dry and (
-            _fid_resolve_idx % _fid_progress_every == 0
-            or _fid_resolve_idx == _total_parents
-        ):
+    def _log_fid_progress(done: int) -> None:
+        if done % _fid_progress_every == 0 or done == _total_parents:
             _log(
-                f"[stubs] Parent-FIDs: {_fid_resolve_idx}/{_total_parents} "
+                f"[stubs] Parent-FIDs: {done}/{_total_parents} "
                 f"({_cache_hits} cache, {_cache_misses} neu, {_parents_failed} fehl) "
                 f"{time.time() - _t_fid_resolve:.0f}s"
             )
+
+    if _cache_hits:
+        _log_fid_progress(_cache_hits)
+
+    if parents_to_resolve and not dry:
+        fid_threads = max(
+            1,
+            int(
+                os.environ.get(
+                    "PCLOUD_STUB_FID_THREADS",
+                    os.environ.get("PCLOUD_API_META_CONCURRENCY", "6"),
+                )
+                or "6"
+            ),
+        )
+        _log(
+            f"[stubs] {len(parents_to_resolve)} Parent(s) parallel auflösen "
+            f"({fid_threads} Threads, nach Pfadtiefe)..."
+        )
+
+        def _parent_depth(parent_path: str) -> int:
+            return pc._norm_remote_path(parent_path).count("/")
+
+        by_depth: dict[int, list[str]] = {}
+        for parent in parents_to_resolve:
+            by_depth.setdefault(_parent_depth(parent), []).append(parent)
+
+        def _resolve_one(parent: str) -> tuple[str, Optional[int], Optional[BaseException]]:
+            try:
+                normalized_parent = pc._norm_remote_path(parent)
+                with _fid_lock:
+                    cached = folder_cache.get(normalized_parent)
+                if cached:
+                    return parent, int(cached), None
+                fid = _resolve_parent_fid(parent, normalized_parent)
+                return parent, fid, None
+            except BaseException as e:
+                return parent, None, e
+
+        for depth in sorted(by_depth.keys()):
+            batch = by_depth[depth]
+            if fid_threads > 1 and len(batch) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=fid_threads) as ex:
+                    results = list(ex.map(_resolve_one, batch))
+            else:
+                results = [_resolve_one(p) for p in batch]
+
+            for parent, fid, err in results:
+                with _fid_lock:
+                    if err is not None:
+                        _parents_failed += 1
+                        n_skip = len(by_parent[parent])
+                        _stubs_skipped_no_fid += n_skip
+                        _log(
+                            f"[warn] cannot resolve/ensure folderid for {parent}: {err} "
+                            f"({n_skip} Stub(s) übersprungen)"
+                        )
+                    else:
+                        parent_fids[parent] = int(fid)
+                        folder_cache[pc._norm_remote_path(parent)] = int(fid)
+                        _cache_misses += 1
+                        _api_calls += 1
+
+                _fid_resolve_idx = _cache_hits + _cache_misses + _parents_failed
+                _log_fid_progress(_fid_resolve_idx)
 
     # Performance-Report
     if not dry:
