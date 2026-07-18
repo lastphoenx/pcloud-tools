@@ -2925,15 +2925,19 @@ def write_json_to_folderid(cfg: dict, *, folderid: int, filename: str, obj: dict
     staging_dir = os.environ.get("PCLOUD_JSON_STAGING_DIR") or os.path.join(
         os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "staging", "json"
     )
-    os.makedirs(staging_dir, exist_ok=True)
+    # Pro Zielordner eigener Unterordner — verhindert Kollisionen bei gleichem Dateinamen
+    # (z.B. viele index.json.blob.meta.json in verschiedenen PBS-Pfaden).
+    local_dir = os.path.join(staging_dir, str(int(folderid)))
+    os.makedirs(local_dir, exist_ok=True)
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
-    local_path = os.path.join(staging_dir, f"{safe_name}.upload.tmp")
+    local_path = os.path.join(local_dir, f"{safe_name}.upload.tmp")
 
     file_size = write_json_local_atomic(local_path, obj, minify=minify)
-    print(
-        f"[json-staging] {filename}: {_format_byte_size(file_size)} -> {local_path}",
-        flush=True,
-    )
+    if os.environ.get("PCLOUD_JSON_STAGING_LOG", "0") == "1":
+        print(
+            f"[json-staging] {filename}: {_format_byte_size(file_size)} -> {local_path}",
+            flush=True,
+        )
 
     threshold = int(os.environ.get("PCLOUD_RESUMABLE_UPLOAD_MIN_BYTES", str(4 * 1024 * 1024)))
     log_every = int(os.environ.get("PCLOUD_UPLOAD_LOG_EVERY_CHUNKS", "10"))

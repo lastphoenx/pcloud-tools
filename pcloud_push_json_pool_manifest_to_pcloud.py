@@ -1129,7 +1129,9 @@ def _pool_object_present(cfg: dict, pool_root: str, sha: str, pool_refs: dict) -
     if len(sha) != 64:
         return False
     pool_path = f"{pool_root.rstrip('/')}/{sha[:2]}/{sha}"
-    st = pc.stat_file_safe(cfg, path=pool_path)
+    st = pc.call_with_backoff(
+        pc.stat_file_safe, cfg, path=pool_path, attempts=4, max_sleep=30.0
+    )
     if st and st.get("fileid"):
         return True
     ref = (pool_refs or {}).get(sha)
@@ -1138,7 +1140,9 @@ def _pool_object_present(cfg: dict, pool_root: str, sha: str, pool_refs: dict) -
     ref = ref or {}
     fid = ref.get("fileid")
     if fid:
-        st2 = pc.stat_file_safe(cfg, fileid=int(fid))
+        st2 = pc.call_with_backoff(
+            pc.stat_file_safe, cfg, fileid=int(fid), attempts=4, max_sleep=30.0
+        )
         if st2 and st2.get("fileid"):
             return True
     return False
@@ -1314,9 +1318,12 @@ def _validate_pool_shas_batched(
     pool_refs: dict,
 ) -> list[str]:
     def _check_sha(sha: str) -> Optional[str]:
-        if _pool_object_present(cfg, pool_root, sha, pool_refs):
-            return None
-        return sha
+        try:
+            if _pool_object_present(cfg, pool_root, sha, pool_refs):
+                return None
+            return sha
+        except Exception as e:
+            return f"{sha}: {e}"
 
     return _run_validate_batches(
         sorted(manifest_sha256s), _check_sha, label="pool", unit="SHA256"
@@ -1336,12 +1343,17 @@ def _validate_stubs_batched(
         if not relpath:
             return None
         stub_path = f"{snap_base}/{relpath}.meta.json"
-        if pc.stat_file_safe(cfg, path=stub_path):
-            return None
-        norm_path = ppc.normalize_path_segments(stub_path)
-        if norm_path != stub_path and pc.stat_file_safe(cfg, path=norm_path):
-            return None
-        return relpath
+        try:
+            if pc.call_with_backoff(pc.stat_file_safe, cfg, path=stub_path, attempts=4, max_sleep=30.0):
+                return None
+            norm_path = ppc.normalize_path_segments(stub_path)
+            if norm_path != stub_path and pc.call_with_backoff(
+                pc.stat_file_safe, cfg, path=norm_path, attempts=4, max_sleep=30.0
+            ):
+                return None
+            return relpath
+        except Exception as e:
+            return f"{relpath}: {e}"
 
     return _run_validate_batches(items, _check_stub, label="stubs", unit="Stubs")
 
