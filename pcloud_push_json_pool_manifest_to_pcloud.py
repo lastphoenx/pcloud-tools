@@ -2842,7 +2842,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[pool-mode] Erstelle {len(missing_pool_folders)} fehlende Pool-Ordner...")
                 
                 # Parallel mit Workers erstellen (wie bei Snapshot-Ordnern)
-                pool_threads = int(os.environ.get("PCLOUD_POOL_FOLDER_THREADS", "2"))
+                pool_threads = int(os.environ.get("PCLOUD_POOL_FOLDER_THREADS", "8"))
                 created_count = 0
                 
                 def _create_pool_folder(path: str) -> bool:
@@ -2984,7 +2984,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 for reldir in _pending:
                     folders_by_depth[reldir.count("/")].append(reldir)
 
-                threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "2"))
+                threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
                 _folders_created = _resume_from
                 _folders_lock = threading.Lock()
                 _last_progress_pct = 0

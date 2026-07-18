@@ -448,7 +448,7 @@ _circuit_breaker_lock = threading.Lock()
 def _get_meta_sem() -> threading.Semaphore:
     global _meta_sem
     if _meta_sem is None:
-        n = int(os.environ.get("PCLOUD_API_META_CONCURRENCY", "2"))
+        n = int(os.environ.get("PCLOUD_API_META_CONCURRENCY", "6"))
         _meta_sem = threading.Semaphore(max(1, n))
     return _meta_sem
 
@@ -456,7 +456,7 @@ def _get_meta_sem() -> threading.Semaphore:
 def _get_meta_delay() -> float:
     global _meta_delay
     if _meta_delay is None:
-        _meta_delay = float(os.environ.get("PCLOUD_API_META_DELAY", "0.15"))
+        _meta_delay = float(os.environ.get("PCLOUD_API_META_DELAY", "0.03"))
     return _meta_delay
 
 
