@@ -1877,6 +1877,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                         _log(f"[delta-mode][warn] Marker-Cleanup ({_marker}): {_me}")
         except Exception as e:
             _log(f"[delta-mode][ERROR] copyfolder fehlgeschlagen: {e}")
+            if pc.is_transient_api_error(e):
+                raise RuntimeError(
+                    f"[delta-mode] Abbruch wegen API-Verbindungsfehler "
+                    f"(kein Full-Pool-Fallback): {e}"
+                ) from e
             _log("[delta-mode] Fallback zu Full-Pool-Mode...")
             return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, use_scout=False)
     else:
@@ -1908,8 +1913,9 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             basis_manifest = json.load(f)
     except Exception as e:
         _log(f"[delta-mode][ERROR] Basis-Manifest nicht gefunden: {e}")
-        _log("[delta-mode] Fallback zu Full-Pool-Mode...")
-        return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, use_scout=False)
+        raise RuntimeError(
+            f"[delta-mode] Basis-Manifest fehlt – Abbruch (kein Full-Pool-Fallback): {e}"
+        ) from e
     
     # File-Maps erstellen
     current_files = {
@@ -2566,10 +2572,13 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _log(f"[preflight] Pool-Scan: {len(physical_pool_sha256s)} SHA256s gefunden in {pool_scan_duration:.2f}s")
             
         except Exception as e:
-            # NICHT auf den (evtl. veralteten) Index zurueckfallen -> das koennte Stubs mit
-            # fileids erzeugen, deren Pool-Objekt fehlt (korrupter Snapshot). Stattdessen ALLE
-            # Files als neu behandeln (Full-Upload); _upload_to_pool dedupliziert pro File via
-            # stat -> real vorhandene Objekte werden NICHT neu hochgeladen (sicher, nur langsamer).
+            if pc.is_transient_api_error(e):
+                raise RuntimeError(
+                    f"[preflight] Pool-Scan fehlgeschlagen (API-Verbindung) – "
+                    f"Abbruch statt Full-Upload-Erzwingung: {e}"
+                ) from e
+            # Nicht-transiente Fehler (z.B. Ordner fehlt): alle Files als neu planen;
+            # _upload_to_pool dedupliziert pro File via stat.
             _log(f"[preflight][WARN] Pool-Scan nach Retries fehlgeschlagen: {e}")
             _log(f"[preflight][WARN] → Erzwinge Full-Upload (alle als neu); stat dedupliziert pro File.")
             physical_pool_sha256s = set()
@@ -2791,7 +2800,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[pool-mode] Erstelle {len(missing_pool_folders)} fehlende Pool-Ordner...")
                 
                 # Parallel mit Workers erstellen (wie bei Snapshot-Ordnern)
-                pool_threads = int(os.environ.get("PCLOUD_POOL_FOLDER_THREADS", "8"))
+                pool_threads = int(os.environ.get("PCLOUD_POOL_FOLDER_THREADS", "2"))
                 created_count = 0
                 
                 def _create_pool_folder(path: str) -> bool:
@@ -2933,7 +2942,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 for reldir in _pending:
                     folders_by_depth[reldir.count("/")].append(reldir)
 
-                threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "4"))
+                threads = int(os.environ.get("PCLOUD_FOLDER_THREADS", "2"))
                 _folders_created = _resume_from
                 _folders_lock = threading.Lock()
                 _last_progress_pct = 0
@@ -3485,7 +3494,7 @@ def main() -> None:
               f"resumed_files={MET_RESUMED_FILES} "
               f"stubs_written={MET_STUBS_WRITTEN} promoted={MET_PROMOTED} removed_nodes={MET_REMOVED_NODES} "
               f"fid_cache_hits={fid_cache_hits} fid_lookups={fid_lookups} fid_rest_ms={int(fid_rest_ms)} "
-              f"api_retries={MET_API_RETRIES}")
+              f"api_retries={pc.get_api_retry_count()}")
     except Exception:
         pass
 

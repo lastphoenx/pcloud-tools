@@ -32,6 +32,7 @@ import struct
 import time
 import hashlib
 import inspect
+import threading
 import json as _json
 import tempfile as _tempfile
 from typing import Any, Dict, Callable, Optional, Tuple
@@ -437,31 +438,118 @@ class _BinReader:
             return self._read_number(t)
         raise ValueError(f"unknown type {t}")
 
+_meta_sem: Optional[threading.Semaphore] = None
+_meta_delay: Optional[float] = None
+_api_retry_count = 0
+_consecutive_transient_errors = 0
+_circuit_breaker_lock = threading.Lock()
+
+
+def _get_meta_sem() -> threading.Semaphore:
+    global _meta_sem
+    if _meta_sem is None:
+        n = int(os.environ.get("PCLOUD_API_META_CONCURRENCY", "2"))
+        _meta_sem = threading.Semaphore(max(1, n))
+    return _meta_sem
+
+
+def _get_meta_delay() -> float:
+    global _meta_delay
+    if _meta_delay is None:
+        _meta_delay = float(os.environ.get("PCLOUD_API_META_DELAY", "0.15"))
+    return _meta_delay
+
+
+def _api_ts_log(msg: str) -> None:
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def is_transient_api_error(exc: BaseException) -> bool:
+    """True bei typischen Verbindungs-/Rate-Limit-Fehlern (retry-würdig, kein Full-Pool-Fallback)."""
+    if isinstance(exc, (ConnectionError, ConnectionResetError, BrokenPipeError, TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, ssl.SSLError):
+        return True
+    msg = str(exc).lower()
+    keywords = (
+        "socket closed", "connection reset", "connection aborted", "broken pipe",
+        "timed out", "timeout", "temporarily unavailable", "eof occurred",
+        "econnreset", "ssl", "5000", "5001",
+    )
+    return any(k in msg for k in keywords)
+
+
+def _circuit_breaker_check() -> None:
+    threshold = int(os.environ.get("PCLOUD_CIRCUIT_BREAKER_ERRORS", "12"))
+    with _circuit_breaker_lock:
+        if _consecutive_transient_errors >= threshold:
+            raise RuntimeError(
+                f"API circuit breaker open: {_consecutive_transient_errors} consecutive "
+                f"connection errors (threshold={threshold}). "
+                f"Reduce parallelism (PCLOUD_FOLDER_THREADS) or wait before retry."
+            )
+
+
+def _circuit_breaker_record_success() -> None:
+    global _consecutive_transient_errors
+    with _circuit_breaker_lock:
+        _consecutive_transient_errors = 0
+
+
+def _circuit_breaker_record_failure(exc: BaseException) -> None:
+    global _consecutive_transient_errors
+    if not is_transient_api_error(exc):
+        return
+    threshold = int(os.environ.get("PCLOUD_CIRCUIT_BREAKER_ERRORS", "12"))
+    with _circuit_breaker_lock:
+        _consecutive_transient_errors += 1
+        n = _consecutive_transient_errors
+    if n >= threshold:
+        raise RuntimeError(
+            f"API circuit breaker tripped after {n} consecutive connection errors. "
+            f"Last error: {exc}"
+        ) from exc
+
+
+def get_api_retry_count() -> int:
+    return _api_retry_count
+
+
 def _rpc(host: str, port: int, timeout: int, method: str,
          params: Dict[str,Any], data: bytes|None=None) -> Tuple[Dict[str,Any], Optional[bytes]]:
     """Sendet einen Binary-Request; gibt (top_hash, data_bytes) zurück."""
-    data_len = len(data) if data else 0
-    req = _build_request(method, params, data_len)
-    tls = _connect(host, port, timeout)
+    _circuit_breaker_check()
+    sem = _get_meta_sem()
+    sem.acquire()
+    tls = None
     try:
+        data_len = len(data) if data else 0
+        req = _build_request(method, params, data_len)
+        tls = _connect(host, port, timeout)
         tls.sendall(req)
         if data_len:
             tls.sendall(data)
         resp_len = struct.unpack(LE_U32, _recv_exact(tls, 4))[0]
         payload  = _recv_exact(tls, resp_len)
-        # evtl. Datenteil nachschieben?
         reader = _BinReader(payload)
         top = reader._read_value()
         extra = None
         if isinstance(top, dict):
-            # Wenn "data" Feld vorkommt, separat lesen
             dv = top.get("data")
             if isinstance(dv, dict) and dv.get("__type__")=="data":
                 extra = _recv_exact(tls, int(dv["len"]))
+        _circuit_breaker_record_success()
         return top, extra
     finally:
-        try: tls.close()
-        except: pass
+        if tls is not None:
+            try:
+                tls.close()
+            except Exception:
+                pass
+        delay = _get_meta_delay()
+        if delay > 0:
+            time.sleep(delay)
+        sem.release()
 
 def _expect_ok(top: Dict[str,Any]) -> None:
     if not isinstance(top, dict): raise RuntimeError("unexpected response")
@@ -2892,20 +2980,33 @@ def call_with_backoff(func, *args, attempts: int = 5, max_sleep: float = 60.0, *
     Wiederholt bei typischen temporären pCloud-Fehlern (5000/5001), Netzwerk-
     Fehlern und Rate-Limits. Bricht *nicht* bei Auth/Quota-Fehlern erneut an.
     """
-    import time
+    global _api_retry_count
     last_exc = None
-    for i in range(1, max(1, int(attempts)) + 1):
+    max_attempts = max(1, int(attempts))
+    for i in range(1, max_attempts + 1):
+        _circuit_breaker_check()
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            _circuit_breaker_record_success()
+            return result
         except Exception as e:
             msg = str(e)
             # Harte Fehler → kein Retry
-            if any(x in msg for x in ("1000", "2000", "2008", "Access denied")):
+            if any(x in msg for x in ("1000", "2000", "2008", "Access denied", "circuit breaker")):
+                raise
+            if not is_transient_api_error(e):
                 raise
             last_exc = e
-            if i < attempts:
-                sleep_s = min(max_sleep, 0.25 * (2 ** (i - 1)))
-                print(f"[retry] Versuch {i}/{attempts} fehlgeschlagen ({type(e).__name__}: {e}), warte {sleep_s:.1f}s ...", flush=True)
+            _circuit_breaker_record_failure(e)
+            if i < max_attempts:
+                _api_retry_count += 1
+                base = 2.0 if is_transient_api_error(e) else 0.5
+                sleep_s = min(max_sleep, base * (2 ** (i - 1)))
+                _api_ts_log(
+                    f"[retry] {getattr(func, '__name__', func)} "
+                    f"Versuch {i}/{max_attempts} fehlgeschlagen "
+                    f"({type(e).__name__}: {e}), warte {sleep_s:.1f}s ..."
+                )
                 time.sleep(sleep_s)
     raise last_exc
 
