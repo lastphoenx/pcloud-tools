@@ -100,6 +100,14 @@ def _log(msg: str, *, file=sys.stderr) -> None:
         print(f"{ts} {safe_msg}", file=file, flush=True)
 
 
+def _log_section(title: str, *, tag: str = "") -> None:
+    """Sichtbare Abschnitts-Ueberschrift im Log (eigene Zeile)."""
+    if tag:
+        _log(f"========== [{tag}] {title} ==========")
+    else:
+        _log(f"========== {title} ==========")
+
+
 class DryRunSampler:
     """Hilfsklasse um Dry-Run Logs bei >100k Files zu drosseln"""
     def __init__(self, limit: int = 5):
@@ -639,6 +647,7 @@ def _finalize_after_validation_delta(
     """
     if dry:
         return
+    _log_section("Phase 7: Finalize", tag="delta-mode")
     _release_post_validation_memory()
     _set_upload_complete_marker(cfg, dest_snapshot_dir, marker_data, dry=dry)
     save_content_index(cfg, snapshots_root, index, dry=False)
@@ -856,6 +865,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         
         # Cache-Build nur wenn snapshot_root valide ist
         if snapshot_root:
+            _log_section("Folder-Cache", tag="stubs")
             _log(f"[stubs] Lade Ordner-Struktur via listfolder: {snapshot_root}")
             t_cache_start = time.time()
             folder_cache = _build_folder_cache_from_tree(cfg, snapshot_root)
@@ -881,6 +891,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         _use_legacy_mode = True
     
     # 2c) Parent-FIDs: Cache-Lookup (optimiert) oder Legacy-Mode (sequential)
+    _log_section("Parent-FolderIDs", tag="stubs")
     if _use_legacy_mode:
         _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Legacy-Modus: sequential ensure_path)...")
     else:
@@ -986,6 +997,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     total_tasks = len(tasks)
     
     # Start-Meldung
+    _log_section("Batch-Write", tag="stubs")
     _log(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads} Threads...")
 
     def _upload_one(args: tuple[str, str, dict]):
@@ -1845,6 +1857,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pass
 
     # === PHASE 1: SERVER-SIDE COPY (INSTANT STRUKTUR!) ===
+    _log_section("Phase 1: Basis-Snapshot klonen", tag="delta-mode")
     _log(f"[delta-mode] Phase 1: Klone Basis-Snapshot...")
     t_copy_start = time.time()
     
@@ -1901,6 +1914,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
     
     # === PHASE 2: MANIFEST-DIFF BERECHNEN ===
+    _log_section("Phase 2: Manifest-Diff", tag="delta-mode")
     _log("[delta-mode] Phase 2: Berechne Manifest-Diff...")
     t_diff_start = time.time()
     
@@ -1966,6 +1980,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             )
 
     if paths_to_remove and not dry:
+        _log_section("Phase 3: Cleanup", tag="delta-mode")
         _log(f"[delta-mode] Phase 3: Entferne {len(paths_to_remove)} veraltete Einträge...")
         t_cleanup_start = time.time()
 
@@ -2025,6 +2040,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     tasks = list(added_paths | changed_paths)
     
     if tasks:
+        _log_section(f"Phase 4: Files ({len(tasks)})", tag="delta-mode")
         _log(f"[delta-mode] Phase 4: Verarbeite {len(tasks)} neue/geänderte Files...")
         
         # Index laden
@@ -2246,6 +2262,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         
         # Stubs schreiben
         if stubs_to_write and not dry:
+            _log_section(f"Phase 5: Stubs ({len(stubs_to_write)})", tag="delta-mode")
             _log(f"[delta-mode] Schreibe {len(stubs_to_write)} Stubs...")
             t0 = time.time()
             _batch_write_stubs(cfg, stubs_to_write, dry=False)
@@ -2309,6 +2326,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
 
     validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
     if validation_enabled and not dry:
+        _log_section("Phase 6: Post-Upload Validation", tag="delta-mode")
         _log("[delta-mode] Starte Post-Upload Validation...")
         is_valid, validation_errors = validate_pool_snapshot(cfg, dest_snapshot_dir, pool_root, manifest, index, dry=dry)
         
