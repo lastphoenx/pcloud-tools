@@ -3068,6 +3068,17 @@ def stat_folderid_fast(cfg: dict, path: str) -> int | None:
         return None
 
 
+def upload_complete_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
+    """True nur wenn .upload_complete existiert und das snapshot-Feld passt."""
+    if not stat_file_safe(cfg, path=marker_path):
+        return False
+    try:
+        data = _json.loads(get_textfile(cfg, path=marker_path))
+        return str(data.get("snapshot", "")) == str(snapshot_name)
+    except Exception:
+        return False
+
+
 # === Generic retry/backoff wrapper =========================================
 def call_with_backoff(func, *args, attempts: int = 5, max_sleep: float = 60.0, **kwargs):
     """

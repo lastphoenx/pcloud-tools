@@ -651,13 +651,7 @@ def _finalize_after_validation_delta(
 
 def _upload_complete_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
     """True nur wenn .upload_complete existiert und snapshot-Feld passt."""
-    if not pc.stat_file_safe(cfg, path=marker_path):
-        return False
-    try:
-        data = json.loads(pc.get_textfile(cfg, path=marker_path))
-        return str(data.get("snapshot", "")) == str(snapshot_name)
-    except Exception:
-        return False
+    return pc.upload_complete_matches_snapshot(cfg, marker_path, snapshot_name)
 
 
 def _purge_snapshot_refs_from_index(index: dict, snapshot_name: str) -> int:
