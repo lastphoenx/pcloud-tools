@@ -1872,6 +1872,97 @@ def deletefolder_recursive(cfg: dict, *, path: str | None = None, folderid: int 
     _expect_ok(top)
     return top
 
+
+def deletefolder_recursive_wait(
+    cfg: dict,
+    *,
+    path: str | None = None,
+    folderid: int | None = None,
+    log=None,
+    max_wait_sec: float | None = None,
+    poll_sec: float | None = None,
+) -> None:
+    """
+    Löscht einen Ordner rekursiv und wartet, bis er remote wirklich weg ist.
+
+    Große Snapshot-Bäume können serverseitig Minuten brauchen. API 5000 direkt
+    nach deletefolderrecursive bedeutet oft „noch in Arbeit“, nicht „fertig fehlgeschlagen“.
+    """
+    if (path is None) == (folderid is None):
+        raise ValueError("deletefolder_recursive_wait: genau eines von path oder folderid.")
+
+    log = log or (lambda _msg: None)
+    try:
+        max_wait = float(
+            max_wait_sec if max_wait_sec is not None
+            else os.environ.get("PCLOUD_DELETE_MAX_WAIT_SEC", "3600")
+        )
+    except (TypeError, ValueError):
+        max_wait = 3600.0
+    try:
+        poll = float(
+            poll_sec if poll_sec is not None
+            else os.environ.get("PCLOUD_DELETE_POLL_SEC", "30")
+        )
+    except (TypeError, ValueError):
+        poll = 30.0
+    poll = max(5.0, poll)
+
+    norm_path = _norm_remote_path(path) if path else None
+    label = norm_path or f"folderid={folderid}"
+
+    def _still_exists() -> bool:
+        if norm_path:
+            return stat_folderid_fast(cfg, norm_path) is not None
+        try:
+            stat_folder(cfg, folderid=int(folderid))
+            return True
+        except Exception:
+            return False
+
+    if not _still_exists():
+        log(f"[delete] bereits weg: {label}")
+        return
+
+    t0 = time.time()
+    delete_count = 0
+    last_delete_at = -poll
+
+    while _still_exists():
+        elapsed = time.time() - t0
+        if elapsed >= max_wait:
+            raise RuntimeError(
+                f"[delete] Timeout nach {max_wait:.0f}s: {label} existiert noch"
+            )
+
+        if delete_count == 0 or (elapsed - last_delete_at) >= poll:
+            delete_count += 1
+            last_delete_at = elapsed
+            log(f"[delete] deletefolderrecursive #{delete_count} ({label}, {elapsed:.0f}s)…")
+            try:
+                if norm_path:
+                    call_with_backoff(
+                        deletefolder_recursive, cfg,
+                        path=norm_path,
+                        attempts=3,
+                        max_sleep=30.0,
+                    )
+                else:
+                    call_with_backoff(
+                        deletefolder_recursive, cfg,
+                        folderid=int(folderid),
+                        attempts=3,
+                        max_sleep=30.0,
+                    )
+                log("[delete] API-Aufruf OK — warte auf serverseitige Entfernung…")
+            except Exception as e:
+                log(f"[delete][warn] deletefolderrecursive: {e} — weiter warten ({elapsed:.0f}s)")
+
+        log(f"[delete] noch vorhanden… {elapsed:.0f}s / max {max_wait:.0f}s")
+        time.sleep(poll)
+
+    log(f"[delete] ✓ entfernt ({time.time() - t0:.1f}s): {label}")
+
 def put_textfile(cfg: dict, *, path: str, text: str, encoding: str = "utf-8") -> dict:
     """Schreibt Textdatei robust per Binary-Upload (kein REST)."""
     rp = _norm_remote_path(path)

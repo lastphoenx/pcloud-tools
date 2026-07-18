@@ -1827,10 +1827,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                      f"(erwartet {snapshot_name}) → verwerfe und starte sauber neu")
             else:
                 _log(f"[delta-mode] Ziel existiert, aber unvollständig (kein .upload_complete) → verwerfe und starte sauber neu")
-            try:
-                pc.deletefolder_recursive(cfg, folderid=int(existing_fid))
-            except Exception as e:
-                _log(f"[delta-mode][warn] Konnte unvollständigen Ziel-Ordner nicht entfernen: {e}")
+            pc.deletefolder_recursive_wait(
+                cfg,
+                path=dest_snapshot_dir,
+                log=_log,
+            )
 
             # STAMMDATEN BEREINIGEN: snapshot_name aus pool_refs entfernen.
             # Der Snapshot-Ordner inkl. aller Stubs wurde soeben geloescht. Ohne
@@ -1861,41 +1862,49 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     t_copy_start = time.time()
     
     if not dry:
-        try:
-            # WICHTIG: copycontentonly=True kopiert die KINDER von from_path direkt
-            # nach to_folderid. to_folderid MUSS daher der Snapshot-Ordner SELBST
-            # sein - nicht der _snapshots-Parent. Sonst landen alle Top-Level-Ordner
-            # des Snapshots plus die mitkopierten Marker direkt in _snapshots/ statt
-            # in _snapshots/<snapshot>/. toname wird bei copycontentonly ignoriert.
-            # Gleiches, bewaehrtes Muster wie weiter unten (ensure_path -> Ziel-FID
-            # -> copyfolder hinein).
-            dest_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-            pc.copyfolder(cfg, from_path=basis_snapshot_dir, to_folderid=dest_fid,
-                         copycontentonly=True)
-            copy_duration = time.time() - t_copy_start
-            _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")
+        copy_attempts = max(1, int(os.environ.get("PCLOUD_COPYFOLDER_ATTEMPTS", "3")))
+        copy_err: Exception | None = None
+        for copy_try in range(1, copy_attempts + 1):
+            try:
+                # WICHTIG: copycontentonly=True kopiert die KINDER von from_path direkt
+                # nach to_folderid. to_folderid MUSS daher der Snapshot-Ordner SELBST
+                # sein - nicht der _snapshots-Parent.
+                dest_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+                pc.copyfolder(
+                    cfg,
+                    from_path=basis_snapshot_dir,
+                    to_folderid=dest_fid,
+                    copycontentonly=True,
+                )
+                copy_duration = time.time() - t_copy_start
+                _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")
+                copy_err = None
+                break
+            except Exception as e:
+                copy_err = e
+                _log(
+                    f"[delta-mode][ERROR] copyfolder Versuch {copy_try}/{copy_attempts}: {e}"
+                )
+                if copy_try < copy_attempts:
+                    time.sleep(min(30.0 * copy_try, 90.0))
 
-            # Vom Basis mitkopierte Status-Marker entfernen. Sonst gilt der frisch
-            # geklonte Snapshot faelschlich als 'bereits vollstaendig' (Complete-Marker
-            # des Basis) bzw. traegt einen fremden Started-Marker. Der frische
-            # Started-Marker wird unmittelbar danach neu geschrieben.
-            for _marker in (marker_complete, marker_started):
-                try:
-                    _mmd = pc.stat_file_safe(cfg, path=_marker)
-                    if _mmd and _mmd.get("fileid"):
-                        pc.delete_file(cfg, fileid=int(_mmd["fileid"]))
-                except Exception as _me:
-                    if verbose:
-                        _log(f"[delta-mode][warn] Marker-Cleanup ({_marker}): {_me}")
-        except Exception as e:
-            _log(f"[delta-mode][ERROR] copyfolder fehlgeschlagen: {e}")
-            if pc.is_transient_api_error(e):
-                raise RuntimeError(
-                    f"[delta-mode] Abbruch wegen API-Verbindungsfehler "
-                    f"(kein Full-Pool-Fallback): {e}"
-                ) from e
-            _log("[delta-mode] Fallback zu Full-Pool-Mode...")
-            return push_pool_mode(cfg, manifest, dest_root, dry=dry, verbose=verbose, use_scout=False)
+        if copy_err is not None:
+            raise RuntimeError(
+                f"[delta-mode] copyfolder fehlgeschlagen nach {copy_attempts} Versuch(en) "
+                f"(kein Full-Pool-Fallback): {copy_err}"
+            ) from copy_err
+
+        # Vom Basis mitkopierte Status-Marker entfernen. Sonst gilt der frisch
+        # geklonte Snapshot faelschlich als 'bereits vollstaendig' (Complete-Marker
+        # des Basis) bzw. traegt einen fremden Started-Marker.
+        for _marker in (marker_complete, marker_started):
+            try:
+                _mmd = pc.stat_file_safe(cfg, path=_marker)
+                if _mmd and _mmd.get("fileid"):
+                    pc.delete_file(cfg, fileid=int(_mmd["fileid"]))
+            except Exception as _me:
+                if verbose:
+                    _log(f"[delta-mode][warn] Marker-Cleanup ({_marker}): {_me}")
     else:
         _log(f"[dry] copyfolder({basis_snapshot_dir} → {snapshot_name})")
     
@@ -2491,23 +2500,20 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         marker_started = f"{dest_snapshot_dir}/.upload_started"
         marker_complete = f"{dest_snapshot_dir}/.upload_complete"
         
-        # Prüfen ob unvollständiger Upload existiert
+        # Prüfen ob Upload bereits abgeschlossen (snapshot-Feld muss passen!)
         incomplete_upload = False
-        try:
-            pc.stat_file(cfg, path=marker_started, with_checksum=False)
-            # Started-Marker existiert
-            try:
-                pc.stat_file(cfg, path=marker_complete, with_checksum=False)
-                # Complete-Marker auch da → Upload war erfolgreich
-                _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
-                return {"uploaded": 0, "stubs": 0, "resumed": False}
-            except:
-                # Nur Started, kein Complete → unvollständig!
-                incomplete_upload = True
-                _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
-        except:
-            # Kein Started-Marker → frischer Upload
-            pass
+        if _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
+            _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+            return {"uploaded": 0, "stubs": 0, "resumed": False}
+        if pc.stat_file_safe(cfg, path=marker_complete):
+            _log(
+                f"[warn] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
+                f"(erwartet {snapshot_name}) — behandle als unvollständig"
+            )
+            incomplete_upload = True
+        elif pc.stat_file_safe(cfg, path=marker_started):
+            incomplete_upload = True
+            _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
         
         # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
         if incomplete_upload:
