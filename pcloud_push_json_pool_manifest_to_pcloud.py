@@ -1796,13 +1796,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     
     # Timeout-Protection: copyfolder ist ein Socket-Read-Timeout pro Antwort-Byte.
     # Bei 80k Stubs + 70k Ordnern dauert der Server-seitige Copy ~600s (beobachtet
-    # 2026-06-04). Default 300s löst 2 Retries aus bevor Erfolg → ineffizient und
-    # fragil. Neuer Default: 700s (genug Reserve über 591s Messwert).
-    # Override via PCLOUD_COPYFOLDER_TIMEOUT.
+    # 2026-06-04). PCLOUD_COPYFOLDER_TIMEOUT hat immer Vorrang (mindestens dieser Wert),
+    # auch wenn PCLOUD_TIMEOUT höher als 60 aber unter copyfolder liegt (z.B. 120).
     current_timeout = int(cfg.get("timeout", 30))
-    if current_timeout <= 60:
-        cfg["timeout"] = int(os.environ.get("PCLOUD_COPYFOLDER_TIMEOUT", "700"))
-        _log(f"[delta-mode] Timeout erhöht: {current_timeout}s → {cfg['timeout']}s (Meta-Operationen)")
+    copyfolder_timeout = int(os.environ.get("PCLOUD_COPYFOLDER_TIMEOUT", "700"))
+    if current_timeout < copyfolder_timeout:
+        cfg["timeout"] = copyfolder_timeout
+        _log(f"[delta-mode] Timeout erhöht: {current_timeout}s → {cfg['timeout']}s (copyfolder)")
     else:
         _log(f"[delta-mode] Timeout beibehalten: {current_timeout}s")
 
