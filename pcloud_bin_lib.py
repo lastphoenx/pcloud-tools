@@ -2674,6 +2674,13 @@ def _format_byte_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+def _resume_state_slug(key: str) -> str:
+    """Filesystem-safe slug for resume state (logical keys may contain / or :)."""
+    if key and len(key) <= 64 and all(c.isalnum() or c in "._-" for c in key):
+        return key
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def get_resume_state_dir() -> str:
     """
     State-Verzeichnis fuer resumable Uploads (SSD bevorzugt, nicht microSD).
@@ -2796,7 +2803,7 @@ def upload_local_file_resumable(
 
     state_dir = get_resume_state_dir()
     if state_key:
-        sk = state_key
+        sk = _resume_state_slug(state_key)
     elif remote_path:
         sk = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
     else:

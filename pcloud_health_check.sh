@@ -229,19 +229,34 @@ check_backup_age() {
     [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}  ✓ Manifest/snapshot count matches${NC}"
   fi
   
-  # Get latest successful pCloud backup from DB (if enabled)
+  # pCloud sync status from DB (if enabled)
+  # IMPORTANT: Compare snapshot NAMES, not finished_at — catch-up uploads for older
+  # snapshots finish later than newer ones and must not look like a GAP.
   local pcloud_backup_age_hours=999999
   local pcloud_snapshot=""
+  local latest_rtb_uploaded=0
+  local snap_escaped="${latest_rtb_snapshot//\'/\'\'}"
   
   if [[ "$PCLOUD_ENABLE_DB" == "1" ]]; then
-    local last_success
-    last_success=$(_mysql "SELECT snapshot_name, TIMESTAMPDIFF(HOUR, finished_at, NOW()) AS age_hours FROM backup_runs WHERE status='SUCCESS' ORDER BY finished_at DESC LIMIT 1" 2>/dev/null || echo "")
+    local rtb_db_age
+    rtb_db_age=$(_mysql "SELECT TIMESTAMPDIFF(HOUR, finished_at, NOW()) FROM backup_runs WHERE snapshot_name='${snap_escaped}' AND status='SUCCESS' ORDER BY finished_at DESC LIMIT 1" 2>/dev/null || echo "")
     
-    if [[ -n "$last_success" ]]; then
-      pcloud_snapshot=$(echo "$last_success" | cut -f1)
-      pcloud_backup_age_hours=$(echo "$last_success" | cut -f2)
-      
-      # Format age display
+    if [[ -n "$rtb_db_age" ]]; then
+      latest_rtb_uploaded=1
+      pcloud_snapshot="$latest_rtb_snapshot"
+      pcloud_backup_age_hours="$rtb_db_age"
+    fi
+    
+    # Newest SUCCESS by snapshot name (for gap display / fallback only)
+    local newest_success
+    newest_success=$(_mysql "SELECT snapshot_name, TIMESTAMPDIFF(HOUR, finished_at, NOW()) AS age_hours FROM backup_runs WHERE status='SUCCESS' ORDER BY snapshot_name DESC LIMIT 1" 2>/dev/null || echo "")
+    
+    if [[ $latest_rtb_uploaded -eq 0 && -n "$newest_success" ]]; then
+      pcloud_snapshot=$(echo "$newest_success" | cut -f1)
+      pcloud_backup_age_hours=$(echo "$newest_success" | cut -f2)
+    fi
+    
+    if [[ -n "$pcloud_snapshot" ]]; then
       local pcloud_age_display
       local pcloud_age_days=$(( pcloud_backup_age_hours / 24 ))
       if [[ $pcloud_backup_age_hours -ge 24 ]]; then
@@ -250,7 +265,11 @@ check_backup_age() {
         pcloud_age_display="${pcloud_backup_age_hours}h ago"
       fi
       
-      [[ $VERBOSE -eq 1 ]] && echo "  Latest pCloud backup: $pcloud_snapshot ($pcloud_age_display)"
+      if [[ $latest_rtb_uploaded -eq 1 ]]; then
+        [[ $VERBOSE -eq 1 ]] && echo "  Latest RTB snapshot on pCloud: $pcloud_snapshot ($pcloud_age_display)"
+      else
+        [[ $VERBOSE -eq 1 ]] && echo "  Newest pCloud backup (by snapshot): $pcloud_snapshot ($pcloud_age_display); latest RTB $latest_rtb_snapshot not uploaded yet"
+      fi
     else
       [[ $VERBOSE -eq 1 ]] && echo "  No successful pCloud backups in database"
     fi
@@ -260,19 +279,25 @@ check_backup_age() {
   
   # Gap Detection Logic (RTB is change-only backup!)
   # IMPORTANT: RTB only creates snapshots on changes, so age-based checks are WRONG
-  # Correct approach: Check if RTB and pCloud are SYNCHRONIZED (same latest snapshot)
-  if [[ "$PCLOUD_ENABLE_DB" == "1" && -n "$pcloud_snapshot" ]]; then
-    # Compare snapshot NAMES, not timestamps
-    if [[ "$latest_rtb_snapshot" == "$pcloud_snapshot" ]]; then
-      # RTB and pCloud are in sync → ALL GOOD (age doesn't matter!)
+  # Correct approach: latest RTB snapshot must have SUCCESS in backup_runs
+  if [[ "$PCLOUD_ENABLE_DB" == "1" ]]; then
+    if [[ $latest_rtb_uploaded -eq 1 ]]; then
       log_issue "OK" "pCloud in sync with RTB (both: $latest_rtb_snapshot)"
-    else
-      # Different snapshots → GAP detected!
+    elif [[ -n "$pcloud_snapshot" ]]; then
+      local pcloud_age_display
+      local pcloud_age_days=$(( pcloud_backup_age_hours / 24 ))
+      if [[ $pcloud_backup_age_hours -ge 24 ]]; then
+        pcloud_age_display="${pcloud_age_days}d $((pcloud_backup_age_hours % 24))h ago"
+      else
+        pcloud_age_display="${pcloud_backup_age_hours}h ago"
+      fi
       log_issue "CRITICAL" "Backup GAP detected! RTB has newer snapshot ($latest_rtb_snapshot, $rtb_age_display) but pCloud backup is older ($pcloud_snapshot, $pcloud_age_display)"
       set_status 2
+    else
+      log_issue "WARNING" "pCloud backup tracking not available (no successful backups in DB)"
+      set_status 1
     fi
   else
-    # Fallback: DB disabled or no pCloud backups yet
     log_issue "WARNING" "pCloud backup tracking not available (enable PCLOUD_ENABLE_DB=1 for proper monitoring)"
     set_status 1
   fi

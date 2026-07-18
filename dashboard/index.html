@@ -1271,12 +1271,13 @@
         const ageLbl = ag ? ag.label : (h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago');
         rows += drow('Neuester Snapshot (lokal)', localSnap + ' (' + ageLbl + ')', h < 48 ? 'green' : h < 72 ? 'yellow' : 'red');
       }
-      // pcloud_snapshot = last DB-recorded pCloud upload (requires PCLOUD_ENABLE_DB=1)
+      // pcloud_snapshot = newest SUCCESS for latest RTB snap, or newest by snapshot name if GAP
       if (ba.pcloud_snapshot && ba.pcloud_snapshot !== 'none' && ba.pcloud_snapshot !== 'unknown') {
         const h = ba.pcloud_age_hours || 0;
         const age = h < 24 ? h + 'h ago' : Math.floor(h/24) + 'd ' + (h%24) + 'h ago';
         const isSame = localSnap === ba.pcloud_snapshot;
-        rows += drow('Letzter DB-Eintrag (pCloud)', ba.pcloud_snapshot + ' (' + age + ')' + (isSame ? '' : ' ⚠ abweichend!'), isSame ? '' : 'yellow');
+        const lbl = isSame ? 'Neuester Snapshot (pCloud/DB)' : 'Neuester pCloud-Upload (DB)';
+        rows += drow(lbl, ba.pcloud_snapshot + ' (' + age + ')' + (isSame ? '' : ' ⚠ abweichend!'), isSame ? '' : 'yellow');
       }
 
       const pq = (cloud.checks||{}).pcloud_quota || {};
