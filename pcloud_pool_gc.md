@@ -228,10 +228,12 @@ python pcloud_pool_gc.py \
 ```
 
 **Ablauf `--retention-apply`:**
-1. `remote_snaps − local_rtb_snaps` → Remote-Snapshot-Ordner löschen
-2. `content_index.json` bereinigen (Snapshot-Refs + verwaiste `pool_refs`-Keys)
-3. Lokalen Master-Index (`$PCLOUD_ARCHIVE_DIR/indexes/content_index_master.json`) aktualisieren
+1. Retention-Modus aus `.env` (`PCLOUD_REMOTE_RETENTION_DAYS_FULL` > 0 → **Zeit-Retention** 62d + Wochen-Tier; sonst rtb-spiegel)
+2. **Sicherheitsabbruch**, wenn rtb-spiegel aktiv und RTB nicht gemountet oder 0 lokale Snapshots
+3. Kandidaten löschen → `content_index.json` bereinigen
 4. Optional `--run-gc`: verwaiste Pool-Dateien entfernen
+
+**Wichtig:** Zeit-Retention liest `PCLOUD_REMOTE_RETENTION_*` aus der `--env-file` (nicht nur aus der Shell-Umgebung). Ohne das würde Cron fälschlich rtb-spiegel nutzen.
 
 Der Wrapper ruft **kein** `--retention-sync` mehr auf — Retention gehört ins GC-Skript.
 
