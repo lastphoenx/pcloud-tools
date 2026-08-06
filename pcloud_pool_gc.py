@@ -213,24 +213,34 @@ def _parse_snapshot_dt(name: str) -> Optional[datetime.datetime]:
         return None
 
 
-def _time_retention_params() -> Tuple[int, int]:
-    days_full = int(os.environ.get("PCLOUD_REMOTE_RETENTION_DAYS_FULL", "0") or 0)
-    weekly_weeks = int(os.environ.get("PCLOUD_REMOTE_RETENTION_WEEKLY_WEEKS", "54") or 54)
+def _env_get(env_vars: Optional[Dict[str, str]], key: str, default: str = "") -> str:
+    """Wert aus .env-Dict (Cron) oder os.environ (Shell)."""
+    if env_vars and key in env_vars:
+        return env_vars[key]
+    return os.environ.get(key, default)
+
+
+def _time_retention_params(env_vars: Optional[Dict[str, str]] = None) -> Tuple[int, int]:
+    days_full = int(_env_get(env_vars, "PCLOUD_REMOTE_RETENTION_DAYS_FULL", "0") or 0)
+    weekly_weeks = int(_env_get(env_vars, "PCLOUD_REMOTE_RETENTION_WEEKLY_WEEKS", "54") or 54)
     return days_full, weekly_weeks
 
 
-def _time_retention_enabled() -> bool:
-    return _time_retention_params()[0] > 0
+def _time_retention_enabled(env_vars: Optional[Dict[str, str]] = None) -> bool:
+    return _time_retention_params(env_vars)[0] > 0
 
 
-def compute_time_retention_keep(remote_snaps: Set[str]) -> Tuple[Set[str], Set[str]]:
+def compute_time_retention_keep(
+    remote_snaps: Set[str],
+    env_vars: Optional[Dict[str, str]] = None,
+) -> Tuple[Set[str], Set[str]]:
     """
     Remote-Retention: alle Snapshots der letzten N Tage + aelter nur 1 pro ISO-Woche,
     maximal W Wochen in der Wochen-Tier.
 
     Env: PCLOUD_REMOTE_RETENTION_DAYS_FULL, PCLOUD_REMOTE_RETENTION_WEEKLY_WEEKS
     """
-    days_full, weekly_weeks = _time_retention_params()
+    days_full, weekly_weeks = _time_retention_params(env_vars)
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days_full)
 
     keep: Set[str] = set()
@@ -269,14 +279,34 @@ def compute_time_retention_keep(remote_snaps: Set[str]) -> Tuple[Set[str], Set[s
 def _resolve_retention_deletes(
     remote_snaps: Set[str],
     local_snaps: Set[str],
+    env_vars: Optional[Dict[str, str]] = None,
 ) -> Tuple[Set[str], str]:
-    if _time_retention_enabled():
-        days_full, weekly_weeks = _time_retention_params()
-        keep, to_delete = compute_time_retention_keep(remote_snaps)
+    if _time_retention_enabled(env_vars):
+        days_full, weekly_weeks = _time_retention_params(env_vars)
+        keep, to_delete = compute_time_retention_keep(remote_snaps, env_vars)
         mode = f"zeit:{days_full}d+{weekly_weeks}w (behalten {len(keep)})"
         return to_delete, mode
     to_delete = remote_snaps - local_snaps
     return to_delete, f"rtb-spiegel (remote ohne lokales RTB, del {len(to_delete)})"
+
+
+def _retention_safety_abort(
+    rtb_root: str,
+    local_snaps: Set[str],
+    remote_snaps: Set[str],
+    env_vars: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """Verhindert Massenloeschung bei ungemountetem/leerem RTB im rtb-spiegel-Modus."""
+    if _time_retention_enabled(env_vars):
+        return None
+    if not os.path.isdir(rtb_root):
+        return f"RTB-Pfad nicht erreichbar: {rtb_root}"
+    if len(local_snaps) == 0 and len(remote_snaps) > 0:
+        return (
+            "0 lokale Snapshots bei rtb-spiegel — "
+            "vermutlich ungemountetes RTB; wuerde ALLE Remote-Snapshots loeschen"
+        )
+    return None
 
 
 def _load_index(cfg: dict, snapshots_root: str) -> Tuple[dict, dict]:
@@ -395,15 +425,21 @@ def run_retention_forecast(
     rtb_root: str,
     *,
     verbose: bool = False,
+    env_file: str = ".env",
 ) -> dict:
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
     snapshots_root = f"{dest_root}/_snapshots"
     pool_root = f"{dest_root}/_pool"
+    env_vars = _load_env_file(env_file)
 
     _log("[retention-forecast] ===== START =====")
     local_snaps = _list_local_rtb_snaps(rtb_root)
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
-    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps)
+    abort = _retention_safety_abort(rtb_root, local_snaps, remote_snaps, env_vars)
+    if abort:
+        _log(f"[retention-forecast][ERROR] Sicherheitsabbruch: {abort}")
+        return {"aborted": abort, "local_snaps": len(local_snaps), "remote_snaps": len(remote_snaps)}
+    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps, env_vars)
     to_delete = sorted(to_delete_set)
     keep_remote = remote_snaps - to_delete_set
 
@@ -516,6 +552,7 @@ def run_retention_apply(
 ) -> dict:
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
     snapshots_root = f"{dest_root}/_snapshots"
+    env_vars = _load_env_file(env_file)
 
     _log("[retention] ===== RETENTION APPLY =====")
     if dry:
@@ -523,13 +560,17 @@ def run_retention_apply(
 
     local_snaps = _list_local_rtb_snaps(rtb_root)
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
-    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps)
+    abort = _retention_safety_abort(rtb_root, local_snaps, remote_snaps, env_vars)
+    if abort:
+        _log(f"[retention][ERROR] Sicherheitsabbruch: {abort}")
+        return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": abort}
+    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps, env_vars)
     to_delete = sorted(to_delete_set)
 
     _log(f"[retention] Modus: {mode}")
     _log(f"[retention] Zu loeschen: {len(to_delete)} Remote-Snapshots")
-    poll_sec = int(os.environ.get("PCLOUD_RETENTION_DELETE_POLL_SEC", "60"))
-    timeout_sec = int(os.environ.get("PCLOUD_RETENTION_DELETE_TIMEOUT_SEC", "1200"))
+    poll_sec = int(_env_get(env_vars, "PCLOUD_RETENTION_DELETE_POLL_SEC", "60") or 60)
+    timeout_sec = int(_env_get(env_vars, "PCLOUD_RETENTION_DELETE_TIMEOUT_SEC", "1200") or 1200)
     errors = 0
     deleted = 0
     deleted_snaps: Set[str] = set()
@@ -1131,7 +1172,9 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
     rtb_root = args.rtb_root or env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
 
     if args.retention_forecast:
-        run_retention_forecast(cfg, pool_root, rtb_root, verbose=args.verbose)
+        run_retention_forecast(
+            cfg, pool_root, rtb_root, verbose=args.verbose, env_file=args.env_file,
+        )
         sys.exit(0)
 
     if args.retention_apply:
