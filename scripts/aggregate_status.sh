@@ -328,11 +328,13 @@ check_rtb_wrapper() {
   fi
 
   # ---- Live Dry-Run pre-check ----
-  # Call rtb_wrapper.sh --check-only: pure rsync -ni, no lock / no log / no backup.
+  # Call rtb_wrapper.sh --check-only: flock + cache; no backup pipeline lock.
   #   exit 1 + "changes_detected" → backup will fire next run
   #   exit 0 + "no_changes"       → no backup needed
   #   exit 0 + "no_baseline"      → no prior snapshot yet
+  #   exit 3 + "check_busy"       → skipped (another check running, no cache)
   local dry_run_result="unknown"
+  local dry_run_stale=0
   local dry_run_ts=""
   local dry_run_delta_json=""
   local dry_run_backup_scope_json=""
@@ -346,10 +348,15 @@ check_rtb_wrapper() {
     set -e
     dry_run_ts=$(date '+%Y-%m-%d %H:%M:%S')
     # Parse output - robust against formatted/prefixed messages
-    if echo "$check_out" | grep -q "changes_detected"; then
+    if echo "$check_out" | grep -q "check_busy"; then
+      dry_run_result="busy"
+    elif echo "$check_out" | grep -q "changes_detected"; then
       dry_run_result="changes_detected"
     elif echo "$check_out" | grep -qE "no_changes|only pipeline"; then
       dry_run_result="no_changes"
+    fi
+    if echo "$check_out" | grep -q "check_cached"; then
+      dry_run_stale=1
     fi
     if echo "$check_out" | grep -q '^\[RTB Delta JSON\]'; then
       dry_run_delta_json=$(echo "$check_out" | grep '^\[RTB Delta JSON\]' | sed 's/^\[RTB Delta JSON\] //' | head -1)
@@ -409,6 +416,9 @@ check_rtb_wrapper() {
     json="$json,\"dry_run_result\":\"$dry_run_result\""
     if [[ -n "$dry_run_ts" ]]; then
       json="$json,\"dry_run_ts\":\"$dry_run_ts\""
+    fi
+    if [[ "$dry_run_stale" -eq 1 ]]; then
+      json="$json,\"dry_run_cached\":true"
     fi
   fi
   if [[ -n "$dry_run_delta_json" ]]; then
