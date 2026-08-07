@@ -68,6 +68,11 @@ mkdir -p "${PCLOUD_TEMP_DIR}" "${PCLOUD_ARCHIVE_DIR}/manifests" "${PCLOUD_ARCHIV
 # ========= Globales Lock =========
 LOCKFILE=${LOCKFILE:-/run/backup_pipeline.lock}
 WAIT_SEC=${WAIT_SEC:-7200}
+NAS_HEAVY_OPS_LIB=${NAS_HEAVY_OPS_LIB:-/opt/apps/rtb/nas_heavy_ops_lock.sh}
+if [[ -f "$NAS_HEAVY_OPS_LIB" ]]; then
+  # shellcheck source=/opt/apps/rtb/nas_heavy_ops_lock.sh
+  source "$NAS_HEAVY_OPS_LIB"
+fi
 SAFETY_DELAY_SEC=${SAFETY_DELAY_SEC:-120}
 PCLOUD_PREFLIGHT_RETRIES=${PCLOUD_PREFLIGHT_RETRIES:-3}
 PCLOUD_PREFLIGHT_RETRY_DELAY_SEC=${PCLOUD_PREFLIGHT_RETRY_DELAY_SEC:-5}
@@ -589,6 +594,11 @@ if [[ "${BACKUP_PIPELINE_LOCKED:-0}" != "1" ]]; then
     _log WARN "Konnte Lock innerhalb ${WAIT_SEC}s nicht bekommen"
     exit 0
   fi
+fi
+
+if declare -F apply_oom_score_adj &>/dev/null; then
+  apply_oom_score_adj "${PCLOUD_OOM_SCORE_ADJ:--500}"
+  _log INFO "OOM-Schutz: oom_score_adj=${PCLOUD_OOM_SCORE_ADJ:--500} (Upload-Prozess geschützt)"
 fi
 
 _log INFO "========== pCloud Sync 1to1 Start =========="
