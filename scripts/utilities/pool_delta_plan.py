@@ -4,7 +4,7 @@
 pool_delta_plan.py — Delta vs. Full planen (Manifest-Diff, Phase-3-Aufwand).
 
 Schätzt pro Snapshot, was Turbo-Delta (Scout + copyfolder + Phase 3 Bereinigung)
-kosten würde — ohne Upload. Hilft bei Catch-up: wann PCLOUD_SCOUT_ENABLED=0 (Full).
+kosten würde — ohne Upload. Scout bevorzugt chronologischen Vorgänger (wie Production nach Fix).
 
 Beispiele (pi-nas):
   cd /opt/apps/pcloud-tools/main
@@ -40,6 +40,7 @@ class DeltaPlanRow:
     snapshot: str
     remote_ok: bool
     basis: Optional[str]
+    basis_strategy: str
     similarity_pct: float
     files: int
     added: int
@@ -112,38 +113,13 @@ def _scout_best_basis(
     manifest: dict,
     archive_dir: str,
     remote_snaps: Set[str],
-) -> Tuple[Optional[str], float]:
-    """Jaccard wie scout_best_pool_basis, ohne Log."""
-    current_name = manifest.get("snapshot")
-    current_files = _manifest_files(manifest)
-    if not current_files:
-        return None, 0.0
-
-    manifests_path = os.path.join(archive_dir, "manifests")
-    candidates = sorted(remote_snaps - {current_name}, reverse=True)
-    best_snap: Optional[str] = None
-    best_score = 0.0
-
-    for snap_name in candidates:
-        basis_path = os.path.join(manifests_path, f"{snap_name}.json")
-        if not os.path.isfile(basis_path):
-            continue
-        try:
-            basis_manifest = _load_manifest(basis_path)
-            basis_files = _manifest_files(basis_manifest)
-            if not basis_files:
-                continue
-            matches = sum(1 for rp, sha in current_files.items() if basis_files.get(rp) == sha)
-            score = matches / len(current_files)
-            if score > best_score:
-                best_score = score
-                best_snap = snap_name
-            if best_score > 0.95:
-                break
-        except (OSError, json.JSONDecodeError, KeyError):
-            continue
-
-    return best_snap, best_score
+    scout_threshold: float,
+) -> Tuple[Optional[str], float, str]:
+    """Wie scout_best_pool_basis (pc.scout_pool_basis)."""
+    basis, score, strategy = pc.scout_pool_basis(
+        manifest, archive_dir, remote_snaps, scout_threshold=scout_threshold,
+    )
+    return basis, score, strategy
 
 
 def _recommend(
@@ -159,20 +135,20 @@ def _recommend(
     delete_full_threshold: int,
 ) -> Tuple[str, str]:
     if not basis:
-        return "FULL", "kein Remote-Basis-Manifest"
+        return "FULL", "keine passende Basis (Similarity < Schwelle)"
     if similarity < scout_threshold:
-        return "FULL", f"Scout {similarity * 100:.1f}% < {scout_threshold * 100:.0f}%"
-    if basis > snapshot:
-        return "FULL", f"Basis {basis} chronologisch neuer als Ziel"
-    if deleted > delete_full_threshold:
-        return "FULL", f"Phase-3-Bereinigung {deleted} > {delete_full_threshold}"
+        return "FULL", f"Similarity {similarity * 100:.1f}% < {scout_threshold * 100:.0f}%"
     tasks = added + changed
-    if deleted > 2000 and phase3_total == deleted:
-        return "FULL", f"viele Einzel-Loeschungen ({deleted})"
+    if deleted > delete_full_threshold and deleted > tasks * 2:
+        return "FULL", f"Phase-3 {deleted} >> Upload {tasks}"
+    if deleted > tasks and deleted > delete_full_threshold:
+        return "FULL", "mehr Deletes als Upload-Aufgaben"
     if tasks < 3000 and deleted < 1000:
         return "DELTA", "kleines Diff"
-    if deleted > added + changed:
-        return "FULL", "mehr Deletes als Upload-Aufgaben"
+    if similarity >= 0.90 and deleted < delete_full_threshold:
+        return "DELTA", f"hohe Similarity ({similarity * 100:.1f}%)"
+    if deleted > delete_full_threshold:
+        return "DELTA", f"Phase-3 hoch ({deleted}), aber Diff ausgewogen"
     return "DELTA", "Diff ok"
 
 
@@ -240,7 +216,9 @@ def _plan_one(
         if c.get("isfolder") and c.get("name") and c.get("name") != "_index"
     )
 
-    basis, similarity = _scout_best_basis(manifest, archive_dir, remote_folders)
+    basis, similarity, strategy = _scout_best_basis(
+        manifest, archive_dir, remote_folders, scout_threshold,
+    )
     added: Set[str] = set()
     deleted: Set[str] = set()
     changed: Set[str] = set()
@@ -269,6 +247,7 @@ def _plan_one(
         snapshot=snapshot,
         remote_ok=snapshot in remote_ok,
         basis=basis,
+        basis_strategy=strategy,
         similarity_pct=round(similarity * 100, 1),
         files=len(current_files),
         added=len(added),
@@ -287,7 +266,7 @@ def _plan_one(
 
 def _print_table(rows: List[DeltaPlanRow]) -> None:
     hdr = (
-        f"{'Snapshot':<22} {'Remote':^6} {'Empf.':^5} {'Basis':<22} {'Sim%':>5} "
+        f"{'Snapshot':<22} {'Remote':^6} {'Empf.':^5} {'Basis':<22} {'Strat':^5} {'Sim%':>5} "
         f"{'+':>6} {'-':>6} {'Δ':>5} {'=':>6} {'P3':>6} {'P3dir':>5} {'P3stub':>6} {'P4':>6}  Grund"
     )
     print(hdr)
@@ -295,8 +274,9 @@ def _print_table(rows: List[DeltaPlanRow]) -> None:
     for r in rows:
         basis = r.basis or "-"
         remote = "ok" if r.remote_ok else "MISS"
+        strat = (r.basis_strategy or "-")[:5]
         print(
-            f"{r.snapshot:<22} {remote:^6} {r.recommend:^5} {basis:<22} {r.similarity_pct:5.1f} "
+            f"{r.snapshot:<22} {remote:^6} {r.recommend:^5} {basis:<22} {strat:^5} {r.similarity_pct:5.1f} "
             f"{r.added:6d} {r.deleted:6d} {r.changed:5d} {r.unchanged:6d} "
             f"{r.phase3_total:6d} {r.phase3_dead_dirs:5d} {r.phase3_single_stubs:6d} {r.phase4_tasks:6d}  "
             f"{r.reason}"
@@ -395,8 +375,8 @@ def main() -> int:
         print(f"Empfehlung: {n_full}× FULL, {n_delta}× DELTA (Schwellen: Scout≥{scout_threshold*100:.0f}%, P3−>{delete_full_threshold})")
         print(f"Laufzeit: {time.time() - t0:.1f}s")
         print()
-        print("Legende: P3=Phase-3-Loeschungen, P3dir=rekursive Ordner, P3stub=Einzel-Stubs, P4=neu/geaendert")
-        print("Catch-up: FULL → PCLOUD_SCOUT_ENABLED=0 ./wrapper_pcloud_pool_sync_1to1.sh <SNAP>")
+        print("Legende: P3=Phase-3-Loeschungen, Strat=chrono|jaccard, P4=neu/geaendert")
+        print("Catch-up chronologisch: DELTA mit Scout (git pull fuer Fix) oder FULL bei Sim < 70%")
 
     return 0
 
