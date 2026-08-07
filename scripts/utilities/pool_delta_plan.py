@@ -15,7 +15,10 @@ Beispiele (pi-nas):
     --env-file .env --snapshot 2026-07-25-040041
 
   /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pool_delta_plan.py \\
-    --env-file .env --missing-only --json
+    --env-file .env --missing-only --simulate-catchup
+
+  /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pool_delta_plan.py \\
+    --env-file .env --missing-only --simulate-catchup --compare-static
 """
 from __future__ import annotations
 
@@ -54,6 +57,8 @@ class DeltaPlanRow:
     recommend: str
     reason: str
     basis_newer_than_target: bool
+    catchup_step: int = 0
+    plan_mode: str = "static"
 
 
 def _manifest_files(manifest: dict) -> Dict[str, str]:
@@ -190,15 +195,26 @@ def _remote_complete_snaps(cfg: dict, snaps_root: str, workers: int = 8) -> Set[
     return out
 
 
+def _list_remote_snapshot_folders(cfg: dict, snaps_root: str) -> Set[str]:
+    return {
+        c["name"]
+        for c in (pc.listfolder(cfg, path=snaps_root, recursive=False, nofiles=True)
+                  .get("metadata", {}) or {}).get("contents", []) or []
+        if c.get("isfolder") and c.get("name") and c.get("name") != "_index"
+        and _SNAP_RE.match(c.get("name", ""))
+    }
+
+
 def _plan_one(
-    cfg: dict,
     *,
     snapshot: str,
     archive_dir: str,
-    snaps_root: str,
     remote_ok: Set[str],
+    remote_available: Set[str],
     scout_threshold: float,
     delete_full_threshold: int,
+    catchup_step: int = 0,
+    plan_mode: str = "static",
 ) -> Optional[DeltaPlanRow]:
     manifest_path = os.path.join(archive_dir, "manifests", f"{snapshot}.json")
     if not os.path.isfile(manifest_path):
@@ -209,15 +225,8 @@ def _plan_one(
     if not current_files:
         return None
 
-    remote_folders = set(
-        c["name"]
-        for c in (pc.listfolder(cfg, path=snaps_root, recursive=False, nofiles=True)
-                  .get("metadata", {}) or {}).get("contents", []) or []
-        if c.get("isfolder") and c.get("name") and c.get("name") != "_index"
-    )
-
     basis, similarity, strategy = _scout_best_basis(
-        manifest, archive_dir, remote_folders, scout_threshold,
+        manifest, archive_dir, remote_available, scout_threshold,
     )
     added: Set[str] = set()
     deleted: Set[str] = set()
@@ -261,12 +270,53 @@ def _plan_one(
         recommend=rec,
         reason=reason,
         basis_newer_than_target=bool(basis and basis > snapshot),
+        catchup_step=catchup_step,
+        plan_mode=plan_mode,
     )
 
 
-def _print_table(rows: List[DeltaPlanRow]) -> None:
+def _plan_targets(
+    *,
+    targets: List[str],
+    archive_dir: str,
+    remote_ok: Set[str],
+    remote_available: Set[str],
+    scout_threshold: float,
+    delete_full_threshold: int,
+    plan_mode: str,
+    simulate_growth: bool,
+) -> Tuple[List[DeltaPlanRow], List[str]]:
+    """Plant Snapshots; bei simulate_growth wächst remote_available nach jedem Schritt."""
+    rows: List[DeltaPlanRow] = []
+    skipped: List[str] = []
+    available = set(remote_available)
+    ordered = sorted(targets)
+
+    for step, snap in enumerate(ordered, start=1):
+        row = _plan_one(
+            snapshot=snap,
+            archive_dir=archive_dir,
+            remote_ok=remote_ok,
+            remote_available=available,
+            scout_threshold=scout_threshold,
+            delete_full_threshold=delete_full_threshold,
+            catchup_step=step if simulate_growth else 0,
+            plan_mode=plan_mode,
+        )
+        if row:
+            rows.append(row)
+            if simulate_growth:
+                available.add(snap)
+        else:
+            skipped.append(snap)
+
+    return rows, skipped
+
+
+def _print_table(rows: List[DeltaPlanRow], *, show_step: bool = False) -> None:
+    step_col = f"{'#':>3} " if show_step else ""
     hdr = (
-        f"{'Snapshot':<22} {'Remote':^6} {'Empf.':^5} {'Basis':<22} {'Strat':^5} {'Sim%':>5} "
+        f"{step_col}{'Snapshot':<22} {'Remote':^6} {'Empf.':^5} {'Basis':<22} {'Strat':^5} {'Sim%':>5} "
         f"{'+':>6} {'-':>6} {'Δ':>5} {'=':>6} {'P3':>6} {'P3dir':>5} {'P3stub':>6} {'P4':>6}  Grund"
     )
     print(hdr)
@@ -275,12 +325,36 @@ def _print_table(rows: List[DeltaPlanRow]) -> None:
         basis = r.basis or "-"
         remote = "ok" if r.remote_ok else "MISS"
         strat = (r.basis_strategy or "-")[:5]
+        step_prefix = f"{r.catchup_step:3d} " if show_step else ""
         print(
-            f"{r.snapshot:<22} {remote:^6} {r.recommend:^5} {basis:<22} {strat:^5} {r.similarity_pct:5.1f} "
+            f"{step_prefix}{r.snapshot:<22} {remote:^6} {r.recommend:^5} {basis:<22} {strat:^5} {r.similarity_pct:5.1f} "
             f"{r.added:6d} {r.deleted:6d} {r.changed:5d} {r.unchanged:6d} "
             f"{r.phase3_total:6d} {r.phase3_dead_dirs:5d} {r.phase3_single_stubs:6d} {r.phase4_tasks:6d}  "
             f"{r.reason}"
         )
+
+
+def _print_catchup_summary(rows: List[DeltaPlanRow]) -> None:
+    if not rows:
+        return
+    total_p3 = sum(r.phase3_total for r in rows)
+    total_p4 = sum(r.phase4_tasks for r in rows)
+    n_full = sum(1 for r in rows if r.recommend == "FULL")
+    n_delta = sum(1 for r in rows if r.recommend == "DELTA")
+    first, last = rows[0], rows[-1]
+    print()
+    print(
+        f"Catch-up gesamt ({len(rows)} Schritte): {n_delta}× DELTA, {n_full}× FULL | "
+        f"P3={total_p3} P4={total_p4}"
+    )
+    print(
+        f"  Schritt 1 ({first.snapshot}): Sim {first.similarity_pct}% Basis {first.basis or '-'} "
+        f"P3={first.phase3_total} P4={first.phase4_tasks}"
+    )
+    print(
+        f"  Schritt {last.catchup_step} ({last.snapshot}): Sim {last.similarity_pct}% Basis {last.basis or '-'} "
+        f"P3={last.phase3_total} P4={last.phase4_tasks}"
+    )
 
 
 def main() -> int:
@@ -298,6 +372,21 @@ def main() -> int:
         type=int,
         default=None,
         help="Ab so vielen Phase-3-Loeschungen → FULL (Default: PCLOUD_DELTA_PLAN_DELETE_FULL oder 5000)",
+    )
+    ap.add_argument(
+        "--simulate-catchup",
+        action="store_true",
+        help="Chronologische Reihenfolge: Remote-Basis waechst nach jedem geplanten Snapshot",
+    )
+    ap.add_argument(
+        "--static",
+        action="store_true",
+        help="Nur aktuellen Remote-Stand (keine Catch-up-Simulation)",
+    )
+    ap.add_argument(
+        "--compare-static",
+        action="store_true",
+        help="Zusaetzlich statische Planung zum Vergleich anzeigen",
     )
     ap.add_argument("--json", action="store_true", dest="as_json")
     args = ap.parse_args()
@@ -330,6 +419,7 @@ def main() -> int:
 
     t0 = time.time()
     remote_ok = _remote_complete_snaps(cfg, snaps_root)
+    remote_folders = _list_remote_snapshot_folders(cfg, snaps_root)
     rtb_snaps = _list_rtb_snapshots(args.rtb)
 
     if args.snapshot:
@@ -339,44 +429,70 @@ def main() -> int:
     else:
         targets = rtb_snaps
 
-    rows: List[DeltaPlanRow] = []
-    skipped: List[str] = []
-    for snap in targets:
-        row = _plan_one(
-            cfg,
-            snapshot=snap,
+    simulate = args.simulate_catchup or (args.missing_only and not args.static)
+
+    rows, skipped = _plan_targets(
+        targets=targets,
+        archive_dir=archive_dir,
+        remote_ok=remote_ok,
+        remote_available=remote_ok if simulate else remote_folders,
+        scout_threshold=scout_threshold,
+        delete_full_threshold=delete_full_threshold,
+        plan_mode="catchup" if simulate else "static",
+        simulate_growth=simulate,
+    )
+
+    static_rows: List[DeltaPlanRow] = []
+    if args.compare_static and simulate:
+        static_rows, static_skipped = _plan_targets(
+            targets=targets,
             archive_dir=archive_dir,
-            snaps_root=snaps_root,
             remote_ok=remote_ok,
+            remote_available=remote_folders,
             scout_threshold=scout_threshold,
             delete_full_threshold=delete_full_threshold,
+            plan_mode="static",
+            simulate_growth=False,
         )
-        if row:
-            rows.append(row)
-        else:
-            skipped.append(snap)
+        skipped = sorted(set(skipped) | set(static_skipped))
 
     if args.as_json:
-        print(json.dumps({
+        payload: dict = {
             "remote_complete_count": len(remote_ok),
+            "simulate_catchup": simulate,
             "rows": [asdict(r) for r in rows],
             "skipped_no_manifest": skipped,
             "elapsed_sec": round(time.time() - t0, 1),
-        }, indent=2, ensure_ascii=False))
+        }
+        if static_rows:
+            payload["static_rows"] = [asdict(r) for r in static_rows]
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
+        mode = "Catch-up-Simulation (chronologisch)" if simulate else "Statisch (aktueller Remote-Stand)"
+        print(f"Modus: {mode}")
         print(f"Remote ok: {len(remote_ok)} | Geplant: {len(rows)} | Manifest fehlt: {len(skipped)}")
         if skipped:
             print(f"  (kein Manifest: {', '.join(skipped[:8])}{'…' if len(skipped) > 8 else ''})")
         print()
-        _print_table(rows)
+        _print_table(rows, show_step=simulate)
         n_full = sum(1 for r in rows if r.recommend == "FULL")
         n_delta = sum(1 for r in rows if r.recommend == "DELTA")
         print()
         print(f"Empfehlung: {n_full}× FULL, {n_delta}× DELTA (Schwellen: Scout≥{scout_threshold*100:.0f}%, P3−>{delete_full_threshold})")
+        if simulate:
+            _print_catchup_summary(rows)
+        if static_rows:
+            print()
+            print("=== Vergleich: Statisch (ohne Reihenfolge-Effekt) ===")
+            _print_table(static_rows, show_step=False)
+            n_full_s = sum(1 for r in static_rows if r.recommend == "FULL")
+            n_delta_s = sum(1 for r in static_rows if r.recommend == "DELTA")
+            print()
+            print(f"Statisch: {n_full_s}× FULL, {n_delta_s}× DELTA")
         print(f"Laufzeit: {time.time() - t0:.1f}s")
         print()
-        print("Legende: P3=Phase-3-Loeschungen, Strat=chrono|jaccard, P4=neu/geaendert")
-        print("Catch-up chronologisch: DELTA mit Scout (git pull fuer Fix) oder FULL bei Sim < 70%")
+        print("Legende: P3=Phase-3-Loeschungen, Strat=chrono|jaccard, P4=neu/geaendert, #=Catch-up-Schritt")
+        print("Catch-up: chronologisch hochladen — jeder Schritt verbessert die Basis fuer den naechsten")
 
     return 0
 
