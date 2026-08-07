@@ -6,6 +6,9 @@ pcloud_trash_audit.py — Papierkorb auf pCloud prüfen / Snapshot-Ordner wieder
 Retention (deletefolderrecursive) verschiebt Snapshots in den Papierkorb — nicht sofort
 endgültig gelöscht. trash_list/trash_restore sind REST-only (kein Binary-RPC).
 
+Hinweis: OAuth/rclone-Tokens (PCLOUD_TOKEN) können trash_* oft nicht aufrufen
+(userinfo/listfolder OK, trash_list → 1000). Dann nur Web-UI oder Catch-up-Upload.
+
 Beispiele (pi-nas):
   cd /opt/apps/pcloud-tools/main
   /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pcloud_trash_audit.py --env-file .env probe
@@ -49,6 +52,7 @@ def _find_snapshot_folders(meta: dict, *, prefix: str = "") -> List[dict]:
 
 
 def cmd_list(cfg: dict, args: argparse.Namespace) -> int:
+    pc._ensure_trash_api(cfg)
     top = pc.trash_list(
         cfg,
         folderid=0,
@@ -74,6 +78,7 @@ def cmd_list(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_restore(cfg: dict, args: argparse.Namespace) -> int:
+    pc._ensure_trash_api(cfg)
     folderid: Optional[int] = args.folderid
     name = args.name
 
@@ -117,6 +122,12 @@ def cmd_probe(cfg: dict, args: argparse.Namespace) -> int:
         for k in probes
         if k.startswith("trash_list")
     )
+    if not trash_ok:
+        print(
+            "\n[info] trash_list nicht verfügbar mit OAuth-Token — "
+            "Papierkorb per API nicht prüfbar/restaurierbar.",
+            file=sys.stderr,
+        )
     return 0 if trash_ok else 1
 
 
@@ -148,10 +159,14 @@ def main() -> int:
 
     pc.preflight_or_raise(cfg)
 
-    if args.cmd == "list":
-        return cmd_list(cfg, args)
-    if args.cmd == "restore":
-        return cmd_restore(cfg, args)
+    try:
+        if args.cmd == "list":
+            return cmd_list(cfg, args)
+        if args.cmd == "restore":
+            return cmd_restore(cfg, args)
+    except pc.TrashApiUnavailable as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 3
     return 2
 
 

@@ -2107,6 +2107,35 @@ def _rest_get_trash(cfg: dict, endpoint: str, params: dict | None = None) -> dic
     raise RuntimeError(f"trash API auth failed ({endpoint}): " + "; ".join(errors))
 
 
+class TrashApiUnavailable(RuntimeError):
+    """
+    trash_* nicht erreichbar (typisch: OAuth/rclone-Token).
+
+    userinfo/listfolder/deletefolder funktionieren; trash_list liefert 1000/2000.
+    """
+
+
+def trash_api_available(cfg: dict) -> bool:
+    """True wenn mindestens eine trash_list-Auth-Variante funktioniert."""
+    probes = trash_auth_probe(cfg)
+    return any(
+        probes.get(k, {}).get("ok")
+        for k in probes
+        if k.startswith("trash_list")
+    )
+
+
+def _ensure_trash_api(cfg: dict) -> None:
+    if trash_api_available(cfg):
+        return
+    raise TrashApiUnavailable(
+        "Papierkorb-API (trash_list) mit diesem PCLOUD_TOKEN nicht erreichbar.\n"
+        "  probe: userinfo/listfolder OK, trash_list → 1000/2000 (OAuth-Limit).\n"
+        "  Restore per API nicht möglich — Catch-up-Upload (wrapper_pcloud_pool_sync_1to1.sh).\n"
+        "  Web-UI: https://my.pcloud.com/#/trash (falls verfügbar)."
+    )
+
+
 def trash_auth_probe(cfg: dict) -> dict:
     """Diagnose: welche Auth-Variante funktioniert für trash_list/userinfo/listfolder?"""
     probes = {
