@@ -2036,6 +2036,63 @@ def _rest_get(cfg: dict, endpoint: str, params: dict | None = None):
     _expect_ok(jd)
     return jd
 
+
+def _legacy_auth_from_userinfo(cfg: dict) -> str:
+    """
+    OAuth access_token in legacy auth-Token tauschen (userinfo?getauth=1).
+
+    Einige REST-Endpoints (trash_list, trash_restore, …) liefern mit
+    access_token nur result=1000, obwohl listfolder/userinfo mit access_token OK sind.
+    """
+    top = _rest_get(cfg, "userinfo", {"getauth": 1})
+    auth = top.get("auth")
+    if not auth:
+        raise RuntimeError("userinfo(getauth=1): kein auth-Token in Antwort")
+    return str(auth)
+
+
+def _rest_get_legacy_auth(cfg: dict, endpoint: str, params: dict | None = None) -> dict:
+    """REST GET mit legacy auth= (nach OAuth-Exchange via userinfo)."""
+    import requests
+    import re
+
+    auth = _legacy_auth_from_userinfo(cfg)
+    base = _rest_base(cfg)
+    timeout = int(cfg.get("timeout", 30))
+    s = _get_session(timeout)
+    p = dict(params or {})
+    p["auth"] = auth
+    p.pop("access_token", None)
+
+    try:
+        r = s.get(f"{base}/{endpoint}", params=p, timeout=timeout)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        msg = re.sub(r'auth=[^&\s]+', 'auth=***HIDDEN***', str(e))
+        raise RuntimeError(f"REST {endpoint} HTTP Error: {msg}") from None
+    except requests.exceptions.RequestException as e:
+        msg = re.sub(r'auth=[^&\s]+', 'auth=***HIDDEN***', str(e))
+        raise RuntimeError(f"REST {endpoint} Request Error: {msg}") from None
+
+    try:
+        jd = r.json()
+    except Exception:
+        raise RuntimeError(f"REST {endpoint}: invalid JSON")
+
+    _expect_ok(jd)
+    return jd
+
+
+def _rest_get_trash(cfg: dict, endpoint: str, params: dict | None = None) -> dict:
+    """trash_*: zuerst access_token, bei 1000 legacy auth=."""
+    try:
+        return _rest_get(cfg, endpoint, params)
+    except RuntimeError as e:
+        if "API error 1000" not in str(e):
+            raise
+    return _rest_get_legacy_auth(cfg, endpoint, params)
+
+
 def _rest_post(cfg: dict, endpoint: str, data: dict | None = None, files: dict | None = None):
     """
     POST gegen REST-Endpoint mit gemeinsamer Keep-Alive-Session.
@@ -2550,6 +2607,65 @@ def delete_folder(cfg: Dict[str, Any], *, folderid: int | None = None, path: str
     if int(top.get("result", -1)) != 0:
         raise RuntimeError(f"API error {top.get('result')}: {top.get('error', 'unknown')}")
     return top
+
+
+def trash_list(cfg: Dict[str, Any], *,
+               folderid: int = 0,
+               recursive: bool = False,
+               nofiles: bool = False) -> Dict[str, Any]:
+    """
+    Papierkorb auflisten (REST trash_list — nicht über Binary-RPC).
+
+    deletefolder/deletefile verschieben nach Trash; trash_list/trash_restore sind
+    nur HTTP/JSON-Endpoints (wie listfolder in pool_gc).
+    """
+    params: Dict[str, Any] = {"folderid": int(folderid)}
+    if recursive:
+        params["recursive"] = 1
+    if nofiles:
+        params["nofiles"] = 1
+    top = _rest_get_trash(cfg, "trash_list", params)
+    if int(top.get("result", -1)) != 0:
+        raise RuntimeError(f"API error {top.get('result')}: {top.get('error', 'unknown')}")
+    return top
+
+
+def trash_restorepath(cfg: Dict[str, Any], *,
+                      folderid: int | None = None,
+                      fileid: int | None = None) -> Dict[str, Any]:
+    """Berechnet Zielpfad für trash_restore (REST trash_restorepath)."""
+    if (folderid is None) == (fileid is None):
+        raise ValueError("trash_restorepath: genau eines von folderid oder fileid angeben.")
+    params: Dict[str, Any] = {}
+    if folderid is not None:
+        params["folderid"] = int(folderid)
+    else:
+        params["fileid"] = int(fileid)
+    top = _rest_get_trash(cfg, "trash_restorepath", params)
+    if int(top.get("result", -1)) != 0:
+        raise RuntimeError(f"API error {top.get('result')}: {top.get('error', 'unknown')}")
+    return top
+
+
+def trash_restore(cfg: Dict[str, Any], *,
+                  folderid: int | None = None,
+                  fileid: int | None = None,
+                  restoreto: int | None = None) -> Dict[str, Any]:
+    """Ordner/Datei aus Papierkorb wiederherstellen (REST trash_restore)."""
+    if (folderid is None) == (fileid is None):
+        raise ValueError("trash_restore: genau eines von folderid oder fileid angeben.")
+    params: Dict[str, Any] = {}
+    if folderid is not None:
+        params["folderid"] = int(folderid)
+    else:
+        params["fileid"] = int(fileid)
+    if restoreto is not None:
+        params["restoreto"] = int(restoreto)
+    top = _rest_get_trash(cfg, "trash_restore", params)
+    if int(top.get("result", -1)) != 0:
+        raise RuntimeError(f"API error {top.get('result')}: {top.get('error', 'unknown')}")
+    return top
+
 
 # --- Rekursiv statt Einzelaufrufe ---
 def createfolderrecursive(cfg: Dict[str, Any], path: str) -> Dict[str, Any]:
