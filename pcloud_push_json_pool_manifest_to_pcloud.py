@@ -1716,10 +1716,10 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots
     diffbar - der frueher moegliche Fall "Scout waehlt lokal, remote nicht
     vorhanden -> copyfolder API 2005 -> Endlos-Fallback" kann nicht mehr auftreten.
 
-    Strategie:
-    - Kandidaten = remote_snapshots ∩ lokale Manifeste (ohne aktuellen, ohne _index).
-    - Vergleiche relpath+sha256-Mengen (Jaccard).
-    - Early Exit: Bei >95% Match sofort waehlen.
+    Strategie (pc.scout_pool_basis):
+    - Bevorzugt chronologischen Vorgänger (neuester Remote-Snap mit name < target).
+    - Fallback: bester Jaccard unter älteren Remote-Snaps.
+    - Nie chronologisch neueren Snap als Basis (vermeidet massives Phase-3-Cleanup).
 
     Returns:
         (snapshot_name, similarity) oder (None, 0.0)
@@ -1727,7 +1727,6 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots
     t_start = time.time()
     verbose = os.environ.get("PCLOUD_VERBOSE") == "1"
 
-    # 1. Welche Snapshots existieren REMOTE? (DAS ist die massgebliche Quelle!)
     remote_snaps = list_remote_snapshot_names(cfg, snapshots_root)
     current_name = manifest.get("snapshot")
     remote_snaps.discard(current_name)
@@ -1736,71 +1735,23 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots
         _log(f"[scout] Keine Remote-Snapshots unter {snapshots_root} vorhanden")
         return None, 0.0
 
-    # 2. Aktuelle Dateimenge (relpath → sha256)
-    current_files = {
-        it.get("relpath"): it.get("sha256")
-        for it in manifest.get("items", [])
-        if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
-    }
+    current_files = pc.manifest_file_index(manifest)
     if not current_files:
         _log("[scout] Keine Files im aktuellen Manifest")
         return None, 0.0
 
-    manifests_path = os.path.join(archive_dir, "manifests")
-    best_snap = None
-    best_score = 0.0
+    _log(f"[scout] Prüfe {len(remote_snaps)} Remote-Snapshots...")
 
-    # Neueste zuerst (Namensformat YYYY-mm-dd-HHMMSS sortiert chronologisch)
-    candidates = sorted(remote_snaps, reverse=True)
-    _log(f"[scout] Prüfe {len(candidates)} Remote-Snapshots...")
-
-    for snap_name in candidates:
-        # Diff braucht ein lokales Manifest des Kandidaten - sonst nicht nutzbar
-        basis_manifest_path = os.path.join(manifests_path, f"{snap_name}.json")
-        if not os.path.exists(basis_manifest_path):
-            if verbose:
-                _log(f"[scout]   {snap_name}: remote vorhanden, aber kein lokales Manifest → übersprungen")
-            continue
-
-        try:
-            with open(basis_manifest_path, "r", encoding="utf-8") as f:
-                arch_manifest = json.load(f)
-
-            # Basis-Dateien (relpath → sha256)
-            basis_files = {
-                it.get("relpath"): it.get("sha256")
-                for it in arch_manifest.get("items", [])
-                if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
-            }
-            if not basis_files:
-                continue
-
-            # Jaccard-Similarity (relpath + sha256 match)
-            matches = sum(
-                1 for relpath, sha in current_files.items()
-                if basis_files.get(relpath) == sha
-            )
-            score = matches / len(current_files)
-
-            if verbose:
-                _log(f"[scout]   {snap_name}: {matches}/{len(current_files)} ({score*100:.1f}%)")
-
-            if score > best_score:
-                best_score = score
-                best_snap = snap_name
-
-            # Early Exit bei >95%
-            if best_score > 0.95:
-                break
-
-        except Exception as e:
-            if verbose:
-                _log(f"[scout]   {snap_name}: Fehler beim Laden: {e}")
-            continue
+    best_snap, best_score, strategy = pc.scout_pool_basis(
+        manifest, archive_dir, remote_snaps, scout_threshold=float(
+            os.environ.get("PCLOUD_SCOUT_THRESHOLD", "0.70")
+        ),
+    )
 
     elapsed = time.time() - t_start
     if best_snap:
-        _log(f"[scout] ✓ Best Match (remote): {best_snap} (Similarity: {best_score*100:.1f}%) in {elapsed:.1f}s")
+        strat_note = f", Strategie={strategy}" if verbose else ""
+        _log(f"[scout] ✓ Best Match (remote): {best_snap} (Similarity: {best_score*100:.1f}%{strat_note}) in {elapsed:.1f}s")
     else:
         _log(f"[scout] Kein geeigneter Remote-Basis-Snapshot gefunden in {elapsed:.1f}s")
 

@@ -3438,3 +3438,103 @@ def ensure_path_cached(cfg: dict, path: str) -> int:
     if folderid:
         _fidcache_put(path, folderid)
     return folderid
+
+
+# ===== Pool Scout (Basis-Snapshot für Turbo-Delta) =====
+
+def manifest_file_index(manifest: dict) -> Dict[str, str]:
+    """relpath → sha256 für alle Dateien im Manifest."""
+    return {
+        str(it["relpath"]): str(it.get("sha256") or "")
+        for it in manifest.get("items", [])
+        if it.get("type") == "file" and it.get("relpath") and it.get("sha256")
+    }
+
+
+def manifest_similarity(current_files: Dict[str, str], basis_manifest: dict) -> float:
+    """Anteil current_files mit gleichem relpath+sha256 in basis_manifest."""
+    if not current_files:
+        return 0.0
+    basis_files = manifest_file_index(basis_manifest)
+    if not basis_files:
+        return 0.0
+    matches = sum(1 for rp, sha in current_files.items() if basis_files.get(rp) == sha)
+    return matches / len(current_files)
+
+
+def _load_manifest_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except (OSError, _json.JSONDecodeError, KeyError):
+        return None
+
+
+def scout_pool_basis(
+    manifest: dict,
+    archive_dir: str,
+    remote_snaps: set[str] | list[str],
+    *,
+    scout_threshold: float = 0.70,
+) -> Tuple[Optional[str], float, str]:
+    """
+    Wählt den Remote-Basis-Snapshot für Turbo-Delta.
+
+    Priorität:
+    1. Chronologischer Vorgänger: neuester Remote-Snap mit name < target (copyfolder-Richtung)
+    2. Global bester Jaccard unter allen älteren Remote-Snaps
+    3. Nie einen chronologisch neueren Snap als Basis (verursacht massives Phase-3-Cleanup)
+
+    Returns:
+        (basis_name, similarity 0..1, strategy)
+        strategy: 'chrono' | 'jaccard' | 'chrono_fallback' | 'none'
+    """
+    current_name = manifest.get("snapshot")
+    if not current_name:
+        return None, 0.0, "none"
+
+    current_files = manifest_file_index(manifest)
+    if not current_files:
+        return None, 0.0, "none"
+
+    remote_set = {s for s in remote_snaps if s and s != current_name}
+    if not remote_set:
+        return None, 0.0, "none"
+
+    manifests_path = os.path.join(archive_dir, "manifests")
+
+    def _score(snap_name: str) -> float:
+        path = os.path.join(manifests_path, f"{snap_name}.json")
+        basis_manifest = _load_manifest_json(path)
+        if not basis_manifest:
+            return 0.0
+        return manifest_similarity(current_files, basis_manifest)
+
+    older = sorted(s for s in remote_set if s < current_name)
+    if older:
+        chrono = older[-1]
+        chrono_score = _score(chrono)
+        if chrono_score >= scout_threshold:
+            return chrono, chrono_score, "chrono"
+
+    best_snap: Optional[str] = None
+    best_score = 0.0
+    for snap_name in sorted((s for s in remote_set if s < current_name), reverse=True):
+        score = _score(snap_name)
+        if score > best_score:
+            best_score = score
+            best_snap = snap_name
+        if best_score > 0.95:
+            break
+
+    if best_snap and best_score >= scout_threshold:
+        return best_snap, best_score, "jaccard"
+
+    if older:
+        chrono = older[-1]
+        chrono_score = _score(chrono)
+        if chrono_score > 0.0:
+            return chrono, chrono_score, "chrono_fallback"
+
+    return None, best_score, "none"
+
