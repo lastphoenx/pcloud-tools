@@ -149,6 +149,11 @@ RESUME_CHUNK_SIZE = int(os.environ.get("PCLOUD_RESUME_CHUNK_MB", "128")) * 1024*
 # --- Parallel Upload Configuration ---
 SMALL_FILE_THRESHOLD_BYTES = int(os.environ.get("PCLOUD_SMALL_FILE_THRESHOLD_MB", "50")) * 1024**2  # Default: 50 MB
 PARALLEL_UPLOAD_THREADS = int(os.environ.get("PCLOUD_UPLOAD_THREADS", "4"))  # Default: 4 threads
+PARALLEL_CLEANUP_THREADS = int(os.environ.get(
+    "PCLOUD_DELTA_CLEANUP_THREADS",
+    os.environ.get("PCLOUD_UPLOAD_THREADS", "4"),
+))
+DELTA_CLEANUP_PROGRESS_EVERY = max(1, int(os.environ.get("PCLOUD_DELTA_CLEANUP_PROGRESS_EVERY", "500")))
 
 # --- fileid-Cache Telemetrie (1:1 aus Legacy, beim Ausbau verloren gegangen) ---
 fid_lookups = 0          # Anzahl _fid_for Aufrufe
@@ -1826,6 +1831,132 @@ def _snapshot_stub_relpaths(cfg: dict, snapshot_dir: str) -> set:
     return relpaths
 
 
+def _delta_phase3_cleanup(
+    cfg: dict,
+    *,
+    dest_snapshot_dir: str,
+    paths_to_remove: set,
+    current_paths: set,
+) -> tuple[int, int]:
+    """
+    Phase 3: veraltete Remote-Stubs entfernen (parallel + Fortschritts-Log).
+
+    Returns:
+        (folders_removed, stubs_deleted)
+    """
+    import concurrent.futures
+
+    t0 = time.time()
+
+    kept_dirs: set[str] = set()
+    for rp in current_paths:
+        d = os.path.dirname(rp)
+        while d:
+            kept_dirs.add(d)
+            d = os.path.dirname(d)
+
+    dead_top_dirs: set[str] = set()
+    single_stubs: list[str] = []
+    for rp in paths_to_remove:
+        parent = os.path.dirname(rp)
+        if parent and parent not in kept_dirs:
+            top = parent
+            while True:
+                gp = os.path.dirname(top)
+                if gp and gp not in kept_dirs:
+                    top = gp
+                else:
+                    break
+            dead_top_dirs.add(top)
+        else:
+            single_stubs.append(rp)
+
+    dead_dirs = sorted(dead_top_dirs)
+    threads = max(1, PARALLEL_CLEANUP_THREADS)
+    progress_every = DELTA_CLEANUP_PROGRESS_EVERY
+    total_ops = len(dead_dirs) + len(single_stubs)
+
+    _log(
+        f"[delta-mode] Phase 3: Plan — {len(dead_dirs)} Ordner rekursiv, "
+        f"{len(single_stubs)} Einzel-Stubs ({total_ops} Ops, Threads={threads})"
+    )
+
+    folders_removed = 0
+    stubs_deleted = 0
+    errors = 0
+    done_ops = 0
+    last_pct = -1
+    lock = threading.Lock()
+
+    def _progress_tick() -> None:
+        nonlocal done_ops, last_pct
+        with lock:
+            done_ops += 1
+            if total_ops <= 0:
+                return
+            pct = int((done_ops / total_ops) * 100)
+            show = (
+                done_ops % progress_every == 0
+                or done_ops == total_ops
+                or (pct % 10 == 0 and pct != last_pct)
+            )
+            if not show:
+                return
+            last_pct = pct
+            elapsed = time.time() - t0
+            rate = done_ops / elapsed if elapsed > 0 else 0.0
+            remaining_s = (total_ops - done_ops) / rate if rate > 0 else 0.0
+            eta_str = (
+                f"~{int(remaining_s)}s" if remaining_s < 60 else f"~{int(remaining_s / 60)}min"
+            )
+            _log(
+                f"[delta-mode] Phase 3: {done_ops}/{total_ops} ({pct}%) | "
+                f"dirs={folders_removed} stubs={stubs_deleted} errors={errors} | "
+                f"{eta_str} verbleibend"
+            )
+
+    def _delete_dead_dir(rel_dir: str) -> None:
+        nonlocal folders_removed, errors
+        try:
+            pc.deletefolder_recursive(cfg, path=f"{dest_snapshot_dir}/{rel_dir}")
+            with lock:
+                folders_removed += 1
+        except Exception as e:
+            with lock:
+                errors += 1
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                _log(f"[warn] Konnte toten Ordner nicht löschen: {rel_dir}: {e}")
+        finally:
+            _progress_tick()
+
+    def _delete_single_stub(rp: str) -> None:
+        nonlocal stubs_deleted, errors
+        stub_path = f"{dest_snapshot_dir}/{rp}.meta.json"
+        try:
+            stub_md = pc.stat_file_safe(cfg, path=stub_path)
+            if stub_md and stub_md.get("fileid"):
+                pc.delete_file(cfg, fileid=int(stub_md["fileid"]))
+                with lock:
+                    stubs_deleted += 1
+        except Exception as e:
+            with lock:
+                errors += 1
+            if os.environ.get("PCLOUD_VERBOSE") == "1":
+                _log(f"[warn] Konnte Stub nicht löschen: {stub_path}: {e}")
+        finally:
+            _progress_tick()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        if dead_dirs:
+            _log(f"[delta-mode] Phase 3: Lösche {len(dead_dirs)} tote Ordner (rekursiv)...")
+            list(ex.map(_delete_dead_dir, dead_dirs))
+        if single_stubs:
+            _log(f"[delta-mode] Phase 3: Lösche {len(single_stubs)} Einzel-Stubs...")
+            list(ex.map(_delete_single_stub, single_stubs))
+
+    return folders_removed, stubs_deleted
+
+
 def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapshot_name: str,
                          *, dry: bool = False, verbose: bool = False) -> dict:
     """
@@ -2058,56 +2189,17 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     if paths_to_remove and not dry:
         _log(f"[delta-mode] Phase 3: Entferne {len(paths_to_remove)} veraltete Einträge...")
         t_cleanup_start = time.time()
-
-        # Lebende Ordner: jeder Ordner, unter dem noch ein aktueller File liegt.
-        kept_dirs = set()
-        for rp in current_paths:
-            d = os.path.dirname(rp)
-            while d:
-                kept_dirs.add(d)
-                d = os.path.dirname(d)
-
-        # Komplett tote Teilbäume (höchster toter Ancestor) → 1 deletefolderrecursive
-        # statt N Einzel-Deletes; Stubs in noch lebenden Ordnern → einzeln per deletefile.
-        dead_top_dirs = set()
-        single_stubs = []
-        for rp in paths_to_remove:
-            parent = os.path.dirname(rp)
-            if parent and parent not in kept_dirs:
-                top = parent
-                while True:
-                    gp = os.path.dirname(top)
-                    if gp and gp not in kept_dirs:
-                        top = gp
-                    else:
-                        break
-                dead_top_dirs.add(top)
-            else:
-                single_stubs.append(rp)
-
-        folders_removed = 0
-        for rel_dir in dead_top_dirs:
-            try:
-                pc.deletefolder_recursive(cfg, path=f"{dest_snapshot_dir}/{rel_dir}")
-                folders_removed += 1
-            except Exception as e:
-                if os.environ.get("PCLOUD_VERBOSE") == "1":
-                    _log(f"[warn] Konnte toten Ordner nicht löschen: {rel_dir}: {e}")
-
-        deleted_count = 0
-        for rp in single_stubs:
-            stub_path = f"{dest_snapshot_dir}/{rp}.meta.json"
-            try:
-                stub_md = pc.stat_file_safe(cfg, path=stub_path)
-                if stub_md and stub_md.get("fileid"):
-                    pc.delete_file(cfg, fileid=int(stub_md["fileid"]))
-                    deleted_count += 1
-            except Exception as e:
-                if os.environ.get("PCLOUD_VERBOSE") == "1":
-                    _log(f"[warn] Konnte Stub nicht löschen: {stub_path}: {e}")
-
+        folders_removed, deleted_count = _delta_phase3_cleanup(
+            cfg,
+            dest_snapshot_dir=dest_snapshot_dir,
+            paths_to_remove=paths_to_remove,
+            current_paths=current_paths,
+        )
         cleanup_duration = time.time() - t_cleanup_start
-        _log(f"[delta-mode] ✓ Bereinigt: {folders_removed} tote Ordner rekursiv, {deleted_count} Einzel-Stubs in {cleanup_duration:.1f}s")
+        _log(
+            f"[delta-mode] ✓ Bereinigt: {folders_removed} tote Ordner rekursiv, "
+            f"{deleted_count} Einzel-Stubs in {cleanup_duration:.1f}s"
+        )
     elif paths_to_remove:
         _log(f"[dry] Würde {len(paths_to_remove)} veraltete Einträge entfernen (tote Ordner rekursiv + Einzel-Stubs)")
     
