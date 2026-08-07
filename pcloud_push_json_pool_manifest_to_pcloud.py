@@ -881,10 +881,11 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         _log(f"[stubs] Löse {_total_parents} Parent-FolderIDs auf (Cache-Optimiert: {len(folder_cache)} gecacht)...")
 
     _fid_progress_every = max(1, int(os.environ.get("PCLOUD_STUB_FID_PROGRESS_EVERY", "100") or "100"))
+    _fid_heartbeat_sec = max(15, int(os.environ.get("PCLOUD_STUB_FID_HEARTBEAT_SEC", "60") or "60"))
     _parents_failed = 0
     _stubs_skipped_no_fid = 0
-    _fid_resolve_idx = 0
     _t_fid_resolve = time.time()
+    _last_fid_log_time = _t_fid_resolve
     _fid_lock = threading.Lock()
 
     def _resolve_parent_fid(parent_path: str, normalized: str) -> Optional[int]:
@@ -916,16 +917,29 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         else:
             parents_to_resolve.append(parent)
 
-    def _log_fid_progress(done: int) -> None:
-        if done % _fid_progress_every == 0 or done == _total_parents:
-            _log(
-                f"[stubs] Parent-FIDs: {done}/{_total_parents} "
-                f"({_cache_hits} cache, {_cache_misses} neu, {_parents_failed} fehl) "
-                f"{time.time() - _t_fid_resolve:.0f}s"
-            )
+    def _log_fid_progress(done: int, *, force: bool = False) -> None:
+        nonlocal _last_fid_log_time
+        now = time.time()
+        if not (
+            force
+            or done == _total_parents
+            or done % _fid_progress_every == 0
+            or (now - _last_fid_log_time) >= _fid_heartbeat_sec
+        ):
+            return
+        _last_fid_log_time = now
+        _log(
+            f"[stubs] Parent-FIDs: {done}/{_total_parents} "
+            f"({_cache_hits} cache, {_cache_misses} neu, {_parents_failed} fehl) "
+            f"{now - _t_fid_resolve:.0f}s"
+        )
 
     if _cache_hits:
-        _log_fid_progress(_cache_hits)
+        _log(
+            f"[stubs] Parent-FIDs: {_cache_hits}/{_total_parents} aus Cache, "
+            f"{len(parents_to_resolve)} verbleibend (API)..."
+        )
+        _log_fid_progress(_cache_hits, force=True)
 
     if parents_to_resolve and not dry:
         fid_threads = max(
@@ -964,13 +978,13 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
 
         for depth in sorted(by_depth.keys()):
             batch = by_depth[depth]
-            if fid_threads > 1 and len(batch) > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=fid_threads) as ex:
-                    results = list(ex.map(_resolve_one, batch))
-            else:
-                results = [_resolve_one(p) for p in batch]
+            _log(
+                f"[stubs] Parent-FIDs Tiefe {depth}: {len(batch)} Ordner "
+                f"({fid_threads} Threads)..."
+            )
 
-            for parent, fid, err in results:
+            def _apply_parent_result(parent: str, fid: Optional[int], err: Optional[BaseException]) -> None:
+                nonlocal _parents_failed, _cache_misses, _api_calls, _stubs_skipped_no_fid
                 with _fid_lock:
                     if err is not None:
                         _parents_failed += 1
@@ -985,9 +999,19 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                         folder_cache[pc._norm_remote_path(parent)] = int(fid)
                         _cache_misses += 1
                         _api_calls += 1
+                    done = _cache_hits + _cache_misses + _parents_failed
+                _log_fid_progress(done)
 
-                _fid_resolve_idx = _cache_hits + _cache_misses + _parents_failed
-                _log_fid_progress(_fid_resolve_idx)
+            if fid_threads > 1 and len(batch) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=fid_threads) as ex:
+                    futs = [ex.submit(_resolve_one, p) for p in batch]
+                    for fut in concurrent.futures.as_completed(futs):
+                        parent, fid, err = fut.result()
+                        _apply_parent_result(parent, fid, err)
+            else:
+                for parent in batch:
+                    parent, fid, err = _resolve_one(parent)
+                    _apply_parent_result(parent, fid, err)
 
     # Performance-Report
     if not dry:
@@ -2546,19 +2570,21 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         marker_complete = f"{dest_snapshot_dir}/.upload_complete"
         
         # Prüfen ob Upload bereits abgeschlossen (snapshot-Feld muss passen!)
+        # Zuerst Ordner-Existenz — stat auf Marker ohne Parent wirft API 2002 (Full-Pool-Crash).
         incomplete_upload = False
-        if _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
-            _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
-            return {"uploaded": 0, "stubs": 0, "resumed": False}
-        if pc.stat_file_safe(cfg, path=marker_complete):
-            _log(
-                f"[warn] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
-                f"(erwartet {snapshot_name}) — behandle als unvollständig"
-            )
-            incomplete_upload = True
-        elif pc.stat_file_safe(cfg, path=marker_started):
-            incomplete_upload = True
-            _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
+        if pc.stat_folderid_fast(cfg, dest_snapshot_dir):
+            if _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
+                _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+                return {"uploaded": 0, "stubs": 0, "resumed": False}
+            if pc.stat_file_safe(cfg, path=marker_complete):
+                _log(
+                    f"[warn] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
+                    f"(erwartet {snapshot_name}) — behandle als unvollständig"
+                )
+                incomplete_upload = True
+            elif pc.stat_file_safe(cfg, path=marker_started):
+                incomplete_upload = True
+                _log(f"[warn] Unvollständiger Upload erkannt für {snapshot_name} - starte neu")
         
         # Bei unvollständigem Upload: Index-Driven Skip (keine Löschung)
         if incomplete_upload:

@@ -2463,7 +2463,7 @@ def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int 
         return stat_file(cfg, path=path, fileid=fileid, with_checksum=False, enrich_path=True) or {}
     except Exception as e:
         msg = str(e)
-        if "2055" in msg or "not found" in msg.lower():
+        if "2055" in msg or "2002" in msg or "not found" in msg.lower():
             return {}
         raise
 
