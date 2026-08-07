@@ -8,14 +8,15 @@ endgültig gelöscht. trash_list/trash_restore sind REST-only (kein Binary-RPC).
 
 Beispiele (pi-nas):
   cd /opt/apps/pcloud-tools/main
-  python scripts/utilities/pcloud_trash_audit.py --env-file .env list
-  python scripts/utilities/pcloud_trash_audit.py --env-file .env list --prefix 2026-07
+  /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pcloud_trash_audit.py --env-file .env probe
+  /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pcloud_trash_audit.py --env-file .env list
   python scripts/utilities/pcloud_trash_audit.py --env-file .env restore --name 2026-07-02-040018 --dry-run
   python scripts/utilities/pcloud_trash_audit.py --env-file .env restore --folderid 12345678
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -107,10 +108,24 @@ def cmd_restore(cfg: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe(cfg: dict, args: argparse.Namespace) -> int:
+    del args
+    probes = pc.trash_auth_probe(cfg)
+    print(json.dumps(probes, indent=2, ensure_ascii=False))
+    trash_ok = any(
+        probes.get(k, {}).get("ok")
+        for k in probes
+        if k.startswith("trash_list")
+    )
+    return 0 if trash_ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="pCloud Papierkorb: Snapshots listen / restore.")
     ap.add_argument("--env-file", required=True, help="Pfad zur .env (PCLOUD_TOKEN)")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("probe", help="Auth-Diagnose (userinfo/listfolder/trash_list)")
 
     p_list = sub.add_parser("list", help="Snapshot-Ordner im Papierkorb anzeigen")
     p_list.add_argument("--prefix", default="", help="Namens-Prefix, z.B. 2026-07")
@@ -127,6 +142,10 @@ def main() -> int:
 
     args = ap.parse_args()
     cfg = pc.effective_config(env_file=args.env_file)
+
+    if args.cmd == "probe":
+        return cmd_probe(cfg, args)
+
     pc.preflight_or_raise(cfg)
 
     if args.cmd == "list":

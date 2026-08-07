@@ -2037,60 +2037,99 @@ def _rest_get(cfg: dict, endpoint: str, params: dict | None = None):
     return jd
 
 
-def _legacy_auth_from_userinfo(cfg: dict) -> str:
-    """
-    OAuth access_token in legacy auth-Token tauschen (userinfo?getauth=1).
-
-    Einige REST-Endpoints (trash_list, trash_restore, …) liefern mit
-    access_token nur result=1000, obwohl listfolder/userinfo mit access_token OK sind.
-    """
-    top = _rest_get(cfg, "userinfo", {"getauth": 1})
-    auth = top.get("auth")
-    if not auth:
-        raise RuntimeError("userinfo(getauth=1): kein auth-Token in Antwort")
-    return str(auth)
-
-
-def _rest_get_legacy_auth(cfg: dict, endpoint: str, params: dict | None = None) -> dict:
-    """REST GET mit legacy auth= (nach OAuth-Exchange via userinfo)."""
+def _rest_get_raw(
+    cfg: dict,
+    endpoint: str,
+    params: dict | None = None,
+    *,
+    auth_mode: str = "access_token",
+) -> dict:
+    """REST GET ohne Ergebnis-Prüfung (Auth-Probing)."""
     import requests
     import re
 
-    auth = _legacy_auth_from_userinfo(cfg)
     base = _rest_base(cfg)
+    tok = cfg.get("token") or ""
     timeout = int(cfg.get("timeout", 30))
     s = _get_session(timeout)
     p = dict(params or {})
-    p["auth"] = auth
+    headers: dict = {}
     p.pop("access_token", None)
+    p.pop("auth", None)
+
+    if auth_mode == "access_token" and tok:
+        p["access_token"] = tok
+    elif auth_mode == "auth" and tok:
+        p["auth"] = tok
+    elif auth_mode == "bearer" and tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    else:
+        raise ValueError(f"unknown auth_mode: {auth_mode}")
 
     try:
-        r = s.get(f"{base}/{endpoint}", params=p, timeout=timeout)
+        r = s.get(f"{base}/{endpoint}", params=p, headers=headers, timeout=timeout)
         r.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        msg = re.sub(r'auth=[^&\s]+', 'auth=***HIDDEN***', str(e))
+        msg = re.sub(r'(access_token|auth)=[^&\s]+', r'\1=***HIDDEN***', str(e))
         raise RuntimeError(f"REST {endpoint} HTTP Error: {msg}") from None
     except requests.exceptions.RequestException as e:
-        msg = re.sub(r'auth=[^&\s]+', 'auth=***HIDDEN***', str(e))
+        msg = re.sub(r'(access_token|auth)=[^&\s]+', r'\1=***HIDDEN***', str(e))
         raise RuntimeError(f"REST {endpoint} Request Error: {msg}") from None
 
     try:
-        jd = r.json()
+        return r.json()
     except Exception:
         raise RuntimeError(f"REST {endpoint}: invalid JSON")
 
-    _expect_ok(jd)
-    return jd
-
 
 def _rest_get_trash(cfg: dict, endpoint: str, params: dict | None = None) -> dict:
-    """trash_*: zuerst access_token, bei 1000 legacy auth=."""
-    try:
-        return _rest_get(cfg, endpoint, params)
-    except RuntimeError as e:
-        if "API error 1000" not in str(e):
-            raise
-    return _rest_get_legacy_auth(cfg, endpoint, params)
+    """
+    trash_* via REST — probiert OAuth-Varianten (access_token, Bearer, auth=).
+
+    getauth=1 liefert bei OAuth-Tokens kein legacy auth-Feld; daher kein Exchange.
+    """
+    p = dict(params or {})
+    if cfg.get("device"):
+        p.setdefault("device", cfg["device"])
+
+    errors: list[str] = []
+    for mode in ("access_token", "bearer", "auth"):
+        try:
+            jd = _rest_get_raw(cfg, endpoint, dict(p), auth_mode=mode)
+            res = jd.get("result")
+            if res not in (0, "0", 0.0, None):
+                errors.append(f"{mode}: API {res} {jd.get('error', '')}".strip())
+                continue
+            return jd
+        except Exception as e:
+            errors.append(f"{mode}: {e}")
+
+    raise RuntimeError(f"trash API auth failed ({endpoint}): " + "; ".join(errors))
+
+
+def trash_auth_probe(cfg: dict) -> dict:
+    """Diagnose: welche Auth-Variante funktioniert für trash_list/userinfo/listfolder?"""
+    probes = {
+        "userinfo+access_token": ("userinfo", {"getauth": 1}, "access_token"),
+        "listfolder+access_token": ("listfolder", {"path": "/", "nofiles": 1}, "access_token"),
+        "trash_list+access_token": ("trash_list", {"folderid": 0, "nofiles": 1}, "access_token"),
+        "trash_list+bearer": ("trash_list", {"folderid": 0, "nofiles": 1}, "bearer"),
+        "trash_list+auth": ("trash_list", {"folderid": 0, "nofiles": 1}, "auth"),
+    }
+    out: dict = {}
+    dev = cfg.get("device")
+    for label, (ep, par, mode) in probes.items():
+        p = dict(par)
+        if dev:
+            p.setdefault("device", dev)
+        try:
+            jd = _rest_get_raw(cfg, ep, p, auth_mode=mode)
+            res = jd.get("result")
+            ok = res in (0, "0", 0.0, None)
+            out[label] = {"ok": ok, "result": res, "error": jd.get("error")}
+        except Exception as e:
+            out[label] = {"ok": False, "error": str(e)}
+    return out
 
 
 def _rest_post(cfg: dict, endpoint: str, data: dict | None = None, files: dict | None = None):
