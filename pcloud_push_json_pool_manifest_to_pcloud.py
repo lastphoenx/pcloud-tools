@@ -3600,7 +3600,18 @@ def retention_pool_mode(cfg: dict, dest_root: str, *, local_snaps: Optional[list
 
 # ----------------- CLI -----------------
 
+def _apply_oom_protection() -> None:
+    """Upload vor OOM-Killer schützen (Kinder erben oom_score_adj vom Parent)."""
+    try:
+        adj = int(os.environ.get("PCLOUD_OOM_SCORE_ADJ", "-500"))
+        with open("/proc/self/oom_score_adj", "w", encoding="utf-8") as f:
+            f.write(str(adj))
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _apply_oom_protection()
     # --- Neu: Encoding rekonfigurieren ---
     try:
         import sys

@@ -1,7 +1,7 @@
 [Service]
 # RAM-Schutz: Backup-Pipeline darf System nicht ersticken (OOM/Thrashing)
-MemoryMax=5G
-MemorySwapMax=1G
+MemoryMax=3G
+MemorySwapMax=512M
 OOMScoreAdjust=500
 # Globaler Hardware-Watchdog (1min->10min): systemd/system.conf.d/watchdog-longops.conf
 # RuntimeWatchdogSec gehoert NICHT in [Service] — systemd ignoriert/ warnt.
