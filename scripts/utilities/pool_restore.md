@@ -322,6 +322,6 @@ python scripts/utilities/pool_verify_backup.py \
 
 ## Siehe auch
 
-- `pcloud_pool_gc.md` — Pool Garbage Collection
+- `docs/pcloud_pool_gc.md` — Pool Garbage Collection
 - `docs/SETUP.md` §10 — Kurzanleitung Restore
 - `docs/DEVELOPER_GUIDE.md` — Datenstrukturen (Stubs, pool_refs)

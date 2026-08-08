@@ -345,7 +345,7 @@ Schema-Validierung:
         print()
         print(f"  Upload-Befehl:")
         print(f"    /opt/apps/pcloud-tools/venv-.../bin/python \\")
-        print(f"      /opt/apps/pcloud-tools/main/pcloud_push_json_manifest_to_pcloud.py \\")
+        print(f"      /opt/apps/pcloud-tools/main/legacy/pcloud_push_json_manifest_to_pcloud.py \\")
         print(f"      --manifest /srv/pcloud-temp/manifest.json \\")
         print(f"      --dest-root {dest_root} \\")
         print(f"      --snapshot-mode 1to1 \\")

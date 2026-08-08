@@ -164,7 +164,7 @@ python3 scripts/utilities/pool_audit_status.py \
   --env-file .env --pool-root /Backup/rtb_pool --rtb-root /mnt/backup/rtb_nas
 ```
 
-**Remote-Zombie** (Ordner auf pCloud, kein lokales RTB, kein `.upload_complete`): per Retention entfernen — siehe `pcloud_pool_gc.md` § `--retention-apply` (erst `--dry-run`).
+**Remote-Zombie** (Ordner auf pCloud, kein lokales RTB, kein `.upload_complete`): per Retention entfernen — siehe `docs/pcloud_pool_gc.md` § `--retention-apply` (erst `--dry-run`).
 
 Fortschritt:
 ```bash
@@ -259,7 +259,7 @@ python pcloud_pool_gc.py \
 #   --env-file .env --pool-root /Backup/rtb_pool >> /var/log/backup/pool_gc.log 2>&1
 ```
 
-Ausführliche Doku: `pcloud_pool_gc.md`
+Ausführliche Doku: `docs/pcloud_pool_gc.md`
 
 GC-Kandidaten vorab anzeigen (ohne Löschen):
 

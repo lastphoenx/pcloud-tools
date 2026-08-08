@@ -25,7 +25,8 @@ import time
 from collections import defaultdict
 from typing import Optional
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
 import pcloud_bin_lib as pc
 
 TEMPLATE_DIRNAME = "_folder_template"

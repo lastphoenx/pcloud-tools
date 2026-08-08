@@ -330,7 +330,7 @@ python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --env-file "$ENV_FILE" --d
 
 **GC-Lock:** `.gc_lock`-Datei verhindert Race-Condition zwischen laufendem Upload und GC.
 
-Siehe `pcloud_pool_gc.md` für Retention-Apply, Grace-Period-Triage und Troubleshooting.
+Siehe `docs/pcloud_pool_gc.md` für Retention-Apply, Grace-Period-Triage und Troubleshooting.
 
 ### `pcloud_bin_lib` — Pool-relevante Helfer (Juni 2026)
 
@@ -453,7 +453,7 @@ python scripts/utilities/pool_check_remote.py \
   --snapshot 2026-05-15-120009
 
 # 4. tamper-detect
-python pcloud_quick_delta.py --dest-root /Backup/rtb_pool --env-file "$ENV_FILE"
+python legacy/pcloud_quick_delta.py --dest-root /Backup/rtb_pool --env-file "$ENV_FILE"
 
 # 5. Undefined-Names-Check (vor Deployment)
 python scripts/utilities/check_undefined_names.py \

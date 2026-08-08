@@ -86,7 +86,8 @@ EntropyWatcher + ClamAV  →  RTB Wrapper  →  rsync-time-backup  →  pCloud-T
       (Safety Gate)          (Dry-Run)        (Hardlink-Snap)      (Cloud-Sync)
 ```
 
-Der Einstiegspunkt ist `rtb_wrapper.sh` (rtb-Repo), der nach erfolgreichem lokalem Backup automatisch `wrapper_pcloud_sync_1to1.sh` aufruft.  
+Der Einstiegspunkt für **Pool-Produktion** ist `rtb_pool_wrapper.sh` (rtb-Repo) → `wrapper_pcloud_pool_sync_1to1.sh`.  
+Legacy 1to1: `rtb_wrapper.sh` → `legacy/wrapper_pcloud_sync_1to1.sh` (eingestellt).  
 → Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
 → Entstehungsgeschichte & Gesamt-Pipeline: [rtb/README.md](https://github.com/lastphoenx/rtb#die-entstehungsgeschichte)
 
@@ -243,14 +244,24 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 
 | Datei | Funktion |
 |---|---|
-| `wrapper_pcloud_sync_1to1.sh` | Orchestrator: ruft alle Phasen in Reihenfolge auf |
-| `pcloud_json_manifest.py` | Manifest-Erstellung (Smart-Hashing via inode/mtime) |
-| `pcloud_push_json_manifest_to_pcloud.py` | Upload-Engine: SAFE-MODE / TURBO-MODE, Deduplication, **Chunked-Upload**, **Parallel Uploads** |
-| `pcloud_quick_delta.py` | Post-Upload-Verifikation (Delta-Check) |
-| `pcloud_bin_lib.py` | pCloud API-Bibliothek (Connection, Retry, Chunked Upload, **REST delete_file/delete_folder**, Pool-Pfad-Helfer) |
-| `create_folder_template.py` | Einmaliges Setup des `_folder_template`-Cache (SAFE-MODE Beschleunigung) |
-| `pcloud_health_check.sh` | Backup-Status, Quota, Alter — Nagios/Zabbix-kompatibel |
+| `wrapper_pcloud_pool_sync_1to1.sh` | Orchestrator Pool-Modus: Catch-up, MariaDB-Phasen, NAS-Lock |
+| `pcloud_json_pool_manifest.py` | Manifest-Erstellung Pool (Schema v4, Smart-Hashing) |
+| `pcloud_push_json_pool_manifest_to_pcloud.py` | Pool-Upload: Scout, Turbo-Delta, Full-Pool, Validation |
+| `pcloud_pool_gc.py` | Pool Garbage Collection ([Doku](docs/pcloud_pool_gc.md)) |
+| `pcloud_bin_lib.py` | pCloud API-Bibliothek (Circuit Breaker, `copyfolder`, Chunked Upload) |
+| `pcloud_path_compat.py` | Pfad-Normalisierung Manifest ↔ pCloud (Whitespace, Skip-Globs) |
+| `pcloud_health_check.sh` | Backup-Status, Quota — Nagios/Zabbix-kompatibel |
 | `pcloud_status.sh` | Interaktives Status-Dashboard aus MariaDB |
+| `monitoring-dashboard-server.py` | Multi-Repo Web-Dashboard (Port 8080) |
+
+**Legacy 1to1** (Referenz): [`legacy/`](legacy/README.md) — nicht mehr in Produktion.
+
+**Neu seit August 2026 (Catch-up / Robustheit):**
+- **Scout-Fix:** chronologischer Vorgänger, kein neuerer Snap als Delta-Basis
+- **Phase 3 parallel** + Fortschritts-Logs (`PCLOUD_DELTA_CLEANUP_THREADS`)
+- **Circuit Breaker** mit Cooldown und Parallelitäts-Ramp (16→12→8 Threads)
+- **`pool_delta_plan.py`** — Delta vs. Full planen inkl. Catch-up-Simulation
+- → [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)
 
 **Neu seit April 2026:**  
 - **Chunked-Upload mit automatischem Resume** für große Dateien (>5 GB)  
@@ -272,15 +283,16 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/cleanup_orphaned_manifests.sh` | Entfernt Manifeste ohne zugehörigen Snapshot |
 | `scripts/fix_stubs_missing_fileid.py` | Repariert Stubs ohne FileID (nach API-Fehlern) |
 | `scripts/rewrite_stubs_from_index.py` | Regeneriert alle Stubs eines Snapshots aus dem Index |
-| `pcloud_manifest_diff.py` | Vergleicht zwei Manifeste (Diff-Ansicht) |
+| `pcloud_manifest_diff.py` | *(legacy)* Manifest-Diff — siehe `legacy/` |
 | `scripts/pcloud_integrity_check.py` | Tiefenprüfung: Hashes, FileIDs, Holder-Konsistenz |
 | `scripts/pcloud_repair_index.py` | Repariert den Remote-Index (Phantom-Anchors etc.) |
 | `scripts/utilities/pcloud_restore.py` | Legacy 1to1-Restore (anchor_path, nicht Pool) |
+| `scripts/utilities/pool_delta_plan.py` | Catch-up-Planung: Delta vs. Full, Phase-3-Aufwand |
 | `scripts/utilities/pool_restore.py` | Pool-Mode Restore (Einzel-Snapshot oder `--all-versions` über alle Snapshots) |
 | `scripts/utilities/pool_verify_backup.py` | Integritätscheck Manifest ↔ Pool ↔ Index |
 | `scripts/utilities/pool_audit_status.py` | Schneller Status RTB vs. Manifeste vs. pCloud vs. DB |
 | `docs/STORAGE_PATHS.md` | Lokale Pfade pi-nas (Bind-Mounts, was **nicht** Pipeline ist) |
-| `pcloud_pool_gc.py` | Pool Garbage Collection (verwaiste SHA256s löschen, siehe `pcloud_pool_gc.md`) |
+| `pcloud_pool_gc.py` | Pool Garbage Collection (siehe [docs/pcloud_pool_gc.md](docs/pcloud_pool_gc.md)) |
 | `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
 
 **Testing & Development:**
@@ -334,7 +346,10 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 
 | Dokument | Inhalt |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architektur, Ablaufkette, SAFE/TURBO-Logik, Tool-Inventar |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architektur, Ablaufkette, Pool-Modi, Tool-Inventar |
+| [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md) | August 2026: Lock, Scout, Phase 3, Circuit Breaker, Planungstool |
+| [docs/pcloud_pool_gc.md](docs/pcloud_pool_gc.md) | Pool GC, Retention, Grace Period |
+| [docs/ENV_VARIABLES.md](docs/ENV_VARIABLES.md) | ENV-Referenz (Scout, Delta, Circuit Breaker) |
 | [docs/SETUP.md](docs/SETUP.md) | Vollständige Installations-Anleitung |
 | [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md) | Alerting-Konfiguration (Telegram, Discord, ntfy…) |
 | [docs/RCLONE_TOKEN_REFRESH.md](docs/RCLONE_TOKEN_REFRESH.md) | pCloud OAuth-Token erneuern (headless/SSH) |

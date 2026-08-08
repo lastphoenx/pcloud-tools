@@ -10,7 +10,7 @@ Simple HTTP server for monitoring dashboard with cache-control headers.
     - /pcloud-tools/dashboard/
     - /entropy-watcher-und-clamav-scanner/docs/
     
-    See: ../DEPLOYMENT_UPDATE_2026.md for migration guide
+    See: ../docs/DEPLOYMENT_UPDATE_2026.md for migration guide
 """
 
 import http.server
@@ -37,7 +37,7 @@ if __name__ == '__main__':
     print("Absolute links to /entropy-watcher-und-clamav-scanner/ will NOT work!")
     print()
     print("For PRODUCTION, use: monitoring-dashboard-server.py (workspace root)")
-    print("See: DEPLOYMENT_UPDATE_2026.md for details")
+    print("See: docs/DEPLOYMENT_UPDATE_2026.md for details")
     print("=" * 70)
     print()
     

@@ -32,7 +32,7 @@ import argparse
 import tempfile
 
 # Add current directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pcloud_bin_lib as pc
 

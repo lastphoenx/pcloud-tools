@@ -136,7 +136,7 @@ echo ""
 mkdir -p "$TEST_ROOT/index_dir"
 
 cd "$SCRIPT_DIR/../pcloud-tools"
-python3 pcloud_push_json_manifest_to_pcloud.py \
+python3 legacy/pcloud_push_json_manifest_to_pcloud.py \
   --manifest "$TEST_ROOT/manifests/${SNAPSHOT_NAME}.json" \
   --dest-root "$PCLOUD_TEST_ROOT" \
   --snapshot-mode 1to1 \
@@ -194,7 +194,7 @@ PYEOF
     
     echo ""
     echo "Starte Upload erneut (sollte von vorne beginnen)..."
-    python3 pcloud_push_json_manifest_to_pcloud.py \
+    python3 legacy/pcloud_push_json_manifest_to_pcloud.py \
       --manifest "$TEST_ROOT/manifests/${SNAPSHOT_NAME}.json" \
       --dest-root "$PCLOUD_TEST_ROOT" \
       --snapshot-mode 1to1 \
@@ -215,7 +215,7 @@ PYEOF
     
     echo ""
     echo "Starte Upload erneut (sollte resumen!)..."
-    python3 pcloud_push_json_manifest_to_pcloud.py \
+    python3 legacy/pcloud_push_json_manifest_to_pcloud.py \
       --manifest "$TEST_ROOT/manifests/${SNAPSHOT_NAME}.json" \
       --dest-root "$PCLOUD_TEST_ROOT" \
       --snapshot-mode 1to1 \
