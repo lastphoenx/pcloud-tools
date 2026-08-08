@@ -439,17 +439,52 @@ class _BinReader:
         raise ValueError(f"unknown type {t}")
 
 _meta_sem: Optional[threading.Semaphore] = None
+_meta_sem_n: Optional[int] = None
 _meta_delay: Optional[float] = None
 _api_retry_count = 0
 _consecutive_transient_errors = 0
 _circuit_breaker_lock = threading.Lock()
+_circuit_state = "closed"  # closed | open | half_open
+_circuit_open_until = 0.0
+_throttle_step = 0
+_recovery_success_streak = 0
+_last_circuit_wait_log = 0.0
+
+
+def _parallelism_multipliers() -> list[float]:
+    raw = os.environ.get("PCLOUD_CIRCUIT_PARALLELISM_TIERS", "1,0.75,0.5")
+    mults = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    return mults or [1.0, 0.75, 0.5]
+
+
+def effective_parallel_workers(requested: int) -> int:
+    """Reduziert Thread-Parallelität je nach Circuit-Breaker-Stufe (1.0 → 0.75 → 0.5)."""
+    mults = _parallelism_multipliers()
+    step = min(_throttle_step, len(mults) - 1)
+    return max(1, int(requested * mults[step] + 0.5))
+
+
+def get_meta_concurrency() -> int:
+    base = int(os.environ.get("PCLOUD_API_META_CONCURRENCY", "6"))
+    return effective_parallel_workers(base)
+
+
+def get_circuit_throttle_step() -> int:
+    return _throttle_step
+
+
+def _reset_meta_sem() -> None:
+    global _meta_sem, _meta_sem_n
+    _meta_sem = None
+    _meta_sem_n = None
 
 
 def _get_meta_sem() -> threading.Semaphore:
-    global _meta_sem
-    if _meta_sem is None:
-        n = int(os.environ.get("PCLOUD_API_META_CONCURRENCY", "6"))
+    global _meta_sem, _meta_sem_n
+    n = get_meta_concurrency()
+    if _meta_sem is None or _meta_sem_n != n:
         _meta_sem = threading.Semaphore(max(1, n))
+        _meta_sem_n = n
     return _meta_sem
 
 
@@ -479,36 +514,96 @@ def is_transient_api_error(exc: BaseException) -> bool:
     return any(k in msg for k in keywords)
 
 
+def _circuit_cooldown_sec() -> float:
+    base = float(os.environ.get("PCLOUD_CIRCUIT_BREAKER_COOLDOWN_SEC", "60"))
+    # Längere Pause bei wiederholten Auslösungen (tier 1 → 1×, tier 2 → 2×, …)
+    mult = min(4.0, 2 ** max(0, _throttle_step - 1))
+    return base * mult
+
+
+def _circuit_breaker_trip(*, reason: str, last_error: BaseException | None = None) -> None:
+    global _circuit_state, _circuit_open_until, _throttle_step, _consecutive_transient_errors
+    max_tier = len(_parallelism_multipliers()) - 1
+    _circuit_state = "open"
+    _throttle_step = min(max_tier, _throttle_step + 1)
+    cooldown = _circuit_cooldown_sec()
+    _circuit_open_until = time.time() + cooldown
+    _consecutive_transient_errors = 0
+    _reset_meta_sem()
+    err_hint = f" Last error: {last_error}" if last_error else ""
+    _api_ts_log(
+        f"[circuit-breaker] OPEN ({reason}): pause {cooldown:.0f}s, "
+        f"parallelism tier {_throttle_step}/{max_tier}.{err_hint}"
+    )
+
+
 def _circuit_breaker_check() -> None:
+    """Blockiert bei OPEN bis Cooldown abgelaufen, dann HALF-OPEN-Probe erlauben."""
+    global _circuit_state, _last_circuit_wait_log
     threshold = int(os.environ.get("PCLOUD_CIRCUIT_BREAKER_ERRORS", "12"))
-    with _circuit_breaker_lock:
-        if _consecutive_transient_errors >= threshold:
-            raise RuntimeError(
-                f"API circuit breaker open: {_consecutive_transient_errors} consecutive "
-                f"connection errors (threshold={threshold}). "
-                f"Reduce parallelism (PCLOUD_FOLDER_THREADS) or wait before retry."
-            )
+
+    while True:
+        wait_until: float | None = None
+        with _circuit_breaker_lock:
+            if _circuit_state == "closed":
+                if _consecutive_transient_errors < threshold:
+                    return
+                _circuit_breaker_trip(reason=f"{threshold} consecutive connection errors")
+                wait_until = _circuit_open_until
+            elif _circuit_state == "open":
+                now = time.time()
+                if now >= _circuit_open_until:
+                    _circuit_state = "half_open"
+                    _api_ts_log("[circuit-breaker] HALF-OPEN: probing pCloud API...")
+                    return
+                wait_until = _circuit_open_until
+            elif _circuit_state == "half_open":
+                return
+
+        if wait_until is None:
+            return
+        remaining = wait_until - time.time()
+        if remaining <= 0:
+            continue
+        now = time.time()
+        if now - _last_circuit_wait_log >= 15.0:
+            _last_circuit_wait_log = now
+            _api_ts_log(f"[circuit-breaker] waiting {remaining:.0f}s before retry...")
+        time.sleep(min(remaining, 5.0))
 
 
 def _circuit_breaker_record_success() -> None:
-    global _consecutive_transient_errors
+    global _consecutive_transient_errors, _circuit_state, _recovery_success_streak, _throttle_step
     with _circuit_breaker_lock:
         _consecutive_transient_errors = 0
+        if _circuit_state == "half_open":
+            _circuit_state = "closed"
+            _recovery_success_streak = 0
+            _api_ts_log("[circuit-breaker] CLOSED: half-open probe succeeded")
+            return
+        if _circuit_state != "closed":
+            return
+        streak_need = max(1, int(os.environ.get("PCLOUD_CIRCUIT_RECOVERY_SUCCESSES", "30")))
+        _recovery_success_streak += 1
+        if _throttle_step > 0 and _recovery_success_streak >= streak_need:
+            old = _throttle_step
+            _throttle_step -= 1
+            _recovery_success_streak = 0
+            _reset_meta_sem()
+            _api_ts_log(
+                f"[circuit-breaker] parallelism tier {old} → {_throttle_step} "
+                f"(ramp-up after {streak_need} successes)"
+            )
 
 
 def _circuit_breaker_record_failure(exc: BaseException) -> None:
-    global _consecutive_transient_errors
+    global _consecutive_transient_errors, _circuit_state
     if not is_transient_api_error(exc):
         return
-    threshold = int(os.environ.get("PCLOUD_CIRCUIT_BREAKER_ERRORS", "12"))
     with _circuit_breaker_lock:
         _consecutive_transient_errors += 1
-        n = _consecutive_transient_errors
-    if n >= threshold:
-        raise RuntimeError(
-            f"API circuit breaker tripped after {n} consecutive connection errors. "
-            f"Last error: {exc}"
-        ) from exc
+        if _circuit_state == "half_open":
+            _circuit_breaker_trip(reason="half-open probe failed", last_error=exc)
 
 
 def get_api_retry_count() -> int:
@@ -3289,7 +3384,7 @@ def call_with_backoff(func, *args, attempts: int = 5, max_sleep: float = 60.0, *
         except Exception as e:
             msg = str(e)
             # Harte Fehler → kein Retry
-            if any(x in msg for x in ("1000", "2000", "2008", "Access denied", "circuit breaker")):
+            if any(x in msg for x in ("1000", "2000", "2008", "Access denied")):
                 raise
             if not is_transient_api_error(e):
                 raise
