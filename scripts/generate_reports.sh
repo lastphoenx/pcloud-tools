@@ -315,12 +315,23 @@ get_failed_backups() {
   local result
   result=$(db_query "
     SELECT
-      snapshot_name,
-      $(mdb_ts_sql started_at) AS started_at,
-      COALESCE(duration_sec, 0) AS duration_sec,
-      COALESCE(error_message, '') AS error_message
-    FROM v_failed_backups
-    ORDER BY started_at DESC
+      br.snapshot_name,
+      $(mdb_ts_sql br.started_at) AS started_at,
+      COALESCE(br.duration_sec, 0) AS duration_sec,
+      COALESCE(br.error_message, '') AS error_message
+    FROM backup_runs br
+    WHERE br.status = 'FAILED'
+      AND br.started_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      AND br.error_message IS NOT NULL
+      AND TRIM(br.error_message) != ''
+      AND NOT EXISTS (
+          SELECT 1
+          FROM backup_runs br_ok
+          WHERE br_ok.snapshot_name = br.snapshot_name
+            AND br_ok.status = 'SUCCESS'
+            AND br_ok.started_at > br.started_at
+      )
+    ORDER BY br.started_at DESC
     LIMIT 5;
   " 2>/dev/null || echo "")
 

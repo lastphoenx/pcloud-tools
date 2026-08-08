@@ -129,11 +129,18 @@ SELECT
     finished_at,
     duration_sec,
     error_message
-FROM backup_runs
+FROM backup_runs br
 WHERE status = 'FAILED'
   AND started_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
   AND error_message IS NOT NULL
   AND TRIM(error_message) != ''
+  AND NOT EXISTS (
+      SELECT 1
+      FROM backup_runs br_ok
+      WHERE br_ok.snapshot_name = br.snapshot_name
+        AND br_ok.status = 'SUCCESS'
+        AND br_ok.started_at > br.started_at
+  )
 ORDER BY started_at DESC;
 
 -- Performance statistics (last 30 days)
