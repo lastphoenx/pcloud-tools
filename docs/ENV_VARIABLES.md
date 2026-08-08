@@ -7,6 +7,8 @@ Vollständige Dokumentation aller ENV-Variablen zur Performance-Optimierung und 
 ## 📋 Inhaltsverzeichnis
 
 - [Threading & Parallelität](#threading--parallelität)
+- [Delta-Mode & Scout](#delta-mode--scout)
+- [API-Schonung & Circuit Breaker](#api-schonung--circuit-breaker)
 - [File Size Thresholds](#file-size-thresholds)
 - [Chunking & Resume](#chunking--resume)
 - [Connection & Timeouts](#connection--timeouts)
@@ -54,11 +56,140 @@ PCLOUD_FOLDER_THREADS=8
 **Beschreibung:** Anzahl paralleler Threads für Stub-Writes (JSON-Metadaten).  
 **Default:** `4`  
 **Empfohlen:** `8` (Balance zwischen Speed und API-Stabilität)  
-**Verwendet in:** `pcloud_push_json_manifest_to_pcloud.py`
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`, `pcloud_push_json_manifest_to_pcloud.py`  
+**Hinweis:** Effektive Threads können durch Circuit-Breaker-Tiers reduziert werden (`effective_parallel_workers`).
 
 ```bash
 PCLOUD_STUB_THREADS=8
 ```
+
+### `PCLOUD_STUB_FID_THREADS`
+**Beschreibung:** Parallele Auflösung von Parent-FolderIDs vor Stub-Write (Delta-Upload mit vielen neuen Ordnern, z. B. PBS `.chunks`).  
+**Default:** `PCLOUD_API_META_CONCURRENCY` (6)  
+**Empfohlen (pi-nas):** `6–16` — bei API-Fehlern senkt der Circuit Breaker automatisch (16→12→8).  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_STUB_FID_THREADS=16
+```
+
+### `PCLOUD_DELTA_CLEANUP_THREADS`
+**Beschreibung:** Parallele Threads für Turbo-Delta **Phase 3** (Löschen veralteter Stubs/Ordner).  
+**Default:** `PCLOUD_UPLOAD_THREADS`  
+**Empfohlen:** gleich wie Upload-Threads (z. B. `16`)  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_DELTA_CLEANUP_THREADS=16
+```
+
+### `PCLOUD_DELTA_CLEANUP_PROGRESS_EVERY`
+**Beschreibung:** Fortschritts-Log in Phase 3 alle N abgeschlossenen Lösch-Tasks.  
+**Default:** `500`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_DELTA_CLEANUP_PROGRESS_EVERY=500
+```
+
+---
+
+## Delta-Mode & Scout
+
+### `PCLOUD_SCOUT_ENABLED`
+**Beschreibung:** Scout/Turbo-Delta aktivieren. `0` erzwingt Full-Pool-Mode.  
+**Default:** `1`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_SCOUT_ENABLED=1
+```
+
+### `PCLOUD_SCOUT_THRESHOLD`
+**Beschreibung:** Mindest-Jaccard-Ähnlichkeit (0–1) für Turbo-Delta. Scout bevorzugt chronologischen Vorgänger (`scout_pool_basis`).  
+**Default:** `0.70`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`, `pool_delta_plan.py`
+
+```bash
+PCLOUD_SCOUT_THRESHOLD=0.70
+```
+
+### `PCLOUD_DELTA_PLAN_DELETE_FULL`
+**Beschreibung:** Schwellwert Phase-3-Löschungen für `pool_delta_plan.py`-Empfehlung „FULL“.  
+**Default:** `5000`  
+**Verwendet in:** `scripts/utilities/pool_delta_plan.py`
+
+```bash
+PCLOUD_DELTA_PLAN_DELETE_FULL=5000
+```
+
+### `PCLOUD_COPYFOLDER_TIMEOUT`
+**Beschreibung:** Socket-Timeout (Sekunden) für `copyfolder` (große Snapshots).  
+**Default:** `700` in Code-Fallback; **pi-nas empfohlen:** `2400`  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_COPYFOLDER_TIMEOUT=2400
+```
+
+---
+
+## API-Schonung & Circuit Breaker
+
+Schützt vor Verbindungs-Stürmen während Stub-/FID-Phase. Statt Hard-Stop: **Pause → Half-Open-Probe → schrittweise Parallelitäts-Erhöhung**.
+
+### `PCLOUD_API_META_CONCURRENCY`
+**Beschreibung:** Globales Semaphore-Limit für Meta-API-Calls (`listfolder`, `ensure_path`, …).  
+**Default:** `6`  
+**Verwendet in:** `pcloud_bin_lib.py`
+
+```bash
+PCLOUD_API_META_CONCURRENCY=6
+```
+
+### `PCLOUD_API_META_DELAY`
+**Beschreibung:** Pause **nach jedem** RPC (Sekunden). Default **0.03 = 30 ms**.  
+**Verwendet in:** `pcloud_bin_lib.py`
+
+```bash
+PCLOUD_API_META_DELAY=0.03
+```
+
+### `PCLOUD_CIRCUIT_BREAKER_ERRORS`
+**Beschreibung:** Aufeinanderfolgende Verbindungsfehler bis OPEN (Pause).  
+**Default:** `12`
+
+```bash
+PCLOUD_CIRCUIT_BREAKER_ERRORS=12
+```
+
+### `PCLOUD_CIRCUIT_BREAKER_COOLDOWN_SEC`
+**Beschreibung:** Basis-Pause (Sekunden) nach Auslösung; verdoppelt sich bei wiederholten Trips (Tier 2+).  
+**Default:** `60`
+
+```bash
+PCLOUD_CIRCUIT_BREAKER_COOLDOWN_SEC=60
+```
+
+### `PCLOUD_CIRCUIT_RECOVERY_SUCCESSES`
+**Beschreibung:** Erfolgreiche API-Calls bis Parallelitäts-Tier um eine Stufe hoch (Ramp-up).  
+**Default:** `30`
+
+```bash
+PCLOUD_CIRCUIT_RECOVERY_SUCCESSES=30
+```
+
+### `PCLOUD_CIRCUIT_PARALLELISM_TIERS`
+**Beschreibung:** Multiplikatoren für Thread-Limits (Tier 0/1/2). Bei `16` Threads: `1,0.75,0.5` → 16 / 12 / 8.  
+**Default:** `1,0.75,0.5`
+
+```bash
+PCLOUD_CIRCUIT_PARALLELISM_TIERS=1,0.75,0.5
+```
+
+**Retry-Backoff (`call_with_backoff`):** exponentiell 2 s, 4 s, 8 s, 16 s … (max. `max_sleep`, Stub-Calls oft 30 s), 5 Versuche — unabhängig vom Circuit Breaker.
+
+→ Details: [CHANGELOG_2026-08.md](CHANGELOG_2026-08.md)
 
 ---
 
@@ -265,7 +396,7 @@ Siehe `docs/STORAGE_PATHS.md`.
 **Beschreibung:** Remote Pool-Root auf pCloud (`/_pool`, `/_snapshots` darunter).  
 **Default (Pool-Wrapper):** `/Backup/rtb_pool` — wird im Wrapper gesetzt, fehlt oft in `.env`  
 **Wichtig:** Bei manuellem `source .env` ohne Wrapper **explizit setzen**, sonst landen Delta-Checks unter `/_snapshots` (API-Fehler 2002)  
-**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`, `pcloud_quick_delta.py`, `pool_verify_backup.py`
+**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`, `legacy/pcloud_quick_delta.py`, `pool_verify_backup.py`
 
 ```bash
 PCLOUD_DEST=/Backup/rtb_pool
@@ -336,7 +467,7 @@ PCLOUD_POST_UPLOAD_INTEGRITY=1
 Nicht mehr vom Wrapper verwendet. Tamper-Detect nur noch manuell:
 
 ```bash
-python pcloud_quick_delta.py --dest-root /Backup/rtb_pool --snapshots SNAP
+python legacy/pcloud_quick_delta.py --dest-root /Backup/rtb_pool --snapshots SNAP
 ```
 
 ---

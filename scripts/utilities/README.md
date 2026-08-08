@@ -18,6 +18,8 @@ Alle Utilities haben eine dedizierte Markdown-Dokumentation im gleichen Verzeich
 | `rewrite_stubs_from_index.py` | Stub-Regenerierung aus Index | [→ Docs](rewrite_stubs_from_index.md) |
 | `analyze_manifest_duplicates.py` | Duplikat-Analyse (Excel-Report) | [→ Docs](analyze_manifest_duplicates.md) |
 | `smart_strategy_decision_simulator.py` | Offline-Simulation Smart-Strategy 2.0 | [→ Docs](smart_strategy_decision_simulator.md) |
+| `pool_delta_plan.py` | Catch-up: Delta vs. Full planen (Phase 3/4) | [→ Docs](pool_delta_plan.md) |
+| `pool_audit_status.py` | Remote `.upload_complete` / Catch-up-Status | [→ Docs](pool_audit_status.md) |
 | `setup_venv.sh` / `.ps1` | Virtual Environment Setup | [→ Docs](setup_venv.md) |
 
 ## 🔧 Verwendung
@@ -63,9 +65,10 @@ Details siehe jeweilige `.md`-Dokumentation.
 - rewrite_stubs_from_index.py → Stub-Regenerierung
 - analyze_manifest_duplicates.py → Duplikat-Analyse
 
-**Development:**
+**Development / Planung:**
 - setup_venv.sh / .ps1 → Entwicklungsumgebung
 - smart_strategy_decision_simulator.py → Strategie-Simulation (offline)
+- pool_delta_plan.py → Delta vs. Full für Catch-up (mit `--simulate-catchup`)
 
 ## ⚠️ Hinweise
 

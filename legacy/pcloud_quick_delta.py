@@ -24,6 +24,10 @@ from __future__ import annotations
 import os, sys, json, argparse, time
 from typing import Dict, List, Any, Optional, Set, Tuple
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 try:
     import pcloud_bin_lib as pc
     import pcloud_path_compat as ppc

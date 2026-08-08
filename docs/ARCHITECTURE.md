@@ -1,6 +1,6 @@
 # pCloud-Tools: Architektur & Ablaufkette
 
-> **Stand:** Juni 2026 · **Status:** Production / Stable · **Modus:** Pool-only
+> **Stand:** August 2026 · **Status:** Production / Stable · **Modus:** Pool-only
 
 ---
 
@@ -18,9 +18,9 @@ pCloud-Tools ist eine schlanke, selbst-gehostete Backup-Pipeline, die lokale Rsy
 
 - **Lokale Backups auf dem NAS** — Die Basis aller Snapshots sind lokale Backups mit [rsync-time-backup](https://github.com/laurent22/rsync-time-backup) (`rsync_tmbackup.sh`). Unveränderte Dateien werden als **Hardlinks** gesetzt — gleicher Inode = kein Re-Hash nötig.
 
-- **Orchestrator** — `rtb_pool_wrapper.sh` wird vom systemd-Timer ausgelöst. Er führt zuerst einen rsync Dry-Run durch (Änderungen seit letztem Snapshot?), ruft bei Bedarf `rsync_tmbackup.sh` auf, und startet danach automatisch `wrapper_pcloud_pool_sync_1to1.sh` im Catch-up-Modus. Catch-up: **`latest` zuerst**, dann älteres Backlog chronologisch; ein fehlgeschlagener Backlog-Snapshot blockiert juengere nicht (weiter mit `continue`). Harte Abbrüche nur bei `--upload-only` / explizitem Target.
+- **Orchestrator** — `rtb_pool_wrapper.sh` (Repo `rtb`) wird vom systemd-Timer ausgelöst. Gemeinsamer **NAS Heavy-Ops-Lock** (`/run/backup_pipeline.lock`) mit ClamAV/Entropy-Scans — kein paralleles rsync + pCloud + AV auf `/srv/nas`. Nach RTB: `wrapper_pcloud_pool_sync_1to1.sh` im Catch-up-Modus (**latest zuerst**, dann Backlog).
 
-- **pCloud-Sync** — `wrapper_pcloud_pool_sync_1to1.sh` orchestriert: Manifest-Erstellung, Pool-Upload und Verifikation pro Snapshot. Mit EntropyWatcher Safety-Gate-Check vor dem Backup.
+- **pCloud-Sync** — `wrapper_pcloud_pool_sync_1to1.sh` orchestriert: Manifest-Erstellung, Pool-Upload und Verifikation pro Snapshot. EntropyWatcher Safety-Gate vor dem Backup. MariaDB-Phasen-Logging, OOM-Schutz (`PCLOUD_OOM_SCORE_ADJ`).
 
 ---
 
@@ -55,12 +55,12 @@ Erfasst den Ist-Zustand des lokalen Snapshots: relpath, sha256, size, mtime, ino
 ### Phase 3 — Pool-Upload (`pcloud_push_json_pool_manifest_to_pcloud.py`)
 Wählt automatisch den effizientesten Upload-Modus:
 
-- **Turbo-Delta-Mode**: Der Scout berechnet Jaccard-Similarity zwischen aktuellem Manifest und allen Remote-Snapshots. Bei ≥ 70% wird der beste Basis-Snapshot serverseitig geklont (`copyfolder`) und nur die Differenz hochgeladen. Typischer Lauf mit 50 MB Änderungen: wenige Minuten.
-- **Full-Pool-Mode**: Fallback bei < 70% Similarity (erster Snapshot eines neuen Geräts). Lädt alle nicht-im-Pool-befindlichen Dateien hoch, baut Ordnerstruktur für Stubs auf.
+- **Turbo-Delta-Mode**: Scout (`scout_pool_basis`) wählt chronologischen Vorgänger oder besten Jaccard unter **älteren** Remote-Snaps (nie neuerer Snap als Basis). Bei ≥ 70 % Similarity: `copyfolder` + Diff. Phase 3 Cleanup parallel (`PCLOUD_DELTA_CLEANUP_THREADS`).
+- **Full-Pool-Mode**: Fallback bei < 70 % Similarity oder Scout deaktiviert. Delta-Fehler → Full mit `use_scout=False` (keine Rekursion).
 
 Nach dem Upload: Post-Upload-Validation (100% Coverage: Pool-SHAs + Stubs per Batch-`stat()`, Index-Konsistenz via `pool_refs`). RAM-begrenzt — kein rekursives `listfolder` mehr. Nur bei erfolgreicher Validation wird `.upload_complete` gesetzt; danach Index-Upload (lokal auf SSD, resumable).
 
-### Phase 4 — tamper-detect (`pcloud_quick_delta.py`)
+### Phase 4 — tamper-detect (`legacy/pcloud_quick_delta.py` oder `pool_integrity_run.py`)
 Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Prüft pro SHA256: fileid, pcloud_hash, size, Stub-Existenz. Erkennt fehlende Pool-Objekte und Abweichungen. **Verwaiste Pool-Objekte** (physisch in `_pool/`, nicht in `pool_refs`) sind GC-Hinweise — kein kritischer Pipeline-Fehler (Juni 2026).
 
 ---
@@ -71,11 +71,11 @@ Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Pr
 
 | Tool | Zweck |
 |---|---|
-| `pcloud_bin_lib.py` | Zentrale API-Bibliothek: Verbindung, Error-Handling, `copyfolder`, chunked Upload, REST `delete_file`/`delete_folder`, Pool-Pfad- und Metadaten-Helfer |
-| `wrapper_pcloud_pool_sync_1to1.sh` | Orchestrator: Lock, Logging, MariaDB-Tracking, Catch-up-Loop |
+| `pcloud_bin_lib.py` | Zentrale API-Bibliothek: Verbindung, Circuit Breaker (Cooldown/Half-Open), `copyfolder`, chunked Upload, `scout_pool_basis` |
+| `wrapper_pcloud_pool_sync_1to1.sh` | Orchestrator: NAS-Lock, Logging, MariaDB-Tracking, Catch-up-Loop |
 | `pcloud_json_pool_manifest.py` | Manifest-Erstellung (Schema v4): SHA256, Smart-Mode, inode-Cache |
 | `pcloud_push_json_pool_manifest_to_pcloud.py` | Pool-Upload: Scout, Turbo-Delta, Full-Pool, Validation, Index-Management |
-| `pcloud_quick_delta.py` | tamper-detect: v2-Index (pool_refs), Pool-Objekte, Stubs |
+| `legacy/pcloud_quick_delta.py` | tamper-detect CLI (1to1 + manuell Pool); Wrapper nutzt `pool_integrity_run.py` |
 | `pcloud_pool_gc.py` | Garbage Collection: entfernt Pool-Objekte ohne Index-Referenz (REST-Delete via Lib, Grace Period) |
 
 ### Wartung & Diagnose (Manuell)
@@ -83,6 +83,7 @@ Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Pr
 | Tool | Zweck |
 |---|---|
 | `scripts/utilities/pool_check_remote.py` | Read-only: .upload_complete, Stub-Anzahl, Pool-SHAs |
+| `scripts/utilities/pool_delta_plan.py` | Offline: Delta vs. Full planen, Catch-up-Simulation |
 | `scripts/utilities/pool_verify_backup.py` | Vollständiger Integritätscheck: Manifest→Pool (SHA-Set), Manifest→Stubs (100%), optional Stub-Inhalt |
 | `scripts/utilities/pool_rebuild_index_v2.py` | Rebuild des v2-Index aus lokalen Manifesten × Remote-Pool |
 | `scripts/utilities/pool_archive_index.py` | Erzeugt gefilterte per-Snapshot-Archivindizes |
@@ -129,7 +130,7 @@ _snapshots/
 ```mermaid
 flowchart TD
     Start[Start Phase 3] --> Scout{Scout: Similarity\nzum besten Remote-Snap?}
-    Scout -- ">= 70%" --> Turbo[Turbo-Delta-Mode:\ncopyfolder(basis) + Diff\n→ nur Deltas uploaden]
+    Scout -- ">= 70%" --> Turbo[Turbo-Delta-Mode:\ncopyfolder(chrono basis) + Diff\nPhase 3 parallel]
     Scout -- "< 70%" --> Full[Full-Pool-Mode:\nPool-Preflight + Delta-SHAs\n→ Upload + Ordnerstruktur]
     Turbo --> Validate[Post-Upload-Validation\n100% Stub-Check, Pool-SHA, Index]
     Full --> Validate
@@ -165,6 +166,9 @@ $CLEAN_CALL /opt/apps/entropywatcher/main/entropywatcher.py --env nas status
 2. `safety_gate.sh` startet `entropywatcher.py` mit `env -u`
 3. Statusabfrage funktioniert → Safety-Gate gibt Exitcode 0/1/2
 
-Verwandte Komponenten: `rtb_pool_wrapper.sh`, `safety_gate.sh` (EntropyWatcher-Repo).
+Verwandte Komponenten: `rtb_pool_wrapper.sh`, `nas_heavy_ops_lock.sh` (rtb-Repo), `safety_gate.sh` (EntropyWatcher-Repo).
+
+→ Cross-Repo-Betrieb: Doku-Repo `doku/Raspi/raspinas/pcloud-tools/OPERATIONS_2026-08.md`  
+→ Änderungslog: [CHANGELOG_2026-08.md](CHANGELOG_2026-08.md)
 
 ---

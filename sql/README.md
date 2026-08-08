@@ -407,7 +407,7 @@ DEALLOCATE PREPARE stmt;
 
 ## Related Documentation
 
-- **Wrapper Script**: `wrapper_pcloud_sync_1to1.sh` (database integration code)
+- **Wrapper Script**: `legacy/wrapper_pcloud_sync_1to1.sh` (database integration code)
 - **Health Check**: `pcloud_health_check.sh` (queries this database)
 - **Dashboard**: `dashboard/index.html` (displays backup statistics)
 - **Main README**: `../README.md` (overall project documentation)
