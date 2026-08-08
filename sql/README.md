@@ -81,7 +81,34 @@ sudo /opt/apps/pcloud-tools/main/scripts/generate_reports.sh
 
 `memory-limit.conf`: **kein** `RuntimeWatchdogSec` in `[Service]` (ungueltig). Nur `MemoryMax`/`MemorySwapMax`.
 
-### Dashboard einmalig bereinigen (stale-Meldungen, Reconcile)
+### Dashboard / DB bereinigen (empfohlen)
+
+Ein Skript fuer alles: RUNNING-Zombies, Reconcile, superseded FAILED entfernen, View aktualisieren.
+
+```bash
+systemctl is-active backup-pipeline.service   # muss inactive sein
+cd /opt/apps/pcloud-tools/main
+sudo git pull
+sudo ./scripts/maintenance_db_cleanup.sh
+```
+
+Optional Historie >90 Tage loeschen:
+
+```bash
+sudo ./scripts/maintenance_db_cleanup.sh --purge-90d
+```
+
+Manuell nur SQL:
+
+```bash
+sudo mysql pcloud_backup < sql/maintenance_db_cleanup.sql
+sudo scripts/generate_reports.sh
+sudo systemctl restart monitoring-dashboard.service
+```
+
+**Warum „Letzte Fehler (7d)“ alte Snapshots zeigt:** Oft fehlt die aktuelle `v_failed_backups`-View (7-Tage-Filter) auf dem NAS, oder ein alter `FAILED`-Lauf steht noch in der DB obwohl der Snapshot spaeter `SUCCESS` wurde. Das Maintenance-Skript behebt beides.
+
+### Dashboard einmalig bereinigen (legacy)
 
 ```bash
 systemctl is-active backup-pipeline.service   # inactive
@@ -90,9 +117,9 @@ sudo scripts/generate_reports.sh
 sudo systemctl restart monitoring-dashboard.service
 ```
 
-Setzt `FAILED`+`integrity_status=OK` auf `SUCCESS` und entfernt `stale RUNNING bereinigt` aus `error_message`.
+Setzt `FAILED`+`integrity_status=OK` auf `SUCCESS` und entfernt `stale RUNNING bereinigt` aus `error_message`. **Besser:** `maintenance_db_cleanup.sh` (siehe oben).
 
-Danach View-Update (Dashboard „Letzte Fehler“ ohne leere Zombie-Eintraege):
+Danach View-Update (falls nur View fehlt):
 
 ```bash
 sudo mysql pcloud_backup < sql/migrate_failed_backups_view_v4.sql
@@ -346,6 +373,10 @@ SELECT * FROM backup_runs WHERE run_id LIKE 'backfill-%';
 ---
 
 ## Maintenance
+
+### `maintenance_db_cleanup.sql` / `scripts/maintenance_db_cleanup.sh`
+
+Periodische Bereinigung: RUNNING-Zombies, Reconcile (`integrity_status=OK`), superseded FAILED loeschen, `v_failed_backups` aktualisieren. Siehe Abschnitt **Dashboard / DB bereinigen** oben.
 
 ### Clean Old Entries (>90 days)
 

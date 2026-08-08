@@ -1,5 +1,8 @@
 -- Einmalige Dashboard-/DB-Bereinigung (pi-nas 2026-06-23)
 --
+-- DEPRECATED: Bitte sql/maintenance_db_cleanup.sql bzw.
+--   scripts/maintenance_db_cleanup.sh verwenden.
+--
 -- 1) "stale RUNNING bereinigt" aus error_message entfernen (Letzte Fehler-Liste)
 -- 2) FAILED-Laeufe mit integrity_status=OK -> SUCCESS (Upload war fertig, nur DB-Zombie)
 --
