@@ -947,7 +947,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
         _log_fid_progress(_cache_hits, force=True)
 
     if parents_to_resolve and not dry:
-        fid_threads = max(
+        fid_base = max(
             1,
             int(
                 os.environ.get(
@@ -957,9 +957,10 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                 or "6"
             ),
         )
+        fid_threads = pc.effective_parallel_workers(fid_base)
         _log(
             f"[stubs] {len(parents_to_resolve)} Parent(s) parallel auflösen "
-            f"({fid_threads} Threads, nach Pfadtiefe)..."
+            f"({fid_threads}/{fid_base} Threads, nach Pfadtiefe)..."
         )
 
         def _parent_depth(parent_path: str) -> int:
@@ -983,9 +984,10 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
 
         for depth in sorted(by_depth.keys()):
             batch = by_depth[depth]
+            fid_workers = pc.effective_parallel_workers(fid_base)
             _log(
                 f"[stubs] Parent-FIDs Tiefe {depth}: {len(batch)} Ordner "
-                f"({fid_threads} Threads)..."
+                f"({fid_workers}/{fid_base} Threads)..."
             )
 
             def _apply_parent_result(parent: str, fid: Optional[int], err: Optional[BaseException]) -> None:
@@ -1007,8 +1009,8 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
                     done = _cache_hits + _cache_misses + _parents_failed
                 _log_fid_progress(done)
 
-            if fid_threads > 1 and len(batch) > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=fid_threads) as ex:
+            if fid_workers > 1 and len(batch) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=fid_workers) as ex:
                     futs = [ex.submit(_resolve_one, p) for p in batch]
                     for fut in concurrent.futures.as_completed(futs):
                         parent, fid, err = fut.result()
@@ -1056,11 +1058,12 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     if not tasks:
         return
 
-    threads = int(os.environ.get("PCLOUD_STUB_THREADS", "4") or "4")
+    stub_base = max(1, int(os.environ.get("PCLOUD_STUB_THREADS", "4") or "4"))
+    threads = pc.effective_parallel_workers(stub_base)
     total_tasks = len(tasks)
     
     # Start-Meldung
-    _log(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads} Threads...")
+    _log(f"[stubs] Starte Batch-Write: {total_tasks} Stubs mit {threads}/{stub_base} Threads...")
 
     def _upload_one(args: tuple[str, str, dict]):
         nonlocal _stubs_written, _stubs_failed, _last_progress_pct
