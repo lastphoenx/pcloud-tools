@@ -315,13 +315,18 @@ remote_has_snapshots() {
 remote_snapshot_exists() {
   local snapname="$1"
   local marker_path="${PCLOUD_DEST}/_snapshots/${snapname}/.upload_complete"
-  
-  # Prüfe EXPLIZIT ob .upload_complete Marker existiert (REST API, zuverlässig)
+
+  # YES = Marker da | NO = fehlt/ungueltig | ERR:... = API/Netzwerk (nicht „fehlt“)
   local result
-  result=$(MARKER_PATH="$marker_path" SNAPNAME="$snapname" "${PY}" - <<'PY' 2>/dev/null
+  result=$(MARKER_PATH="$marker_path" SNAPNAME="$snapname" "${PY}" - <<'PY'
 import os, sys
 sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
+
+def _emit_err(exc: BaseException) -> None:
+    msg = str(exc).replace("\n", " ").replace("\t", " ")[:240]
+    print(f"ERR:{type(exc).__name__}: {msg}")
+
 try:
     cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
     marker_path = os.environ.get("MARKER_PATH")
@@ -330,11 +335,71 @@ try:
         print("YES")
     else:
         print("NO")
-except Exception:
-    print("NO")
+except Exception as e:
+    _emit_err(e)
 PY
 )
   echo "$result"
+}
+
+# Nach build_and_push: complete | missing | api_unreachable
+confirm_remote_upload_complete() {
+  local snapname="$1"
+  local max_attempts="${PCLOUD_MARKER_VERIFY_RETRIES:-5}"
+  local delay="${PCLOUD_MARKER_VERIFY_RETRY_SEC:-2}"
+  local attempt=1
+  local result=""
+
+  while [[ $attempt -le $max_attempts ]]; do
+    result="$(remote_snapshot_exists "$snapname")"
+    case "$result" in
+      YES)
+        echo "complete"
+        return 0
+        ;;
+      NO)
+        echo "missing"
+        return 0
+        ;;
+      ERR:*)
+        if [[ $attempt -lt $max_attempts ]]; then
+          _log WARN "pCloud API nicht erreichbar (.upload_complete-Check ${snapname}, ${attempt}/${max_attempts}): ${result#ERR:}"
+          sleep "$delay"
+          if [[ $delay -lt 30 ]]; then delay=$(( delay * 2 )); fi
+          attempt=$(( attempt + 1 ))
+        else
+          _log WARN "pCloud API nach ${max_attempts} Versuchen nicht erreichbar (${snapname}): ${result#ERR:}"
+          _log WARN "Upload/Inline-Validation war erfolgreich; Marker-Check uebersprungen (kein False-FAIL)."
+          echo "api_unreachable"
+          return 0
+        fi
+        ;;
+      *)
+        _log WARN "Unerwartete Antwort remote_snapshot_exists (${snapname}): ${result}"
+        echo "api_unreachable"
+        return 0
+        ;;
+    esac
+  done
+}
+
+# 0 = OK (Marker da oder API nach Retries unklar), 1 = Marker wirklich fehlt
+_handle_upload_complete_check() {
+  local snapname="$1"
+  local verdict
+  verdict="$(confirm_remote_upload_complete "$snapname")"
+  case "$verdict" in
+    complete) return 0 ;;
+    api_unreachable) return 0 ;;
+    missing)
+      _log ERROR "Upload von ${snapname} scheinbar fertig, aber .upload_complete fehlt auf pCloud!"
+      return 1
+      ;;
+    *)
+      _log WARN "Upload von ${snapname}: unbekannter Marker-Check-Status: ${verdict}"
+      return 0
+      ;;
+  esac
 }
 
 local_snapshot_names() {
@@ -682,8 +747,8 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
   for s in "${SNAPS[@]}"; do
     build_and_push "$RTB/$s" || exit 1
     # Harte Verifikation: Marker muss auf pCloud sein (im Dry-Run uebersprungen)
-    if [[ "$DRY_RUN" != "1" && "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-      _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud! Markiere als FAILED."
+    if [[ "$DRY_RUN" != "1" ]] && ! _handle_upload_complete_check "$s"; then
+      _log ERROR "Markiere als FAILED."
       exit 1
     fi
   done
@@ -752,8 +817,7 @@ for s in "${missing_snaps[@]}"; do
     continue
   fi
   # Im Dry-Run wird nichts hochgeladen -> kein .upload_complete -> Verify ueberspringen
-  if [[ "$DRY_RUN" != "1" && "$(remote_snapshot_exists "$s")" == "NO" ]]; then
-    _log ERROR "Upload von $s scheinbar fertig, aber .upload_complete fehlt auf pCloud!"
+  if [[ "$DRY_RUN" != "1" ]] && ! _handle_upload_complete_check "$s"; then
     if [[ -n "$TARGET_SNAPSHOT" ]]; then
       exit 1
     fi

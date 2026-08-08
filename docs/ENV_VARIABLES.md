@@ -463,6 +463,16 @@ PCLOUD_POST_UPLOAD_INTEGRITY=1
 # PCLOUD_POST_UPLOAD_INTEGRITY=skip
 ```
 
+### `PCLOUD_MARKER_VERIFY_RETRIES` / `PCLOUD_MARKER_VERIFY_RETRY_SEC`
+**Beschreibung:** Nach erfolgreichem Upload prüft der Wrapper per API, ob `.upload_complete` auf pCloud existiert. Bei API-/DNS-Fehlern wird retried; danach kein False-FAIL („Marker fehlt“), sondern Warnung und weicher OK-Exit (Upload hatte bereits inline-Validation).  
+**Default:** `5` Versuche, Start-Pause `2` s (exponentiell bis max. 30 s)  
+**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`
+
+```bash
+PCLOUD_MARKER_VERIFY_RETRIES=5
+PCLOUD_MARKER_VERIFY_RETRY_SEC=2
+```
+
 ### `PCLOUD_POST_UPLOAD_DELTA` (deprecated)
 Nicht mehr vom Wrapper verwendet. Tamper-Detect nur noch manuell:
 

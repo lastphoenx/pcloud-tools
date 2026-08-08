@@ -130,7 +130,15 @@ cd /opt/apps/entropywatcher/main && git pull origin main   # falls Scan-Units ak
 
 ---
 
-## 8. Commit-Referenzen (Auswahl)
+## 8. Wrapper: `.upload_complete`-Check vs. API-Ausfall
+
+**Problem:** Kurzer DNS-/API-Ausfall nach erfolgreichem Upload → `remote_snapshot_exists` gab `NO` zurück → fälschlich „`.upload_complete` fehlt“ und Exit 1, obwohl Marker gesetzt war.
+
+**Lösung:** `YES` / `NO` / `ERR:…` unterscheiden, Retries (`PCLOUD_MARKER_VERIFY_RETRIES`), danach weicher OK mit Warnung statt False-FAIL.
+
+---
+
+## 9. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
