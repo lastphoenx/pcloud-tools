@@ -520,18 +520,20 @@ build_and_push() {
   if [[ "$DRY_RUN" == "1" ]]; then
     _log INFO "Integrity verification uebersprungen (--dry-run)"
   else
-  _integrity_mode="${PCLOUD_POST_UPLOAD_INTEGRITY:-1}"
+  _integrity_mode="${PCLOUD_POST_UPLOAD_INTEGRITY:-skip}"
   case "${_integrity_mode,,}" in
-    0|skip|off|false|no)
-      _integrity_mode=skip
+    1|run|on|true|yes)
+      _integrity_mode=run
       ;;
     *)
-      _integrity_mode=run
+      _integrity_mode=skip
       ;;
   esac
 
   if [[ "$_integrity_mode" == "skip" ]]; then
-    _log INFO "Post-upload integrity uebersprungen (PCLOUD_POST_UPLOAD_INTEGRITY=skip)"
+    _log INFO "Wrapper-Verify uebersprungen (Integrity-Gate laeuft im Push-Skript)"
+    _db_phase_log "verify" "start"
+    _db_phase_log "verify" "end" "SUCCESS"
   else
   _log INFO "Starting integrity verification (snapshot=$SNAPNAME)..."
   local integrity_report="${PCLOUD_ARCHIVE_DIR}/integrity/integrity_${SNAPNAME}_pending.json"

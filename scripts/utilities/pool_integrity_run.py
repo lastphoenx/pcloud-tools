@@ -43,6 +43,7 @@ def run_integrity_for_snapshot(
     verbose: bool = True,
     no_db: bool = False,
     json_out: Optional[str] = None,
+    prefilled_result: Optional[Dict[str, Any]] = None,
 ) -> tuple[bool, Dict[str, Any]]:
     """Einzel-Snapshot-Integrity inkl. Report + DB. Fuer Batch mit remote_cache."""
     archive = env.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
@@ -64,25 +65,28 @@ def run_integrity_for_snapshot(
         print()
 
     t0 = time.time()
-    try:
-        result: Dict[str, Any] = run_verify(
-            cfg,
-            pool_root_raw=pool_root,
-            manifests_dir=manifests_dir,
-            snapshot_filter=[snapshot],
-            stub_sample=stub_sample,
-            verbose=verbose,
-            remote_cache=remote_cache,
-        )
-    except Exception as e:
-        result = {
-            "ok": False,
-            "issues": 1,
-            "error": str(e),
-            "error_summary": str(e),
-            "duration_sec": round(time.time() - t0, 2),
-        }
-        print(f"[FAIL] verify exception: {e}", file=sys.stderr)
+    if prefilled_result is not None:
+        result = dict(prefilled_result)
+    else:
+        try:
+            result = run_verify(
+                cfg,
+                pool_root_raw=pool_root,
+                manifests_dir=manifests_dir,
+                snapshot_filter=[snapshot],
+                stub_sample=stub_sample,
+                verbose=verbose,
+                remote_cache=remote_cache,
+            )
+        except Exception as e:
+            result = {
+                "ok": False,
+                "issues": 1,
+                "error": str(e),
+                "error_summary": str(e),
+                "duration_sec": round(time.time() - t0, 2),
+            }
+            print(f"[FAIL] verify exception: {e}", file=sys.stderr)
 
     result["check_type"] = check_type
     result["snapshot"] = snapshot

@@ -1542,6 +1542,152 @@ def validate_pool_snapshot(cfg: dict, snapshot_dir: str, pool_root: str, manifes
     return (True, [])
 
 
+def _import_pool_integrity_utils():
+    _util = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "utilities")
+    if _util not in sys.path:
+        sys.path.insert(0, _util)
+    from pool_verify_backup import run_verify  # noqa: WPS433
+    from pool_integrity_run import run_integrity_for_snapshot  # noqa: WPS433
+    return run_verify, run_integrity_for_snapshot
+
+
+def _push_env_for_integrity() -> Dict[str, Any]:
+    return {k: v for k, v in os.environ.items() if k.startswith("PCLOUD_")}
+
+
+def _run_listfolder_integrity_gate(
+    cfg: dict,
+    manifest: dict,
+    dest_root: str,
+    snapshot_name: str,
+    *,
+    dry: bool = False,
+) -> None:
+    """
+    Hartes Post-Upload-Gate (listfolder, ~30–60s).
+    Optional Pool-Backfill wie bei validate_pool_snapshot (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX).
+    """
+    if dry:
+        _log("[integrity-gate] (dry-run) uebersprungen")
+        return
+
+    run_verify, run_integrity_for_snapshot = _import_pool_integrity_utils()
+    dest_root = pc._norm_remote_path(dest_root).rstrip("/")
+    pool_root = f"{dest_root}/_pool"
+    archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    manifests_dir = os.path.join(archive, "manifests")
+    integrity_report = os.path.join(archive, "integrity", f"integrity_{snapshot_name}_pending.json")
+    env = _push_env_for_integrity()
+    backup_run_id = os.environ.get("RUN_ID") or None
+
+    _log("[integrity-gate] Post-Upload Integritaet (listfolder)...")
+    t0 = time.time()
+
+    result = run_verify(
+        cfg,
+        pool_root_raw=dest_root,
+        manifests_dir=manifests_dir,
+        snapshot_filter=[snapshot_name],
+        verbose=True,
+    )
+
+    if not result.get("ok"):
+        snap_res = (result.get("manifest_vs_pool") or {}).get("per_snapshot", {}).get(snapshot_name, {})
+        missing_shas = set(snap_res.get("missing_shas") or [])
+        stub_miss = int((result.get("stubs_vs_index") or {}).get("manifest_missing_total") or 0)
+        try:
+            repair_max = int(os.environ.get("PCLOUD_VALIDATE_POOL_BACKFILL_MAX", "50"))
+        except (TypeError, ValueError):
+            repair_max = 50
+
+        if missing_shas and stub_miss == 0 and 0 < len(missing_shas) <= repair_max:
+            _log(f"[integrity-gate] Pool-Backfill: {len(missing_shas)} fehlende SHA(s)...")
+            filled, bf_errs = _backfill_missing_pool_shas(
+                cfg, dest_root, pool_root, manifest, missing_shas, dry=False,
+            )
+            for err in bf_errs[:5]:
+                _log(f"[integrity-gate][backfill] {err}")
+            if filled:
+                _log(f"[integrity-gate] Backfill: {filled} nachgeladen — erneuter Check...")
+                result = run_verify(
+                    cfg,
+                    pool_root_raw=dest_root,
+                    manifests_dir=manifests_dir,
+                    snapshot_filter=[snapshot_name],
+                    verbose=True,
+                )
+
+    if not result.get("ok"):
+        summary = result.get("error_summary") or result.get("error") or "integrity failed"
+        _log(f"[integrity-gate][ERROR] Complete-Marker wird NICHT gesetzt")
+        _log(f"[integrity-gate][ERROR] {summary}")
+        try:
+            import tempfile as _tf
+            _fail_idx = os.path.join(
+                os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir()),
+                f"pcloud_pool_index_{snapshot_name}.json",
+            )
+            if os.path.exists(_fail_idx):
+                os.remove(_fail_idx)
+        except Exception:
+            pass
+        raise RuntimeError(f"Integrity-Gate fehlgeschlagen: {summary}")
+
+    _log(f"[integrity-gate] ✓ OK ({time.time() - t0:.1f}s)")
+
+    ok, _ = run_integrity_for_snapshot(
+        env=env,
+        cfg=cfg,
+        pool_root=dest_root,
+        snapshot=snapshot_name,
+        check_type="post_upload",
+        backup_run_id=backup_run_id,
+        verbose=False,
+        json_out=integrity_report,
+        prefilled_result=result,
+    )
+    if not ok:
+        raise RuntimeError("Integrity-Gate: Report/DB-Persistierung fehlgeschlagen")
+
+
+def _post_upload_gate(
+    cfg: dict,
+    manifest: dict,
+    dest_root: str,
+    snapshot_name: str,
+    dest_snapshot_dir: str,
+    pool_root: str,
+    index: dict,
+    *,
+    dry: bool = False,
+    mode_label: str = "pool",
+) -> None:
+    """
+    Post-Upload-Gate vor .upload_complete.
+    Default: listfolder-Integrity (schnell). Legacy: PCLOUD_VALIDATE_UPLOAD=1 (stat, langsam).
+    """
+    if dry:
+        return
+
+    if os.environ.get("PCLOUD_VALIDATE_UPLOAD", "0") == "1":
+        _log(f"[{mode_label}] Post-Upload Validation (legacy stat, PCLOUD_VALIDATE_UPLOAD=1)...")
+        is_valid, validation_errors = validate_pool_snapshot(
+            cfg, dest_snapshot_dir, pool_root, manifest, index, dry=dry,
+        )
+        if not is_valid:
+            _log(f"[{mode_label}][ERROR] Validation fehlgeschlagen: {len(validation_errors)} Fehler!")
+            _log(f"[{mode_label}][ERROR] Complete-Marker wird NICHT gesetzt")
+            for err in validation_errors[:5]:
+                _log(f"[{mode_label}][ERROR]   {err}")
+            raise RuntimeError(
+                f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden"
+            )
+        _log(f"[{mode_label}] ✓ Validation erfolgreich (legacy stat)")
+        return
+
+    _run_listfolder_integrity_gate(cfg, manifest, dest_root, snapshot_name, dry=dry)
+
+
 # ==============================================================================
 # LOCK-FILE MANAGEMENT (Race-Condition Protection)
 # ==============================================================================
@@ -2443,33 +2589,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         "basis": basis_snapshot_name,
     }
 
-    validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
-    if validation_enabled and not dry:
-        _log("[delta-mode] Starte Post-Upload Validation...")
-        is_valid, validation_errors = validate_pool_snapshot(cfg, dest_snapshot_dir, pool_root, manifest, index, dry=dry)
-        
-        if not is_valid:
-            _log(f"[delta-mode][ERROR] Validation fehlgeschlagen: {len(validation_errors)} Fehler!")
-            _log("[delta-mode][ERROR] Complete-Marker wird NICHT gesetzt (inkonsistenter Snapshot)")
-            for err in validation_errors[:5]:  # Erste 5 Fehler zeigen
-                _log(f"[delta-mode][ERROR]   {err}")
-            # Index-Checkpoint verwerfen (duerfte ohne .upload_complete nie persistiert sein)
-            try:
-                import tempfile as _tf
-                _fail_idx = os.path.join(os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir()),
-                                         f"pcloud_pool_index_{snapshot_name}.json")
-                if os.path.exists(_fail_idx):
-                    os.remove(_fail_idx)
-            except Exception:
-                pass
-            raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
-        else:
-            _log("[delta-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
-            _finalize_after_validation_delta(
-                cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry
-            )
-    elif not validation_enabled:
-        _log("[delta-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
+    if not dry:
+        _post_upload_gate(
+            cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
+            dry=dry, mode_label="delta-mode",
+        )
         _finalize_after_validation_delta(
             cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry
         )
@@ -3434,25 +3558,12 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 except Exception as e:
                     print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
         
-        # === POST-UPLOAD VALIDATION (User-Request: Konsistenz-Check VOR Complete-Marker!) ===
-        validation_enabled = os.environ.get("PCLOUD_VALIDATE_UPLOAD", "1") != "0"
-        if validation_enabled and not dry:
-            _log("[pool-mode] Starte Post-Upload Validation...")
-            is_valid, validation_errors = validate_pool_snapshot(cfg, dest_snapshot_dir, pool_root, manifest, index, dry=dry)
-            
-            if not is_valid:
-                _log(f"[pool-mode][ERROR] Validation fehlgeschlagen: {len(validation_errors)} Fehler!")
-                _log("[pool-mode][ERROR] Complete-Marker wird NICHT gesetzt (inkonsistenter Snapshot)")
-                for err in validation_errors[:5]:  # Erste 5 Fehler zeigen
-                    _log(f"[pool-mode][ERROR]   {err}")
-                
-                # KRITISCH: Upload ist fehlerhaft, kein Complete-Marker!
-                raise RuntimeError(f"Snapshot-Validation fehlgeschlagen: {len(validation_errors)} Fehler gefunden")
-            else:
-                _log("[pool-mode] ✓ Validation erfolgreich - Snapshot ist konsistent")
-        elif not validation_enabled:
-            _log("[pool-mode] Validation übersprungen (PCLOUD_VALIDATE_UPLOAD=0)")
-        
+        if not dry:
+            _post_upload_gate(
+                cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
+                dry=dry, mode_label="pool-mode",
+            )
+
         # === COMPLETE-MARKER SETZEN (wie Original!) ===
         if not dry:
             try:
