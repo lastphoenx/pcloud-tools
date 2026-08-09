@@ -186,7 +186,7 @@ pcloud_json_pool_manifest.py \
   [--ref-manifest /srv/pcloud-archive/manifests/<prev>.json]
 ```
 
-**Smart-Mode** (`--ref-manifest` oder Auto-Pick via `--pick-ref-manifest`): nutzt `mtime + size + inode` eines archivierten Manifests als SHA256-Cache. Der Wrapper wählt automatisch den Kandidaten mit höchster **mtime/size-Deckung** zum Ziel-Snapshot (alle Archive-Manifeste, auch chronologisch neuere). Nur geänderte Dateien werden neu gehasht (~40× schneller bei inkrementellen Backups).
+**Smart-Mode** (`--ref-manifest` oder `--auto-ref-manifest`): SHA256-Cache via mtime/size+inode. Auto-Pick wählt nach dem Scan bis zu 6 chronologisch nächste Archiv-Manifeste und nimmt die beste Deckung — **ein Walk**, kein separates Vorab-Scoring.
 
 `ReferenceCache.lookup()`:
 1. Gleicher `relpath` + gleiche `mtime` + gleiche `size` → SHA aus Cache
