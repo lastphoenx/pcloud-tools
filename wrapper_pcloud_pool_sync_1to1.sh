@@ -805,6 +805,16 @@ if [[ -z "$TARGET_SNAPSHOT" && ${#missing_snaps[@]} -gt 1 ]]; then
   fi
 fi
 
+# Catch-up-Drossel: pro Pipeline-Lauf max. N Snaps (Default 1). 0 = unbegrenzt. Explizites Target ausgenommen.
+if [[ -z "$TARGET_SNAPSHOT" ]]; then
+  _catchup_max="${PCLOUD_CATCHUP_MAX_PER_RUN:-1}"
+  if [[ "$_catchup_max" =~ ^[0-9]+$ ]] && (( _catchup_max > 0 )) && (( ${#missing_snaps[@]} > _catchup_max )); then
+    _rest=$(( ${#missing_snaps[@]} - _catchup_max ))
+    _log INFO "Catch-up limit: ${_catchup_max} von ${#missing_snaps[@]} Snapshot(s) diesmal (${_rest} später, PCLOUD_CATCHUP_MAX_PER_RUN)"
+    missing_snaps=("${missing_snaps[@]:0:_catchup_max}")
+  fi
+fi
+
 for s in "${missing_snaps[@]}"; do
   _log INFO "Uploading missing snapshot: $s"
   if ! build_and_push "$RTB/$s"; then
