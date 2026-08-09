@@ -451,12 +451,12 @@ build_and_push() {
 
   # Prüfe ob Manifest bereits vollständig vorhanden
   if [[ -f "$mani" ]]; then
-    # Manifest existiert - prüfe ob gültig
-    if jq -e '.items' "$mani" >/dev/null 2>&1; then
+    # Manifest existiert - items-Array muss mindestens 1 Eintrag haben
+    if jq -e '(.items | type == "array") and ((.items | length) > 0)' "$mani" >/dev/null 2>&1; then
       manifest_exists=1
-      _log INFO "✓ Verwende existierendes Manifest: $(basename "$mani")"
+      _log INFO "✓ Verwende existierendes Manifest: $(basename "$mani") ($(jq '.items | length' "$mani") Items)"
     else
-      _log INFO "⚠ Manifest existiert aber ist ungültig - neu generieren"
+      _log INFO "⚠ Manifest leer oder ungültig (items=0) - neu generieren"
       rm -f "$mani"
     fi
   elif [[ -f "$mani_jsonl" ]]; then

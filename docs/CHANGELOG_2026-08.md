@@ -213,6 +213,22 @@ Stubs → [integrity-gate] pool_verify_backup (listfolder)
 
 ---
 
+## 13. Manifest: leeres `items[]` verhindert (9. Aug 2026, Abend)
+
+**Symptom:** Manifest-Scan 116k Dateien, Push liest `0 Files` → `ZeroDivisionError` → `upload_failed`.
+
+**Ursache:** JSONL-Streaming schrieb Items in `.tmp.jsonl`, Finalize fehlte/fiel durch → Fallback schrieb `items: []`. Wrapper akzeptierte leeres Array (`jq -e '.items'`).
+
+**Fix:**
+
+| Datei | Änderung |
+|-------|----------|
+| `pcloud_json_pool_manifest.py` | Fehler wenn JSONL fehlt oder Finalize 0 Items |
+| `wrapper_pcloud_pool_sync_1to1.sh` | Manifest gültig nur wenn `items \| length > 0` |
+| `pcloud_push_json_pool_manifest_to_pcloud.py` | Klare Meldung statt `ZeroDivisionError` bei 0 Files |
+
+---
+
 ## 13. Dashboard / DB-Wartung
 
 **Problem:** Dashboard „Letzte Fehler (7d)“ zeigte alte FAILED-Einträge, obwohl Snapshots später erfolgreich waren.

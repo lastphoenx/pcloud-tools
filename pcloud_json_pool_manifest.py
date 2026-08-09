@@ -590,7 +590,14 @@ def main() -> None:
         _log(f"[stats] total={total_files} | mode={mode} (kein Cache)")
 
     # Manifest schreiben (stdout oder Datei)
-    if jsonl_tmp and os.path.exists(jsonl_tmp) and args.out:
+    if jsonl_tmp and args.out:
+        if not os.path.exists(jsonl_tmp):
+            print(
+                f"[error] JSONL-Checkpoint fehlt: {jsonl_tmp} "
+                f"(Streaming-Walk mit {total_files} Dateien — kein leeres Manifest schreiben)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         _log("[finalize] JSONL → JSON (streaming, kein RAM-Spike)...")
         item_count = pcl.manifest_write_json_from_jsonl(
             args.out,
@@ -598,9 +605,21 @@ def main() -> None:
             jsonl_path=jsonl_tmp,
         )
         os.remove(jsonl_tmp)
+        if item_count <= 0 and total_files > 0:
+            print(
+                f"[error] Finalize: 0 Items aus JSONL (erwartet ~{total_files})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         _log(f"[finalize] ✓ {item_count} Items geschrieben")
         _log(f"[manifest] ✓ Geschrieben: {args.out}")
     elif args.out:
+        if total_files > 0 and not items:
+            print(
+                "[error] Walk ohne JSONL lieferte keine Items — Abbruch (kein items:[] schreiben)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         payload = dict(payload_meta)
         payload["items"] = items
         with open(args.out, "w", encoding="utf-8") as f:

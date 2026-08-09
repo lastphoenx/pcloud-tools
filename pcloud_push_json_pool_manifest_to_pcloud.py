@@ -2841,6 +2841,12 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         }
         
         _log(f"[preflight] Manifest: {len(manifest_files)} Files, {len(manifest_sha256_to_item)} unique SHA256s")
+
+        if not manifest_sha256_to_item:
+            raise RuntimeError(
+                "[preflight] Manifest enthält 0 Dateien — Upload abgebrochen. "
+                "Temp-Manifest löschen und Manifest-Generierung erneut ausführen."
+            )
         
         # 2. PHYSISCHE Pool-SHA256s via listfolder (NEU: wie Validation-Audit!)
         _log(f"[preflight] Scanne Pool-Struktur via listfolder({pool_root})...")
@@ -2938,8 +2944,9 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     pass
         
         preflight_duration = time.time() - t_preflight_start
-        _log(f"[preflight] Delta: {len(delta_sha256s)} benötigen Upload ({len(delta_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
-        _log(f"[preflight] Reused: {len(reused_sha256s)} aus Pool wiederverwendet ({len(reused_sha256s)*100/len(manifest_sha256_to_item):.1f}%)")
+        _mf_total = len(manifest_sha256_to_item)
+        _log(f"[preflight] Delta: {len(delta_sha256s)} benötigen Upload ({len(delta_sha256s)*100/_mf_total:.1f}%)")
+        _log(f"[preflight] Reused: {len(reused_sha256s)} aus Pool wiederverwendet ({len(reused_sha256s)*100/_mf_total:.1f}%)")
         _log(f"[preflight] Skipped: {len(already_in_snapshot)} bereits für Snapshot registriert")
         _log(f"[preflight] Abgeschlossen in {preflight_duration:.2f}s")
         
