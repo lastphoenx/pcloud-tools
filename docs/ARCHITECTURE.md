@@ -37,7 +37,8 @@ flowchart TD
     PCLOUD_WRAPPER --> P1[Phase 1: Preflight]
     P1 --> P2[Phase 2: Manifest-Erstellung]
     P2 --> P3[Phase 3: Pool-Upload]
-    P3 --> P4[Phase 4: Validation + tamper-detect]
+    P3 --> P4[Integrity-Gate listfolder]
+    P4 --> P5[.upload_complete + Index-Upload]
     end
 ```
 
@@ -58,9 +59,17 @@ Wählt automatisch den effizientesten Upload-Modus:
 - **Turbo-Delta-Mode**: Scout (`scout_pool_basis`) wählt chronologischen Vorgänger oder besten Jaccard unter **älteren** Remote-Snaps (nie neuerer Snap als Basis). Bei ≥ 70 % Similarity: `copyfolder` + Diff. Phase 3 Cleanup parallel (`PCLOUD_DELTA_CLEANUP_THREADS`).
 - **Full-Pool-Mode**: Fallback bei < 70 % Similarity oder Scout deaktiviert. Delta-Fehler → Full mit `use_scout=False` (keine Rekursion).
 
-Nach dem Upload: Post-Upload-Validation (100% Coverage: Pool-SHAs + Stubs per Batch-`stat()`, Index-Konsistenz via `pool_refs`). RAM-begrenzt — kein rekursives `listfolder` mehr. Nur bei erfolgreicher Validation wird `.upload_complete` gesetzt; danach Index-Upload (lokal auf SSD, resumable).
+Nach Stubs/Index-Pflege: **Integrity-Gate** (`_post_upload_gate` in `pcloud_push_json_pool_manifest_to_pcloud.py`):
 
-### Phase 4 — tamper-detect (`legacy/pcloud_quick_delta.py` oder `pool_integrity_run.py`)
+1. **Default:** `pool_verify_backup` per `listfolder` (~30–60 s) — Manifest-SHAs vs. Pool, Stubs vs. Manifest
+2. **Optional:** Pool-Backfill bei wenigen fehlenden SHAs (`PCLOUD_VALIDATE_POOL_BACKFILL_MAX`, Default 50)
+3. **DB:** `integrity_status` / `post_upload` via `pool_integrity_run.py` (im Gate, nicht im Wrapper)
+4. Nur bei **OK** → `.upload_complete` setzen → danach Index-Upload (lokal auf SSD, resumable)
+
+**Legacy (optional):** `PCLOUD_VALIDATE_UPLOAD=1` aktiviert die alte Massen-`stat()`-Validation (~40 Min).  
+**Wrapper:** `PCLOUD_POST_UPLOAD_INTEGRITY=skip` (Default) — kein redundanter zweiter Integritätslauf.
+
+### Phase 5 — tamper-detect / Audit (manuell oder Timer)
 Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Prüft pro SHA256: fileid, pcloud_hash, size, Stub-Existenz. Erkennt fehlende Pool-Objekte und Abweichungen. **Verwaiste Pool-Objekte** (physisch in `_pool/`, nicht in `pool_refs`) sind GC-Hinweise — kein kritischer Pipeline-Fehler (Juni 2026).
 
 ---
@@ -132,10 +141,10 @@ flowchart TD
     Start[Start Phase 3] --> Scout{Scout: Similarity\nzum besten Remote-Snap?}
     Scout -- ">= 70%" --> Turbo[Turbo-Delta-Mode:\ncopyfolder(chrono basis) + Diff\nPhase 3 parallel]
     Scout -- "< 70%" --> Full[Full-Pool-Mode:\nPool-Preflight + Delta-SHAs\n→ Upload + Ordnerstruktur]
-    Turbo --> Validate[Post-Upload-Validation\n100% Stub-Check, Pool-SHA, Index]
-    Full --> Validate
-    Validate -- "OK" --> Complete[.upload_complete setzen]
-    Validate -- "FAIL" --> NoComplete[Kein Marker → nächster Lauf\nwipet und startet neu]
+    Turbo --> Gate[Integrity-Gate\nlistfolder ~30–60s\noptional Pool-Backfill]
+    Full --> Gate
+    Gate -- "OK" --> Complete[.upload_complete + Index-Upload]
+    Gate -- "FAIL" --> NoComplete[Kein Marker → nächster Lauf\nwipet und startet neu]
 ```
 
 ---

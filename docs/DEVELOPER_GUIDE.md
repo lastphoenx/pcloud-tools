@@ -231,32 +231,37 @@ Kandidaten = Remote-Snapshots ∩ lokale Manifeste (ohne current). Scout wählt 
 2. **Ordnerstruktur**: 256 `_pool/XX`-Ordner anlegen (idempotent)
 3. **Upload**: Delta-SHAs hochladen (4 Threads für kleine, sequenziell für große)
 4. **Stubs**: für alle Manifest-Dateien schreiben
-5. **Index aktualisieren**
-6. **Post-Upload-Validation**
+5. **Index aktualisieren (lokal, Checkpoint)**
+6. **Integrity-Gate** (`_post_upload_gate`) — hartes Gate vor `.upload_complete`
 
-### Post-Upload-Validation
+### Integrity-Gate (Default, August 2026)
 
-Läuft nach **jedem** Modus. Ohne erfolgreiche Validation kein `.upload_complete`:
+Läuft nach **jedem** Modus (Full + Delta). Ohne erfolgreiches Gate kein `.upload_complete`:
 
-```python
-# 1. Pool-SHA-Check (batch): stat() pro Manifest-SHA via _pool_object_present()
-missing_in_pool = _validate_pool_shas_batched(...)
-
-# 2. Index-Konsistenz: alle SHAs in pool_refs mit korrektem Snapshot?
-for sha in manifest_sha256s:
-    assert snapshot_name in pool_refs[sha]['snapshots']
-
-# 3. Stub-Vollcheck (batch, 100%): stat() pro Manifest-relpath (.meta.json)
-missing_stubs = _validate_stubs_batched(...)
+```
+Stubs geschrieben
+  → [integrity-gate] pool_verify_backup (listfolder, ~30–60s)
+      → optional Pool-Backfill (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX)
+      → pool_integrity_run (post_upload → MariaDB)
+  → .upload_complete
+  → Index-Upload (resumable, ~700 MB)
 ```
 
-**RAM-Strategie (Juli 2026):** Statt `listfolder(_pool)` + `listfolder(snapshot_dir)` (Millionen-Knoten-Bäume, OOM auf pi-nas) werden Pool-SHAs und Stubs in Batches mit parallelem `stat()` geprüft. Konfiguration: `PCLOUD_VALIDATE_BATCH_SIZE` (Default 5000), `PCLOUD_VALIDATE_THREADS` (Default 8). Siehe [ENV_VARIABLES.md](ENV_VARIABLES.md#pool-finalize-ram-sparend).
+Implementierung: `_run_listfolder_integrity_gate()` ruft `pool_verify_backup.run_verify()` und bei Bedarf `_backfill_missing_pool_shas()`.
 
-**Pool-Objekt-Lookup:** `_pool_object_present()` prüft zuerst `by_fileid` (aus `pool_refs`), dann Pfad in `by_path`.
+**Legacy stat-Validation:** `PCLOUD_VALIDATE_UPLOAD=1` schaltet auf `validate_pool_snapshot()` um (~40 Min, Batch-`stat()`). Nur für Debug/Paranoia.
 
-**Pool-Backfill:** Fehlen wenige SHA256s im Pool (z.B. nach GC), lädt `validate_pool_snapshot` die Quelldateien aus dem Manifest nach (`PCLOUD_VALIDATE_POOL_BACKFILL_MAX`, Default 50). Deaktivieren: `PCLOUD_VALIDATE_POOL_BACKFILL_MAX=0`.
+| ENV | Default | Wirkung |
+|-----|---------|---------|
+| `PCLOUD_VALIDATE_UPLOAD` | `0` | `0` = listfolder-Gate, `1` = legacy stat |
+| `PCLOUD_VALIDATE_POOL_BACKFILL_MAX` | `50` | Max. fehlende Pool-SHAs zum Nachladen im Gate; `0` = aus |
+| `PCLOUD_POST_UPLOAD_INTEGRITY` | `skip` | Wrapper: kein zweiter Lauf (Gate reicht) |
 
-**Finalize-Reihenfolge (Delta):** `gc.collect()` → `.upload_complete` → Index-Upload (lokal + resumable) → Manifest archivieren.
+**RAM-Hinweis (legacy stat):** `PCLOUD_VALIDATE_BATCH_SIZE` / `PCLOUD_VALIDATE_THREADS` — nur relevant bei `PCLOUD_VALIDATE_UPLOAD=1`. Siehe [ENV_VARIABLES.md](ENV_VARIABLES.md#pool-finalize-ram-sparend).
+
+**Finalize-Reihenfolge (Delta):** `gc.collect()` → Integrity-Gate → `.upload_complete` → Index-Upload (lokal + resumable) → Manifest archivieren.
+
+**Wrapper danach:** Marker-Verify mit Retries (`PCLOUD_MARKER_VERIFY_RETRIES`); bei API-Ausfall kein False-FAIL mehr.
 
 ---
 
@@ -377,8 +382,11 @@ PCLOUD_COPYFOLDER_TIMEOUT=300      # Meta-Operationen: 300s statt 30s
 # Scout
 PCLOUD_SCOUT_THRESHOLD=0.70        # Mindest-Similarity für Turbo-Delta
 
-# Validation
-PCLOUD_VALIDATE_UPLOAD=0           # Default: listfolder-Gate im Push; 1 = legacy stat (~40min)
+# Validation / Integrity-Gate
+PCLOUD_VALIDATE_UPLOAD=0             # Default: listfolder-Gate im Push; 1 = legacy stat (~40min)
+PCLOUD_POST_UPLOAD_INTEGRITY=skip    # Wrapper: kein redundanter zweiter Lauf
+PCLOUD_VALIDATE_POOL_BACKFILL_MAX=50 # Pool-Backfill im Gate
+PCLOUD_MARKER_VERIFY_RETRIES=5       # Wrapper: .upload_complete API-Check
 
 # Logging
 PCLOUD_LOG=/var/log/backup/pcloud_sync.log

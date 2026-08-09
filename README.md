@@ -257,10 +257,14 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 **Legacy 1to1** (Referenz): [`legacy/`](legacy/README.md) — nicht mehr in Produktion.
 
 **Neu seit August 2026 (Catch-up / Robustheit):**
+- **Integrity-Gate:** listfolder-Verify (~30–60 s) vor `.upload_complete` + Pool-Backfill; legacy stat optional (`PCLOUD_VALIDATE_UPLOAD=1`)
+- **Manifest Smart-Ref:** Auto-Pick max. 6 chronologisch nächste Kandidaten (mtime/size-Deckung, ein Walk)
+- **Wrapper:** Marker-Verify mit Retries (kein False-FAIL bei API-Ausfall); Post-Upload-Integrity default `skip`
 - **Scout-Fix:** chronologischer Vorgänger, kein neuerer Snap als Delta-Basis
 - **Phase 3 parallel** + Fortschritts-Logs (`PCLOUD_DELTA_CLEANUP_THREADS`)
 - **Circuit Breaker** mit Cooldown und Parallelitäts-Ramp (16→12→8 Threads)
 - **`pool_delta_plan.py`** — Delta vs. Full planen inkl. Catch-up-Simulation
+- **DB-Wartung:** `scripts/maintenance_db_cleanup.sh` — Dashboard „Letzte Fehler (7d)“ bereinigen
 - → [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)
 
 **Neu seit April 2026:**  
@@ -293,6 +297,7 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 | `scripts/utilities/pool_audit_status.py` | Schneller Status RTB vs. Manifeste vs. pCloud vs. DB |
 | `docs/STORAGE_PATHS.md` | Lokale Pfade pi-nas (Bind-Mounts, was **nicht** Pipeline ist) |
 | `pcloud_pool_gc.py` | Pool Garbage Collection (siehe [docs/pcloud_pool_gc.md](docs/pcloud_pool_gc.md)) |
+| `scripts/maintenance_db_cleanup.sh` | DB-Wartung: RUNNING-Zombies, superseded FAILED, Dashboard 7d-Filter |
 | `scripts/pcloud_verify_index_vs_manifests.py` | Gleicht Remote-Index gegen lokale Manifeste ab |
 
 **Testing & Development:**
@@ -347,7 +352,7 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 | Dokument | Inhalt |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architektur, Ablaufkette, Pool-Modi, Tool-Inventar |
-| [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md) | August 2026: Lock, Scout, Phase 3, Circuit Breaker, Planungstool |
+| [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md) | August 2026: Lock, Scout, Integrity-Gate, Manifest-Ref, DB-Wartung |
 | [docs/pcloud_pool_gc.md](docs/pcloud_pool_gc.md) | Pool GC, Retention, Grace Period |
 | [docs/ENV_VARIABLES.md](docs/ENV_VARIABLES.md) | ENV-Referenz (Scout, Delta, Circuit Breaker) |
 | [docs/SETUP.md](docs/SETUP.md) | Vollständige Installations-Anleitung |
@@ -357,6 +362,7 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 | [docs/GAP_HANDLING_FAQ.md](docs/GAP_HANDLING_FAQ.md) | Gap-Handling: FAQs |
 | [docs/GAP_HANDLING_WORKFLOWS.md](docs/GAP_HANDLING_WORKFLOWS.md) | Gap-Handling: Visuelle Workflow-Diagramme (Mermaid) |
 | [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md) | Technische Analyse der Delta-Copy-Implementierung |
+| [docs/POOL_INTEGRITY.md](docs/POOL_INTEGRITY.md) | Post-Upload-Gate, Audit-Timer, Dashboard-Spalten |
 | [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Technical Deep Dive:** Gap-Handling, Delta-Copy, Index-System, Performance, Security |
 
 ---

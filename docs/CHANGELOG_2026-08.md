@@ -148,11 +148,42 @@ cd /opt/apps/entropywatcher/main && git pull origin main   # falls Scan-Units ak
 
 ## 10. Integrity-Gate (listfolder, Default)
 
-**Aenderung:** Hartes Gate vor `.upload_complete` = `pool_verify_backup` (~30–60s) + Pool-Backfill. Legacy stat-Validation (`PCLOUD_VALIDATE_UPLOAD=1`, ~40 Min) optional. Wrapper-Verify default `skip`.
+**Problem:** Drei redundante Validierungsschichten — legacy `stat()` (~40 Min), listfolder-Verify (~60 s), Wrapper-Integrity — bei jedem Upload.
+
+**Lösung:** Ein hartes Gate im Push-Skript **vor** `.upload_complete`:
+
+| Schicht | Wo | Default | Dauer |
+|---------|-----|---------|-------|
+| **Integrity-Gate** | `pcloud_push_json_pool_manifest_to_pcloud.py` | **an** | ~30–60 s (`listfolder`) |
+| Legacy stat-Validation | gleiches Skript (`PCLOUD_VALIDATE_UPLOAD=1`) | **aus** | ~40 Min |
+| Wrapper-Integrity | `wrapper_pcloud_pool_sync_1to1.sh` | **skip** | redundant |
+
+**Ablauf:**
+```
+Stubs → [integrity-gate] pool_verify_backup (listfolder)
+      → optional Pool-Backfill (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX)
+      → pool_integrity_run (post_upload → MariaDB)
+      → .upload_complete → Index-Upload
+```
+
+**ENV:** `PCLOUD_VALIDATE_UPLOAD=0`, `PCLOUD_POST_UPLOAD_INTEGRITY=skip`, `PCLOUD_VALIDATE_POOL_BACKFILL_MAX=50`
 
 ---
 
-## 11. Commit-Referenzen (Auswahl)
+## 11. Dashboard / DB-Wartung
+
+**Problem:** Dashboard „Letzte Fehler (7d)“ zeigte alte FAILED-Einträge, obwohl Snapshots später erfolgreich waren.
+
+**Lösung:** `sql/maintenance_db_cleanup.sql` + `scripts/maintenance_db_cleanup.sh` — superseded FAILED entfernen, RUNNING-Zombies bereinigen, `v_failed_backups` (7-Tage-Filter) aktualisieren.
+
+```bash
+sudo ./scripts/maintenance_db_cleanup.sh
+sudo ./scripts/generate_reports.sh
+```
+
+---
+
+## 12. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
@@ -162,3 +193,7 @@ cd /opt/apps/entropywatcher/main && git pull origin main   # falls Scan-Units ak
 | Scout chronologisch | `6c57336` |
 | Catch-up-Simulation | `15c108e` |
 | Circuit Breaker Cooldown | `adde572` |
+| Integrity-Gate (listfolder) | `76441b7` |
+| Manifest Smart-Ref (max 6) | `f7f440c`, `53d7fce`, `4da0d21` |
+| Marker-Verify API-Ausfall | `0a24f12` |
+| DB-Wartung Dashboard | `79e5430` |

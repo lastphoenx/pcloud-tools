@@ -1,6 +1,17 @@
 # Pool-Integrität (Dashboard Spalten Post-Upload & Audit)
 
-Stand: Juni 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
+Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
+
+## Upload-Pipeline vs. Audit
+
+| Wann | Was | Wo |
+|------|-----|-----|
+| **Jeder Upload** | Hartes Integrity-Gate (`listfolder`, ~30–60 s) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
+| **Jeder Upload** | `post_upload` in MariaDB | im Gate via `pool_integrity_run.py` (`check_type=post_upload`) |
+| **3×/Tag Timer** | `monthly_audit` (10 Snapshots/Lauf) | `integrity-audit.service` |
+| **Wrapper (optional)** | Zweiter Lauf | nur bei `PCLOUD_POST_UPLOAD_INTEGRITY=1` (Default: `skip`) |
+
+**Log-Marker im Upload:** `[integrity-gate] Post-Upload Integritaet (listfolder)...` — ersetzt `[validate-pool]` / `[validate-stubs]` (~40 Min).
 
 ## Dashboard „Pool-Integrität“
 
