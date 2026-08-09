@@ -201,13 +201,15 @@ def walk(root: str,
         return ppc.relpath_excluded(rel, skip_globs)
 
     # === 1. Scan → sortierte TSV auf Disk (pcloud_bin_lib) ===
+    # scan_base darf NICHT jsonl_tmp sein — cleanup würde sonst die JSONL-Checkpoint-Datei löschen.
+    scan_base = f"{jsonl_tmp}.scan" if jsonl_tmp else None
     _log("[scan] Erstelle sortierte File-Liste (disk-backed)...")
     scan = pcl.manifest_scan_tree_to_sorted_tsv(
         base,
         follow_symlinks=follow_symlinks,
         relpath_excluded=_excluded,
         check_risky_relpath=check_risky,
-        scan_base=jsonl_tmp,
+        scan_base=scan_base,
     )
     total_files = scan.total_files
     total_bytes = scan.total_bytes

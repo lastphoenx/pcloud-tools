@@ -3664,6 +3664,15 @@ def manifest_cleanup_scan_files(scan: ManifestScanIndex) -> None:
                 os.remove(path)
         except OSError:
             pass
+    # Entferne verwaiste Scan-Temp-Dateien (.unsorted bleibt selten liegen)
+    if scan.scan_base:
+        for suffix in (".unsorted",):
+            try:
+                p = f"{scan.scan_base}{suffix}"
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                pass
 
 
 def manifest_scan_tree_to_sorted_tsv(

@@ -263,7 +263,23 @@ Details: `rtb/README.md`, `doku/Raspi/raspinas/pcloud-tools/OPERATIONS_2026-08.m
 
 ---
 
-## 15. Commit-Referenzen (Auswahl)
+## 15. Manifest JSONL gelöscht vor Finalize (10. Aug 2026)
+
+**Symptom:** `[manifest] 98%` → `[stats]` → `JSONL-Checkpoint fehlt` → `FileNotFoundError` auf `.json`.
+
+**Ursache:** `scan_base=jsonl_tmp` — `manifest_cleanup_scan_files()` löschte nach dem Walk die JSONL-Checkpoint-Datei (gleicher Pfad).
+
+**Fix:** `scan_base=f"{jsonl_tmp}.scan"` (separate TSV-Temp-Dateien).
+
+```bash
+cd /opt/apps/pcloud-tools/main && git pull
+rm -f /srv/pcloud-temp/pcloud_mani.2026-08-09-224716.json*
+sudo /opt/apps/rtb/rtb_pool_wrapper.sh --upload-only /mnt/backup/rtb_nas/2026-08-09-224716
+```
+
+---
+
+## 16. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
