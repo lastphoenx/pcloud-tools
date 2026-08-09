@@ -138,7 +138,15 @@ cd /opt/apps/entropywatcher/main && git pull origin main   # falls Scan-Units ak
 
 ---
 
-## 9. Commit-Referenzen (Auswahl)
+## 9. Manifest Smart-Ref: mtime/size-Deckung
+
+**Problem:** Catch-up wählte global neuestes Archiv-Manifest (z. B. Aug 6) als Referenz für ältere Snapshots (Jul 12) → unnötiges Re-Hashing.
+
+**Lösung:** `--pick-ref-manifest` vergleicht alle Kandidaten in `manifests/` per mtime+size-Deckung (gleiche Metrik wie `ReferenceCache`); Wrapper nutzt das automatisch im Smart-Mode.
+
+---
+
+## 10. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
