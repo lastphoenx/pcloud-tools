@@ -199,7 +199,7 @@ backup-pipeline.service completes    → monitoring-status-update.service runs
 ```ini
 OnSuccess=monitoring-reports.service
 ```
-(Siehe `entropy-watcher-und-clamav-scanner/systemd/backup-pipeline.service.example`)
+(Siehe `pcloud-tools/systemd/backup-pipeline.service.example` und `scripts/install-backup-pipeline-systemd.sh`)
 
 **Benefits:**
 - Dashboard shows fresh data seconds after key operations

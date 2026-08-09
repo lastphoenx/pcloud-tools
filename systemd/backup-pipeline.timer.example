@@ -1,0 +1,15 @@
+# /etc/systemd/system/backup-pipeline.timer
+# Deploy: sudo /opt/apps/pcloud-tools/main/scripts/install-backup-pipeline-systemd.sh
+[Unit]
+Description=Backup Pipeline (RTB + pCloud) - 3x täglich
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*-*-* 04:00:00
+OnCalendar=*-*-* 12:00:00
+OnCalendar=*-*-* 20:00:00
+Persistent=true
+Unit=backup-pipeline.service
+
+[Install]
+WantedBy=timers.target

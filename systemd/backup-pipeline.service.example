@@ -1,0 +1,41 @@
+# /etc/systemd/system/backup-pipeline.service
+# Deploy (pi-nas): sudo /opt/apps/pcloud-tools/main/scripts/install-backup-pipeline-systemd.sh
+[Unit]
+Description=Backup Pipeline (RTB + pCloud POOL)
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/nas
+OnSuccess=monitoring-reports.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/apps/pcloud-tools/main
+
+ExecStartPre=/bin/mkdir -p /var/log/backup
+ExecStart=/opt/apps/rtb/rtb_pool_wrapper.sh
+
+# erlaubt Backups auch bei Warnungen (0 = YELLOW)
+Environment=SAFETY_GATE_STRICT=0
+Environment=NAS_HEAVY_OPS_FAIL_FAST=1
+Environment=RTB_OOM_SCORE_ADJ=500
+Environment=PCLOUD_MAIN_DIR=/opt/apps/pcloud-tools/main
+# KEIN NAS_HEAVY_OPS_ALLOW_HOURS — alle 3 Backup-Slots (04/12/20) müssen laufen
+# Trigger: RTB_TRIGGER_MODE=signature (Default in rtb) — kein rsync -ni Vollbaum
+# Logging nur via rtb_pool_wrapper.sh → /var/log/backup/rtb_wrapper.log
+# KEIN StandardOutput=append hier (Doppel-Tee mit Script würde RAM/IO belasten)
+# KEIN MemoryMax — Backup darf RAM nutzen; Schutz = Pipeline-Fixes + OOMScoreAdjust
+
+OOMScoreAdjust=500
+SuccessExitStatus=1
+
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=100
+IOWeight=50
+
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=multi-user.target
