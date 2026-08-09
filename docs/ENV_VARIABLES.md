@@ -463,6 +463,15 @@ PCLOUD_FIDCACHE_TTL=3600
 
 ## 🧠 RAM & Integritaet
 
+### `PCLOUD_CATCHUP_MAX_PER_RUN`
+**Beschreibung:** Max. Anzahl fehlender Snapshots pro **automatischem** Wrapper-Lauf (ohne explizites Snap-Argument). Drosselt Catch-up — NAS bleibt tagsüber nutzbar.  
+**Default:** `1` · `0` = alle fehlenden (Legacy)  
+**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`
+
+```bash
+PCLOUD_CATCHUP_MAX_PER_RUN=1
+```
+
 ### `PCLOUD_POST_UPLOAD_INTEGRITY`
 **Beschreibung:** Zusaetzlicher Integritaetslauf im **Wrapper** nach dem Push (redundant). Das **harte Gate** (`listfolder`, ~30–60s) laeuft im Push-Skript vor `.upload_complete`.  
 **Default:** `skip`  
