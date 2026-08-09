@@ -82,9 +82,10 @@ pCloud-Tools ist Teil einer mehrstufigen Backup-Pipeline. Jedes Repo steht für 
 
 **Ablaufkette (vollständige Pipeline):**
 ```
-EntropyWatcher + ClamAV  →  RTB Wrapper  →  rsync-time-backup  →  pCloud-Tools
-      (Safety Gate)          (Dry-Run)        (Hardlink-Snap)      (Cloud-Sync)
+EntropyWatcher + ClamAV  →  RTB Wrapper  →  rtb_staged_backup  →  pCloud-Tools
+      (Safety Gate)          (Trigger)         (Hardlink-Snap)         (Cloud-Sync)
 ```
+(Fallback `RTB_STAGED=0`: vanilla `rsync_tmbackup.sh` statt staged.)
 
 Der Einstiegspunkt für **Pool-Produktion** ist `rtb_pool_wrapper.sh` (rtb-Repo) → `wrapper_pcloud_pool_sync_1to1.sh`.  
 Legacy 1to1: `rtb_wrapper.sh` → `legacy/wrapper_pcloud_sync_1to1.sh` (eingestellt).  
