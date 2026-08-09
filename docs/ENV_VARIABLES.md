@@ -421,7 +421,11 @@ PCLOUD_TEMP_DIR=/srv/pcloud-temp
 
 ### `PCLOUD_MANIFEST_REF_MIN_HIT_RATE`
 **Beschreibung:** Mindest-Deckung (0–1) für Auto-Pick; darunter kein `--ref-manifest`. Default `0`.  
-**Verwendet in:** `pcloud_json_pool_manifest.py --pick-ref-manifest`
+**Verwendet in:** `pcloud_json_pool_manifest.py`
+
+### `PCLOUD_MANIFEST_REF_MAX_CANDIDATES`
+**Beschreibung:** Max. archivierte Manifeste für Auto-Pick (chronologisch nächste am Ziel-Snapshot). Default `6`. Scoring nutzt denselben Scan wie die Manifest-Generierung (kein zweiter Walk).  
+**Verwendet in:** `pcloud_json_pool_manifest.py`, `wrapper_pcloud_pool_sync_1to1.sh`
 
 ### `PCLOUD_MANIFEST_SKIP_GLOBS`
 **Beschreibung:** Komma-getrennte Glob-Patterns — beim Pool-Manifest-Scan (`pcloud_json_pool_manifest.py`) werden passende Dateien übersprungen (nicht in Manifest/Index).  

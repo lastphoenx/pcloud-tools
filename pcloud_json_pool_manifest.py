@@ -35,6 +35,7 @@ Beispiel (Smart Mode - mtime/size-Cache gegen Vorgänger)
 """
 
 from __future__ import annotations
+import bisect
 import os, sys, json, argparse, hashlib, time, datetime
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional, Iterator
@@ -166,7 +167,8 @@ def walk(root: str,
          store_symlink_target: bool,
          progress_interval: float = 30.0,
          ref_cache: Optional[ReferenceCache] = None,
-         jsonl_tmp: Optional[str] = None) -> List[Dict[str, Any]]:
+         auto_ref_manifests_dir: Optional[str] = None,
+         jsonl_tmp: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[ReferenceCache]]:
     """
     Scannt Verzeichnisbaum und erzeugt Manifest-Items.
     
@@ -194,7 +196,7 @@ def walk(root: str,
         
         # Verzeichnis als Item
         if not (rel_cur and ppc.relpath_excluded(rel_cur, skip_globs)):
-            all_paths.append(("dir", rel_cur, None, 0))
+            all_paths.append(("dir", rel_cur, None, 0, 0.0))
             if rel_cur and ppc.manifest_warn_risky_paths_enabled() and ppc.relpath_has_risky_segments(rel_cur):
                 risky_path_count += 1
                 if len(risky_samples) < 3:
@@ -217,7 +219,7 @@ def walk(root: str,
             try:
                 st = os.lstat(ab)
                 size = int(st.st_size) if not os.path.islink(ab) else 0
-                all_paths.append(("file", rel, ab, size))
+                all_paths.append(("file", rel, ab, size, float(st.st_mtime)))
                 if not os.path.islink(ab):
                     total_bytes += size
             except (FileNotFoundError, OSError):
@@ -225,7 +227,7 @@ def walk(root: str,
     
     # Sortieren (garantiert identische Reihenfolge bei Resume)
     all_paths.sort(key=lambda x: x[1])  # Nach relpath sortieren
-    total_files = sum(1 for t, _, _, _ in all_paths if t == "file")
+    total_files = sum(1 for t, _, _, _, _ in all_paths if t == "file")
     
     if skipped_files:
         _log(f"[scan] Übersprungen (PCLOUD_MANIFEST_SKIP_GLOBS): {skipped_files} Dateien")
@@ -233,6 +235,29 @@ def walk(root: str,
         examples = ", ".join(repr(s) for s in risky_samples)
         _log(f"[scan][WARN] {risky_path_count} Pfad(e) mit Segment-Whitespace "
              f"(pCloud kann anders normalisieren) — z.B. {examples}")
+
+    if ref_cache is None and auto_ref_manifests_dir:
+        file_scan = [
+            (relpath, mtime, size)
+            for typ, relpath, _ab, size, mtime in all_paths
+            if typ == "file"
+        ]
+        pick = pick_best_ref_manifest_from_scan(
+            snapshot,
+            auto_ref_manifests_dir,
+            file_scan,
+            max_candidates=_max_ref_candidates(),
+            min_hit_rate=_min_ref_hit_rate(),
+        )
+        if pick:
+            _log(
+                f"[ref-pick] ✓ {pick.snapshot} "
+                f"({pick.hit_rate * 100:.1f}% mtime/size, {pick.hits}/{pick.total_files}, "
+                f"{pick.candidates} Kandidaten)"
+            )
+            ref_cache = ReferenceCache(pick.path)
+        else:
+            _log("[ref-pick] Kein Referenz-Manifest gewaehlt — Full-Hash")
     
     _log(f"[manifest] Starte: {total_files} Dateien, {_fmt_bytes(total_bytes)}")
     
@@ -256,7 +281,7 @@ def walk(root: str,
     t_start = time.monotonic()
     t_last_progress = t_start
     
-    for idx, (item_type, relpath, abs_path, size) in enumerate(all_paths):
+    for idx, (item_type, relpath, abs_path, size, _scan_mtime) in enumerate(all_paths):
         # Skip bereits verarbeitete Items (Resume)
         if idx < resume_from:
             continue
@@ -366,9 +391,71 @@ def walk(root: str,
     if jsonl_file:
         jsonl_file.close()
     
-    return items
+    return items, ref_cache
 
 # ---------------- smart ref manifest picker ----------------
+
+def _max_ref_candidates() -> int:
+    try:
+        return max(1, int(os.environ.get("PCLOUD_MANIFEST_REF_MAX_CANDIDATES", "6")))
+    except (TypeError, ValueError):
+        return 6
+
+
+def _min_ref_hit_rate() -> float:
+    try:
+        return float(os.environ.get("PCLOUD_MANIFEST_REF_MIN_HIT_RATE", "0"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _closest_manifest_snapshots(
+    snapshot_name: str,
+    all_snapshots: List[str],
+    *,
+    max_candidates: int,
+) -> List[str]:
+    """Chronologisch naechste Manifest-Snapshots (bis max_candidates)."""
+    ordered = sorted(s for s in all_snapshots if s != snapshot_name)
+    if not ordered or max_candidates <= 0:
+        return []
+    pos = bisect.bisect_left(ordered, snapshot_name)
+    picked: List[str] = []
+    left, right = pos - 1, pos
+    while len(picked) < max_candidates and (left >= 0 or right < len(ordered)):
+        if right < len(ordered):
+            picked.append(ordered[right])
+            right += 1
+        if len(picked) >= max_candidates:
+            break
+        if left >= 0:
+            picked.append(ordered[left])
+            left -= 1
+    return picked
+
+
+def _candidate_manifest_paths(
+    snapshot_name: str,
+    manifests_dir: str,
+    *,
+    max_candidates: int,
+) -> List[str]:
+    if not os.path.isdir(manifests_dir):
+        return []
+    all_snaps = [
+        name[:-5]
+        for name in os.listdir(manifests_dir)
+        if name.endswith(".json")
+    ]
+    closest = _closest_manifest_snapshots(
+        snapshot_name, all_snaps, max_candidates=max_candidates,
+    )
+    paths: List[str] = []
+    for snap in closest:
+        path = os.path.join(manifests_dir, f"{snap}.json")
+        if os.path.isfile(path):
+            paths.append(path)
+    return paths
 
 @dataclass(frozen=True)
 class RefManifestPick:
@@ -424,35 +511,23 @@ def _iter_snapshot_files_for_ref_score(
             yield rel, float(st.st_mtime), int(st.st_size)
 
 
-def pick_best_ref_manifest(
-    snapshot_root: str,
+def pick_best_ref_manifest_from_scan(
     snapshot_name: str,
     manifests_dir: str,
+    file_scan: List[Tuple[str, float, int]],
     *,
-    follow_symlinks: bool = False,
+    max_candidates: int = 6,
     min_hit_rate: float = 0.0,
 ) -> Optional[RefManifestPick]:
     """
-    Waehlt das Referenz-Manifest mit hoechster mtime/size-Deckung zum Ziel-Snapshot.
+    Waehlt Referenz-Manifest mit hoechster mtime/size-Deckung (max. N Kandidaten).
 
-    Alle Kandidaten in manifests_dir (auch chronologisch neuere) werden verglichen —
-    gleiche Metrik wie ReferenceCache.lookup (relpath + mtime + size).
+    file_scan: (relpath, mtime, size) aus dem Manifest-Scan — kein zweiter Walk.
     """
-    if not os.path.isdir(manifests_dir):
-        return None
-
-    candidate_paths: List[str] = []
-    for name in sorted(os.listdir(manifests_dir)):
-        if not name.endswith(".json"):
-            continue
-        snap = name[:-5]
-        if snap == snapshot_name:
-            continue
-        path = os.path.join(manifests_dir, name)
-        if os.path.isfile(path):
-            candidate_paths.append(path)
-
-    if not candidate_paths:
+    candidate_paths = _candidate_manifest_paths(
+        snapshot_name, manifests_dir, max_candidates=max_candidates,
+    )
+    if not candidate_paths or not file_scan:
         return None
 
     caches: Dict[str, Tuple[str, Dict[str, Tuple[float, int]]]] = {}
@@ -466,16 +541,13 @@ def pick_best_ref_manifest(
         return None
 
     scores: Dict[str, int] = {p: 0 for p in caches}
-    total_files = 0
-    for relpath, mtime, size in _iter_snapshot_files_for_ref_score(
-        snapshot_root, follow_symlinks=follow_symlinks,
-    ):
-        total_files += 1
+    for relpath, mtime, size in file_scan:
         for path, (_snap, cache) in caches.items():
             ent = cache.get(relpath)
             if ent is not None and ent[0] == mtime and ent[1] == size:
                 scores[path] += 1
 
+    total_files = len(file_scan)
     if total_files == 0:
         return None
 
@@ -499,6 +571,28 @@ def pick_best_ref_manifest(
     )
 
 
+def pick_best_ref_manifest(
+    snapshot_root: str,
+    snapshot_name: str,
+    manifests_dir: str,
+    *,
+    follow_symlinks: bool = False,
+    max_candidates: int = 6,
+    min_hit_rate: float = 0.0,
+) -> Optional[RefManifestPick]:
+    """CLI-Helfer: ein Walk, dann Scoring (gleiche Kandidaten-Logik wie im Manifest-Lauf)."""
+    file_scan = list(_iter_snapshot_files_for_ref_score(
+        snapshot_root, follow_symlinks=follow_symlinks,
+    ))
+    return pick_best_ref_manifest_from_scan(
+        snapshot_name,
+        manifests_dir,
+        file_scan,
+        max_candidates=max_candidates,
+        min_hit_rate=min_hit_rate,
+    )
+
+
 def run_pick_ref_manifest_cli(args: argparse.Namespace) -> int:
     manifests_dir = os.path.abspath(args.manifests_dir or "")
     if not manifests_dir:
@@ -506,7 +600,7 @@ def run_pick_ref_manifest_cli(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        min_hit = float(os.environ.get("PCLOUD_MANIFEST_REF_MIN_HIT_RATE", "0"))
+        min_hit = _min_ref_hit_rate()
     except ValueError:
         min_hit = 0.0
 
@@ -515,6 +609,7 @@ def run_pick_ref_manifest_cli(args: argparse.Namespace) -> int:
         args.snapshot or os.path.basename(os.path.abspath(args.root)),
         manifests_dir,
         follow_symlinks=bool(args.follow_symlinks),
+        max_candidates=_max_ref_candidates(),
         min_hit_rate=min_hit,
     )
     if pick is None:
@@ -543,11 +638,16 @@ def main() -> None:
     ap.add_argument(
         "--pick-ref-manifest",
         action="store_true",
-        help="Nur bestes Referenz-Manifest waehlen (mtime/size-Deckung); Pfad auf stdout",
+        help="Nur bestes Referenz-Manifest waehlen (ein Walk, max. 6 Kandidaten); Pfad auf stdout",
+    )
+    ap.add_argument(
+        "--auto-ref-manifest",
+        action="store_true",
+        help="Referenz nach Scan automatisch waehlen (ein Walk, integriert in Manifest-Lauf)",
     )
     ap.add_argument(
         "--manifests-dir",
-        help="Archiv-Verzeichnis fuer --pick-ref-manifest (z. B. /srv/pcloud-archive/manifests)",
+        help="Archiv-Verzeichnis fuer --pick-ref-manifest / --auto-ref-manifest",
     )
 
     # Verhalten
@@ -574,10 +674,17 @@ def main() -> None:
     snap = args.snapshot or time.strftime("%Y%m%d-%H%M%S")
     hash_algo = None if args.hash == "none" else args.hash
     
-    # Smart-Mode: ReferenceCache initialisieren
+    # Smart-Mode: ReferenceCache (explizit oder Auto-Pick im Scan)
     ref_cache = None
     if args.ref_manifest:
         ref_cache = ReferenceCache(args.ref_manifest)
+
+    auto_ref_dir: Optional[str] = None
+    if args.auto_ref_manifest:
+        if not args.manifests_dir:
+            print("--manifests-dir erforderlich mit --auto-ref-manifest", file=sys.stderr)
+            sys.exit(2)
+        auto_ref_dir = os.path.abspath(args.manifests_dir)
     
     # JSONL-Streaming: Nur wenn --out gegeben (sonst stdout → kein Resume sinnvoll)
     jsonl_tmp = None
@@ -585,7 +692,7 @@ def main() -> None:
         jsonl_tmp = f"{args.out}.tmp.jsonl"
     
     # Items sammeln (JSONL-Streaming oder Memory)
-    items = walk(
+    items, ref_cache = walk(
         root,
         snap,
         hash_algo=hash_algo,
@@ -594,6 +701,7 @@ def main() -> None:
         store_hardlink_target=bool(args.store_hardlink_target),
         store_symlink_target=bool(args.store_symlink_target),
         ref_cache=ref_cache,
+        auto_ref_manifests_dir=auto_ref_dir,
         jsonl_tmp=jsonl_tmp,
     )
     
@@ -629,8 +737,9 @@ def main() -> None:
     
     # Schema 4 Erweiterungen
     if ref_cache:
+        ref_path = ref_cache.ref_manifest_path or args.ref_manifest or ""
         payload["ref_manifest"] = {
-            "path": args.ref_manifest,
+            "path": ref_path,
             "snapshot": ref_cache.ref_snapshot or "?",
             "loaded_at": int(time.time()),
         }

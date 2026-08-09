@@ -142,7 +142,7 @@ cd /opt/apps/entropywatcher/main && git pull origin main   # falls Scan-Units ak
 
 **Problem:** Catch-up wählte global neuestes Archiv-Manifest (z. B. Aug 6) als Referenz für ältere Snapshots (Jul 12) → unnötiges Re-Hashing.
 
-**Lösung:** `--pick-ref-manifest` vergleicht alle Kandidaten in `manifests/` per mtime+size-Deckung (gleiche Metrik wie `ReferenceCache`); Wrapper nutzt das automatisch im Smart-Mode.
+**Lösung:** Auto-Pick per mtime/size-Deckung; max. **6** chronologisch nächste Kandidaten; Scoring im **gleichen** Manifest-Scan (kein zweiter Walk, kein Laden aller Archiv-Manifeste).
 
 ---
 

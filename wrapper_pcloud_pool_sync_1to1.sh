@@ -471,22 +471,12 @@ build_and_push() {
     local ref_manifest_arg=""
     
     if [[ "$MANIFEST_MODE" == "smart" ]]; then
-      local ref_manifest=""
       if [[ -n "${PCLOUD_MANIFEST_REF:-}" && -f "${PCLOUD_MANIFEST_REF}" ]]; then
-        ref_manifest="${PCLOUD_MANIFEST_REF}"
-        _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$ref_manifest") (PCLOUD_MANIFEST_REF)"
+        ref_manifest_arg="--ref-manifest ${PCLOUD_MANIFEST_REF}"
+        _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$PCLOUD_MANIFEST_REF") (PCLOUD_MANIFEST_REF)"
       else
-        ref_manifest="$("${PY}" "$MANI" --pick-ref-manifest \
-          --root "$SNAP" --snapshot "$SNAPNAME" \
-          --manifests-dir "${PCLOUD_ARCHIVE_DIR}/manifests" 2>>"$PCLOUD_LOG")"
-      fi
-      if [[ -n "$ref_manifest" && -f "$ref_manifest" ]]; then
-        ref_manifest_arg="--ref-manifest $ref_manifest"
-        if [[ -z "${PCLOUD_MANIFEST_REF:-}" ]]; then
-          _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$ref_manifest")"
-        fi
-      else
-        _log INFO "Manifest: Full-Mode (kein passendes Referenz-Manifest)"
+        ref_manifest_arg="--auto-ref-manifest --manifests-dir ${PCLOUD_ARCHIVE_DIR}/manifests"
+        _log INFO "Manifest: Smart-Mode (Auto-Ref nach Scan, max. ${PCLOUD_MANIFEST_REF_MAX_CANDIDATES:-6} Kandidaten)"
       fi
     else
       _log INFO "Manifest: Full-Mode (PCLOUD_MANIFEST_MODE=full)"
