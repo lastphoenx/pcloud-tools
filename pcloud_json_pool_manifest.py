@@ -35,11 +35,11 @@ Beispiel (Smart Mode - mtime/size-Cache gegen Vorgänger)
 """
 
 from __future__ import annotations
-import bisect
 import os, sys, json, argparse, hashlib, time, datetime
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional, Iterator
 
+import pcloud_bin_lib as pcl
 import pcloud_path_compat as ppc
 
 # ---- Logging mit Timestamp (RTB-Stil) ----
@@ -157,6 +157,18 @@ def _fmt_bytes(b: int) -> str:
             return f"{b:.1f} {unit}"
         b /= 1024
 
+
+@dataclass
+class WalkStats:
+    total_files: int
+    total_bytes: int
+    total_items: int
+
+
+# Aliase für CLI-Kompatibilität (Implementierung in pcloud_bin_lib)
+RefManifestPick = pcl.ManifestRefPick
+
+
 def walk(root: str,
          snapshot: str,
          *,
@@ -168,86 +180,57 @@ def walk(root: str,
          progress_interval: float = 30.0,
          ref_cache: Optional[ReferenceCache] = None,
          auto_ref_manifests_dir: Optional[str] = None,
-         jsonl_tmp: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[ReferenceCache]]:
+         jsonl_tmp: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[ReferenceCache], WalkStats]:
     """
     Scannt Verzeichnisbaum und erzeugt Manifest-Items.
-    
-    NEU: JSONL-Streaming für crash-resistente, RAM-schonende Verarbeitung.
-    - Wenn jsonl_tmp gegeben: Items werden sofort als JSONL geschrieben (append-only)
-    - Resume: Existierende Zeilen in jsonl_tmp werden übersprungen
-    - Return: Leere Liste (Items sind in jsonl_tmp), oder vollständige Liste falls jsonl_tmp=None
+
+    Scan-Index landet auf SSD (TSV + externes sort), nicht in RAM.
+    Mit jsonl_tmp: Items sofort als JSONL schreiben (append-only, resume-fähig).
     """
 
     base = os.path.abspath(root)
 
     skip_globs = ppc.parse_manifest_skip_globs()
-    skipped_files = 0
-    risky_path_count = 0
-    risky_samples: List[str] = []
+    check_risky = (
+        ppc.relpath_has_risky_segments
+        if ppc.manifest_warn_risky_paths_enabled()
+        else None
+    )
 
-    # === 1. Sortierte File-Liste erstellen (deterministisch!) ===
-    _log("[scan] Erstelle sortierte File-Liste...")
-    all_paths = []
-    total_bytes = 0
-    
-    for cur, dirs, files in os.walk(base, followlinks=follow_symlinks):
-        rel_cur = os.path.relpath(cur, base).replace("\\", "/")
-        if rel_cur == ".": rel_cur = ""
-        
-        # Verzeichnis als Item
-        if not (rel_cur and ppc.relpath_excluded(rel_cur, skip_globs)):
-            all_paths.append(("dir", rel_cur, None, 0, 0.0))
-            if rel_cur and ppc.manifest_warn_risky_paths_enabled() and ppc.relpath_has_risky_segments(rel_cur):
-                risky_path_count += 1
-                if len(risky_samples) < 3:
-                    risky_samples.append(rel_cur)
-        
-        # Dateien/Symlinks
-        for name in files:
-            ab = os.path.join(cur, name)
-            rel = (os.path.join(rel_cur, name) if rel_cur else name).replace("\\", "/")
+    def _excluded(rel: str) -> bool:
+        return ppc.relpath_excluded(rel, skip_globs)
 
-            if ppc.relpath_excluded(rel, skip_globs):
-                skipped_files += 1
-                continue
+    # === 1. Scan → sortierte TSV auf Disk (pcloud_bin_lib) ===
+    _log("[scan] Erstelle sortierte File-Liste (disk-backed)...")
+    scan = pcl.manifest_scan_tree_to_sorted_tsv(
+        base,
+        follow_symlinks=follow_symlinks,
+        relpath_excluded=_excluded,
+        check_risky_relpath=check_risky,
+        scan_base=jsonl_tmp,
+    )
+    total_files = scan.total_files
+    total_bytes = scan.total_bytes
+    total_items = scan.total_items
 
-            if ppc.manifest_warn_risky_paths_enabled() and ppc.relpath_has_risky_segments(rel):
-                risky_path_count += 1
-                if len(risky_samples) < 3:
-                    risky_samples.append(rel)
-            
-            try:
-                st = os.lstat(ab)
-                size = int(st.st_size) if not os.path.islink(ab) else 0
-                all_paths.append(("file", rel, ab, size, float(st.st_mtime)))
-                if not os.path.islink(ab):
-                    total_bytes += size
-            except (FileNotFoundError, OSError):
-                continue
-    
-    # Sortieren (garantiert identische Reihenfolge bei Resume)
-    all_paths.sort(key=lambda x: x[1])  # Nach relpath sortieren
-    total_files = sum(1 for t, _, _, _, _ in all_paths if t == "file")
-    
-    if skipped_files:
-        _log(f"[scan] Übersprungen (PCLOUD_MANIFEST_SKIP_GLOBS): {skipped_files} Dateien")
-    if risky_path_count:
-        examples = ", ".join(repr(s) for s in risky_samples)
-        _log(f"[scan][WARN] {risky_path_count} Pfad(e) mit Segment-Whitespace "
+    if scan.skipped_files:
+        _log(f"[scan] Übersprungen (PCLOUD_MANIFEST_SKIP_GLOBS): {scan.skipped_files} Dateien")
+    if scan.risky_path_count:
+        examples = ", ".join(repr(s) for s in scan.risky_samples)
+        _log(f"[scan][WARN] {scan.risky_path_count} Pfad(e) mit Segment-Whitespace "
              f"(pCloud kann anders normalisieren) — z.B. {examples}")
 
     if ref_cache is None and auto_ref_manifests_dir:
-        file_scan = [
-            (relpath, mtime, size)
-            for typ, relpath, _ab, size, mtime in all_paths
-            if typ == "file"
-        ]
-        pick = pick_best_ref_manifest_from_scan(
+        pick = pcl.manifest_pick_ref_from_scan(
             snapshot,
             auto_ref_manifests_dir,
-            file_scan,
-            max_candidates=_max_ref_candidates(),
-            min_hit_rate=_min_ref_hit_rate(),
+            pcl.manifest_iter_file_scan_from_sorted(scan.sorted_path),
+            total_files=total_files,
+            max_candidates=pcl.manifest_ref_max_candidates(),
+            min_hit_rate=pcl.manifest_ref_min_hit_rate(),
+            on_candidate_skip=lambda p, e: _log(
+                f"[ref-pick][warn] Ueberspringe {os.path.basename(p)}: {e}"
+            ),
         )
         if pick:
             _log(
@@ -258,52 +241,47 @@ def walk(root: str,
             ref_cache = ReferenceCache(pick.path)
         else:
             _log("[ref-pick] Kein Referenz-Manifest gewaehlt — Full-Hash")
-    
+
     _log(f"[manifest] Starte: {total_files} Dateien, {_fmt_bytes(total_bytes)}")
-    
-    # === 2. Resume: Wie viele Items bereits verarbeitet? ===
-    resume_from = 0
-    if jsonl_tmp and os.path.exists(jsonl_tmp):
-        with open(jsonl_tmp, encoding="utf-8") as f:
-            resume_from = sum(1 for _ in f)
-        _log(f"[resume] ✓ {resume_from}/{len(all_paths)} Items bereits verarbeitet - setze fort")
-    
+
+    # === 2. Resume ===
+    resume_from = pcl.manifest_jsonl_line_count(jsonl_tmp) if jsonl_tmp else 0
+    if resume_from:
+        _log(f"[resume] ✓ {resume_from}/{total_items} Items bereits verarbeitet - setze fort")
+
     # === 3. Streaming Processing ===
-    items: List[Dict[str, Any]] = []  # Leer bei JSONL-Mode
-    first_seen: dict[tuple[int,int], str] = {}
-    
+    items: List[Dict[str, Any]] = []
+    first_seen: dict[tuple[int, int], str] = {}
+
     jsonl_file = None
     if jsonl_tmp:
         jsonl_file = open(jsonl_tmp, "a", encoding="utf-8")
-    
+
     done_files = 0
     done_bytes = 0
     t_start = time.monotonic()
     t_last_progress = t_start
-    
-    for idx, (item_type, relpath, abs_path, size, _scan_mtime) in enumerate(all_paths):
-        # Skip bereits verarbeitete Items (Resume)
+
+    for idx, (item_type, relpath, abs_path, size, _scan_mtime) in enumerate(
+        pcl.manifest_iter_scan_records(scan.sorted_path)
+    ):
         if idx < resume_from:
             continue
-        
+
         entry: Dict[str, Any] = {}
-        
-        # === DIR ===
+
         if item_type == "dir":
             entry = {
                 "snapshot": snapshot,
                 "relpath": relpath,
                 "type": "dir",
             }
-        
-        # === FILE/SYMLINK ===
         else:
             try:
                 st = os.lstat(abs_path)
             except (FileNotFoundError, OSError):
                 continue
-            
-            # Symlink?
+
             if os.path.islink(abs_path):
                 entry = {
                     "snapshot": snapshot,
@@ -316,21 +294,19 @@ def walk(root: str,
                         entry["target"] = os.readlink(abs_path)
                     except OSError as e:
                         entry["target_error"] = str(e)
-            
-            # Reguläre Datei
+
             elif os.path.isfile(abs_path):
                 dev = int(st.st_dev); ino = int(st.st_ino); nlink = int(st.st_nlink)
                 inode_obj = {"dev": dev, "ino": ino, "nlink": nlink}
-                
+
                 _, ext = os.path.splitext(relpath)
                 ext = ext if ext else None
-                
-                # Hash via Smart-Cache oder Berechnung
+
                 file_hash = None
                 if hash_algo == "sha256":
                     if ref_cache:
                         file_hash = ref_cache.lookup(relpath, float(st.st_mtime), int(st.st_size), dev, ino)
-                    
+
                     if not file_hash:
                         try:
                             file_hash = sha256_file(abs_path)
@@ -338,7 +314,7 @@ def walk(root: str,
                                 ref_cache.record_calculated(relpath, file_hash, float(st.st_mtime), int(st.st_size), dev, ino)
                         except Exception as e:
                             print(f"[warn] hash fail: {abs_path}: {e}", file=sys.stderr)
-                
+
                 entry = {
                     "snapshot": snapshot,
                     "type": "file",
@@ -351,11 +327,10 @@ def walk(root: str,
                 }
                 if file_hash:
                     entry["sha256"] = file_hash
-                
+
                 done_files += 1
                 done_bytes += int(st.st_size)
-                
-                # Hardlink-Ziel optional festhalten
+
                 if store_hardlink_target and nlink > 1:
                     key = (dev, ino)
                     if key in first_seen:
@@ -363,8 +338,7 @@ def walk(root: str,
                     else:
                         first_seen[key] = relpath
                         entry["hardlink_master"] = True
-                
-                # Progress
+
                 now = time.monotonic()
                 if now - t_last_progress >= progress_interval:
                     elapsed = now - t_start
@@ -378,111 +352,41 @@ def walk(root: str,
                         f"{eta_str} verbleibend"
                     )
                     t_last_progress = now
-        
-        # === Write: JSONL oder Memory ===
+
         if entry:
             if jsonl_file:
                 jsonl_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                jsonl_file.flush()  # Sofort auf Disk (crash-resistent)
+                jsonl_file.flush()
             else:
                 items.append(entry)
-    
-    # Cleanup
+
     if jsonl_file:
         jsonl_file.close()
-    
-    return items, ref_cache
 
-# ---------------- smart ref manifest picker ----------------
+    pcl.manifest_cleanup_scan_files(scan)
 
-def _max_ref_candidates() -> int:
-    try:
-        return max(1, int(os.environ.get("PCLOUD_MANIFEST_REF_MAX_CANDIDATES", "6")))
-    except (TypeError, ValueError):
-        return 6
+    stats = WalkStats(total_files=total_files, total_bytes=total_bytes, total_items=total_items)
+    return items, ref_cache, stats
 
+# ---------------- smart ref manifest picker (CLI; Kern in pcloud_bin_lib) ----------------
 
-def _min_ref_hit_rate() -> float:
-    try:
-        return float(os.environ.get("PCLOUD_MANIFEST_REF_MIN_HIT_RATE", "0"))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _closest_manifest_snapshots(
-    snapshot_name: str,
-    all_snapshots: List[str],
-    *,
-    max_candidates: int,
-) -> List[str]:
-    """Chronologisch naechste Manifest-Snapshots (bis max_candidates)."""
-    ordered = sorted(s for s in all_snapshots if s != snapshot_name)
-    if not ordered or max_candidates <= 0:
-        return []
-    pos = bisect.bisect_left(ordered, snapshot_name)
-    picked: List[str] = []
-    left, right = pos - 1, pos
-    while len(picked) < max_candidates and (left >= 0 or right < len(ordered)):
-        if right < len(ordered):
-            picked.append(ordered[right])
-            right += 1
-        if len(picked) >= max_candidates:
-            break
-        if left >= 0:
-            picked.append(ordered[left])
-            left -= 1
-    return picked
-
-
-def _candidate_manifest_paths(
+def pick_best_ref_manifest_from_scan(
     snapshot_name: str,
     manifests_dir: str,
+    file_scan,
     *,
-    max_candidates: int,
-) -> List[str]:
-    if not os.path.isdir(manifests_dir):
-        return []
-    all_snaps = [
-        name[:-5]
-        for name in os.listdir(manifests_dir)
-        if name.endswith(".json")
-    ]
-    closest = _closest_manifest_snapshots(
-        snapshot_name, all_snaps, max_candidates=max_candidates,
+    total_files: int,
+    max_candidates: int = 6,
+    min_hit_rate: float = 0.0,
+) -> Optional[RefManifestPick]:
+    return pcl.manifest_pick_ref_from_scan(
+        snapshot_name,
+        manifests_dir,
+        file_scan,
+        total_files=total_files,
+        max_candidates=max_candidates,
+        min_hit_rate=min_hit_rate,
     )
-    paths: List[str] = []
-    for snap in closest:
-        path = os.path.join(manifests_dir, f"{snap}.json")
-        if os.path.isfile(path):
-            paths.append(path)
-    return paths
-
-@dataclass(frozen=True)
-class RefManifestPick:
-    path: str
-    snapshot: str
-    hit_rate: float
-    hits: int
-    total_files: int
-    candidates: int
-
-
-def _mtime_size_cache_from_manifest(path: str) -> Tuple[str, Dict[str, Tuple[float, int]]]:
-    """relpath → (mtime, size) aus archiviertem Manifest."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    snap = str(data.get("snapshot") or os.path.splitext(os.path.basename(path))[0])
-    cache: Dict[str, Tuple[float, int]] = {}
-    for item in data.get("items", []):
-        if item.get("type") != "file":
-            continue
-        relpath = item.get("relpath")
-        mtime = item.get("mtime")
-        size = item.get("size")
-        if not relpath or mtime is None or size is None:
-            continue
-        cache[str(relpath)] = (float(mtime), int(size))
-    return snap, cache
 
 
 def _iter_snapshot_files_for_ref_score(
@@ -511,66 +415,6 @@ def _iter_snapshot_files_for_ref_score(
             yield rel, float(st.st_mtime), int(st.st_size)
 
 
-def pick_best_ref_manifest_from_scan(
-    snapshot_name: str,
-    manifests_dir: str,
-    file_scan: List[Tuple[str, float, int]],
-    *,
-    max_candidates: int = 6,
-    min_hit_rate: float = 0.0,
-) -> Optional[RefManifestPick]:
-    """
-    Waehlt Referenz-Manifest mit hoechster mtime/size-Deckung (max. N Kandidaten).
-
-    file_scan: (relpath, mtime, size) aus dem Manifest-Scan — kein zweiter Walk.
-    """
-    candidate_paths = _candidate_manifest_paths(
-        snapshot_name, manifests_dir, max_candidates=max_candidates,
-    )
-    if not candidate_paths or not file_scan:
-        return None
-
-    caches: Dict[str, Tuple[str, Dict[str, Tuple[float, int]]]] = {}
-    for path in candidate_paths:
-        try:
-            caches[path] = _mtime_size_cache_from_manifest(path)
-        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            _log(f"[ref-pick][warn] Ueberspringe {os.path.basename(path)}: {e}")
-
-    if not caches:
-        return None
-
-    scores: Dict[str, int] = {p: 0 for p in caches}
-    for relpath, mtime, size in file_scan:
-        for path, (_snap, cache) in caches.items():
-            ent = cache.get(relpath)
-            if ent is not None and ent[0] == mtime and ent[1] == size:
-                scores[path] += 1
-
-    total_files = len(file_scan)
-    if total_files == 0:
-        return None
-
-    best_path = max(
-        scores.keys(),
-        key=lambda p: (scores[p] / total_files, scores[p], p),
-    )
-    hits = scores[best_path]
-    hit_rate = hits / total_files
-    if hit_rate < min_hit_rate:
-        return None
-
-    best_snap = caches[best_path][0]
-    return RefManifestPick(
-        path=best_path,
-        snapshot=best_snap,
-        hit_rate=hit_rate,
-        hits=hits,
-        total_files=total_files,
-        candidates=len(caches),
-    )
-
-
 def pick_best_ref_manifest(
     snapshot_root: str,
     snapshot_name: str,
@@ -584,10 +428,11 @@ def pick_best_ref_manifest(
     file_scan = list(_iter_snapshot_files_for_ref_score(
         snapshot_root, follow_symlinks=follow_symlinks,
     ))
-    return pick_best_ref_manifest_from_scan(
+    return pcl.manifest_pick_ref_from_scan(
         snapshot_name,
         manifests_dir,
         file_scan,
+        total_files=len(file_scan),
         max_candidates=max_candidates,
         min_hit_rate=min_hit_rate,
     )
@@ -600,7 +445,7 @@ def run_pick_ref_manifest_cli(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        min_hit = _min_ref_hit_rate()
+        min_hit = pcl.manifest_ref_min_hit_rate()
     except ValueError:
         min_hit = 0.0
 
@@ -609,7 +454,7 @@ def run_pick_ref_manifest_cli(args: argparse.Namespace) -> int:
         args.snapshot or os.path.basename(os.path.abspath(args.root)),
         manifests_dir,
         follow_symlinks=bool(args.follow_symlinks),
-        max_candidates=_max_ref_candidates(),
+        max_candidates=pcl.manifest_ref_max_candidates(),
         min_hit_rate=min_hit,
     )
     if pick is None:
@@ -692,7 +537,7 @@ def main() -> None:
         jsonl_tmp = f"{args.out}.tmp.jsonl"
     
     # Items sammeln (JSONL-Streaming oder Memory)
-    items, ref_cache = walk(
+    items, ref_cache, walk_stats = walk(
         root,
         snap,
         hash_algo=hash_algo,
@@ -704,24 +549,14 @@ def main() -> None:
         auto_ref_manifests_dir=auto_ref_dir,
         jsonl_tmp=jsonl_tmp,
     )
-    
-    # Finalize: JSONL → Items laden (wenn JSONL-Modus aktiv war)
-    if jsonl_tmp and os.path.exists(jsonl_tmp):
-        _log("[finalize] Konvertiere JSONL → JSON...")
-        with open(jsonl_tmp, encoding="utf-8") as f:
-            items = [json.loads(line) for line in f if line.strip()]
-        # Cleanup JSONL (erfolgreich abgeschlossen)
-        os.remove(jsonl_tmp)
-        _log(f"[finalize] ✓ {len(items)} Items geladen")
-    
+
+    total_files = walk_stats.total_files
+
     # Schema 4 für Pool-Mode
     schema_version = 4
     mode = "pool_smart" if ref_cache else "pool_full"
-    
-    # total_files VOR if-Block berechnen (nicht nur im ref_cache-Block!)
-    total_files = sum(1 for it in items if it.get("type") == "file")
-    
-    payload: Dict[str, Any] = {
+
+    payload_meta: Dict[str, Any] = {
         "schema": schema_version,
         "mode": mode,
         "snapshot": snap,
@@ -732,40 +567,48 @@ def main() -> None:
         "follow_hardlinks": bool(args.follow_hardlinks),
         "store_hardlink_target": bool(args.store_hardlink_target),
         "store_symlink_target": bool(args.store_symlink_target),
-        "items": items,
     }
-    
-    # Schema 4 Erweiterungen
+
     if ref_cache:
         ref_path = ref_cache.ref_manifest_path or args.ref_manifest or ""
-        payload["ref_manifest"] = {
+        payload_meta["ref_manifest"] = {
             "path": ref_path,
             "snapshot": ref_cache.ref_snapshot or "?",
             "loaded_at": int(time.time()),
         }
-        
-        # Stats: Performance-Metriken (nur bei Smart-Mode)
-        payload["stats"] = {
+        payload_meta["stats"] = {
             "total_files": total_files,
             "reused_from_ref_mtime": ref_cache.stats["reused_from_ref_mtime"],
             "reused_from_hardlink": ref_cache.stats["reused_from_hardlink"],
             "calculated_sha256": ref_cache.stats["calculated_sha256"],
         }
-        
         _log(f"[stats] total={total_files} | "
              f"reused_mtime={ref_cache.stats['reused_from_ref_mtime']} | "
              f"reused_hardlink={ref_cache.stats['reused_from_hardlink']} | "
              f"calculated={ref_cache.stats['calculated_sha256']}")
     else:
-        # Full-Mode: keine Cache-Stats
         _log(f"[stats] total={total_files} | mode={mode} (kein Cache)")
-    
+
     # Manifest schreiben (stdout oder Datei)
-    if args.out:
+    if jsonl_tmp and os.path.exists(jsonl_tmp) and args.out:
+        _log("[finalize] JSONL → JSON (streaming, kein RAM-Spike)...")
+        item_count = pcl.manifest_write_json_from_jsonl(
+            args.out,
+            meta=payload_meta,
+            jsonl_path=jsonl_tmp,
+        )
+        os.remove(jsonl_tmp)
+        _log(f"[finalize] ✓ {item_count} Items geschrieben")
+        _log(f"[manifest] ✓ Geschrieben: {args.out}")
+    elif args.out:
+        payload = dict(payload_meta)
+        payload["items"] = items
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
         _log(f"[manifest] ✓ Geschrieben: {args.out}")
     else:
+        payload = dict(payload_meta)
+        payload["items"] = items
         json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
         print(file=sys.stdout)  # Trailing newline
 

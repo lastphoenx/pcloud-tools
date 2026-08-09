@@ -83,7 +83,13 @@ PCLOUD_JSONL_LOG=${PCLOUD_JSONL_LOG:-${PCLOUD_LOG%.log}.jsonl}
 PCLOUD_ENABLE_JSONL=${PCLOUD_ENABLE_JSONL:-1}  # 1=enabled, 0=disabled
 
 mkdir -p "$(dirname "$PCLOUD_LOG")"
-exec > >(tee -a "$PCLOUD_LOG") 2>&1
+# Unter systemd: direkt append (kein tee-Pipe — vermeidet RAM-Backpressure bei viel stdout).
+# Manuell/interaktiv: tee für Konsole + Log.
+if [[ -n "${INVOCATION_ID:-}" ]]; then
+  exec >>"$PCLOUD_LOG" 2>&1
+else
+  exec > >(tee -a "$PCLOUD_LOG") 2>&1
+fi
 
 # Legacy log function (for backwards compatibility)
 log(){ _log INFO "$@"; }
@@ -553,9 +559,16 @@ build_and_push() {
     _integrity_args+=(--backup-run-id "$RUN_ID")
   fi
 
-  if "${PY}" "$INTEGRITY_RUN" "${_integrity_args[@]}" 2>&1 | tee -a "$PCLOUD_LOG"; then
+  _integrity_out="$(mktemp /tmp/pcloud_integrity.XXXXXX)"
+  if "${PY}" "$INTEGRITY_RUN" "${_integrity_args[@]}" >"$_integrity_out" 2>&1; then
     _integrity_ok=1
   fi
+  if [[ -n "${INVOCATION_ID:-}" ]]; then
+    cat "$_integrity_out" >>"$PCLOUD_LOG"
+  else
+    cat "$_integrity_out"
+  fi
+  rm -f "$_integrity_out"
 
   local verify_duration=$(( $(date +%s) - T0 ))
   if [[ $_integrity_ok -eq 1 ]]; then
