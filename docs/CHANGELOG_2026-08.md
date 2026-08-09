@@ -187,11 +187,33 @@ Stubs → [integrity-gate] pool_verify_backup (listfolder)
 
 **Nicht breaking:** Manifest-Schema v4 unverändert; JSON-Ausgabe weiterhin gültiges JSON (`jq -e '.items'`). Nur intern weniger RAM, etwas mehr SSD-I/O.
 
-**Offen:** `pcloud_push_json_pool_manifest_to_pcloud.py` lädt Manifest noch per `json.load()` — nächster RAM-Kandidat.
+**Offen:** `pcloud_push_json_pool_manifest_to_pcloud.py` lädt Manifest noch per `json.load()` — nächster RAM-Kandidat nach RTB.
 
 ---
 
-## 12. Dashboard / DB-Wartung
+## 12. RTB: Batch-Fork revertiert + OOM-Opfer entfernt (9. Aug 2026)
+
+**Was schiefging (Commits `55e469c`–`d987261`, kurz auf pi-nas):**
+
+- `rsync_tmbackup.sh` wurde mit `--batch-top-level` geforkt (21 rsync-Läufe pro Snapshot) — **gegen Architektur-Regel**.
+- `d987261` übersprang `pcloud-archive`/`pcloud-temp` im Batch → Snapshot **ohne** Pipeline-Pfade, obwohl Policy „Mitläufer“ verlangt.
+- Lauf ~18:39: rsync auf `pcloud-archive` → **OOM-Kill** (`anon-rss` ~3,5 GB, `oom_score_adj=500`).
+- Lauf 20:00 mit `d987261`: „erfolgreich“ in 27 s, weil pcloud-Pfade **übersprungen** — kein echter Policy-Erfolg.
+
+**Fix (Commits `e86a96b` rtb, `8c3367c` pcloud-tools):**
+
+| Änderung | Warum |
+|----------|--------|
+| `rsync_tmbackup.sh` wieder Upstream | Kein Batch-Fork; Clone des Originals bleibt gültig |
+| `excludes.txt` ohne pcloud-Pfade | Zwei-Schichten: Mitläufer nur in `rtb_check_excludes.sh` |
+| Wrapper: `--rsync-set-flags` ohne itemize | Kein stdout/Log-RAM; Upstream unverändert |
+| `RTB_OOM_SCORE_ADJ` / `OOMScoreAdjust=500` entfernt | rsync nicht mehr gezielt opfern |
+
+**Deploy pi-nas:** `git pull` rtb + pcloud-tools → `install-backup-pipeline-systemd.sh` → `backup.inprogress` löschen falls halb.
+
+---
+
+## 13. Dashboard / DB-Wartung
 
 **Problem:** Dashboard „Letzte Fehler (7d)“ zeigte alte FAILED-Einträge, obwohl Snapshots später erfolgreich waren.
 
@@ -204,7 +226,7 @@ sudo ./scripts/generate_reports.sh
 
 ---
 
-## 13. Commit-Referenzen (Auswahl)
+## 14. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
@@ -217,5 +239,6 @@ sudo ./scripts/generate_reports.sh
 | Integrity-Gate (listfolder) | `76441b7` |
 | Manifest Smart-Ref (max 6) | `f7f440c`, `53d7fce`, `4da0d21` |
 | Pipeline RAM / streaming | `c8513c6` (rtb), `046e42d` (rtb), `fd09a17` + Manifest-Lib (pcloud-tools) |
+| RTB Batch revert + OOM-Opfer weg | `e86a96b` (rtb), `8c3367c` (pcloud-tools) |
 | Marker-Verify API-Ausfall | `0a24f12` |
 | DB-Wartung Dashboard | `79e5430` |

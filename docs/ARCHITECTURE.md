@@ -16,7 +16,7 @@ pCloud-Tools ist eine schlanke, selbst-gehostete Backup-Pipeline, die lokale Rsy
 
 ## Zusammenhänge & Ablauf
 
-- **Lokale Backups auf dem NAS** — Die Basis aller Snapshots sind lokale Backups mit [rsync-time-backup](https://github.com/laurent22/rsync-time-backup) (`rsync_tmbackup.sh`). Unveränderte Dateien werden als **Hardlinks** gesetzt — gleicher Inode = kein Re-Hash nötig.
+- **Lokale Backups auf dem NAS** — [rsync-time-backup](https://github.com/laurent22/rsync-time-backup) (`rsync_tmbackup.sh`) **unverändert**; `rtb_pool_wrapper.sh` orchestriert Trigger, Flags und Logging. Hardlinks via Upstream `--link-dest`.
 
 - **Orchestrator** — `rtb_pool_wrapper.sh` (Repo `rtb`) wird vom systemd-Timer ausgelöst. Gemeinsamer **NAS Heavy-Ops-Lock** (`/run/backup_pipeline.lock`) mit ClamAV/Entropy-Scans — kein paralleles rsync + pCloud + AV auf `/srv/nas`. Nach RTB: `wrapper_pcloud_pool_sync_1to1.sh` im Catch-up-Modus (**latest zuerst**, dann Backlog).
 
