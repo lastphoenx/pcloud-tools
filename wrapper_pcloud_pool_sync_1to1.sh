@@ -466,20 +466,27 @@ build_and_push() {
   if [[ $manifest_exists -eq 0 ]]; then
     _db_phase_log "manifest" "start"
     
-    # Smart-Mode: Auto-detect letztes Manifest als Referenz (Schema v3)
+    # Smart-Mode: Referenz-Manifest per mtime/size-Deckung waehlen
     local MANIFEST_MODE="${PCLOUD_MANIFEST_MODE:-smart}"  # smart|full
     local ref_manifest_arg=""
     
     if [[ "$MANIFEST_MODE" == "smart" ]]; then
-      # Suche letztes Manifest im manifests/-Unterordner (Push-Tool archiviert dort)
-      local last_manifest
-      last_manifest="$(find "${PCLOUD_ARCHIVE_DIR}/manifests" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort -r | head -n1)"
-      
-      if [[ -n "$last_manifest" && -f "$last_manifest" ]]; then
-        ref_manifest_arg="--ref-manifest $last_manifest"
-        _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$last_manifest")"
+      local ref_manifest=""
+      if [[ -n "${PCLOUD_MANIFEST_REF:-}" && -f "${PCLOUD_MANIFEST_REF}" ]]; then
+        ref_manifest="${PCLOUD_MANIFEST_REF}"
+        _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$ref_manifest") (PCLOUD_MANIFEST_REF)"
       else
-        _log INFO "Manifest: Full-Mode (kein Referenz-Manifest)"
+        ref_manifest="$("${PY}" "$MANI" --pick-ref-manifest \
+          --root "$SNAP" --snapshot "$SNAPNAME" \
+          --manifests-dir "${PCLOUD_ARCHIVE_DIR}/manifests" 2>>"$PCLOUD_LOG")"
+      fi
+      if [[ -n "$ref_manifest" && -f "$ref_manifest" ]]; then
+        ref_manifest_arg="--ref-manifest $ref_manifest"
+        if [[ -z "${PCLOUD_MANIFEST_REF:-}" ]]; then
+          _log INFO "Manifest: Smart-Mode mit Referenz $(basename "$ref_manifest")"
+        fi
+      else
+        _log INFO "Manifest: Full-Mode (kein passendes Referenz-Manifest)"
       fi
     else
       _log INFO "Manifest: Full-Mode (PCLOUD_MANIFEST_MODE=full)"

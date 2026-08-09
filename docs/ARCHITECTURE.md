@@ -50,7 +50,7 @@ Prüft pCloud-Authentifizierung, Quota und API-Erreichbarkeit. Bei Fehlern: Abbr
 
 ### Phase 2 — Manifest-Erstellung (`pcloud_json_pool_manifest.py`)
 Erfasst den Ist-Zustand des lokalen Snapshots: relpath, sha256, size, mtime, inode.
-- **Smart-Mode**: Nutzt das vorherige Manifest als Referenz. Vergleicht `mtime`, `size` und `inode`. Nur geänderte Dateien werden neu gehasht. ~40× schneller als Full-Hash.
+- **Smart-Mode**: Auto-Pick des Referenz-Manifests per höchster mtime/size-Deckung (`--pick-ref-manifest`); SHA256-Cache wie bisher. ~40× schneller als Full-Hash.
 
 ### Phase 3 — Pool-Upload (`pcloud_push_json_pool_manifest_to_pcloud.py`)
 Wählt automatisch den effizientesten Upload-Modus:
