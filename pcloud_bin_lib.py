@@ -35,7 +35,10 @@ import inspect
 import threading
 import json as _json
 import tempfile as _tempfile
-from typing import Any, Dict, Callable, Optional, Tuple
+import subprocess as _subprocess
+import bisect as _bisect
+from dataclasses import dataclass
+from typing import Any, Dict, Callable, Optional, Tuple, List, Iterator, Union
 import requests as _requests
 
 
@@ -3533,6 +3536,356 @@ def ensure_path_cached(cfg: dict, path: str) -> int:
     if folderid:
         _fidcache_put(path, folderid)
     return folderid
+
+
+# ===== Manifest I/O (disk-backed scan, JSONL streaming) =====
+
+MANIFEST_SCAN_FIELD_SEP = "\t"
+
+
+@dataclass(frozen=True)
+class ManifestScanIndex:
+    """Sortierter Scan-Index auf Disk (TSV) — kein all_paths in RAM."""
+    sorted_path: str
+    scan_base: str
+    total_files: int
+    total_bytes: int
+    total_items: int
+    skipped_files: int = 0
+    risky_path_count: int = 0
+    risky_samples: Tuple[str, ...] = ()
+
+
+def manifest_scan_record_line(
+    item_type: str,
+    relpath: str,
+    abs_path: Optional[str],
+    size: int,
+    mtime: float,
+) -> str:
+    return MANIFEST_SCAN_FIELD_SEP.join(
+        (
+            item_type,
+            relpath,
+            abs_path or "",
+            str(int(size)),
+            repr(float(mtime)),
+        )
+    )
+
+
+def manifest_parse_scan_line(line: str) -> Tuple[str, str, str, int, float]:
+    item_type, relpath, abs_path, size_s, mtime_s = line.rstrip("\n").split(
+        MANIFEST_SCAN_FIELD_SEP, 4
+    )
+    return item_type, relpath, abs_path, int(size_s), float(mtime_s)
+
+
+def manifest_sort_scan_tsv(unsorted_path: str, sorted_path: str) -> None:
+    """Externes Sortieren nach relpath (Spalte 2) — deterministisch, wenig RAM."""
+    _subprocess.run(
+        ["sort", "-t", MANIFEST_SCAN_FIELD_SEP, "-k2,2", "-o", sorted_path, unsorted_path],
+        check=True,
+    )
+
+
+def manifest_iter_scan_records(path: str) -> Iterator[Tuple[str, str, str, int, float]]:
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            yield manifest_parse_scan_line(line)
+
+
+def manifest_iter_file_scan_from_sorted(path: str) -> Iterator[Tuple[str, float, int]]:
+    for item_type, relpath, _abs_path, size, mtime in manifest_iter_scan_records(path):
+        if item_type == "file":
+            yield relpath, mtime, size
+
+
+def manifest_jsonl_line_count(path: str) -> int:
+    if not path or not os.path.isfile(path):
+        return 0
+    with open(path, encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def manifest_jsonl_append(path: str, entry: Dict[str, Any], *, flush: bool = True) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        if flush:
+            f.flush()
+
+
+def manifest_write_json_from_jsonl(
+    out_path: str,
+    *,
+    meta: Dict[str, Any],
+    jsonl_path: str,
+) -> int:
+    """Manifest-JSON schreiben; items aus JSONL streamen (kein RAM-Spike am Ende)."""
+    item_count = 0
+    with open(out_path, "w", encoding="utf-8") as out:
+        out.write("{\n")
+        meta_keys = list(meta.keys())
+        for key in meta_keys:
+            out.write(f'  {_json.dumps(key)}: {_json.dumps(meta[key], ensure_ascii=False)},\n')
+        out.write('  "items": [\n')
+        first_item = True
+        with open(jsonl_path, encoding="utf-8") as jf:
+            for line in jf:
+                line = line.strip()
+                if not line:
+                    continue
+                if not first_item:
+                    out.write(",\n")
+                out.write("    ")
+                out.write(line)
+                first_item = False
+                item_count += 1
+        out.write("\n  ]\n}\n")
+    return item_count
+
+
+def manifest_cleanup_scan_files(scan: ManifestScanIndex) -> None:
+    for path in (scan.sorted_path, scan.scan_base):
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def manifest_scan_tree_to_sorted_tsv(
+    root: str,
+    *,
+    follow_symlinks: bool,
+    relpath_excluded: Callable[[str], bool],
+    check_risky_relpath: Optional[Callable[[str], bool]] = None,
+    scan_base: Optional[str] = None,
+) -> ManifestScanIndex:
+    """
+    os.walk → unsorted TSV → GNU sort → sorted TSV.
+    relpath_excluded: z. B. ppc.relpath_excluded mit skip_globs.
+    """
+    base = os.path.abspath(root)
+    scan_base = scan_base or _tempfile.mktemp(prefix="pcloud_scan.", suffix=".tsv")
+    scan_unsorted = f"{scan_base}.unsorted"
+    scan_sorted = f"{scan_base}.sorted"
+    total_bytes = 0
+    total_files = 0
+    total_items = 0
+    skipped_files = 0
+    risky_path_count = 0
+    risky_samples: List[str] = []
+
+    with open(scan_unsorted, "w", encoding="utf-8") as scan_f:
+        for cur, _dirs, files in os.walk(base, followlinks=follow_symlinks):
+            rel_cur = os.path.relpath(cur, base).replace("\\", "/")
+            if rel_cur == ".":
+                rel_cur = ""
+
+            if not (rel_cur and relpath_excluded(rel_cur)):
+                scan_f.write(manifest_scan_record_line("dir", rel_cur, None, 0, 0.0) + "\n")
+                total_items += 1
+                if rel_cur and check_risky_relpath and check_risky_relpath(rel_cur):
+                    risky_path_count += 1
+                    if len(risky_samples) < 3:
+                        risky_samples.append(rel_cur)
+
+            for name in files:
+                ab = os.path.join(cur, name)
+                rel = (os.path.join(rel_cur, name) if rel_cur else name).replace("\\", "/")
+
+                if relpath_excluded(rel):
+                    skipped_files += 1
+                    continue
+
+                if check_risky_relpath and check_risky_relpath(rel):
+                    risky_path_count += 1
+                    if len(risky_samples) < 3:
+                        risky_samples.append(rel)
+
+                try:
+                    st = os.lstat(ab)
+                    size = int(st.st_size) if not os.path.islink(ab) else 0
+                    mtime = float(st.st_mtime)
+                    scan_f.write(manifest_scan_record_line("file", rel, ab, size, mtime) + "\n")
+                    total_items += 1
+                    if not os.path.islink(ab):
+                        total_files += 1
+                        total_bytes += size
+                except (FileNotFoundError, OSError):
+                    continue
+
+    manifest_sort_scan_tsv(scan_unsorted, scan_sorted)
+    try:
+        os.remove(scan_unsorted)
+    except OSError:
+        pass
+
+    return ManifestScanIndex(
+        sorted_path=scan_sorted,
+        scan_base=scan_base,
+        total_files=total_files,
+        total_bytes=total_bytes,
+        total_items=total_items,
+        skipped_files=skipped_files,
+        risky_path_count=risky_path_count,
+        risky_samples=tuple(risky_samples),
+    )
+
+
+@dataclass(frozen=True)
+class ManifestRefPick:
+    path: str
+    snapshot: str
+    hit_rate: float
+    hits: int
+    total_files: int
+    candidates: int
+
+
+def manifest_ref_max_candidates() -> int:
+    try:
+        return max(1, int(os.environ.get("PCLOUD_MANIFEST_REF_MAX_CANDIDATES", "6")))
+    except (TypeError, ValueError):
+        return 6
+
+
+def manifest_ref_min_hit_rate() -> float:
+    try:
+        return float(os.environ.get("PCLOUD_MANIFEST_REF_MIN_HIT_RATE", "0"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _manifest_closest_snapshots(
+    snapshot_name: str,
+    all_snapshots: List[str],
+    *,
+    max_candidates: int,
+) -> List[str]:
+    ordered = sorted(s for s in all_snapshots if s != snapshot_name)
+    if not ordered or max_candidates <= 0:
+        return []
+    pos = _bisect.bisect_left(ordered, snapshot_name)
+    picked: List[str] = []
+    left, right = pos - 1, pos
+    while len(picked) < max_candidates and (left >= 0 or right < len(ordered)):
+        if right < len(ordered):
+            picked.append(ordered[right])
+            right += 1
+        if len(picked) >= max_candidates:
+            break
+        if left >= 0:
+            picked.append(ordered[left])
+            left -= 1
+    return picked
+
+
+def manifest_ref_candidate_paths(
+    snapshot_name: str,
+    manifests_dir: str,
+    *,
+    max_candidates: int,
+) -> List[str]:
+    if not os.path.isdir(manifests_dir):
+        return []
+    all_snaps = [
+        name[:-5]
+        for name in os.listdir(manifests_dir)
+        if name.endswith(".json")
+    ]
+    closest = _manifest_closest_snapshots(
+        snapshot_name, all_snaps, max_candidates=max_candidates,
+    )
+    paths: List[str] = []
+    for snap in closest:
+        path = os.path.join(manifests_dir, f"{snap}.json")
+        if os.path.isfile(path):
+            paths.append(path)
+    return paths
+
+
+def manifest_mtime_size_index(path: str) -> Tuple[str, Dict[str, Tuple[float, int]]]:
+    """relpath → (mtime, size) aus archiviertem Manifest."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as e:
+        raise OSError(f"manifest not readable: {path}") from e
+    snap = str(data.get("snapshot") or os.path.splitext(os.path.basename(path))[0])
+    cache: Dict[str, Tuple[float, int]] = {}
+    for item in data.get("items", []):
+        if item.get("type") != "file":
+            continue
+        relpath = item.get("relpath")
+        mtime = item.get("mtime")
+        size = item.get("size")
+        if not relpath or mtime is None or size is None:
+            continue
+        cache[str(relpath)] = (float(mtime), int(size))
+    return snap, cache
+
+
+def manifest_pick_ref_from_scan(
+    snapshot_name: str,
+    manifests_dir: str,
+    file_scan: Union[List[Tuple[str, float, int]], Iterator[Tuple[str, float, int]]],
+    *,
+    total_files: int,
+    max_candidates: int = 6,
+    min_hit_rate: float = 0.0,
+    on_candidate_skip: Optional[Callable[[str, BaseException], None]] = None,
+) -> Optional[ManifestRefPick]:
+    """
+    Referenz-Manifest mit hoechster mtime/size-Deckung (max. N Kandidaten).
+    file_scan: Iterator oder Liste — kein zweiter Walk, kein all_paths in RAM.
+    """
+    candidate_paths = manifest_ref_candidate_paths(
+        snapshot_name, manifests_dir, max_candidates=max_candidates,
+    )
+    if not candidate_paths or not file_scan or total_files <= 0:
+        return None
+
+    caches: Dict[str, Tuple[str, Dict[str, Tuple[float, int]]]] = {}
+    for path in candidate_paths:
+        try:
+            caches[path] = manifest_mtime_size_index(path)
+        except (OSError, _json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            if on_candidate_skip:
+                on_candidate_skip(path, e)
+            continue
+
+    if not caches:
+        return None
+
+    scores: Dict[str, int] = {p: 0 for p in caches}
+    for relpath, mtime, size in file_scan:
+        for path, (_snap, cache) in caches.items():
+            ent = cache.get(relpath)
+            if ent is not None and ent[0] == mtime and ent[1] == size:
+                scores[path] += 1
+
+    best_path = max(
+        scores.keys(),
+        key=lambda p: (scores[p] / total_files, scores[p], p),
+    )
+    hits = scores[best_path]
+    hit_rate = hits / total_files
+    if hit_rate < min_hit_rate:
+        return None
+
+    best_snap = caches[best_path][0]
+    return ManifestRefPick(
+        path=best_path,
+        snapshot=best_snap,
+        hit_rate=hit_rate,
+        hits=hits,
+        total_files=total_files,
+        candidates=len(caches),
+    )
 
 
 # ===== Pool Scout (Basis-Snapshot für Turbo-Delta) =====

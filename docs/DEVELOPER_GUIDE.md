@@ -78,6 +78,24 @@ _SESSION.mount('https://', HTTPAdapter(pool_connections=4, pool_maxsize=8))
 
 Verhindert TCP-Reconnects zwischen API-Calls. Spart ~50 ms pro Call bei stabiler Verbindung.
 
+### Manifest-I/O (disk-backed, August 2026)
+
+RAM-schonende Manifest-Bausteine — **eine Implementierung in der Lib**, Aufruf aus `pcloud_json_pool_manifest.py` und künftig aus Push/Verify:
+
+| Funktion | Zweck |
+|----------|--------|
+| `manifest_scan_tree_to_sorted_tsv()` | `os.walk` → TSV auf SSD → GNU `sort` (kein `all_paths` in RAM) |
+| `manifest_iter_scan_records()` | Sortierte Scan-Zeilen zeilenweise lesen |
+| `manifest_iter_file_scan_from_sorted()` | Nur Dateien für Ref-Pick-Scoring |
+| `manifest_jsonl_line_count()` / `manifest_jsonl_append()` | Resume + crash-sicheres JSONL |
+| `manifest_write_json_from_jsonl()` | Finalize: JSONL → `.json` ohne RAM-Spike |
+| `manifest_pick_ref_from_scan()` | Smart-Mode Referenz-Manifest (mtime/size-Deckung) |
+| `manifest_cleanup_scan_files()` | Temp-TSV aufräumen |
+
+**Trade-off:** etwas mehr SSD-I/O und Scan+Sort-Zeit, dafür konstanter RAM-Verbrauch auf pi-nas (8 GB, NAS parallel nutzbar).
+
+**Wrapper-Logging (`wrapper_pcloud_pool_sync_1to1.sh`):** Unter systemd (`INVOCATION_ID`) kein `tee`-Pipe auf stdout — direktes Append ins Logfile; Subprozess-Ausgabe (Integrity) über Temp-Datei (gleiches Muster wie `rtb_pool_wrapper.sh`).
+
 ---
 
 ## 🗃️ Säule 2: Pool-Struktur & v2-Index
@@ -187,6 +205,8 @@ pcloud_json_pool_manifest.py \
 ```
 
 **Smart-Mode** (`--ref-manifest` oder `--auto-ref-manifest`): SHA256-Cache via mtime/size+inode. Auto-Pick wählt nach dem Scan bis zu 6 chronologisch nächste Archiv-Manifeste und nimmt die beste Deckung — **ein Walk**, kein separates Vorab-Scoring.
+
+**RAM / Streaming (August 2026):** Scan-Index und Finalize laufen über `pcloud_bin_lib` (TSV + externes `sort`, JSONL-Checkpoint, streaming Finalize). Kein vollständiges `all_paths`/`items`-Array mehr im RAM. Resume: `{out}.tmp.jsonl` Zeilenzahl.
 
 `ReferenceCache.lookup()`:
 1. Gleicher `relpath` + gleiche `mtime` + gleiche `size` → SHA aus Cache

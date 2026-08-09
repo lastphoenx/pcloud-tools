@@ -170,7 +170,28 @@ Stubs → [integrity-gate] pool_verify_backup (listfolder)
 
 ---
 
-## 11. Dashboard / DB-Wartung
+## 11. Pipeline RAM: Logging + Manifest-Streaming (August 2026)
+
+**Problem:** Backup-Pipeline auf pi-nas (8 GB) lief in OOM/Swap — u. a. `tee`-Pipes unter systemd, rsync `--itemize-changes`, Manifest mit `all_paths` + Finalize-Spike im RAM.
+
+**Lösung (Repos `rtb` + `pcloud-tools`):**
+
+| Bereich | Änderung |
+|---------|----------|
+| RTB Trigger | FD-Kollision Lock vs. Check behoben (`rtb_backup_trigger_run_locked`) |
+| RTB/rsync | Kein `--itemize-changes` in Produktion; stdout → Temp-Datei statt Parent-`tee` |
+| RTB Wrapper | Unter systemd: `exec >>log` statt `tee`-Pipe |
+| pCloud Wrapper | Gleiches Logging-Muster; Integrity-Ausgabe über Temp-Datei |
+| Manifest | Scan/Finalize in `pcloud_bin_lib.py` (TSV + `sort`, JSONL, streaming JSON) |
+| systemd | `install-backup-pipeline-systemd.sh` — kanonische Unit ohne `MemoryMax`/`StandardOutput=append` |
+
+**Nicht breaking:** Manifest-Schema v4 unverändert; JSON-Ausgabe weiterhin gültiges JSON (`jq -e '.items'`). Nur intern weniger RAM, etwas mehr SSD-I/O.
+
+**Offen:** `pcloud_push_json_pool_manifest_to_pcloud.py` lädt Manifest noch per `json.load()` — nächster RAM-Kandidat.
+
+---
+
+## 12. Dashboard / DB-Wartung
 
 **Problem:** Dashboard „Letzte Fehler (7d)“ zeigte alte FAILED-Einträge, obwohl Snapshots später erfolgreich waren.
 
@@ -183,7 +204,7 @@ sudo ./scripts/generate_reports.sh
 
 ---
 
-## 12. Commit-Referenzen (Auswahl)
+## 13. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
@@ -195,5 +216,6 @@ sudo ./scripts/generate_reports.sh
 | Circuit Breaker Cooldown | `adde572` |
 | Integrity-Gate (listfolder) | `76441b7` |
 | Manifest Smart-Ref (max 6) | `f7f440c`, `53d7fce`, `4da0d21` |
+| Pipeline RAM / streaming | `c8513c6` (rtb), `046e42d` (rtb), `fd09a17` + Manifest-Lib (pcloud-tools) |
 | Marker-Verify API-Ausfall | `0a24f12` |
 | DB-Wartung Dashboard | `79e5430` |
