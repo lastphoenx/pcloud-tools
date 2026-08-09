@@ -52,7 +52,10 @@ Unterverzeichnisse (von Pipeline/Wrapper angelegt):
   deltas/
     delta_verify_<snap>.json
   resume/                 ← Chunked-Upload Resume-State
+  staging/json/           ← Upload-Scratch (pro folderid) — **nicht** ins RTB (`excludes.txt`)
 ```
+
+**RTB:** Manifeste/Index/Deltas werden mitgesichert (Mergerfs-Spiegel `/srv/nas/pcloud-archive/`). Nur `staging/` ist Scratch — in `rtb/excludes.txt` ausgeschlossen. Seit `1f0a1c9` werden leere `staging/json/<id>/` nach Upload entfernt.
 
 ---
 

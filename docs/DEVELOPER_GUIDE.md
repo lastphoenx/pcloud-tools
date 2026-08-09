@@ -20,9 +20,9 @@
 | 6 | **GC** | `pcloud_pool_gc.py` | Verwaiste Pool-Objekte entfernen |
 | 7 | **Orchestrator** | `wrapper_pcloud_pool_sync_1to1.sh` | Catch-up-Loop, MariaDB, Preflight, tamper-detect |
 
-**Pipeline-Aufruf:** `rtb_pool_wrapper.sh` → `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
+**Pipeline-Aufruf:** `rtb_pool_wrapper.sh` → `rtb_staged_backup.sh` (Default `RTB_STAGED=1`) oder `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
 
-**RTB ↔ Pipeline (Kurz):** Zwei Exclude-Schichten — `excludes.txt` (nie ins Snapshot: `__pycache__`, `/restore/`, …) und `rtb_check_excludes.sh` (nur Check: `pcloud-archive/`, `pcloud-temp/` triggern nicht, werden aber mitgesichert). **`rsync_tmbackup.sh` bleibt Upstream** — keine Batch-Forks; Wrapper setzt Produktions-Flags ohne `--itemize-changes`. Trigger: `RTB_TRIGGER_MODE=signature` (Default). Details: [STORAGE_PATHS.md](./STORAGE_PATHS.md) § RTB vs. Pipeline, [DASHBOARD.md](./DASHBOARD.md) § Backup-Trigger, `rtb/README.md` § Architektur-Regeln.
+**RTB ↔ Pipeline (Kurz):** Zwei Exclude-Schichten — `excludes.txt` (nie ins Snapshot: `__pycache__`, `/restore/`, **`/pcloud-archive/staging/`**) und `rtb_check_excludes.sh` (nur Check: `pcloud-archive/`, `pcloud-temp/` triggern nicht, werden aber mitgesichert). **`rsync_tmbackup.sh` bleibt Upstream** — Staging nur in `rtb_staged_backup.sh`. Trigger: `RTB_TRIGGER_MODE=signature` (Default). Nach Wartung: `scripts/restore-pipeline-services.sh`. Details: [STORAGE_PATHS.md](./STORAGE_PATHS.md) § RTB vs. Pipeline, [DASHBOARD.md](./DASHBOARD.md) § Backup-Trigger, `rtb/README.md` § Staged Backup.
 
 ---
 

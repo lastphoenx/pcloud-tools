@@ -366,6 +366,16 @@ sudo systemctl restart monitoring-status-update.timer
 sudo systemctl restart monitoring-dashboard.service
 ```
 
+### Restore after manual maintenance
+
+After OOM recovery, staged resume, or `--upload-only`, re-enable timers:
+
+```bash
+sudo /opt/apps/pcloud-tools/main/scripts/restore-pipeline-services.sh
+```
+
+Re-enables: `backup-pipeline.timer`, monitoring timers, `monitoring-dashboard.service`, EntropyWatcher timers.
+
 ## 📊 Monitoring
 
 ### Dashboard URL

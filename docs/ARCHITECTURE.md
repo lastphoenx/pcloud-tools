@@ -16,9 +16,9 @@ pCloud-Tools ist eine schlanke, selbst-gehostete Backup-Pipeline, die lokale Rsy
 
 ## Zusammenhänge & Ablauf
 
-- **Lokale Backups auf dem NAS** — [rsync-time-backup](https://github.com/laurent22/rsync-time-backup) (`rsync_tmbackup.sh`) **unverändert**; `rtb_pool_wrapper.sh` orchestriert Trigger, Flags und Logging. Hardlinks via Upstream `--link-dest`.
+- **Lokale Backups auf dem NAS** — [rsync-time-backup](https://github.com/laurent22/rsync-time-backup) (`rsync_tmbackup.sh`) **unverändert**; `rtb_pool_wrapper.sh` ruft standardmäßig `rtb_staged_backup.sh` auf (mehrere rsync-Einheiten pro Snapshot, RAM ~600 MB/Einheit statt ~5 GB monolithisch). Hardlinks via `--link-dest` pro Teilpfad.
 
-- **Orchestrator** — `rtb_pool_wrapper.sh` (Repo `rtb`) wird vom systemd-Timer ausgelöst. Gemeinsamer **NAS Heavy-Ops-Lock** (`/run/backup_pipeline.lock`) mit ClamAV/Entropy-Scans — kein paralleles rsync + pCloud + AV auf `/srv/nas`. Nach RTB: `wrapper_pcloud_pool_sync_1to1.sh` im Catch-up-Modus (**latest zuerst**, dann Backlog).
+- **Orchestrator** — `rtb_pool_wrapper.sh` (Repo `rtb`) wird vom systemd-Timer ausgelöst. Gemeinsamer **NAS Heavy-Ops-Lock** (`/run/backup_pipeline.lock`) mit ClamAV/Entropy-Scans. Offenes Staged-Resume (`backup.inprogress` + `.rtb_staged_active`) überspringt den Delta-Check. Nach RTB: `wrapper_pcloud_pool_sync_1to1.sh` im Catch-up-Modus (**latest zuerst**, dann Backlog).
 
 - **pCloud-Sync** — `wrapper_pcloud_pool_sync_1to1.sh` orchestriert: Manifest-Erstellung, Pool-Upload und Verifikation pro Snapshot. EntropyWatcher Safety-Gate vor dem Backup. MariaDB-Phasen-Logging, OOM-Schutz (`PCLOUD_OOM_SCORE_ADJ`).
 
@@ -29,8 +29,8 @@ pCloud-Tools ist eine schlanke, selbst-gehostete Backup-Pipeline, die lokale Rsy
 ```mermaid
 flowchart TD
     Timer([systemd-Timer]) --> RTB_Wrapper[rtb_pool_wrapper.sh]
-    RTB_Wrapper --> RSYNC[rsync_tmbackup.sh]
-    RSYNC -- "Erstellt Snapshot" --> NAS_DIR[/mnt/backup/rtb_nas/]
+    RTB_Wrapper --> STAGED[rtb_staged_backup.sh]
+    STAGED -- "Mehrere rsync-Einheiten" --> NAS_DIR[/mnt/backup/rtb_nas/]
     NAS_DIR --> PCLOUD_WRAPPER[wrapper_pcloud_pool_sync_1to1.sh]
 
     subgraph Pipeline [pCloud Pool-Sync Pipeline]

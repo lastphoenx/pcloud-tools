@@ -242,7 +242,28 @@ sudo ./scripts/generate_reports.sh
 
 ---
 
-## 14. Commit-Referenzen (Auswahl)
+## 14. RTB Staged Backup — OOM auf pi-nas (9.–10. Aug 2026)
+
+**Problem:** Monolithischer rsync über `/srv/nas` (~240k Einträge) → OOM auf 8 GB-Pi. `pcloud-archive/staging/json` (~47k Scratch-Ordner) erzeugte bei fehlerhaftem Tree-Split **~47k rsync-Läufe**.
+
+**Lösung:**
+
+| Repo | Änderung |
+|------|----------|
+| `rtb` | `rtb_staged_backup.sh` — ~32 Einheiten, Resume, Excludes in Unit-Liste (`d653c61`), Top-Level-Dateien (`33c8d1d`) |
+| `rtb` | `excludes.txt`: `/pcloud-archive/staging/` |
+| `rtb` | Wrapper: Delta-Check skip bei offenem Staged-Resume |
+| `pcloud-tools` | `RTB_STAGED=1` in `backup-pipeline.service.example` |
+| `pcloud-tools` | `write_json_to_folderid()` entfernt leere Scratch-Ordner nach Upload |
+| `pcloud-tools` | `scripts/restore-pipeline-services.sh` — Timer nach Wartung |
+
+**Nach manuellem RTB:** `--upload-only` für pCloud, dann `restore-pipeline-services.sh`.
+
+Details: `rtb/README.md`, `doku/Raspi/raspinas/pcloud-tools/OPERATIONS_2026-08.md` §11.
+
+---
+
+## 15. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
@@ -258,3 +279,4 @@ sudo ./scripts/generate_reports.sh
 | RTB Batch revert + OOM-Opfer weg | `e86a96b` (rtb), `8c3367c` (pcloud-tools) |
 | Marker-Verify API-Ausfall | `0a24f12` |
 | DB-Wartung Dashboard | `79e5430` |
+| RTB staged backup | `bdf93b7`–`33c8d1d` (rtb), `51228b0` + `1f0a1c9` (pcloud-tools) |
