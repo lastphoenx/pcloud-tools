@@ -22,7 +22,7 @@
 
 **Pipeline-Aufruf:** `rtb_pool_wrapper.sh` → `rsync_tmbackup.sh` → `wrapper_pcloud_pool_sync_1to1.sh`
 
-**RTB ↔ Pipeline (Kurz):** Zwei Exclude-Schichten — `excludes.txt` (nie ins Snapshot: `__pycache__`, `/restore/`, …) und `rtb_check_excludes.sh` (nur Check: `pcloud-archive/`, `pcloud-temp/` triggern nicht, werden aber mitgesichert). Post-Filter in `rtb_check_only_delta.py`. Dashboard: Backup-Trigger vs. Pipeline vs. Exclude-Policy. Details: [STORAGE_PATHS.md](./STORAGE_PATHS.md) § RTB vs. Pipeline, [DASHBOARD.md](./DASHBOARD.md) § Backup-Trigger.
+**RTB ↔ Pipeline (Kurz):** Zwei Exclude-Schichten — `excludes.txt` (nie ins Snapshot: `__pycache__`, `/restore/`, …) und `rtb_check_excludes.sh` (nur Check: `pcloud-archive/`, `pcloud-temp/` triggern nicht, werden aber mitgesichert). **`rsync_tmbackup.sh` bleibt Upstream** — keine Batch-Forks; Wrapper setzt Produktions-Flags ohne `--itemize-changes`. Trigger: `RTB_TRIGGER_MODE=signature` (Default). Details: [STORAGE_PATHS.md](./STORAGE_PATHS.md) § RTB vs. Pipeline, [DASHBOARD.md](./DASHBOARD.md) § Backup-Trigger, `rtb/README.md` § Architektur-Regeln.
 
 ---
 
