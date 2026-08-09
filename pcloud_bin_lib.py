@@ -3299,6 +3299,8 @@ def write_json_to_folderid(cfg: dict, *, folderid: int, filename: str, obj: dict
     Staging auf lokaler SSD (PCLOUD_ARCHIVE_DIR/staging/json), dann:
     - kleine Dateien: upload_streaming (liest von Disk)
     - grosse Dateien: upload_local_file_resumable (Resume pro Chunk)
+    Nach erfolgreichem Upload: Temp-Datei und leerer folderid-Ordner entfernen
+    (ausser PCLOUD_JSON_STAGING_KEEP=1).
 
     Vermeidet json.dumps()+BytesIO im RAM (OOM bei grossem content_index).
     """
@@ -3325,7 +3327,7 @@ def write_json_to_folderid(cfg: dict, *, folderid: int, filename: str, obj: dict
 
     try:
         if file_size >= threshold:
-            return upload_local_file_resumable(
+            result = upload_local_file_resumable(
                 cfg,
                 local_path,
                 folderid=int(folderid),
@@ -3334,15 +3336,23 @@ def write_json_to_folderid(cfg: dict, *, folderid: int, filename: str, obj: dict
                 log_prefix=f"[json-upload:{filename}]",
                 log_every_chunks=log_every,
             )
-        return upload_streaming(
-            cfg, local_path, dest_folderid=int(folderid), filename=filename
-        )
+        else:
+            result = upload_streaming(
+                cfg, local_path, dest_folderid=int(folderid), filename=filename
+            )
     finally:
         if os.environ.get("PCLOUD_JSON_STAGING_KEEP", "0") != "1":
             try:
                 os.remove(local_path)
             except OSError:
                 pass
+
+    if os.environ.get("PCLOUD_JSON_STAGING_KEEP", "0") != "1":
+        try:
+            os.rmdir(local_dir)
+        except OSError:
+            pass
+    return result
 
 
 def stat_folderid_fast(cfg: dict, path: str) -> int | None:
