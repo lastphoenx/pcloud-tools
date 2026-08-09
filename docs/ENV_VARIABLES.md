@@ -464,19 +464,26 @@ PCLOUD_FIDCACHE_TTL=3600
 ## 🧠 RAM & Integritaet
 
 ### `PCLOUD_POST_UPLOAD_INTEGRITY`
-**Beschreibung:** Post-Upload-Integritaetscheck via `pool_integrity_run.py` (ein Snapshot, DB-Tracking).  
-**Default:** `1` (aktiv)  
-**Werte:** `1` / `skip` / `0` / `off`  
+**Beschreibung:** Zusaetzlicher Integritaetslauf im **Wrapper** nach dem Push (redundant). Das **harte Gate** (`listfolder`, ~30–60s) laeuft im Push-Skript vor `.upload_complete`.  
+**Default:** `skip`  
+**Werte:** `skip` / `0` / `off` oder `1` / `run` (zweiter Lauf, nur Audit)  
 **Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`
 
-Ersetzt den früheren `pcloud_quick_delta`-Lauf nach Upload (OOM-Risiko auf 8GB-Pi).
+```bash
+# Standard (Gate im Push reicht):
+PCLOUD_POST_UPLOAD_INTEGRITY=skip
+# Optional zweiter Lauf im Wrapper:
+# PCLOUD_POST_UPLOAD_INTEGRITY=1
+```
 
-Die **inline Post-Upload-Validation** im Push-Script (`validate_pool_snapshot`) nutzt seit Juli 2026 Batch-`stat()` statt `listfolder` — siehe [Pool-Finalize](#pool-finalize-ram-sparend).
+### `PCLOUD_VALIDATE_UPLOAD`
+**Beschreibung:** Legacy Post-Upload-Validation per Massen-`stat()` (`validate_pool_snapshot`, ~40 Min). **Default aus** — stattdessen Integrity-Gate (`listfolder`) im Push.  
+**Werte:** `1` = legacy stat-Validation, `0` = listfolder-Gate (Default)  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
 
 ```bash
-PCLOUD_POST_UPLOAD_INTEGRITY=1
-# Notfall:
-# PCLOUD_POST_UPLOAD_INTEGRITY=skip
+# Nur fuer Debug/Paranoia:
+# PCLOUD_VALIDATE_UPLOAD=1
 ```
 
 ### `PCLOUD_MARKER_VERIFY_RETRIES` / `PCLOUD_MARKER_VERIFY_RETRY_SEC`
@@ -598,7 +605,7 @@ PCLOUD_VALIDATE_FAIL_LIMIT=50
 ```
 
 ### `PCLOUD_VALIDATE_STUB_FULL`
-**Beschreibung:** Stub-Vollcheck per Batch-`stat()` (1 = aktiv). Nur für Notfall/Debug auf `0` setzen.  
+**Beschreibung:** Nur relevant bei **Legacy** `PCLOUD_VALIDATE_UPLOAD=1`: Stub-Vollcheck per Batch-`stat()`.  
 **Default:** `1`  
 **Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
 

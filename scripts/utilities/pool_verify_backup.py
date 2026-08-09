@@ -194,6 +194,7 @@ def check_manifest_vs_pool(
             "total_files": len(files),
             "unique_shas": len(snap_shas),
             "missing_from_pool": sorted(missing)[:20],
+            "missing_shas": sorted(missing),
             "missing_count": len(missing),
         }
 

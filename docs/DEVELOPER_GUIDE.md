@@ -378,7 +378,7 @@ PCLOUD_COPYFOLDER_TIMEOUT=300      # Meta-Operationen: 300s statt 30s
 PCLOUD_SCOUT_THRESHOLD=0.70        # Mindest-Similarity für Turbo-Delta
 
 # Validation
-PCLOUD_VALIDATE_UPLOAD=1           # 0 = überspringen (nur Notfall)
+PCLOUD_VALIDATE_UPLOAD=0           # Default: listfolder-Gate im Push; 1 = legacy stat (~40min)
 
 # Logging
 PCLOUD_LOG=/var/log/backup/pcloud_sync.log
