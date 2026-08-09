@@ -146,7 +146,13 @@ cd /opt/apps/entropywatcher/main && git pull origin main   # falls Scan-Units ak
 
 ---
 
-## 10. Commit-Referenzen (Auswahl)
+## 10. Integrity-Gate (listfolder, Default)
+
+**Aenderung:** Hartes Gate vor `.upload_complete` = `pool_verify_backup` (~30–60s) + Pool-Backfill. Legacy stat-Validation (`PCLOUD_VALIDATE_UPLOAD=1`, ~40 Min) optional. Wrapper-Verify default `skip`.
+
+---
+
+## 11. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
 |-------|------------------------|
