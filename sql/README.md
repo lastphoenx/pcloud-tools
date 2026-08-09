@@ -59,14 +59,16 @@ sudo scripts/generate_reports.sh
 
 Siehe `docs/POOL_INTEGRITY.md`.
 
-RAM limit for backup pipeline (8GB Pi):
+### backup-pipeline systemd (pi-nas)
+
+Nach Änderungen an der Unit im Repo:
 
 ```bash
-sudo mkdir -p /etc/systemd/system/backup-pipeline.service.d
-sudo cp systemd/backup-pipeline.service.d/memory-limit.conf.example \
-  /etc/systemd/system/backup-pipeline.service.d/memory-limit.conf
-sudo systemctl daemon-reload
+cd /opt/apps/pcloud-tools/main && git pull
+sudo ./scripts/install-backup-pipeline-systemd.sh
 ```
+
+Das Script kopiert `systemd/backup-pipeline.service.example` und `.timer.example` nach `/etc` und entfernt ein veraltetes `memory-limit.conf` Drop-in.
 
 ### Stale RUNNING-Zombies bereinigen
 
@@ -78,8 +80,6 @@ sudo mysql pcloud_backup < sql/fix_stale_running_backup_runs.sql
 sudo mysql pcloud_backup < sql/migrate_integrity_v3_view.sql
 sudo /opt/apps/pcloud-tools/main/scripts/generate_reports.sh
 ```
-
-`memory-limit.conf`: **kein** `RuntimeWatchdogSec` in `[Service]` (ungueltig). Nur `MemoryMax`/`MemorySwapMax`.
 
 ### Dashboard / DB bereinigen (empfohlen)
 
