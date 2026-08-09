@@ -140,8 +140,8 @@ Erwarteter Ablauf:
 2. Pool-Preflight: `listfolder(_pool)` → 0 SHA256s (Pool leer)
 3. Alle Dateien hochladen (~45 MB/s je nach Bandbreite)
 4. 19808 Stubs schreiben
-5. Post-Upload-Validation: Pool-SHA-Check + Stub-100%-Check
-6. `.upload_complete` gesetzt
+5. Integrity-Gate: `pool_verify_backup` per `listfolder` (~30–60 s), optional Pool-Backfill
+6. `.upload_complete` gesetzt → Index-Upload
 
 ---
 
@@ -379,7 +379,7 @@ sudo mysql pcloud_backup -e \
 ./wrapper_pcloud_pool_sync_1to1.sh <snapshot>
 ```
 
-### Pool-Objekt fehlt in Validation
+### Pool-Objekt fehlt im Integrity-Gate
 ```bash
 # SHA identifizieren:
 python scripts/utilities/pool_check_remote.py \
