@@ -22,6 +22,7 @@ Environment=NAS_HEAVY_OPS_FAIL_FAST=1
 Environment=PCLOUD_MAIN_DIR=/opt/apps/pcloud-tools/main
 # KEIN NAS_HEAVY_OPS_ALLOW_HOURS — alle 3 Backup-Slots (04/12/20) müssen laufen
 # Trigger: RTB_TRIGGER_MODE=signature (Default in rtb) — kein rsync -ni Vollbaum
+Environment=RTB_STAGED=1
 # Logging nur via rtb_pool_wrapper.sh → /var/log/backup/rtb_wrapper.log
 # KEIN StandardOutput=append hier (Doppel-Tee mit Script würde RAM/IO belasten)
 # KEIN MemoryMax — Backup darf RAM nutzen; kein OOMScoreAdjust (rsync nicht gezielt opfern)
