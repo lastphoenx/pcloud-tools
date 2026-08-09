@@ -20,6 +20,7 @@ ExecStart=/opt/apps/rtb/rtb_pool_wrapper.sh
 Environment=SAFETY_GATE_STRICT=0
 Environment=NAS_HEAVY_OPS_FAIL_FAST=1
 Environment=RTB_OOM_SCORE_ADJ=500
+Environment=RTB_RSYNC_BATCH_TOP_LEVEL=1
 Environment=PCLOUD_MAIN_DIR=/opt/apps/pcloud-tools/main
 # KEIN NAS_HEAVY_OPS_ALLOW_HOURS — alle 3 Backup-Slots (04/12/20) müssen laufen
 # Trigger: RTB_TRIGGER_MODE=signature (Default in rtb) — kein rsync -ni Vollbaum
