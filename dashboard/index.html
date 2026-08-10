@@ -1848,8 +1848,9 @@
       const pol = rtb.exclude_policy;
       if (!pol) return '';
       const trigger = pol.trigger_only || [];
+      const sigIgnore = pol.signature_ignore || [];
       const never = pol.never_backup || [];
-      if (!trigger.length && !never.length) return '';
+      if (!trigger.length && !sigIgnore.length && !never.length) return '';
       let rows = '';
       trigger.forEach(function(p) {
         rows += '<tr>'
@@ -1857,6 +1858,14 @@
           + '<td class="muted">nur Check</td>'
           + '<td class="pol-nein">nein</td>'
           + '<td class="pol-mit">mit</td>'
+          + '</tr>';
+      });
+      sigIgnore.forEach(function(p) {
+        rows += '<tr>'
+          + '<td><code>' + esc(p) + '</code></td>'
+          + '<td class="muted">Signature</td>'
+          + '<td class="pol-nein">nein</td>'
+          + '<td class="muted">nur Snapshot</td>'
           + '</tr>';
       });
       never.forEach(function(p) {
@@ -1867,7 +1876,7 @@
           + '<td class="pol-nie">nie</td>'
           + '</tr>';
       });
-      const n = trigger.length + never.length;
+      const n = trigger.length + sigIgnore.length + never.length;
       return '<details class="rtb-policy-details">'
         + '<summary>Exclude-Policy (' + n + ' Pattern) \u2014 Trigger vs. Snapshot</summary>'
         + '<table class="rtb-policy-table">'
@@ -1887,8 +1896,10 @@
       const pol = rtb.exclude_policy;
       if (!pol) return '';
       const trig = (pol.trigger_only || []).join(', ') || '\u2014';
+      const sigIgn = (pol.signature_ignore || []).join(', ') || '\u2014';
       const neverN = (pol.never_backup || []).length;
       return drow('Exclude trigger-only', trig, '', 200)
+        + drow('Signature ignore', sigIgn, '', 200)
         + drow('Exclude nie (excludes.txt)', neverN + ' Pattern(s)', '', 120);
     }
 
