@@ -354,6 +354,10 @@ check_rtb_wrapper() {
       dry_run_result="changes_detected"
     elif echo "$check_out" | grep -qE "no_changes|only pipeline"; then
       dry_run_result="no_changes"
+    elif [[ -n "$check_out" ]]; then
+      dry_run_result="no_changes"
+    else
+      dry_run_result="unavailable"
     fi
     if echo "$check_out" | grep -q "check_cached"; then
       dry_run_stale=1
@@ -382,6 +386,9 @@ check_rtb_wrapper() {
         echo "$rtb_exclude_policy_json" | jq empty 2>/dev/null || rtb_exclude_policy_json=""
       fi
     fi
+  else
+    dry_run_result="unavailable"
+    dry_run_ts=$(date '+%Y-%m-%d %H:%M:%S')
   fi
 
   # Escape message and details
