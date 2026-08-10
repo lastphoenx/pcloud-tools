@@ -343,7 +343,7 @@ check_rtb_wrapper() {
   if [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
     local check_out check_rc
     set +e
-    check_out=$("${RTB_WRAPPER_SCRIPT}" --check-only 2>/dev/null)
+    check_out=$("${RTB_WRAPPER_SCRIPT}" --check-only 2>&1)
     check_rc=$?
     set -e
     dry_run_ts=$(date '+%Y-%m-%d %H:%M:%S')
@@ -353,6 +353,12 @@ check_rtb_wrapper() {
     elif echo "$check_out" | grep -q "changes_detected"; then
       dry_run_result="changes_detected"
     elif echo "$check_out" | grep -qE "no_changes|only pipeline"; then
+      dry_run_result="no_changes"
+    elif [[ "$check_rc" -eq 1 ]]; then
+      dry_run_result="changes_detected"
+    elif [[ "$check_rc" -eq 3 ]]; then
+      dry_run_result="busy"
+    elif [[ "$check_rc" -eq 0 ]]; then
       dry_run_result="no_changes"
     elif [[ -n "$check_out" ]]; then
       dry_run_result="no_changes"
