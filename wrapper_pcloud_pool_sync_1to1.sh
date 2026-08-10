@@ -58,8 +58,8 @@ if [[ -f "${ENV_FILE:-}" ]]; then
   done < "${ENV_FILE}"
 fi
 
-# Temp-Pfad aus Env oder Default
-export PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/tmp}"
+# Temp-Pfad aus Env oder Default (SSD2 — niemals Micro-SD /tmp)
+export PCLOUD_TEMP_DIR="${PCLOUD_TEMP_DIR:-/srv/pcloud-temp}"
 export PCLOUD_ARCHIVE_DIR="${PCLOUD_ARCHIVE_DIR:-/srv/pcloud-archive}"
 
 # Verzeichnisse erstellen falls nicht vorhanden
@@ -510,7 +510,15 @@ build_and_push() {
   
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode pool --env-file "$ENV_FILE" "${EXTRA_PUSH_ARGS[@]}" || {
     _db_phase_log "upload" "end" "FAILED"
-    # Temp-Manifest behalten: Retry ueberspringt Regenerierung, Diagnose via jq moeglich
+    # Integrity-Gate kann vor main()-Archivierung abbrechen — Manifest auf SSD sichern
+    if [[ -f "$mani" ]]; then
+      mkdir -p "${PCLOUD_ARCHIVE_DIR}/manifests" 2>/dev/null || true
+      if cp -f "$mani" "${PCLOUD_ARCHIVE_DIR}/manifests/${SNAPNAME}.json" 2>/dev/null; then
+        _log WARN "Upload fehlgeschlagen — Manifest gesichert: ${PCLOUD_ARCHIVE_DIR}/manifests/${SNAPNAME}.json"
+      else
+        _log WARN "Upload fehlgeschlagen — Temp-Manifest bleibt: $mani"
+      fi
+    fi
     _db_fail_and_return "upload_failed"
   }
   

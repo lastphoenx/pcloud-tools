@@ -665,7 +665,7 @@ PCLOUD_FIDCACHE_TTL=7200
 
 # === Pfade ===
 PCLOUD_ARCHIVE_DIR=/srv/pcloud-archive
-PCLOUD_TEMP_DIR=/tmp
+PCLOUD_TEMP_DIR=/srv/pcloud-temp
 
 # === Debugging (aus) ===
 PCLOUD_VERBOSE=0

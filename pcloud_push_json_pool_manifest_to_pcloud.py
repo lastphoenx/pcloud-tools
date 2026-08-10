@@ -173,6 +173,11 @@ MET_API_RETRIES    = int(os.environ.get("PCLOUD_API_RETRIES", "0"))  # optional 
 _metrics_lock = threading.Lock()
 
 
+def _default_temp_dir() -> str:
+    """Lokaler Scratch (pi-nas: /srv/pcloud-temp auf SSD2, nicht /tmp auf Micro-SD)."""
+    return os.environ.get("PCLOUD_TEMP_DIR", "/srv/pcloud-temp")
+
+
 def _get_resume_state_dir() -> str:
     """
     Ermittelt State-Verzeichnis für Resume-Uploads (analog zu poc_chunked_resume.py).
@@ -1580,7 +1585,7 @@ def _ensure_archived_manifest(
     source = manifest_source_path or os.environ.get("PCLOUD_ACTIVE_MANIFEST_PATH") or ""
     if not source:
         import tempfile as _tf
-        temp_dir = os.environ.get("PCLOUD_TEMP_DIR", _tf.gettempdir())
+        temp_dir = _default_temp_dir()
         source = os.path.join(temp_dir, f"pcloud_mani.{snapshot_name}.json")
 
     if not os.path.isfile(source):
@@ -2181,7 +2186,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             # Lokalen Index-Checkpoint dieses Snapshots verwerfen
             try:
                 import tempfile as _tf
-                _idx_dir = os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir())
+                _idx_dir = _default_temp_dir()
                 _idx_path = os.path.join(_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
                 if os.path.exists(_idx_path):
                     os.remove(_idx_path)
@@ -2342,7 +2347,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         
         # Index laden
         import tempfile
-        _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        _local_index_dir = _default_temp_dir()
         _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
         os.makedirs(_local_index_dir, exist_ok=True)
         
@@ -2587,7 +2592,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         # Index trotzdem laden + neuen (geklonten) Snapshot fuer ALLE SHAs registrieren
         # (sonst UnboundLocalError bei Validation + fehlende pool_refs-Eintraege).
         import tempfile
-        _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        _local_index_dir = _default_temp_dir()
         _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
         os.makedirs(_local_index_dir, exist_ok=True)
         if os.path.exists(_local_index_path):
@@ -2908,7 +2913,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         
         # === LOKALER INDEX-CACHE (wie Original!) ===
         import tempfile
-        _local_index_dir = os.getenv("PCLOUD_TEMP_DIR", tempfile.gettempdir())
+        _local_index_dir = _default_temp_dir()
         _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
         os.makedirs(_local_index_dir, exist_ok=True)
         
