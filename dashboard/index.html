@@ -1766,6 +1766,10 @@
       }
       if (r === 'no_changes')
         return { text: '\u2713 Keine \xc4nderungen \u2014 kein Backup n\xf6tig' + ts, cls: 'green' };
+      if (r === 'busy')
+        return { text: '\u23F3 Check l\xe4uft / busy' + ts, cls: 'yellow' };
+      if (r === 'unavailable')
+        return { text: '\u26A0 Dry-Run Check nicht verf\xfcgbar (Timer-Sandbox?)' + ts, cls: 'yellow' };
       return null;
     }
     // Inline HTML for the tile info-row
