@@ -466,8 +466,22 @@
     .docs-nav .nav-title {
       font-size: 14px;
       font-weight: 600;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
       color: var(--text);
+    }
+    .docs-nav .nav-group {
+      margin-bottom: 10px;
+    }
+    .docs-nav .nav-group:last-child {
+      margin-bottom: 0;
+    }
+    .docs-nav .nav-group-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
     }
     .docs-nav .nav-links {
       display: flex;
@@ -493,12 +507,121 @@
       color: var(--green);
       transform: translateY(-1px);
     }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .header-btn {
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .header-btn:hover, .header-btn.active {
+      border-color: var(--blue);
+      color: var(--blue);
+      background: rgba(59, 130, 246, 0.12);
+    }
+
+    .cheats-panel {
+      display: none;
+      padding: 14px 20px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 16px;
+    }
+    .cheats-panel.open { display: block; }
+    .cheats-panel .cheats-intro {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .cheats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 14px;
+    }
+    .cheat-section {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .cheat-section h3 {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: var(--blue);
+    }
+    .cheat-item {
+      margin-bottom: 10px;
+    }
+    .cheat-item:last-child { margin-bottom: 0; }
+    .cheat-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+    .cheat-hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .cheat-row {
+      display: flex;
+      gap: 6px;
+      align-items: flex-start;
+    }
+    .cheat-cmd {
+      flex: 1;
+      font-family: ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      padding: 8px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: #a5d6ff;
+      white-space: pre-wrap;
+      word-break: break-all;
+      user-select: all;
+    }
+    .cheat-cmd a {
+      color: #7dd3fc;
+      text-decoration: none;
+    }
+    .cheat-cmd a:hover { text-decoration: underline; }
+    .cheat-copy {
+      flex-shrink: 0;
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .cheat-copy:hover { color: var(--green); border-color: var(--green); }
+    .cheat-copy.copied { color: var(--green); border-color: var(--green); }
   </style>
 </head>
 <body>
 
   <div class="header">
-    <h1>&#x1F5A5;&#xFE0F; Backup &amp; Monitoring Dashboard</h1>
+    <div class="header-left">
+      <h1>&#x1F5A5;&#xFE0F; Backup &amp; Monitoring Dashboard</h1>
+      <button type="button" class="header-btn" id="btn-cheats-toggle" title="Betrieb &amp; Wartung — Befehle kopieren">&#x2328; Cheats</button>
+    </div>
     <div class="meta">
       <span id="hostname">&#x2014;</span>
       <span id="data-timestamp">&#x2014;</span>
@@ -506,54 +629,78 @@
     </div>
   </div>
 
+  <div class="cheats-panel" id="cheats-panel" aria-hidden="true">
+    <div class="cheats-intro">
+      Schnellreferenz pi-nas — Klick auf <strong>Kopieren</strong>. Gleiche Inhalte wie <code>cheatx.py show --nas</code> auf dem Server.
+    </div>
+    <div class="cheats-grid" id="cheats-grid"></div>
+  </div>
+
   <!-- Documentation Navigation -->
   <nav class="docs-nav">
-    <div class="nav-title">📚 Dokumentation & Ressourcen</div>
-    <div class="nav-links">
-      <a href="/entropy-watcher-und-clamav-scanner/docs/index.html" class="nav-link">
-        <span>📖</span>
-        <span>Overview</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/architecture.html" class="nav-link">
-        <span>🏗️</span>
-        <span>Architektur</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/process-flow.html" class="nav-link">
-        <span>📊</span>
-        <span>Prozess-Flow</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/pcloud.html" class="nav-link">
-        <span>☁️</span>
-        <span>pCloud System</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram.html" class="nav-link">
-        <span>⏱️</span>
-        <span>Timing Overview</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-green.html" class="nav-link">
-        <span>🟢</span>
-        <span>GREEN Szenario</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-yellow.html" class="nav-link">
-        <span>🟡</span>
-        <span>YELLOW Szenario</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-red.html" class="nav-link">
-        <span>🔴</span>
-        <span>RED Szenario</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" class="nav-link">
-        <span>🔍</span>
-        <span>Monitoring</span>
-      </a>
-      <a href="/entropy-watcher-und-clamav-scanner/docs/TESTING.html" class="nav-link">
-        <span>🧪</span>
-        <span>Testing</span>
-      </a>
-      <a href="/pcloud-tools/docs/DASHBOARD.html" class="nav-link">
-        <span>📊</span>
-        <span>Dashboard Docs</span>
-      </a>
+    <div class="nav-title">📚 Dokumentation</div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">System &amp; Pool-Backup</div>
+      <div class="nav-links">
+        <a href="/entropy-watcher-und-clamav-scanner/docs/index.html" class="nav-link" title="EntropyWatcher &amp; pCloud — Übersicht">
+          <span>📖</span><span>Overview</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/architecture.html" class="nav-link" title="Hardware &amp; Komponenten">
+          <span>🏗️</span><span>Architektur</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/accurate-flow.html" class="nav-link" title="rtb_pool_wrapper → Pool-Sync (aktuell)">
+          <span>🔄</span><span>Pipeline (Pool)</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/process-flow.html" class="nav-link" title="Detaillierter Prozessflow &amp; Skripte">
+          <span>📊</span><span>Prozess-Details</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/index.html#pcloud" class="nav-link" title="Pool-Modus /Backup/rtb_pool">
+          <span>☁️</span><span>pCloud Pool</span>
+        </a>
+      </div>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Safety-Gate &amp; Timing</div>
+      <div class="nav-links">
+        <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram.html" class="nav-link" title="Timing-Übersicht (präzise)">
+          <span>⏱️</span><span>Timing</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-all-scenarios.html" class="nav-link" title="GREEN / YELLOW / RED / Skip">
+          <span>📋</span><span>Alle Szenarien</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-green.html" class="nav-link" title="Safety-Gate GREEN">
+          <span>🟢</span><span>GREEN</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-yellow.html" class="nav-link" title="Safety-Gate YELLOW">
+          <span>🟡</span><span>YELLOW</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-red.html" class="nav-link" title="Safety-Gate RED — Backup blockiert">
+          <span>🔴</span><span>RED</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/timing-diagram-no_changes.html" class="nav-link" title="Keine RTB-Änderungen — Skip">
+          <span>⏭️</span><span>No Changes</span>
+        </a>
+      </div>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Betrieb &amp; Wartung</div>
+      <div class="nav-links">
+        <a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" class="nav-link" title="status.json, Timer, Troubleshooting">
+          <span>🔍</span><span>Monitoring</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/HONEYFILE_SETUP.html" class="nav-link" title="Honeyfile-Überwachung">
+          <span>🍯</span><span>Honeyfiles</span>
+        </a>
+        <a href="/entropy-watcher-und-clamav-scanner/docs/TESTING.html" class="nav-link" title="Test-Guide &amp; Dry-Runs">
+          <span>🧪</span><span>Testing</span>
+        </a>
+        <a href="/pcloud-tools/docs/DASHBOARD.html" class="nav-link" title="Dashboard-Kacheln &amp; JSON-Quellen">
+          <span>📊</span><span>Dashboard Docs</span>
+        </a>
+      </div>
     </div>
   </nav>
 
@@ -614,6 +761,12 @@
     }
 
     function render(status, reports) {
+      if (status.hostname) {
+        window.__nasHost = status.hostname;
+        if (document.getElementById('cheats-panel') && document.getElementById('cheats-panel').classList.contains('open')) {
+          renderCheats();
+        }
+      }
       document.getElementById('hostname').textContent = status.hostname || '\u2014';
       document.getElementById('data-timestamp').textContent = fmtTs(status.timestamp);
       const tz = (reports && reports.server_timezone) || status.server_timezone || 'Europe/Berlin';
@@ -1841,6 +1994,152 @@
     function esc(str) {
       return (str||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
+
+    // ---- Cheats panel (pi-nas Ops) ----
+    window.__nasHost = window.location.hostname || 'pi-nas';
+
+    function getNasHost() {
+      return window.__nasHost || window.location.hostname || 'pi-nas';
+    }
+
+    function getCheatSections() {
+      const host = getNasHost();
+      const dashUrl = window.location.origin + window.location.pathname;
+      const scriptMgr = 'http://' + host + ':8000/';
+      return [
+        {
+          title: 'Tools & Web-UI',
+          items: [
+            { label: 'pCloud Commander (TUI)', hint: 'Tab Pane · s Scripts · d Download · q Ende',
+              cmd: 'sudo /opt/apps/pcloud-commander/main/pcloud-commander.sh' },
+            { label: 'Script Manager (Web)', hint: 'scripts.yaml — Pool Restore, GC, microSD dd',
+              url: scriptMgr, cmd: scriptMgr },
+            { label: 'Monitoring Dashboard', hint: 'Diese Seite',
+              url: dashUrl, cmd: dashUrl },
+            { label: 'SSH-Tunnel Script Manager (vom PC)', hint: 'falls Port 8000 nicht im LAN offen',
+              cmd: 'ssh -L 8000:127.0.0.1:8000 root@' + host },
+          ],
+        },
+        {
+          title: 'Monitoring & Dashboard-Daten',
+          items: [
+            { label: 'status.json neu (Kacheln, GAP)', hint: 'nach manuellen DB-Fixes',
+              cmd: 'sudo /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh' },
+            { label: 'reports.json neu (Tabellen)', hint: 'DB → Dashboard',
+              cmd: 'sudo /opt/apps/pcloud-tools/main/scripts/generate_reports.sh' },
+            { label: 'Beides + Dashboard neu laden',
+              cmd: 'cd /opt/apps/pcloud-tools/main\nsudo ./scripts/aggregate_status.sh\nsudo ./scripts/generate_reports.sh\nsudo systemctl restart monitoring-dashboard.service' },
+            { label: 'Health-Check (Gap, Quota, DB)',
+              cmd: 'cd /opt/apps/pcloud-tools/main && ./pcloud_health_check.sh --verbose' },
+            { label: 'status.json prüfen',
+              cmd: 'jq \'.scripts.pcloud_backup.checks.backup_age\' /opt/apps/monitoring/status.json' },
+            { label: 'Monitoring-Timer',
+              cmd: 'systemctl list-timers \'monitoring-*\'\njournalctl -u monitoring-status-update.service -n 10 --no-pager' },
+          ],
+        },
+        {
+          title: 'Backup & Pipeline',
+          items: [
+            { label: 'Pipeline-Status / Log',
+              cmd: 'systemctl status backup-pipeline.service --no-pager\njournalctl -u backup-pipeline.service -n 40 --no-pager' },
+            { label: 'RTB Delta (Änderungen?)',
+              cmd: 'sudo bash /opt/apps/rtb/rtb_delta_report.sh' },
+            { label: 'Pool Audit (erster Check)',
+              cmd: 'cd /opt/apps/pcloud-tools/main\n/opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pool_audit_status.py --env-file .env --pool-root /Backup/rtb_pool' },
+            { label: 'Finalize-only (Upload schon da)',
+              cmd: 'cd /opt/apps/pcloud-tools/main\nMANI=/srv/pcloud-temp/pcloud_mani.SNAPSHOT.json\n/opt/apps/pcloud-tools/venv/bin/python pcloud_push_json_pool_manifest_to_pcloud.py \\\n  --manifest "$MANI" --dest-root /Backup/rtb_pool --snapshot-mode pool \\\n  --env-file .env --finalize-only' },
+            { label: 'DB Backup-Runs',
+              cmd: 'sudo bash /opt/apps/pcloud-tools/main/pcloud_status.sh --last-n 5' },
+          ],
+        },
+        {
+          title: 'Wartung & Recovery',
+          items: [
+            { label: 'Retention Prognose (Dry-Run)',
+              cmd: 'cd /opt/apps/pcloud-tools/main\n/opt/apps/pcloud-tools/venv/bin/python pcloud_pool_gc.py --env-file .env --pool-root /Backup/rtb_pool --retention-forecast' },
+            { label: 'DB aufräumen (Dashboard)',
+              cmd: 'sudo mysql pcloud_backup < /opt/apps/pcloud-tools/main/sql/maintenance_db_cleanup.sql' },
+            { label: 'Orphan-Manifeste (lokal)',
+              cmd: 'cd /opt/apps/pcloud-tools/main\nscripts/archiv/cleanup_orphaned_manifests.sh --dry-run' },
+            { label: 'Repos sync (safe-ops)',
+              cmd: 'sudo -u thomas bash /opt/apps/safe-ops-cli/main/tools/sync_repos.sh --status' },
+            { label: 'microSD Image Backup',
+              cmd: 'OUT="/mnt/backup/rpi5-Radxa_SATA_HAT_microsd-live-backup-$(date +%Y%m%d-%H%M%S).img"\nsudo dd if=/dev/mmcblk0 of="$OUT" bs=4M status=progress conv=fsync' },
+            { label: 'cheatx (Terminal)',
+              cmd: 'cheatx.py show --nas --examples-lines 4' },
+          ],
+        },
+      ];
+    }
+
+    function cheatBodyHtml(item) {
+      const text = item.cmd || item.url || '';
+      if (item.url && text.indexOf(item.url) >= 0) {
+        return esc(text).split(esc(item.url)).join(
+          '<a href="' + esc(item.url) + '" target="_blank" rel="noopener">' + esc(item.url) + '</a>'
+        );
+      }
+      if (item.url) {
+        return '<a href="' + esc(item.url) + '" target="_blank" rel="noopener">' + esc(item.url) + '</a>';
+      }
+      return esc(text);
+    }
+
+    function renderCheats() {
+      const grid = document.getElementById('cheats-grid');
+      if (!grid) return;
+      let html = '';
+      getCheatSections().forEach(function(sec) {
+        html += '<div class="cheat-section"><h3>' + esc(sec.title) + '</h3>';
+        sec.items.forEach(function(item) {
+          const text = item.cmd || item.url || '';
+          html += '<div class="cheat-item">'
+            + '<div class="cheat-label">' + esc(item.label) + '</div>'
+            + (item.hint ? '<div class="cheat-hint">' + esc(item.hint) + '</div>' : '')
+            + '<div class="cheat-row"><pre class="cheat-cmd">' + cheatBodyHtml(item) + '</pre>'
+            + '<button type="button" class="cheat-copy">Kopieren</button></div>'
+            + '</div>';
+        });
+        html += '</div>';
+      });
+      grid.innerHTML = html;
+      grid.querySelectorAll('.cheat-row').forEach(function(row) {
+        const pre = row.querySelector('.cheat-cmd');
+        const btn = row.querySelector('.cheat-copy');
+        if (!pre || !btn) return;
+        btn.addEventListener('click', function() {
+          const t = pre.textContent || '';
+          navigator.clipboard.writeText(t).then(function() {
+            btn.textContent = 'OK';
+            btn.classList.add('copied');
+            setTimeout(function() { btn.textContent = 'Kopieren'; btn.classList.remove('copied'); }, 1500);
+          }).catch(function() {
+            btn.textContent = 'Fehler';
+          });
+        });
+      });
+    }
+
+    function initCheatsPanel() {
+      const btn = document.getElementById('btn-cheats-toggle');
+      const panel = document.getElementById('cheats-panel');
+      if (!btn || !panel) return;
+      renderCheats();
+      const open = localStorage.getItem('dashboardCheatsOpen') === '1';
+      if (open) {
+        panel.classList.add('open');
+        panel.setAttribute('aria-hidden', 'false');
+        btn.classList.add('active');
+      }
+      btn.addEventListener('click', function() {
+        const isOpen = panel.classList.toggle('open');
+        panel.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+        btn.classList.toggle('active', isOpen);
+        localStorage.setItem('dashboardCheatsOpen', isOpen ? '1' : '0');
+      });
+    }
+
+    initCheatsPanel();
 
     function resetCountdown() {
       countdown = REFRESH_SEC;
