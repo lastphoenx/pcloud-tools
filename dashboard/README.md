@@ -377,7 +377,7 @@ Nach jedem EntropyWatcher-Scan wechselt der Status für **10 Minuten** auf YELLO
       "dry_run_pipeline_only": { "kind": "pipeline_only", "count": 2, "samples": ["pcloud-temp/..."] },
       "dry_run_backup_scope": { "kind": "backup_scope", "count": 2 },
       "exclude_policy": {
-        "trigger_only": ["/pcloud-archive/", "/pcloud-temp/"],
+        "trigger_only": ["/pcloud-archive/", "/pcloud-temp/", "/Backup/pbs2/", "/Backup/pve2/"],
         "never_backup": ["__pycache__/", "/restore/", "..."]
       },
       "message": "[success] Backup complete"

@@ -379,7 +379,7 @@ Quelle: `aggregate_status.sh` ruft `rtb_pool_wrapper.sh --check-only` auf und pa
 | Trigger | Snapshot | Beispiel |
 |---------|----------|----------|
 | nein | nie | `__pycache__/` (excludes.txt) |
-| nein | mit | `/pcloud-temp/` (nur Check-Exclude) |
+| nein | mit | `/pcloud-temp/`, `/Backup/pbs2/`, `/Backup/pve2/` (nur Check-Exclude) |
 | ja | ja | `Backup/Paperless/data/…` (normale Pfade) |
 
 Details: `rtb/README.md` § Excludes, `docs/STORAGE_PATHS.md` § RTB vs. Pipeline.
