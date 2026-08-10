@@ -231,7 +231,8 @@ python pcloud_pool_gc.py \
 1. Retention-Modus aus `.env` (`PCLOUD_REMOTE_RETENTION_DAYS_FULL` > 0 → **Zeit-Retention** 62d + Wochen-Tier; sonst rtb-spiegel)
 2. **Sicherheitsabbruch**, wenn rtb-spiegel aktiv und RTB nicht gemountet oder 0 lokale Snapshots
 3. Kandidaten löschen → `content_index.json` bereinigen
-4. Optional `--run-gc`: verwaiste Pool-Dateien entfernen
+4. Verwaiste `_index/archive/<snap>_index.json` entfernen (kein Remote-Snapshot mehr)
+5. Optional `--run-gc`: verwaiste Pool-Dateien entfernen
 
 **Wichtig:** Zeit-Retention liest `PCLOUD_REMOTE_RETENTION_*` aus der `--env-file` (nicht nur aus der Shell-Umgebung). Ohne das würde Cron fälschlich rtb-spiegel nutzen.
 
