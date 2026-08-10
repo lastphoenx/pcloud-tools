@@ -1555,6 +1555,45 @@ def _push_env_for_integrity() -> Dict[str, Any]:
     return {k: v for k, v in os.environ.items() if k.startswith("PCLOUD_")}
 
 
+def _archive_manifest_path(snapshot_name: str, manifests_dir: Optional[str] = None) -> str:
+    archive = manifests_dir or os.path.join(
+        os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests"
+    )
+    return os.path.join(archive, f"{snapshot_name}.json")
+
+
+def _ensure_archived_manifest(
+    snapshot_name: str,
+    *,
+    manifest_source_path: Optional[str] = None,
+) -> str:
+    """
+    Integrity-Gate liest manifests/<snap>.json — das Archiv wird erst nach erfolgreichem
+    Upload geschrieben. Staging aus PCLOUD_TEMP (oder --manifest) vor dem Gate.
+    """
+    import shutil
+
+    archive_path = _archive_manifest_path(snapshot_name)
+    if os.path.exists(archive_path):
+        return archive_path
+
+    source = manifest_source_path or os.environ.get("PCLOUD_ACTIVE_MANIFEST_PATH") or ""
+    if not source:
+        import tempfile as _tf
+        temp_dir = os.environ.get("PCLOUD_TEMP_DIR", _tf.gettempdir())
+        source = os.path.join(temp_dir, f"pcloud_mani.{snapshot_name}.json")
+
+    if not os.path.isfile(source):
+        raise RuntimeError(
+            f"Manifest fuer Integrity-Gate nicht gefunden: weder {archive_path} noch {source}"
+        )
+
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    shutil.copy2(source, archive_path)
+    _log(f"[integrity-gate] Manifest gestaged: {archive_path} <- {source}")
+    return archive_path
+
+
 def _run_listfolder_integrity_gate(
     cfg: dict,
     manifest: dict,
@@ -1579,6 +1618,8 @@ def _run_listfolder_integrity_gate(
     integrity_report = os.path.join(archive, "integrity", f"integrity_{snapshot_name}_pending.json")
     env = _push_env_for_integrity()
     backup_run_id = os.environ.get("RUN_ID") or None
+
+    _ensure_archived_manifest(snapshot_name)
 
     _log("[integrity-gate] Post-Upload Integritaet (listfolder)...")
     t0 = time.time()
@@ -1621,16 +1662,6 @@ def _run_listfolder_integrity_gate(
         summary = result.get("error_summary") or result.get("error") or "integrity failed"
         _log(f"[integrity-gate][ERROR] Complete-Marker wird NICHT gesetzt")
         _log(f"[integrity-gate][ERROR] {summary}")
-        try:
-            import tempfile as _tf
-            _fail_idx = os.path.join(
-                os.getenv("PCLOUD_TEMP_DIR", _tf.gettempdir()),
-                f"pcloud_pool_index_{snapshot_name}.json",
-            )
-            if os.path.exists(_fail_idx):
-                os.remove(_fail_idx)
-        except Exception:
-            pass
         raise RuntimeError(f"Integrity-Gate fehlgeschlagen: {summary}")
 
     _log(f"[integrity-gate] ✓ OK ({time.time() - t0:.1f}s)")
@@ -2625,6 +2656,72 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         "mode": "delta",
         "basis": basis_snapshot_name
     }
+
+
+def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False) -> dict:
+    """
+    Nur Integrity-Gate + .upload_complete + Index-Upload.
+    Fuer abgebrochene Laeufe, bei denen Pool+Stubs bereits remote stehen.
+    """
+    snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
+    dest_root = pc._norm_remote_path(dest_root).rstrip("/")
+    snapshots_root = f"{dest_root}/_snapshots"
+    dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
+    pool_root = f"{dest_root}/_pool"
+    marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+
+    _log(f"[finalize-only] Snapshot {snapshot_name} — Gate + Complete + Index")
+
+    if not dry and _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
+        _log("[finalize-only] Bereits vollständig (.upload_complete)")
+        return {"uploaded": 0, "stubs": 0, "mode": "finalize-only", "skipped": True}
+
+    if not dry and not pc.stat_folderid_fast(cfg, dest_snapshot_dir):
+        raise RuntimeError(f"[finalize-only] Remote-Snapshot fehlt: {dest_snapshot_dir}")
+
+    _ensure_archived_manifest(snapshot_name)
+
+    index = load_content_index(cfg, snapshots_root) if not dry else {"pool_refs": {}}
+    pool_refs = index.setdefault("pool_refs", {})
+    n_reg = 0
+    for it in manifest.get("items", []) or []:
+        if it.get("type") != "file":
+            continue
+        sha = it.get("sha256")
+        if not sha:
+            continue
+        rp = it.get("relpath", "")
+        if snapshot_name not in _snap_names(pool_refs.get(sha.lower() if isinstance(sha, str) else sha, {})):
+            n_reg += 1
+        _register_snap(
+            pool_refs, sha, snapshot_name, rp,
+            size=it.get("size"),
+        )
+    if n_reg:
+        _log(f"[finalize-only] {n_reg} pool_refs-Eintraege aus Manifest ergaenzt")
+
+    t_start = time.time()
+    marker_data = {
+        "snapshot": snapshot_name,
+        "completed_at": time.time(),
+        "uploaded": 0,
+        "stubs": len([i for i in (manifest.get("items") or []) if i.get("type") == "file"]),
+        "reused": 0,
+        "duration": 0,
+        "mode": "finalize-only",
+    }
+
+    if not dry:
+        _post_upload_gate(
+            cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
+            dry=dry, mode_label="finalize-only",
+        )
+        _finalize_after_validation_delta(
+            cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry,
+        )
+
+    _log(f"[finalize-only] ✓ Abgeschlossen ({time.time() - t_start:.1f}s)")
+    return {"uploaded": 0, "stubs": marker_data["stubs"], "mode": "finalize-only"}
 
 
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False, use_scout: bool = True) -> dict:
@@ -3702,6 +3799,11 @@ def main() -> None:
     ap.add_argument("--retention-sync", action="store_true",
                     help="Nach dem Upload: Pool-Retention (entfernte Snapshots loeschen, Platz via Pool-GC).")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help="Nur Integrity-Gate + .upload_complete + Index (Stubs/Pool muessen remote bereits stehen)",
+    )
 
 
     # pCloud Config
@@ -3758,7 +3860,12 @@ def main() -> None:
               f"- nur noch 'pool'.", file=sys.stderr)
         sys.exit(2)
 
-    push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
+    os.environ["PCLOUD_ACTIVE_MANIFEST_PATH"] = os.path.abspath(args.manifest)
+
+    if args.finalize_only:
+        push_pool_finalize_only(cfg, manifest, dest_root, dry=bool(args.dry_run))
+    else:
+        push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
 
     # Manifest archivieren (mode-unabhaengig, NUR nach erfolgreichem Upload - push_pool_mode
     # wirft sonst). 1:1 wie Legacy (pcloud_push_json_manifest_to_pcloud.py:2370). Ohne diesen
@@ -3766,12 +3873,12 @@ def main() -> None:
     # danach, und Scout/Smart-Mode-Referenz des naechsten Laufs braucht manifests/<snap>.json.
     if not args.dry_run:
         try:
-            import shutil
             _snap = manifest.get("snapshot") or "SNAPSHOT"
-            _man_archive_dir = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "manifests")
-            os.makedirs(_man_archive_dir, exist_ok=True)
-            _man_archive_path = os.path.join(_man_archive_dir, f"{_snap}.json")
-            shutil.copy2(args.manifest, _man_archive_path)
+            _man_archive_path = _archive_manifest_path(_snap)
+            if not os.path.exists(_man_archive_path):
+                import shutil
+                os.makedirs(os.path.dirname(_man_archive_path), exist_ok=True)
+                shutil.copy2(args.manifest, _man_archive_path)
             _log(f"[archive] Manifest archiviert: {_man_archive_path}")
         except Exception as e:
             _log(f"[archive][warn] Manifest-Archivierung fehlgeschlagen: {e}")
