@@ -64,6 +64,7 @@ from typing import Set, Dict, List, Tuple, Optional
 from collections import defaultdict
 
 _SNAP_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}-\d{6}$")
+_ARCHIVE_INDEX_RE = re.compile(r"^(20\d{2}-\d{2}-\d{2}-\d{6})_index\.json$")
 
 # ---- Logging mit Timestamp (RTB-Stil) ----
 def _log(msg: str, *, file=sys.stderr) -> None:
@@ -375,6 +376,92 @@ def _purge_snaps_from_index(index: dict, snaps_to_remove: Set[str]) -> Dict[str,
     return {"removed_snap_refs": removed_snap_refs, "removed_shas": removed_shas}
 
 
+def _archive_index_remote_path(snapshots_root: str, snap: str) -> str:
+    return f"{snapshots_root.rstrip('/')}/_index/archive/{snap}_index.json"
+
+
+def _delete_remote_archive_index(
+    cfg: dict, snapshots_root: str, snap: str, *, dry: bool = False
+) -> bool:
+    """Entfernt _index/archive/<snap>_index.json (Recovery-Kopie, kein Master-Index)."""
+    path = _archive_index_remote_path(snapshots_root, snap)
+    if dry:
+        _log(f"[dry] delete archive index: {path}")
+        return True
+    try:
+        md = pc.stat_file_safe(cfg, path=path)
+        if not md or not md.get("fileid"):
+            return False
+        sz = int(md.get("size") or 0)
+        pc.delete_file(cfg, fileid=int(md["fileid"]), size_bytes=sz)
+        _log(f"[retention] ✓ Archiv-Index entfernt: {snap}_index.json")
+        return True
+    except Exception as e:
+        _log(f"[retention][warn] Archiv-Index nicht gelöscht ({snap}): {e}")
+        return False
+
+
+def _purge_orphan_archive_indexes(
+    cfg: dict,
+    snapshots_root: str,
+    remote_snaps: Set[str],
+    *,
+    dry: bool = False,
+) -> Dict[str, int]:
+    """
+    Löscht <snap>_index.json unter _index/archive/, wenn kein Remote-Snapshot <snap> existiert.
+
+    Master-Backups (content_index_prev.json, content_index_pre_v2_*) bleiben unangetastet.
+    """
+    archive_dir = f"{snapshots_root.rstrip('/')}/_index/archive"
+    stats = {"listed": 0, "orphans": 0, "deleted": 0, "errors": 0}
+    try:
+        result = pc.listfolder(cfg, path=archive_dir, recursive=False, nofiles=False)
+        contents = (result.get("metadata", {}) or {}).get("contents", []) or []
+    except Exception as e:
+        _log(f"[retention][warn] archive-Ordner nicht lesbar: {e}")
+        return stats
+
+    for it in contents:
+        if it.get("isfolder"):
+            continue
+        name = it.get("name") or ""
+        m = _ARCHIVE_INDEX_RE.match(name)
+        if not m:
+            continue
+        stats["listed"] += 1
+        snap = m.group(1)
+        if snap in remote_snaps:
+            continue
+        stats["orphans"] += 1
+        if dry:
+            _log(f"[dry] orphan archive index: {name} (kein Remote-Snapshot)")
+            stats["deleted"] += 1
+            continue
+        try:
+            fid = it.get("fileid")
+            if not fid:
+                stats["errors"] += 1
+                continue
+            sz = int(it.get("size") or 0)
+            pc.delete_file(cfg, fileid=int(fid), size_bytes=sz)
+            stats["deleted"] += 1
+            _log(f"[retention] ✓ Orphan-Archiv-Index entfernt: {name}")
+        except Exception as e:
+            stats["errors"] += 1
+            _log(f"[retention][warn] Orphan-Archiv-Index {name}: {e}")
+
+    if stats["orphans"]:
+        _log(
+            f"[retention] Archiv-Indexe: {stats['listed']} Snapshot-Archive, "
+            f"{stats['orphans']} ohne Remote-Snapshot, "
+            f"{stats['deleted']} gelöscht, {stats['errors']} Fehler"
+        )
+    elif stats["listed"]:
+        _log(f"[retention] Archiv-Indexe: {stats['listed']} Snapshot-Archive, keine Orphans")
+    return stats
+
+
 def _save_index(cfg: dict, snapshots_root: str, index: dict, env_file: str, *, dry: bool) -> None:
     index_path = f"{snapshots_root}/_index/content_index.json"
     env_vars = _load_env_file(env_file)
@@ -579,6 +666,7 @@ def run_retention_apply(
         snap_path = f"{snapshots_root}/{snap}"
         if dry:
             _log(f"[dry] deletefolderrecursive({snap_path})")
+            _delete_remote_archive_index(cfg, snapshots_root, snap, dry=True)
             deleted += 1
             deleted_snaps.add(snap)
             continue
@@ -593,6 +681,7 @@ def run_retention_apply(
         ):
             deleted += 1
             deleted_snaps.add(snap)
+            _delete_remote_archive_index(cfg, snapshots_root, snap, dry=False)
         else:
             errors += 1
             _log(f"[retention][ERROR] Abbruch Kette bei {snap} — Index wird nicht bereinigt")
@@ -607,7 +696,20 @@ def run_retention_apply(
     else:
         _log("[retention] Nichts zu loeschen — Index unveraendert")
 
-    result = {"deleted": deleted, "errors": errors, "to_delete": to_delete}
+    if dry:
+        remaining_remote = remote_snaps - deleted_snaps
+    else:
+        remaining_remote = _list_remote_snapshot_names(cfg, snapshots_root)
+    archive_stats = _purge_orphan_archive_indexes(
+        cfg, snapshots_root, remaining_remote, dry=dry,
+    )
+
+    result = {
+        "deleted": deleted,
+        "errors": errors,
+        "to_delete": to_delete,
+        "archive_purge": archive_stats,
+    }
 
     if run_gc and not dry:
         _log("[retention] Starte Pool-GC nach Retention...")
