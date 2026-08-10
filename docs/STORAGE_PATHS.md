@@ -125,11 +125,11 @@ python scripts/utilities/pool_verify_backup.py \
 
 ## RTB vs. Pipeline-Artefakte (Juni 2026)
 
-**Ziel:** Reine Pipeline-Änderungen (Upload, Manifest, Temp) sollen **kein** RTB triggern. Sobald **Nutzerdaten** ein Backup auslösen, landen `pcloud-archive/` und `pcloud-temp/` unter `/srv/nas` **mit** im Snapshot.
+**Ziel:** Reine Pipeline-Änderungen (Upload, Manifest, Temp) und **replizierte Backup-Stores** (`Backup/pbs2/`, `Backup/pve2/` — täglich von PBS/pve2 gepusht) sollen **kein** RTB triggern. Sobald **Nutzerdaten** oder **Config-Backups** (z. B. Paperless) ein Backup auslösen, landen diese Pfade **mit** im Snapshot.
 
-| Schicht | Datei / Mechanismus | `pcloud-archive/` `pcloud-temp/` | `__pycache__/` etc. |
-|---------|---------------------|----------------------------------|---------------------|
-| Delta-Check (`rsync -ni`) | `rtb_check_excludes.sh` + Post-Filter | **triggert nicht** | excluded (via excludes.txt in Check-Liste) |
+| Schicht | Datei / Mechanismus | Pipeline + `Backup/pbs2` `Backup/pve2` | `__pycache__/` etc. |
+|---------|---------------------|----------------------------------------|---------------------|
+| Delta-Check (`signature`/`hybrid`) | `rtb_check_excludes.sh` + Sub-Buckets | **triggert nicht** | excluded (via excludes.txt in Check-Liste) |
 | Echtes RTB (`rsync_tmbackup`) | `excludes.txt` | **mitgesichert** wenn Backup läuft | **nie** im Snapshot |
 | Pool-Manifest-Scan | `PCLOUD_MANIFEST_SKIP_GLOBS` in Python | skipped (keine Pool-Userdateien) | optional in `.env` |
 
