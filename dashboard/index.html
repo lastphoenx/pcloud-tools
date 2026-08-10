@@ -1814,12 +1814,36 @@
     }
 
     function rtbDeltaDetailsBlock(d, title, cls, isScope, dryRunResult) {
+      const method = d.method ? (' <span class="muted">(' + esc(d.method) + ')</span>') : '';
       const tops = (d.top_dirs || []).map(function(t) {
         return esc(t.dir) + ' (' + t.count + ')';
       }).join(', ');
       const snap = d.baseline ? d.baseline.replace(/\/+$/, '').split('/').pop() : '';
       let lines = '';
-      if (d.samples && d.samples.length) {
+      let bucketRows = '';
+      (d.bucket_details || []).forEach(function(b) {
+        const st = b.stats || {};
+        const s = st.src || {};
+        const n = st.snap || {};
+        bucketRows += '<div class="rtb-bucket-detail"><strong>' + esc(b.bucket) + '</strong>'
+          + ' — live ' + (s.files != null ? s.files : '?') + ' / snap ' + (n.files != null ? n.files : '?')
+          + ' Dateien; diff ' + (b.diff_total || 0)
+          + ' (+' + (b.added || 0) + ' / -' + (b.removed || 0) + ' / ~' + (b.changed || 0) + ')';
+        if (b.samples && b.samples.length) {
+          bucketRows += '<div class="rtb-delta-lines">';
+          b.samples.forEach(function(smp) {
+            bucketRows += esc((smp.reason || '?') + ': ' + (smp.path || '')) + '<br>';
+          });
+          if ((b.diff_total || 0) > b.samples.length) {
+            bucketRows += '<span class="muted">\u2026 +' + ((b.diff_total || 0) - b.samples.length) + ' weitere</span><br>';
+          }
+          bucketRows += '</div>';
+        }
+        bucketRows += '</div>';
+      });
+      if (bucketRows) {
+        lines += bucketRows;
+      } else if (d.samples && d.samples.length) {
         lines = '<div class="rtb-delta-lines">'
           + d.samples.map(function(p) { return esc(p); }).join('<br>');
         if (d.count > d.samples.length) {
@@ -1836,6 +1860,7 @@
         + '<summary>'
         + esc(title) + ': '
         + d.count + ' \u00c4nderung(en)'
+        + method
         + (tops ? ' \u2014 ' + tops : '')
         + (snap ? ' <span class="muted">vs. ' + esc(snap) + '</span>' : '')
         + '</summary>'
