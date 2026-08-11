@@ -327,6 +327,15 @@ check_rtb_wrapper() {
       | sort -r | head -1 | xargs -r basename 2>/dev/null || echo "")
   fi
 
+  # Last staged-backup unit summary (from rtb_pool_wrapper.log)
+  local last_backup_summary_json=""
+  if echo "$log_tail" | grep -q '^\[RTB BackupSummary JSON\]'; then
+    last_backup_summary_json=$(echo "$log_tail" | grep '^\[RTB BackupSummary JSON\]' | tail -1 | sed 's/^\[RTB BackupSummary JSON\] //')
+    if command -v jq &>/dev/null; then
+      echo "$last_backup_summary_json" | jq empty 2>/dev/null || last_backup_summary_json=""
+    fi
+  fi
+
   # ---- Live Dry-Run pre-check ----
   # Call rtb_wrapper.sh --check-only: flock + cache; no backup pipeline lock.
   #   exit 1 + "changes_detected" → backup will fire next run
@@ -445,6 +454,9 @@ check_rtb_wrapper() {
   fi
   if [[ -n "$rtb_exclude_policy_json" ]]; then
     json="$json,\"exclude_policy\":${rtb_exclude_policy_json}"
+  fi
+  if [[ -n "$last_backup_summary_json" ]]; then
+    json="$json,\"last_backup_summary\":${last_backup_summary_json}"
   fi
   json="$json}"
   

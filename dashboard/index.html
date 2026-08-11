@@ -880,6 +880,7 @@
         +     rtbDeltaPreviewHTML(rtb)
         +     rtbPipelineOnlyHTML(rtb)
         +     rtbBackupScopeHTML(rtb)
+        +     rtbLastBackupSummaryHTML(rtb)
         +     rtbExcludePolicyHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
@@ -1780,6 +1781,15 @@
            + '<span class="val ' + o.cls + '">' + o.text + '</span></div>';
     }
 
+    function rtbPathLabel(row) {
+      if (!row) return '';
+      let label = row.path || ('/srv/nas/' + (row.dir || ''));
+      if (row.canonical && row.canonical !== label) {
+        label += ' \u2192 ' + row.canonical;
+      }
+      return label;
+    }
+
     function rtbDeltaPreviewHTML(rtb, kind) {
       kind = kind || 'trigger';
       const d = kind === 'scope' ? rtb.dry_run_backup_scope : rtb.dry_run_delta;
@@ -1816,7 +1826,7 @@
     function rtbDeltaDetailsBlock(d, title, cls, isScope, dryRunResult) {
       const method = d.method ? (' <span class="muted">(' + esc(d.method) + ')</span>') : '';
       const tops = (d.top_dirs || []).map(function(t) {
-        return esc(t.dir) + ' (' + t.count + ')';
+        return esc(rtbPathLabel(t)) + ' (' + t.count + ')';
       }).join(', ');
       const snap = d.baseline ? d.baseline.replace(/\/+$/, '').split('/').pop() : '';
       let lines = '';
@@ -1825,7 +1835,8 @@
         const st = b.stats || {};
         const s = st.src || {};
         const n = st.snap || {};
-        bucketRows += '<div class="rtb-bucket-detail"><strong>' + esc(b.bucket) + '</strong>'
+        const pathLabel = b.path || rtbPathLabel({dir: b.bucket, path: b.path});
+        bucketRows += '<div class="rtb-bucket-detail"><strong>' + esc(pathLabel) + '</strong>'
           + ' — live ' + (s.files != null ? s.files : '?') + ' / snap ' + (n.files != null ? n.files : '?')
           + ' Dateien; diff ' + (b.diff_total || 0)
           + ' (+' + (b.added || 0) + ' / -' + (b.removed || 0) + ' / ~' + (b.changed || 0) + ')';
@@ -1867,6 +1878,48 @@
         + hint
         + lines
         + '</details>';
+    }
+
+    function rtbLastBackupSummaryHTML(rtb) {
+      const s = rtb.last_backup_summary;
+      if (!s || !s.units || !s.units.length) return '';
+      const snap = s.snapshot || '';
+      const changed = s.units_changed != null ? s.units_changed : 0;
+      const total = s.units_total != null ? s.units_total : s.units.length;
+      let rows = '';
+      s.units.forEach(function(u) {
+        const path = u.path || ('/srv/nas/' + (u.unit || ''));
+        const st = u.status || '?';
+        const files = u.files_transferred || 0;
+        const bytes = u.bytes_transferred || 0;
+        let detail = '';
+        if (st === 'skipped') {
+          detail = 'übersprungen';
+        } else if (files === 0 && bytes === 0) {
+          detail = 'keine Änderung';
+        } else {
+          detail = '+' + files + ' Dateien';
+          if (bytes > 0) {
+            detail += ', ' + fmtBytes(bytes);
+          }
+        }
+        rows += '<div class="rtb-bucket-detail"><strong>' + esc(path) + '</strong>'
+          + ' <span class="muted">' + esc(detail) + '</span></div>';
+      });
+      return '<details class="rtb-policy-details scope">'
+        + '<summary>Letztes Backup'
+        + (snap ? ' <span class="muted">(' + esc(snap) + ')</span>' : '')
+        + ': ' + changed + '/' + total + ' Einheiten mit Transfer</summary>'
+        + rows
+        + '</details>';
+    }
+
+    function fmtBytes(n) {
+      n = Number(n) || 0;
+      if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GiB';
+      if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MiB';
+      if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+      return n + ' B';
     }
 
     function rtbExcludePolicyHTML(rtb) {

@@ -366,9 +366,10 @@ Das Dashboard liest zwei JSON-Dateien:
 | UI-Block | `status.json` Feld | Wann sichtbar |
 |----------|-------------------|---------------|
 | Nächstes Backup | `dry_run_result` | immer (grün/gelb) |
-| **Backup-Trigger** | `dry_run_delta` | nur bei `changes_detected` — echte Nutzerdaten |
-| **Pipeline (triggert nicht)** | `dry_run_pipeline_only` | nur bei `no_changes` + Pipeline-Diff |
+| **Backup-Trigger** | `dry_run_delta` | nur bei `changes_detected` — Pfade z. B. `/srv/nas/Backup/Paperless` |
+| **Pipeline (triggert nicht)** | `dry_run_pipeline_only` | Pfade inkl. `/srv/nas/pcloud-archive` → `/srv/pcloud-archive` |
 | **Mitgesichert bei Backup** | `dry_run_backup_scope` | wenn Scope-Diff (ohne Duplikat zu Pipeline-Block) |
+| **Letztes Backup** | `last_backup_summary` | Staged-RTB Einheiten aus `rtb_wrapper.log` |
 | **Exclude-Policy** | `exclude_policy` | Tabelle: Pattern × Trigger × Snapshot |
 
 Quelle: `aggregate_status.sh` ruft `rtb_pool_wrapper.sh --check-only` auf und parst JSON-Zeilen:
