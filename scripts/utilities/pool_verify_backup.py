@@ -146,7 +146,7 @@ def _collect_pool_shas(cfg: dict, pool_root: str) -> Set[str]:
     return result
 
 
-def _collect_stub_paths_bfs(cfg: dict, snap_path: str) -> Set[str]:
+def _collect_stub_paths_bfs(cfg: dict, snap_path: str, *, progress_cb=None) -> Set[str]:
     """
     Stub-Pfade per BFS (listfolder non-recursive pro Ordner).
     Vermeidet listfolder(recursive=True) auf grossen Snapshots — das haelt den
@@ -155,8 +155,13 @@ def _collect_stub_paths_bfs(cfg: dict, snap_path: str) -> Set[str]:
     root = pc._norm_remote_path(snap_path).rstrip("/")
     stubs: Set[str] = set()
     queue: deque[str] = deque([root])
+    folders_seen = 0
+    progress_every = int(os.environ.get("PCLOUD_VERIFY_BFS_PROGRESS_EVERY", "500") or "500")
     while queue:
         current = queue.popleft()
+        folders_seen += 1
+        if progress_cb and progress_every > 0 and folders_seen % progress_every == 0:
+            progress_cb(folders_seen, len(stubs), len(queue))
         try:
             top = pc.call_with_backoff(
                 pc.listfolder, cfg, path=current, recursive=False, nofiles=False,
@@ -170,6 +175,8 @@ def _collect_stub_paths_bfs(cfg: dict, snap_path: str) -> Set[str]:
                 queue.append(path)
             elif name.endswith(".meta.json"):
                 stubs.add(path)
+    if progress_cb and folders_seen > 0:
+        progress_cb(folders_seen, len(stubs), 0, final=True)
     return stubs
 
 
@@ -660,7 +667,16 @@ def run_verify(
 
     def _fetch_snap_stubs(snap: str) -> Set[str]:
         snap_path = f"{snaps_root}/{snap}"
-        return _collect_stub_paths_bfs(cfg, snap_path)
+
+        def _bfs_progress(folders: int, stub_count: int, queue_len: int, final: bool = False) -> None:
+            if final:
+                return
+            _out(
+                f"[fetch]   {snap}: BFS {folders} Ordner, "
+                f"{stub_count} stubs, queue={queue_len}"
+            )
+
+        return _collect_stub_paths_bfs(cfg, snap_path, progress_cb=_bfs_progress)
 
     def _fetch_index() -> dict:
         txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)

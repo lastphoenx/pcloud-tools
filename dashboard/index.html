@@ -816,6 +816,59 @@
         + esc(explain) + '</div>';
     }
 
+    // backup_runs: nur erfolgreiche Läufe in Tabellen; Retry-Zähler aus allen DB-Einträgen
+    function backupRunsAttemptCounts(allRuns) {
+      const counts = {};
+      (allRuns || []).forEach(function(r) {
+        const s = r.snapshot || '';
+        if (!s) return;
+        counts[s] = (counts[s] || 0) + 1;
+      });
+      return counts;
+    }
+
+    function filterBackupRunsForDisplay(allRuns) {
+      const seen = new Set();
+      const out = [];
+      (allRuns || []).forEach(function(r) {
+        if (r.status !== 'SUCCESS') return;
+        const s = r.snapshot || '';
+        if (!s || seen.has(s)) return;
+        seen.add(s);
+        out.push(r);
+      });
+      return out;
+    }
+
+    function backupRunSnapshotCell(r, attemptCounts) {
+      const snap = esc(r.snapshot || '\u2014');
+      const n = attemptCounts[r.snapshot] || 1;
+      let badges = '';
+      if (n > 1) {
+        badges += ' <span class="badge running" title="' + n + ' DB-Einträge für diesen Snapshot (Retries/Manuell)">Retry \u00d7' + n + '</span>';
+      }
+      if (r.gap_backfill) {
+        badges += ' <span class="badge running" title="Gap-Backfill-Lauf">Gap</span>';
+      }
+      return snap + badges;
+    }
+
+    function uploadStateForSnapshot(reports, snapshotName) {
+      if (!snapshotName) return { kind: 'none' };
+      const all = ((reports || {}).recent_backups) || [];
+      let running = null, failed = null, success = null;
+      all.forEach(function(r) {
+        if (r.snapshot !== snapshotName) return;
+        if (r.status === 'RUNNING' && !running) running = r;
+        if (r.status === 'FAILED' && !failed) failed = r;
+        if (r.status === 'SUCCESS' && !success) success = r;
+      });
+      if (running && !success) return { kind: 'running', run: running };
+      if (success) return { kind: 'success', run: success };
+      if (failed) return { kind: 'failed', run: failed };
+      return { kind: 'none' };
+    }
+
     function tileBackup(rtb, cloud, reports, status) {
       // Use explicit undefined check — status_code=0 is falsy but means "OK"
       const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
@@ -840,7 +893,9 @@
         ? Math.round((perf.successful_runs / perf.total_runs) * 100)
         : null;
 
-      const recent = ((reports || {}).recent_backups || []).slice(0, 7);
+      const allRecent = ((reports || {}).recent_backups || []);
+      const attemptCounts = backupRunsAttemptCounts(allRecent);
+      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 7);
       const poolInt  = ((reports || {}).pool_integrity) || {};
       const intSum   = poolInt.summary || {};
       const intSnaps = poolInt.snapshots || [];
@@ -924,15 +979,16 @@
           + '<span>Letzte Backup-L\xe4ufe</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
           + '<table class="report-table"><thead><tr>'
-          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th><th>GB</th>'
+          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th><th>GB</th><th>Versuch</th>'
           + '</tr></thead><tbody>'
           + recent.map(r =>
               '<tr>'
-            + '<td>' + (r.snapshot || '\u2014') + '</td>'
+            + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
             + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + (r.status||'\u2014') + '</span></td>'
             + '<td>' + fmtTs(r.started_at) + '</td>'
             + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
             + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
+            + '<td>' + ((attemptCounts[r.snapshot] || 1) > 1 ? attemptCounts[r.snapshot] : '\u2014') + '</td>'
             + '</tr>'
             ).join('')
           + '</tbody></table></div></div>';
@@ -1161,7 +1217,6 @@
       const tileCls    = anyFailed ? 'bad' : anyBlocked ? 'warning' : 'ok';
 
       const phases       = ((reports || {}).phase_stats   || []);
-      const failedBackups = ((reports || {}).failed_backups || []).slice(0, 3);
 
       let html = '<div class="tile">'
         + '<div class="tile-header">'
@@ -1190,18 +1245,6 @@
           + '</div>';
       }
 
-      if (failedBackups.length > 0) {
-        html += '<div class="info-group" style="margin-top:8px">'
-          + '<div style="font-size:12px;color:var(--muted);padding:4px 2px;text-transform:uppercase;letter-spacing:0.5px">Letzte Fehler (7 Tage)</div>'
-          + failedBackups.map(f =>
-              '<div class="info-row">'
-            + '<span class="lbl" style="color:var(--red)">' + (f.snapshot||'\u2014') + '</span>'
-            + '<span class="val" title="' + esc(f.error||'') + '">' + trunc(f.error||'\u2014', 30) + '</span>'
-            + '</div>'
-            ).join('')
-          + '</div>';
-      }
-
       html += '</div></div>';
       return html;
     }
@@ -1214,13 +1257,15 @@
       let html = '';
 
       // Backup detail
-      const recent = ((reports||{}).recent_backups||[]).slice(0, 10);
+      const allRecent = ((reports||{}).recent_backups||[]);
+      const attemptCounts = backupRunsAttemptCounts(allRecent);
+      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 10);
       html += '<div class="detail-section">'
         + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
         + '<div class="card-grid">'
         + detailCardRTB(rtb)
         + detailCardPCloud(cloud, reports, rtb)
-        + (recent.length > 0 ? detailCardRecentBackups(recent) : '')
+        + (recent.length > 0 ? detailCardRecentBackups(recent, attemptCounts) : '')
         + '</div></div>';
 
       // Malware / integrity detail
@@ -1254,19 +1299,12 @@
       // System detail
       const sNames = ['cleanup-samba-recycle','backup-pipeline'];
       const sItems = sNames.filter(n => svc[n]).map(n => Object.assign({ name: n }, svc[n]));
-      const failedBk = ((reports||{}).failed_backups||[]).slice(0, 5);
-      if (sItems.length > 0 || failedBk.length > 0) {
+      if (sItems.length > 0) {
         html += '<div class="detail-section">'
           + '<div class="section-heading"><span>\uD83D\uDDA5\uFE0F System \u2013 Details</span></div>'
           + '<div class="card-grid">'
-          + sItems.map(i => detailCardService(i)).join('');
-        if (failedBk.length > 0) {
-          html += '<div class="dcard"><div class="dcard-header"><span>Letzte Fehler (7d)</span></div>'
-            + '<div class="dcard-body">'
-            + failedBk.map(f => drow(f.snapshot||'\u2014', f.error||'\u2014', 'red', 80)).join('')
-            + '</div></div>';
-        }
-        html += '</div></div>';
+          + sItems.map(i => detailCardService(i)).join('')
+          + '</div></div>';
       }
 
       // Safety-Gate Forecast
@@ -1359,6 +1397,7 @@
       rows += rtbExcludePolicyDetailHTML(rtb);
       rows += rtbDeltaDetailHTML(rtb, 'trigger');
       rows += rtbDeltaDetailHTML(rtb, 'scope');
+      rows += rtbLastBackupSummaryDetailHTML(rtb);
       // ── Histor. Safety-Gate + Erklärung zum letzten Lauf ──────
       if (rtb.safety_gate)
         rows += drow('Safety-Gate (letzter Lauf)', rtb.safety_gate, sgValCls(rtb.safety_gate));
@@ -1450,16 +1489,18 @@
     // Combines health-check data (status.json) with DB data (reports.json)
 
     function buildSyncAnalysis(ba, reports) {
-      // 1. DB-basiert: l\xe4uft gerade ein Upload? Letzter fehlgeschlagen?
-      const recent = ((reports||{}).recent_backups || []);
-      const latest = recent[0] || null;
+      // 1. DB: Upload-Status für neuesten lokalen RTB-Snapshot (nicht blind recent[0])
+      const localSnap = (ba || {}).rtb_snapshot || '';
+      const uploadState = uploadStateForSnapshot(reports, localSnap);
 
-      if (latest && latest.status === 'RUNNING') {
-        return { text: '\u21BB Upload l\xe4uft (' + (latest.snapshot||'') + ') \u2014 .upload_complete noch nicht gesetzt', cls: 'blue' };
+      if (uploadState.kind === 'running') {
+        const r = uploadState.run;
+        return { text: '\u21BB Upload l\xe4uft (' + (r.snapshot || localSnap) + ') \u2014 .upload_complete noch nicht gesetzt', cls: 'blue' };
       }
-      if (latest && latest.status === 'FAILED') {
-        const err = latest.error ? ' \u2014 ' + trunc(latest.error, 60) : '';
-        return { text: '\u274C Letzter Upload FEHLGESCHLAGEN: ' + (latest.snapshot||'') + err, cls: 'red' };
+      if (uploadState.kind === 'failed') {
+        const r = uploadState.run;
+        const err = r.error ? ' \u2014 ' + trunc(r.error, 60) : '';
+        return { text: '\u274C Upload FEHLGESCHLAGEN: ' + (r.snapshot || localSnap) + err, cls: 'red' };
       }
 
       // 2. Health-Check status_code
@@ -1497,23 +1538,26 @@
 
     // ---- Detail card: Recent Backups table ---------------------
 
-    function detailCardRecentBackups(recent) {
+    function detailCardRecentBackups(recent, attemptCounts) {
+      attemptCounts = attemptCounts || {};
       return '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header"><span>\uD83D\uDCCB Letzte Backup-L\xe4ufe</span></div>'
+        + '<div class="dcard-header"><span>\uD83D\uDCCB Letzte erfolgreiche Backup-L\xe4ufe</span></div>'
         + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<div class="integrity-hint" style="margin:8px 12px 4px">Nur SUCCESS, pro Snapshot ein Eintrag. '
+        + 'Retries/Manuell: Badge &bdquo;Retry &times;N&ldquo; (aus DB-Historie).</div>'
         + '<table class="report-table">'
         + '<thead><tr>'
-        + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th><th>GB</th><th>Fehler</th>'
+        + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th><th>GB</th><th>Versuch</th>'
         + '</tr></thead><tbody>'
         + recent.map(r => '<tr>'
-            + '<td>' + esc(r.snapshot||'\u2014') + '</td>'
+            + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
             + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + esc(r.status||'\u2014') + '</span></td>'
             + '<td>' + fmtTs(r.started_at) + '</td>'
             + '<td>' + fmtTs(r.finished_at) + '</td>'
             + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
             + '<td>' + (r.files_uploaded || '\u2014') + '</td>'
             + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
-            + '<td title="' + esc(r.error||'') + '">' + esc(trunc(r.error||'', 35)) + '</td>'
+            + '<td>' + ((attemptCounts[r.snapshot] || 1) > 1 ? attemptCounts[r.snapshot] : '\u2014') + '</td>'
           + '</tr>').join('')
         + '</tbody></table>'
         + '</div></div>';
@@ -1534,8 +1578,14 @@
       let html = '<div class="dcard" style="grid-column:1/-1">'
         + '<div class="dcard-header">'
         + '<span>\uD83D\uDDD1\uFE0F ' + esc(title) + '</span>'
+        + '<span class="badge running" style="margin-left:8px">' + files.length + ' Dateien</span>'
         + '</div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">';
+        + '<div class="dcard-body" style="padding:0 0 4px 0">'
+        + '<div class="integrity-hint" style="margin:8px 12px 4px">'
+        + 'EntropyWatcher-Integrit&auml;t: Dateien, die im letzten Scan nicht gefunden wurden '
+        + '(DB-Stand, nicht pCloud-Backup). Oft Paperless-Thumbnails oder alte Manifest-Pfade &mdash; '
+        + 'kein Ransomware-Alarm, solange Safety-Gate GR&Uuml;N ist.'
+        + '</div>';
 
       // Table per source
       Object.keys(bySource).sort().forEach(src => {
@@ -1713,8 +1763,14 @@
       if (s === 'OK')       return '\u2713 Alle Systeme funktionieren normal.';
       if (s === 'RUNNING')  return 'Backup l\xe4uft gerade \u2014 bitte nicht manuell unterbrechen.';
       if (s === 'CRITICAL') {
-        return '\uD83D\uDEA8 Kritischer Fehler \u2014 sofortige Aktion erforderlich! '
-          + '<a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" style="color: #60a5fa; text-decoration: underline;">→ Monitoring-Docs</a>';
+        const pcloudMsg = ((pcloud.checks || {}).backup_age || {}).message || '';
+        let hint = '';
+        if (pcloudMsg.toLowerCase().includes('backup gap')) {
+          hint = ' pCloud: neuer RTB-Snapshot noch nicht vollst&auml;ndig auf pCloud '
+            + '(Upload l&auml;uft oder Retry n&ouml;tig) &mdash; siehe Sync-Status unten.';
+        }
+        return '\uD83D\uDEA8 Kritischer Fehler \u2014 sofortige Aktion erforderlich!' + hint
+          + ' <a href="/entropy-watcher-und-clamav-scanner/docs/MONITORING.html" style="color: #60a5fa; text-decoration: underline;">\u2192 Monitoring-Docs</a>';
       }
 
       if (s === 'WARNING') {
@@ -1906,12 +1962,37 @@
         rows += '<div class="rtb-bucket-detail"><strong>' + esc(path) + '</strong>'
           + ' <span class="muted">' + esc(detail) + '</span></div>';
       });
-      return '<details class="rtb-policy-details scope">'
-        + '<summary>Letztes Backup'
+      return '<details class="rtb-policy-details scope" open>'
+        + '<summary>Letztes RTB-Backup'
         + (snap ? ' <span class="muted">(' + esc(snap) + ')</span>' : '')
         + ': ' + changed + '/' + total + ' Einheiten mit Transfer</summary>'
         + rows
         + '</details>';
+    }
+
+    function rtbLastBackupSummaryDetailHTML(rtb) {
+      const s = rtb.last_backup_summary;
+      if (!s || !s.units || !s.units.length) return '';
+      const snap = s.snapshot || '';
+      const changed = s.units_changed != null ? s.units_changed : 0;
+      const total = s.units_total != null ? s.units_total : s.units.length;
+      let unitLines = '';
+      s.units.forEach(function(u) {
+        const path = u.path || ('/srv/nas/' + (u.unit || ''));
+        const files = u.files_transferred || 0;
+        const bytes = u.bytes_transferred || 0;
+        let detail = files === 0 && bytes === 0 ? 'keine Änderung' : '+' + files + ' Dateien';
+        if (bytes > 0 && (files > 0 || bytes > 0)) detail += ', ' + fmtBytes(bytes);
+        unitLines += '<div style="font-size:11px;margin:2px 0"><code>' + esc(path) + '</code> '
+          + '<span class="muted">' + esc(detail) + '</span></div>';
+      });
+      return '<div class="info-row" style="flex-direction:column;align-items:flex-start;gap:4px">'
+        + '<span class="lbl">Letztes RTB-Backup (Staging)</span>'
+        + '<span class="val" style="text-align:left">'
+        + (snap ? esc(snap) + ' &mdash; ' : '')
+        + changed + '/' + total + ' Einheiten mit Transfer</span>'
+        + unitLines
+        + '</div>';
     }
 
     function fmtBytes(n) {
