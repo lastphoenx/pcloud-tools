@@ -353,6 +353,69 @@ def _upload_file_smart(cfg: dict, local_path: str, remote_path: str,
                                 attempts=12, max_sleep=60.0)
 
 
+def _metadata_ids_from_upload_res(res) -> Tuple[Optional[int], Optional[int]]:
+    """fileid/hash aus uploadfile-Antwort extrahieren (metadata kann dict oder list sein)."""
+    try:
+        md = (res or {}).get("metadata") or {}
+        if isinstance(md, list) and len(md) > 0:
+            md = md[-1]
+        elif not isinstance(md, dict):
+            md = {}
+        return (md.get("fileid"), md.get("hash"))
+    except Exception:
+        return (None, None)
+
+
+def _pool_ids_from_remote_stat(cfg: dict, pool_path_abs: str) -> Tuple[Optional[int], Optional[int]]:
+    """Pool-Objekt per stat suchen; (None, None) wenn nicht vorhanden."""
+    try:
+        stat_md = pc.stat_file_safe(cfg, path=pool_path_abs) or {}
+        pool_fileid = stat_md.get("fileid")
+        if pool_fileid:
+            return (pool_fileid, stat_md.get("hash"))
+    except Exception:
+        pass
+    return (None, None)
+
+
+def _pool_resolve_ids_after_upload(cfg: dict, pool_path_abs: str, res) -> Tuple[Optional[int], Optional[int]]:
+    """Nach Upload: IDs aus Antwort; bei leerer Antwort optional per stat nachladen."""
+    pool_fileid, pcloud_hash = _metadata_ids_from_upload_res(res)
+    if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
+        try:
+            stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=pool_path_abs) or {}
+            if not pool_fileid:
+                pool_fileid = stat_md.get("fileid")
+            if not pcloud_hash:
+                pcloud_hash = stat_md.get("hash")
+        except Exception:
+            pass
+    return (pool_fileid, pcloud_hash)
+
+
+def _pool_recover_after_upload_error(
+    cfg: dict,
+    pool_path_abs: str,
+    exc: BaseException,
+    *,
+    context: str = "",
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Nach Upload-Exception prüfen, ob das Pool-Objekt trotzdem existiert
+    (z.B. Timeout nach erfolgreichem Write auf pCloud-Seite).
+    """
+    if os.environ.get("PCLOUD_POOL_RECOVER_ON_ERROR", "1") == "0":
+        return (None, None)
+    pool_fileid, pcloud_hash = _pool_ids_from_remote_stat(cfg, pool_path_abs)
+    if pool_fileid:
+        ctx = f"{context}: " if context else ""
+        _log(
+            f"[pool] ✓ Recovery — {ctx}Objekt existiert trotz {type(exc).__name__}: "
+            f"{pool_path_abs}"
+        )
+    return (pool_fileid, pcloud_hash)
+
+
 def stat_file_safe(cfg: dict, *, path: Optional[str]=None, fileid: Optional[int]=None) -> Optional[dict]:
     """Stat-Datei; gibt None bei 'not found' zurück (anstatt Exception)."""
     try:
@@ -1551,9 +1614,9 @@ def _import_pool_integrity_utils():
     _util = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "utilities")
     if _util not in sys.path:
         sys.path.insert(0, _util)
-    from pool_verify_backup import run_verify  # noqa: WPS433
+    from pool_verify_backup import PoolRemoteCache, run_verify  # noqa: WPS433
     from pool_integrity_run import run_integrity_for_snapshot  # noqa: WPS433
-    return run_verify, run_integrity_for_snapshot
+    return run_verify, run_integrity_for_snapshot, PoolRemoteCache
 
 
 def _push_env_for_integrity() -> Dict[str, Any]:
@@ -1615,7 +1678,7 @@ def _run_listfolder_integrity_gate(
         _log("[integrity-gate] (dry-run) uebersprungen")
         return
 
-    run_verify, run_integrity_for_snapshot = _import_pool_integrity_utils()
+    run_verify, run_integrity_for_snapshot, PoolRemoteCache = _import_pool_integrity_utils()
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
     pool_root = f"{dest_root}/_pool"
     archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
@@ -1629,12 +1692,15 @@ def _run_listfolder_integrity_gate(
     _log("[integrity-gate] Post-Upload Integritaet (listfolder)...")
     t0 = time.time()
 
+    remote_cache = PoolRemoteCache.fetch(cfg, dest_root, verbose=True)
+
     result = run_verify(
         cfg,
         pool_root_raw=dest_root,
         manifests_dir=manifests_dir,
         snapshot_filter=[snapshot_name],
         verbose=True,
+        remote_cache=remote_cache,
     )
 
     if not result.get("ok"):
@@ -1655,12 +1721,14 @@ def _run_listfolder_integrity_gate(
                 _log(f"[integrity-gate][backfill] {err}")
             if filled:
                 _log(f"[integrity-gate] Backfill: {filled} nachgeladen — erneuter Check...")
+                remote_cache.refresh_pool(cfg)
                 result = run_verify(
                     cfg,
                     pool_root_raw=dest_root,
                     manifests_dir=manifests_dir,
                     snapshot_filter=[snapshot_name],
                     verbose=True,
+                    remote_cache=remote_cache,
                 )
 
     if not result.get("ok"):
@@ -2432,21 +2500,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _dry_sampler.log("upload", f"upload pool: {pool_path_abs}  <- {abs_src}")
                 return (None, None)
 
-            # Check ob bereits existiert
-            try:
-                existing_stat = pc.stat_file_safe(cfg, path=pool_path_abs)
-                if existing_stat:
-                    pool_fileid = existing_stat.get("fileid")
-                    pcloud_hash = existing_stat.get("hash")
-                    if pool_fileid:
-                        try:
-                            with _metrics_lock:
-                                globals()["MET_POOL_REUSED"] += 1
-                        except Exception:
-                            pass
-                        return (pool_fileid, pcloud_hash)
-            except Exception:
-                pass
+            pool_fileid, pcloud_hash = _pool_ids_from_remote_stat(cfg, pool_path_abs)
+            if pool_fileid:
+                try:
+                    with _metrics_lock:
+                        globals()["MET_POOL_REUSED"] += 1
+                except Exception:
+                    pass
+                return (pool_fileid, pcloud_hash)
             
             t0 = time.time()
             res = _upload_file_smart(cfg, abs_src, pool_path_abs, dry=dry)
@@ -2456,19 +2517,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             # (nur echte Uploads; Dedup-Treffer kehren oben frueher zurueck).
             _log(f"[pool] ✓ Original in Pool geladen: {pool_path_rel}  <- {abs_src}")
             
-            try:
-                md = (res or {}).get("metadata") or {}
-                if isinstance(md, list) and len(md) > 0:
-                    md = md[-1]
-                elif not isinstance(md, dict):
-                    md = {}
-                pool_fileid = md.get("fileid")
-                pcloud_hash = md.get("hash")
-            except Exception:
-                pool_fileid = None
-                pcloud_hash = None
-            
-            return (pool_fileid, pcloud_hash)
+            return _pool_resolve_ids_after_upload(cfg, pool_path_abs, res)
         
         def _queue_stub(relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: int, sha256: str) -> None:
             nonlocal stubs
@@ -2535,9 +2584,20 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                     _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
                     
                 except Exception as e:
-                    _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {e}")
-                    with _state_lock:
-                        failed.append(relpath)
+                    pool_path_abs = f"{dest_root.rstrip('/')}/{_get_pool_path(sha256)}"
+                    pool_fileid, pcloud_hash = _pool_recover_after_upload_error(
+                        cfg, pool_path_abs, e, context=relpath)
+                    if pool_fileid:
+                        with _state_lock:
+                            _register_snap(pool_refs, sha256, snapshot_name, relpath,
+                                           fileid=pool_fileid, hash=pcloud_hash,
+                                           size=file_item.get("size"))
+                            uploaded += 1
+                        _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
+                    else:
+                        _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {e}")
+                        with _state_lock:
+                            failed.append(relpath)
             finally:
                 _phase4_progress_tick()
         
@@ -3087,23 +3147,16 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _dry_sampler.log("upload", f"upload pool: {pool_path_abs}  <- {abs_src}")
                 return (None, None)
             
-            # Check ob bereits existiert (Dedupe!)
-            try:
-                existing_stat = pc.stat_file_safe(cfg, path=pool_path_abs)
-                if existing_stat:
-                    pool_fileid = existing_stat.get("fileid")
-                    pcloud_hash = existing_stat.get("hash")
-                    if pool_fileid:
-                        if os.environ.get("PCLOUD_VERBOSE") == "1":
-                            _log(f"[pool] ✓ EXISTS: {pool_path_abs} (fileid={pool_fileid})")
-                        try:
-                            with _metrics_lock:
-                                globals()["MET_POOL_REUSED"] += 1
-                        except Exception:
-                            pass
-                        return (pool_fileid, pcloud_hash)
-            except Exception:
-                pass
+            pool_fileid, pcloud_hash = _pool_ids_from_remote_stat(cfg, pool_path_abs)
+            if pool_fileid:
+                if os.environ.get("PCLOUD_VERBOSE") == "1":
+                    _log(f"[pool] ✓ EXISTS: {pool_path_abs} (fileid={pool_fileid})")
+                try:
+                    with _metrics_lock:
+                        globals()["MET_POOL_REUSED"] += 1
+                except Exception:
+                    pass
+                return (pool_fileid, pcloud_hash)
             
             # Progress-Hinweis für große Dateien
             file_size = os.path.getsize(abs_src)
@@ -3127,32 +3180,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             except Exception:
                 pass
             
-            # fileid + hash aus der Upload-Antwort (1:1 wie Original!)
-            try:
-                md = (res or {}).get("metadata") or {}
-                # Defensive: md kann Liste sein wenn Ordner erstellt wurden
-                if isinstance(md, list) and len(md) > 0:
-                    md = md[-1]  # Letztes Element ist File
-                elif not isinstance(md, dict):
-                    md = {}
-                pool_fileid = md.get("fileid")
-                pcloud_hash = md.get("hash")
-            except Exception:
-                pool_fileid = None
-                pcloud_hash = None
-            
-            # Optional: Eager-FileID via stat (wie Original!)
-            if (not pool_fileid or not pcloud_hash) and os.environ.get("PCLOUD_EAGER_FILEID", "1") != "0":
-                try:
-                    stat_md = pc.call_with_backoff(pc.stat_file_safe, cfg, path=pool_path_abs) or {}
-                    if not pool_fileid:
-                        pool_fileid = stat_md.get("fileid")
-                    if not pcloud_hash:
-                        pcloud_hash = stat_md.get("hash")
-                except Exception:
-                    pass
-            
-            return (pool_fileid, pcloud_hash)
+            return _pool_resolve_ids_after_upload(cfg, pool_path_abs, res)
         
         # === STUB-QUEUE-FUNKTION (1:1 vom Original, nur Payload angepasst!) ===
         def _queue_stub(relpath: str, file_item: dict, pool_fileid: int, pcloud_hash: int, sha256: str) -> None:
@@ -3510,8 +3538,19 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[ERROR] {relpath}: Keine Leserechte: {e}")
                 return
             except Exception as e:
-                _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {type(e).__name__}: {e}")
-                return
+                pool_path_abs = f"{dest_root.rstrip('/')}/{_get_pool_path(sha)}"
+                pool_fileid, pcloud_hash = _pool_recover_after_upload_error(
+                    cfg, pool_path_abs, e, context=relpath)
+                if pool_fileid:
+                    with _state_lock:
+                        _register_snap(pool_refs, sha, snapshot_name, relpath,
+                                       fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
+                        index_changed = True
+                        uploaded += 1
+                    _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
+                else:
+                    _log(f"[ERROR] {relpath}: Upload fehlgeschlagen: {type(e).__name__}: {e}")
+                    return
             
             # Hardlink-Tracking
             with _state_lock:
