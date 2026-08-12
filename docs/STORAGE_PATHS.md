@@ -141,7 +141,16 @@ python scripts/utilities/pool_verify_backup.py \
 
 **Kein separater Pipeline-Export:** `raspi5nas_backup.sh` kopiert **nicht** mehr nach `Backup/raspi5nas/pcloud-*`. Offsite-Manifeste/Temp kommen über RTB, wenn ein Snapshot fällig ist.
 
-**Unvollständiger pCloud-Upload:** Retry (`--upload-only`) braucht **kein** manuelles Löschen — `pcloud_push` erkennt fehlendes `.upload_complete`, verwirft den Remote-Ordner und startet sauber neu.
+**Unvollständiger pCloud-Upload — Retry-Entscheidung:**
+
+| Situation | Befehl | Was passiert |
+|-----------|--------|--------------|
+| Pool + Stubs **remote OK**, nur Verify/`.upload_complete` fehlten (z. B. OOM im Integrity-Gate) | `rtb_pool_wrapper.sh --finalize-only /mnt/backup/rtb_nas/SNAPSHOT` | Nur Integrity-Gate + Marker + Index (~Minuten) |
+| Remote-Snapshot **unvollständig** (kein Phase-4-Erfolg, Stubs fehlen) | `rtb_pool_wrapper.sh --upload-only /mnt/backup/rtb_nas/SNAPSHOT` | Löscht unvollständigen Remote-Ordner, Delta neu (copyfolder + Upload) |
+
+`--upload-only` braucht **kein** manuelles Löschen — `pcloud_push` erkennt fehlendes `.upload_complete` und startet sauber neu.
+
+**Prüfen vor Retry:** In `pcloud_sync.log` nach `Phase 4: … failed=0` und `Stubs erfolgreich` suchen → dann `--finalize-only` statt `--upload-only`.
 
 Siehe auch: `rtb/README.md` (Excludes), `doku/Raspi/raspinas/ops/betrieb.md` §9.
 

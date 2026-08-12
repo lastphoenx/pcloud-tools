@@ -505,8 +505,14 @@ build_and_push() {
   T0=$(date +%s)
   _db_phase_log "upload" "start"
   
-  # Upload-Modus: POOL (deduplizierter Pool + Stub-Snapshots)
-  _log INFO "Upload-Modus: POOL (deduplizierter File-Pool)"
+  local _push_mode="POOL (deduplizierter File-Pool)"
+  for _arg in "${EXTRA_PUSH_ARGS[@]}"; do
+    if [[ "$_arg" == "--finalize-only" ]]; then
+      _push_mode="FINALIZE-ONLY (Integrity-Gate + .upload_complete + Index)"
+      break
+    fi
+  done
+  _log INFO "Upload-Modus: $_push_mode"
   
   "${PY}" "$PUSH" --manifest "$mani" --dest-root "$PCLOUD_DEST" --snapshot-mode pool --env-file "$ENV_FILE" "${EXTRA_PUSH_ARGS[@]}" || {
     _db_phase_log "upload" "end" "FAILED"
@@ -602,7 +608,7 @@ build_and_push() {
 
 # ========= Start =========
 # Optionaler Direktaufruf:
-#   wrapper_pcloud_pool_sync_1to1.sh [SNAPSHOT|/pfad/zu/SNAPSHOT] [--dry-run]
+#   wrapper_pcloud_pool_sync_1to1.sh [SNAPSHOT|/pfad/zu/SNAPSHOT] [--dry-run] [--finalize-only]
 # Flags werden whitelisted und sicher (Array) an das Push-Tool weitergereicht.
 TARGET_SNAPSHOT=""
 DRY_RUN=0
@@ -615,17 +621,24 @@ while [[ $# -gt 0 ]]; do
       EXTRA_PUSH_ARGS+=("$1")
       shift
       ;;
+    --finalize-only)
+      EXTRA_PUSH_ARGS+=("$1")
+      shift
+      ;;
     -h|--help)
       cat <<EOF
 Usage:
-  $0 [SNAPSHOT|/path/to/SNAPSHOT] [--dry-run]
+  $0 [SNAPSHOT|/path/to/SNAPSHOT] [--dry-run] [--finalize-only]
 
 Examples:
   $0
   $0 2026-04-27-173201 --dry-run
+  $0 2026-08-12-040144 --finalize-only
 
 Notes:
-  --dry-run wird an pcloud_push_json_pool_manifest_to_pcloud.py durchgereicht.
+  --dry-run / --finalize-only werden an pcloud_push_json_pool_manifest_to_pcloud.py durchgereicht.
+  --finalize-only: nur Integrity-Gate + .upload_complete + Index (Pool+Stubs muessen remote stehen).
+  Bequemer Einstieg: rtb_pool_wrapper.sh --finalize-only /mnt/backup/rtb_nas/SNAPSHOT
 EOF
       exit 0
       ;;
