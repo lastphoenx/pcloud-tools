@@ -18,13 +18,12 @@ Optional --stub-sample N:
    N zufaellige Stubs parallel downloaden, stub.sha256 + stub.pool_fileid gegen
    Manifest + pool_refs kreuzen => echte Inhalts-Verifikation der Stub-Chain.
 
-Ladezeit:
-  - listfolder(_pool)            ~1.5s  (18k Objekte)
-  - listfolder(_snapshots, rec)  ~5s    (79k Stubs) -- Flaschenhals
-  - content_index.json           ~0.5s
-  Alle 3 parallel => ~5s Gesamtladezeit.
+Ladezeit (BFS, speicherschonend):
+  - listfolder_safe(_pool)         ~1–3s  (flache Liste, nur SHA-Namen)
+  - BFS pro Snapshot-Ordner        variabel (kein rekursiver Riesen-JSON-Baum)
+  - content_index.json             ~0.5s
+  Bei Post-Upload (--snapshots): Pool+Index+Stubs sequentiell (kein RAM-Spike).
   Set-Operationen fuer ~80k Manifest-Dateien => <1s.
-  Gesamtzeit 4 Snapshots: ~6-8s (ohne --stub-sample).
 
 Aufruf:
   MAIN_DIR=/opt/apps/pcloud-tools/main \\
@@ -36,8 +35,9 @@ Aufruf:
   python pool_verify_backup.py ... --stub-sample 100
 """
 from __future__ import annotations
-import os, sys, json, argparse, time
+import os, sys, json, argparse, time, gc
 import concurrent.futures
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Set, List, Tuple, Optional
 
@@ -62,6 +62,12 @@ class PoolRemoteCache:
     def matches(self, pool_root_raw: str) -> bool:
         return self.dest == pc._norm_remote_path(pool_root_raw).rstrip("/")
 
+    def refresh_pool(self, cfg: dict) -> None:
+        """Pool-SHA-Set neu laden (z.B. nach Backfill)."""
+        pool_root = f"{self.dest}/_pool"
+        self.pool_shas = _collect_pool_shas(cfg, pool_root)
+        self.fetched_at = time.time()
+
     @classmethod
     def fetch(
         cls,
@@ -80,10 +86,7 @@ class PoolRemoteCache:
         t0 = time.time()
 
         def _fetch_pool() -> Set[str]:
-            res = pc.call_with_backoff(
-                pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False,
-            )
-            return _walk_pool(res.get("metadata", {}))
+            return _collect_pool_shas(cfg, pool_root)
 
         def _fetch_index() -> dict:
             txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
@@ -119,6 +122,156 @@ def _walk_pool(node) -> Set[str]:
             if len(name) == 64 and all(c in "0123456789abcdef" for c in name):
                 result.add(name)
     return result
+
+
+def _sha_from_pool_entry(child: dict) -> Optional[str]:
+    if child.get("isfolder"):
+        return None
+    name = child.get("name", "")
+    if len(name) == 64 and all(c in "0123456789abcdef" for c in name):
+        return name
+    return None
+
+
+def _collect_pool_shas(cfg: dict, pool_root: str) -> Set[str]:
+    """
+    Pool-SHAs speicherschonend: listfolder_safe (flach) statt verschachtelter Riesen-Baum.
+    """
+    flat = pc.call_with_backoff(pc.listfolder_safe, cfg, path=pool_root, nofiles=False)
+    result: Set[str] = set()
+    for child in flat:
+        sha = _sha_from_pool_entry(child)
+        if sha:
+            result.add(sha)
+    return result
+
+
+def _collect_stub_paths_bfs(cfg: dict, snap_path: str) -> Set[str]:
+    """
+    Stub-Pfade per BFS (listfolder non-recursive pro Ordner).
+    Vermeidet listfolder(recursive=True) auf grossen Snapshots — das haelt den
+    gesamten Baum als verschachteltes JSON im RAM (OOM-Risiko bei 100k+ Stubs).
+    """
+    root = pc._norm_remote_path(snap_path).rstrip("/")
+    stubs: Set[str] = set()
+    queue: deque[str] = deque([root])
+    while queue:
+        current = queue.popleft()
+        try:
+            top = pc.call_with_backoff(
+                pc.listfolder, cfg, path=current, recursive=False, nofiles=False,
+            )
+        except Exception:
+            continue
+        for child in ((top.get("metadata") or {}).get("contents") or []):
+            name = child.get("name", "")
+            path = pc._norm_remote_path(f"{current}/{name}")
+            if child.get("isfolder"):
+                queue.append(path)
+            elif name.endswith(".meta.json"):
+                stubs.add(path)
+    return stubs
+
+
+def _verify_fetch_workers(snapshot_filter: Optional[List[str]]) -> int:
+    """Parallele Remote-Fetches begrenzen (RAM auf pi-nas)."""
+    raw = os.environ.get("PCLOUD_VERIFY_FETCH_WORKERS", "")
+    if raw.strip():
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    if snapshot_filter:
+        return 1
+    return 2
+
+
+def _verify_sequential_fetch(snapshot_filter: Optional[List[str]]) -> bool:
+    mode = os.environ.get("PCLOUD_VERIFY_SEQUENTIAL_FETCH", "auto").strip().lower()
+    if mode in ("1", "true", "yes", "on"):
+        return True
+    if mode in ("0", "false", "no", "off"):
+        return False
+    return bool(snapshot_filter)
+
+
+def _verify_stub_mode(snapshot_filter: Optional[List[str]]) -> str:
+    """bfs = Ordner-fuer-Ordner (default); manifest_stat = nur erwartete Stubs per stat."""
+    mode = os.environ.get("PCLOUD_VERIFY_STUB_MODE", "bfs").strip().lower()
+    if mode in ("bfs", "manifest_stat"):
+        return mode
+    return "bfs"
+
+
+def _check_stubs_manifest_stat(
+    cfg: dict,
+    manifests: Dict[str, Dict[str, str]],
+    snaps_root: str,
+    *,
+    workers: int = 12,
+) -> dict:
+    """
+    Prueft nur Manifest-erwartete Stubs per stat (kein Remote-Vollscan).
+    Fuer sehr grosse Snapshots optional; langsamer als BFS, aber minimaler RAM.
+    """
+    try:
+        workers = max(1, int(os.environ.get("PCLOUD_VERIFY_STAT_WORKERS", str(workers))))
+    except ValueError:
+        workers = 12
+
+    snaps_root = pc._norm_remote_path(snaps_root)
+    tasks: List[Tuple[str, str, str]] = []
+    for snap, files in manifests.items():
+        for rp in files:
+            tasks.append((snap, rp, _manifest_stub_path(snaps_root, snap, rp)))
+
+    manifest_missing: Dict[str, List[str]] = {}
+    manifest_missing_total = 0
+    path_compat_resolved = 0
+
+    def _stat_ok(stub_path: str) -> bool:
+        if pc.stat_file_safe(cfg, path=stub_path):
+            return True
+        alt = ppc.normalize_path_segments(stub_path)
+        if alt != stub_path and pc.stat_file_safe(cfg, path=alt):
+            return True
+        return False
+
+    def _check_one(args: Tuple[str, str, str]) -> Tuple[str, str, bool, bool]:
+        snap, rp, stub_path = args
+        primary = _stat_ok(stub_path)
+        if primary:
+            risky = ppc.relpath_has_risky_segments(rp)
+            compat = risky and not pc.stat_file_safe(cfg, path=stub_path)
+            return (snap, rp, True, compat)
+        return (snap, rp, False, False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(_check_one, tasks))
+
+    for snap, rp, ok, compat in results:
+        if ok:
+            if compat:
+                path_compat_resolved += 1
+            continue
+        manifest_missing_total += 1
+        manifest_missing.setdefault(snap, []).append(rp)
+
+    for snap in list(manifest_missing.keys()):
+        manifest_missing[snap] = manifest_missing[snap][:20]
+
+    return {
+        "expected_stubs": len(tasks),
+        "actual_stubs": len(tasks) - manifest_missing_total,
+        "missing_from_index": 0,
+        "missing_from_index_examples": [],
+        "extra_not_in_index": 0,
+        "extra_stub_examples": [],
+        "manifest_missing_stubs": manifest_missing,
+        "manifest_missing_total": manifest_missing_total,
+        "path_compat_resolved": path_compat_resolved,
+        "mode": "manifest_stat",
+    }
 
 
 def _walk_stubs(node, cur: str) -> Set[str]:
@@ -483,6 +636,15 @@ def run_verify(
     pool_shas: Set[str] = set()
     stub_paths: Set[str] = set()
     pool_refs: dict = {}
+    stub_mode = _verify_stub_mode(snapshot_filter)
+    sequential = _verify_sequential_fetch(snapshot_filter)
+    fetch_workers = _verify_fetch_workers(snapshot_filter)
+    use_manifest_stat = stub_mode == "manifest_stat" and bool(snapshot_filter)
+
+    if use_manifest_stat:
+        _out("[fetch] Stub-Modus: manifest_stat (kein Remote-Vollscan)")
+    else:
+        _out(f"[fetch] Stub-Modus: bfs | sequential={sequential} | workers={fetch_workers}")
 
     use_cache = remote_cache is not None and remote_cache.matches(dest)
     if use_cache:
@@ -493,66 +655,79 @@ def run_verify(
             f"{len(pool_refs)} pool_refs)"
         )
 
-    def _fetch_pool():
-        res = pc.call_with_backoff(pc.listfolder, cfg, path=pool_root, recursive=True, nofiles=False)
-        return _walk_pool(res.get("metadata", {}))
+    def _fetch_pool() -> Set[str]:
+        return _collect_pool_shas(cfg, pool_root)
 
-    def _fetch_snap_stubs(snap):
+    def _fetch_snap_stubs(snap: str) -> Set[str]:
         snap_path = f"{snaps_root}/{snap}"
-        res = pc.call_with_backoff(pc.listfolder, cfg, path=snap_path, recursive=True, nofiles=False)
-        paths: Set[str] = set()
+        return _collect_stub_paths_bfs(cfg, snap_path)
 
-        def _walk(node, cur):
-            for child in node.get("contents", []) or []:
-                name = child.get("name", "")
-                p = f"{cur}/{name}"
-                if child.get("isfolder"):
-                    _walk(child, p)
-                elif name.endswith(".meta.json"):
-                    paths.add(pc._norm_remote_path(p))
-
-        _walk(res.get("metadata", {}), snap_path)
-        return paths
-
-    def _fetch_index():
+    def _fetch_index() -> dict:
         txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
         idx = json.loads(txt or "{}")
         return idx.get("pool_refs") or {}
 
-    if use_cache:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(remote_snaps) or 1) as ex:
-            snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
-            done = 0
-            for snap, fut in snap_futures.items():
-                try:
-                    snap_stubs = fut.result()
-                    stub_paths |= snap_stubs
-                    done += 1
-                    _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
-                except Exception as e:
-                    done += 1
-                    _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-            f_pool = ex.submit(_fetch_pool)
-            f_index = ex.submit(_fetch_index)
-            pool_refs = f_index.result()
-            pool_shas = f_pool.result()
-            snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
-            done = 0
-            for snap, fut in snap_futures.items():
-                try:
-                    snap_stubs = fut.result()
-                    stub_paths |= snap_stubs
-                    done += 1
-                    _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
-                except Exception as e:
-                    done += 1
-                    _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
+    def _fetch_stubs_sequential() -> None:
+        nonlocal stub_paths
+        for i, snap in enumerate(remote_snaps, start=1):
+            try:
+                snap_stubs = _fetch_snap_stubs(snap)
+                stub_paths |= snap_stubs
+                _out(f"[fetch] {i}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs (bfs)")
+            except Exception as e:
+                _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
+            gc.collect()
+
+    if not use_cache:
+        if sequential:
+            _out("[fetch] Pool...")
+            pool_shas = _fetch_pool()
+            gc.collect()
+            _out("[fetch] Index...")
+            pool_refs = _fetch_index()
+            gc.collect()
+            if not use_manifest_stat:
+                _fetch_stubs_sequential()
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=fetch_workers) as ex:
+                f_pool = ex.submit(_fetch_pool)
+                f_index = ex.submit(_fetch_index)
+                pool_refs = f_index.result()
+                pool_shas = f_pool.result()
+                gc.collect()
+                if not use_manifest_stat:
+                    snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
+                    done = 0
+                    for snap, fut in snap_futures.items():
+                        try:
+                            snap_stubs = fut.result()
+                            stub_paths |= snap_stubs
+                            done += 1
+                            _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs (bfs)")
+                        except Exception as e:
+                            done += 1
+                            _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
+    elif not use_manifest_stat:
+        if sequential or fetch_workers <= 1:
+            _fetch_stubs_sequential()
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=fetch_workers) as ex:
+                snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
+                done = 0
+                for snap, fut in snap_futures.items():
+                    try:
+                        snap_stubs = fut.result()
+                        stub_paths |= snap_stubs
+                        done += 1
+                        _out(f"[fetch] {done}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs (bfs)")
+                    except Exception as e:
+                        done += 1
+                        _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
 
     dt_fetch = time.time() - t_fetch
+    stub_info = "manifest_stat" if use_manifest_stat else str(len(stub_paths))
     _out(f"[fetch] Pool: {len(pool_shas)} SHA256s | "
-         f"Stubs: {len(stub_paths)} | "
+         f"Stubs: {stub_info} | "
          f"Index: {len(pool_refs)} pool_refs | "
          f"{dt_fetch:.1f}s")
     _out("")
@@ -585,9 +760,12 @@ def run_verify(
     _out("=== B) Stubs vs Index vs Pool ===")
     t_b = time.time()
     stub_scope = set(snapshot_filter) if snapshot_filter else None
-    res_b = check_stubs_vs_index(
-        pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
-    )
+    if use_manifest_stat:
+        res_b = _check_stubs_manifest_stat(cfg, manifests, snaps_root)
+    else:
+        res_b = check_stubs_vs_index(
+            pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
+        )
     mm = int(res_b.get("manifest_missing_total") or 0)
     if mm > 0:
         issues += mm
