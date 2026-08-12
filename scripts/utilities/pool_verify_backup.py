@@ -156,7 +156,7 @@ def _collect_stub_paths_bfs(cfg: dict, snap_path: str, *, progress_cb=None) -> S
     stubs: Set[str] = set()
     queue: deque[str] = deque([root])
     folders_seen = 0
-    progress_every = int(os.environ.get("PCLOUD_VERIFY_BFS_PROGRESS_EVERY", "500") or "500")
+    progress_every = int(os.environ.get("PCLOUD_VERIFY_BFS_PROGRESS_EVERY", "2000") or "2000")
     while queue:
         current = queue.popleft()
         folders_seen += 1
