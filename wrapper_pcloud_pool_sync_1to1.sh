@@ -99,7 +99,7 @@ _log() {
   local level="${1:-INFO}"
   shift
   local msg="$*"
-  local ts; ts="$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
+  local ts; ts="$(date '+%F %T')"
   
   # Human-readable output (to stdout/file)
   printf "%s [%s] %s\n" "$ts" "$level" "$msg"

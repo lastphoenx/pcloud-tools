@@ -281,8 +281,13 @@ check_backup_age() {
   # IMPORTANT: RTB only creates snapshots on changes, so age-based checks are WRONG
   # Correct approach: latest RTB snapshot must have SUCCESS in backup_runs
   if [[ "$PCLOUD_ENABLE_DB" == "1" ]]; then
+    local running_for_latest=0
+    running_for_latest=$(_mysql "SELECT COUNT(*) FROM backup_runs WHERE snapshot_name='${snap_escaped}' AND status='RUNNING'" 2>/dev/null || echo "0")
     if [[ $latest_rtb_uploaded -eq 1 ]]; then
       log_issue "OK" "pCloud in sync with RTB (both: $latest_rtb_snapshot)"
+    elif [[ "${running_for_latest:-0}" -gt 0 ]]; then
+      log_issue "WARNING" "Upload in progress for latest RTB snapshot ($latest_rtb_snapshot) — GAP expected until .upload_complete"
+      set_status 1
     elif [[ -n "$pcloud_snapshot" ]]; then
       local pcloud_age_display
       local pcloud_age_days=$(( pcloud_backup_age_hours / 24 ))
