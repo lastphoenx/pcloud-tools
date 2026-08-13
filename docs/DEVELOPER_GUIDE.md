@@ -264,7 +264,7 @@ Stubs geschrieben
       → optional Pool-Backfill (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX)
       → pool_integrity_run (post_upload → MariaDB)
   → .upload_complete
-  → Index-Upload (resumable, ~700 MB)
+  → Index-Upload (resumable chunked, volle Master-Datei ~700–900 MB)
 ```
 
 Implementierung: `_run_listfolder_integrity_gate()` ruft `pool_verify_backup.run_verify()` und bei Bedarf `_backfill_missing_pool_shas()`.
@@ -279,7 +279,11 @@ Implementierung: `_run_listfolder_integrity_gate()` ruft `pool_verify_backup.run
 
 **RAM-Hinweis (legacy stat):** `PCLOUD_VALIDATE_BATCH_SIZE` / `PCLOUD_VALIDATE_THREADS` — nur relevant bei `PCLOUD_VALIDATE_UPLOAD=1`. Siehe [ENV_VARIABLES.md](ENV_VARIABLES.md#pool-finalize-ram-sparend).
 
-**Finalize-Reihenfolge (Delta):** `gc.collect()` → Integrity-Gate → `.upload_complete` → Index-Upload (lokal + resumable) → Manifest archivieren.
+**Finalize-Reihenfolge (Delta):** `gc.collect()` → Integrity-Gate → `.upload_complete` → Index-Upload (lokal + resumable) → Snap-Archiv-Index → Manifest archivieren.
+
+**Master-Index-Upload (`content_index.json`):** Nach jedem erfolgreichen Lauf wird die **gesamte** Master-Datei (~700–900 MB) lokal geschrieben und per **resumable Chunk-Upload** (128 MiB-Chunks, `upload_local_file_resumable`) nach pCloud hochgeladen — **nicht inkrementell**. Zusätzlich: kleines per-Snapshot-Archiv `_index/archive/<snap>_index.json` (~30 MB). Chunk-Upload ist robust (Resume, Retries); der Overhead bei Mini-Deltas ist Bandbreite/Zeit (~1–2 min), nicht RAM.
+
+**Catch-up (pCloud):** Lokale RTB-Snapshots ohne remote `.upload_complete` werden nacheinander hochgeladen. `PCLOUD_CATCHUP_MAX_PER_RUN` (Default `1`) begrenzt pro Pipeline-Lauf — verhindert Multi-Snapshot-Marathons. Reihenfolge: **latest zuerst**, dann Backlog.
 
 **Wrapper danach:** Marker-Verify mit Retries (`PCLOUD_MARKER_VERIFY_RETRIES`); bei API-Ausfall kein False-FAIL mehr.
 
@@ -494,11 +498,26 @@ python scripts/utilities/check_undefined_names.py \
 
 ---
 
+## 📊 Monitoring-Dashboard (August 2026)
+
+| JSON | Generator | Timer | Intervall |
+|------|-----------|-------|-----------|
+| `status.json` quick | `aggregate_status.sh` + `AGGREGATE_MODE=quick` | `monitoring-status-quick.timer` | **5 min** |
+| `status.json` full | `aggregate_status.sh` + `AGGREGATE_MODE=full` | `monitoring-status-update.timer` | **15 min** + nach Backup |
+| `reports.json` | `generate_reports.sh` | `monitoring-reports.timer` | **15 min** + nach Backup |
+
+Dashboard (`dashboard/index.html`): Browser-Polling **60 s**; Header-Datum = neuerer Timestamp aus `status.json` / `reports.json`; große Detail-Tabellen default eingeklappt.
+
+Details: [DASHBOARD.md](./DASHBOARD.md), [systemd/README.md](../systemd/README.md).
+
+---
+
 ## 📚 Verwandte Dokumentation
 
 | Datei | Inhalt |
 |---|---|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System-Übersicht, Datenstrukturen, Modi |
+| [DASHBOARD.md](./DASHBOARD.md) | Dashboard-UI, Datenquellen, Refresh-Intervalle |
 | [SETUP.md](./SETUP.md) | Ersteinrichtung, Abhängigkeiten, Pool-Bootstrap |
 | [ENV_VARIABLES.md](./ENV_VARIABLES.md) | Vollständige ENV-Variablen-Referenz |
 | [BACKUP_RETENTION_DEEP_DIVE.md](./BACKUP_RETENTION_DEEP_DIVE.md) | RTB + Pool Retention-Strategie |

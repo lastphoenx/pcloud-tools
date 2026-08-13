@@ -313,34 +313,40 @@ Diese Tools liegen unter `scripts/` und werden **nicht automatisch** angestossen
 
 ## Monitoring & Alerting
 
-Dashboard und Alerting sind implementiert; die systemd/nginx-Integration auf dem Pi ist noch einzurichten.
+Dashboard, Status-Aggregation und Reports sind implementiert. Auf pi-nas: systemd-Units aus `systemd/*.example` deployen.
 
-**Vorhandene Komponenten:**
+**Komponenten:**
 
-| Datei | Funktion |
+| Datei / Unit | Funktion |
 |---|---|
-| `dashboard/index.html` | Web-Dashboard (Vanilla HTML/JS, kein Framework) — zeigt Status aller Services |
-| `scripts/aggregate_status.sh` | Sammelt Status aller Services als `/opt/apps/monitoring/status.json` |
-| `scripts/send_alert.sh` | pCloud-spezifische Alerts via Apprise |
-| `scripts/send_aggregated_alert.sh` | Multi-Service-Alerts, erkennt Statuswechsel (kein Spam) |
+| `dashboard/index.html` | Web-Dashboard (60 s Browser-Refresh, Detail-Bereiche einklappbar) |
+| `scripts/aggregate_status.sh` | `status.json` — Modus `quick` (5 min) oder `full` (15 min + nach Backup) |
+| `scripts/generate_reports.sh` | `reports.json` — alle 15 min + nach Backup |
+| `monitoring-status-quick.timer` | Lightweight Status alle 5 min |
+| `monitoring-status-update.timer` | Full Aggregate alle 15 min + `OnUnitActivation=backup-pipeline` |
+| `monitoring-reports.timer` | DB → `reports.json` |
+| `scripts/send_aggregated_alert.sh` | Alerts bei Statuswechsel |
 
 **Quick Setup:**
 ```bash
-# Dashboard deployen
-sudo mkdir -p /var/www/monitoring
-sudo cp dashboard/index.html /var/www/monitoring/
+cd /opt/apps/pcloud-tools/main
 
-# Status-Aggregator via systemd (event-getriggert + alle 15 min Fallback)
-sudo cp main/systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
-sudo cp main/systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
-sudo cp main/systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
+sudo cp systemd/monitoring-status-quick.service.example /etc/systemd/system/monitoring-status-quick.service
+sudo cp systemd/monitoring-status-quick.timer.example /etc/systemd/system/monitoring-status-quick.timer
+sudo cp systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
+sudo cp systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
+sudo cp systemd/monitoring-reports.service.example /etc/systemd/system/monitoring-reports.service
+sudo cp systemd/monitoring-reports.timer.example /etc/systemd/system/monitoring-reports.timer
+sudo cp systemd/monitoring-dashboard.service.example /etc/systemd/system/monitoring-dashboard.service
+
 sudo systemctl daemon-reload
+sudo systemctl enable --now monitoring-status-quick.timer
 sudo systemctl enable --now monitoring-status-update.timer
+sudo systemctl enable --now monitoring-reports.timer
 sudo systemctl enable --now monitoring-dashboard.service
 
-# Alerts aktivieren
+# Alerts (optional)
 sudo cp apprise.yml.example /opt/apps/apprise.yml
-# Telegram/Discord/ntfy-Credentials eintragen
 ```
 
 → Dashboard-Setup (nginx): [dashboard/README.md](dashboard/README.md)  

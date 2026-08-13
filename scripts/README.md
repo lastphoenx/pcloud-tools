@@ -64,9 +64,12 @@ Ohne diese Zeile zeigt systemd "FAILURE" bei Exit 1/2, obwohl das Script korrekt
 
 **Automation:**
 ```bash
-# Systemd Timer (event-getriggert + 15-min Fallback) — siehe systemd/README.md
+# Quick: alle 5 min | Full: alle 15 min + nach backup-pipeline — siehe systemd/README.md
+sudo systemctl enable --now monitoring-status-quick.timer
 sudo systemctl enable --now monitoring-status-update.timer
 ```
+
+**Modi:** `AGGREGATE_MODE=quick` (Default im quick-Service) überspringt RTB `--check-only` und reused pCloud-Health aus letztem Full-Lauf.
 
 ---
 

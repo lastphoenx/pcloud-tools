@@ -279,6 +279,31 @@ sudo /opt/apps/rtb/rtb_pool_wrapper.sh --upload-only /mnt/backup/rtb_nas/2026-08
 
 ---
 
+## 17. Verify-Gate, Dashboard, Monitoring-Refresh (13. Aug 2026)
+
+**Verify / Gate (Commits `c598202`, `e690eb4`, `b4ec812`):**
+
+| Alt | Neu |
+|-----|-----|
+| BFS `listfolder` pro Ordner + voller Master-Index im RAM | Subprozess + `listfolder_safe` pro Top-Level-Subtree |
+| `manifest_stat` (115k API-Calls) | entfernt |
+| Gate-Stunden / OOM | typisch **20–60 s** |
+
+**Finalize-only:** `rtb_pool_wrapper.sh --finalize-only` ohne 87-Snap-Remote-Scan (`b4ec812`).
+
+**Dashboard (`0d2c52c`, `7368137`):** Detail-Bereiche einklappbar (Letzte 7 Tage default zu); `monitoring-status-quick.timer` (5 min); Browser 60 s; `aggregate_mode` in `status.json`.
+
+**Deploy pi-nas:**
+```bash
+cd /opt/apps/pcloud-tools/main && git pull
+sudo cp systemd/monitoring-status-quick.*.example /etc/systemd/system/
+sudo cp systemd/monitoring-status-update.*.example /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now monitoring-status-quick.timer
+```
+
+---
+
 ## 16. Commit-Referenzen (Auswahl)
 
 | Thema | Commit-Bereich (main) |
@@ -295,4 +320,5 @@ sudo /opt/apps/rtb/rtb_pool_wrapper.sh --upload-only /mnt/backup/rtb_nas/2026-08
 | RTB Batch revert + OOM-Opfer weg | `e86a96b` (rtb), `8c3367c` (pcloud-tools) |
 | Marker-Verify API-Ausfall | `0a24f12` |
 | DB-Wartung Dashboard | `79e5430` |
-| RTB staged backup | `bdf93b7`–`33c8d1d` (rtb), `51228b0` + `1f0a1c9` (pcloud-tools) |
+| Integrity subtree + subprocess | `c598202`, `e690eb4`, `b4ec812` |
+| Dashboard + monitoring-quick | `0d2c52c`, `7368137` |
