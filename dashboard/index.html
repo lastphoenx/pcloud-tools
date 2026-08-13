@@ -747,14 +747,14 @@
   <div id="detail-sections"></div>
 
   <div class="footer">
-    <span>Auto-Refresh in <strong id="countdown">30</strong>s</span>
+    <span>Auto-Refresh in <strong id="countdown">60</strong>s</span>
     <span id="last-update">&#x2014;</span>
   </div>
 
   <script>
     const STATUS_URL  = '/monitoring/status.json';
     const REPORTS_URL = '/monitoring/reports.json';
-    const REFRESH_SEC = 30;
+    const REFRESH_SEC = 60;
 
     let countdown = REFRESH_SEC;
     let countdownInterval = null;
@@ -796,11 +796,15 @@
         }
       }
       document.getElementById('hostname').textContent = status.hostname || '\u2014';
-      document.getElementById('data-timestamp').textContent = fmtTs(status.timestamp);
+      const dataTs = latestDataTimestamp(status, reports);
+      document.getElementById('data-timestamp').textContent = fmtTs(dataTs);
       const tz = (reports && reports.server_timezone) || status.server_timezone || 'Europe/Berlin';
       const tzEl = document.getElementById('server-timezone');
       if (tzEl) tzEl.textContent = tz;
-      document.getElementById('last-update').textContent = 'Letztes Update: ' + new Date().toLocaleTimeString('de-DE');
+      const modeHint = (status.aggregate_mode === 'quick') ? ' (quick)' : '';
+      document.getElementById('last-update').textContent =
+        'Seite ' + new Date().toLocaleTimeString('de-DE')
+        + ' · Datenstand ~5 Min (Status) / ~15 Min (Reports)' + modeHint;
 
       const overall = (status.overall_status || 'UNKNOWN').toUpperCase();
       const dot = document.getElementById('overall-dot');
@@ -2182,6 +2186,26 @@
     }
 
     const DISPLAY_TZ = 'Europe/Berlin';
+
+    function parseTsMs(ts) {
+      if (!ts) return 0;
+      const d = new Date(String(ts).trim());
+      return isNaN(d.getTime()) ? 0 : d.getTime();
+    }
+
+    function latestDataTimestamp(status, reports) {
+      const candidates = [];
+      if (status && status.timestamp) candidates.push(status.timestamp);
+      if (reports && reports.timestamp) candidates.push(reports.timestamp);
+      if (!candidates.length) return null;
+      let best = candidates[0];
+      let bestMs = parseTsMs(best);
+      for (let i = 1; i < candidates.length; i++) {
+        const ms = parseTsMs(candidates[i]);
+        if (ms > bestMs) { best = candidates[i]; bestMs = ms; }
+      }
+      return best;
+    }
 
     function fmtTs(ts) {
       if (!ts || ts === 'never' || ts === 'unknown' || ts === 'N/A') return ts || '\u2014';

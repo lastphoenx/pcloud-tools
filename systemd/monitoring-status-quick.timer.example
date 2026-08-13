@@ -1,0 +1,15 @@
+[Unit]
+Description=Monitoring Status Quick Timer - every 5 minutes
+Documentation=https://github.com/lastphoenx/pcloud-tools
+Requires=monitoring-status-quick.service
+
+[Timer]
+# Lightweight status.json refresh (no RTB --check-only)
+OnCalendar=*:0/5
+OnBootSec=3min
+
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

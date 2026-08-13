@@ -29,6 +29,9 @@ REPORTS_JSON="${REPORTS_JSON:-/opt/apps/monitoring/reports.json}"
 DASHBOARD_URL="${DASHBOARD_URL:-http://$(hostname -I | awk '{print $1}'):8080}"
 VERBOSE=0
 [[ "${1:-}" == "--verbose" ]] && VERBOSE=1
+# full = RTB --check-only + pCloud health + forecast (~1–3 min). quick = services/log/timers (~10–30s).
+AGGREGATE_MODE="${AGGREGATE_MODE:-full}"
+case "${AGGREGATE_MODE}" in full|quick) ;; *) AGGREGATE_MODE=full ;; esac
 
 # Paths to companion scripts (override via env)
 ENTROPYWATCHER_SAFETY_GATE="${ENTROPYWATCHER_SAFETY_GATE:-/opt/apps/entropywatcher/main/safety_gate.sh}"
@@ -336,12 +339,7 @@ check_rtb_wrapper() {
     fi
   fi
 
-  # ---- Live Dry-Run pre-check ----
-  # Call rtb_wrapper.sh --check-only: flock + cache; no backup pipeline lock.
-  #   exit 1 + "changes_detected" → backup will fire next run
-  #   exit 0 + "no_changes"       → no backup needed
-  #   exit 0 + "no_baseline"      → no prior snapshot yet
-  #   exit 3 + "check_busy"       → skipped (another check running, no cache)
+  # ---- Live Dry-Run pre-check (skipped in AGGREGATE_MODE=quick — ~1–3 min on NAS) ----
   local dry_run_result="unknown"
   local dry_run_stale=0
   local dry_run_ts=""
@@ -349,7 +347,21 @@ check_rtb_wrapper() {
   local dry_run_backup_scope_json=""
   local dry_run_pipeline_only_json=""
   local rtb_exclude_policy_json=""
-  if [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
+  if [[ "${AGGREGATE_MODE}" == "quick" ]]; then
+    dry_run_result="deferred"
+    if [[ -f "$MONITORING_OUTPUT" ]] && command -v jq &>/dev/null; then
+      dry_run_result=$(jq -r '.scripts.rtb_wrapper.dry_run_result // "deferred"' "$MONITORING_OUTPUT" 2>/dev/null || echo "deferred")
+      dry_run_ts=$(jq -r '.scripts.rtb_wrapper.dry_run_ts // empty' "$MONITORING_OUTPUT" 2>/dev/null || echo "")
+      dry_run_delta_json=$(jq -c '.scripts.rtb_wrapper.dry_run_delta // empty' "$MONITORING_OUTPUT" 2>/dev/null || echo "")
+      [[ "$dry_run_delta_json" == "null" || -z "$dry_run_delta_json" ]] && dry_run_delta_json=""
+      dry_run_backup_scope_json=$(jq -c '.scripts.rtb_wrapper.dry_run_backup_scope // empty' "$MONITORING_OUTPUT" 2>/dev/null || echo "")
+      [[ "$dry_run_backup_scope_json" == "null" || -z "$dry_run_backup_scope_json" ]] && dry_run_backup_scope_json=""
+      dry_run_pipeline_only_json=$(jq -c '.scripts.rtb_wrapper.dry_run_pipeline_only // empty' "$MONITORING_OUTPUT" 2>/dev/null || echo "")
+      [[ "$dry_run_pipeline_only_json" == "null" || -z "$dry_run_pipeline_only_json" ]] && dry_run_pipeline_only_json=""
+      rtb_exclude_policy_json=$(jq -c '.scripts.rtb_wrapper.exclude_policy // empty' "$MONITORING_OUTPUT" 2>/dev/null || echo "")
+      [[ "$rtb_exclude_policy_json" == "null" || -z "$rtb_exclude_policy_json" ]] && rtb_exclude_policy_json=""
+    fi
+  elif [[ -x "${RTB_WRAPPER_SCRIPT}" ]]; then
     local check_out check_rc
     set +e
     check_out=$("${RTB_WRAPPER_SCRIPT}" --check-only 2>&1)
@@ -529,6 +541,18 @@ enrich_rtb_json() {
 # =====================================================
 # pCloud Health Check Integration
 # =====================================================
+check_pcloud_cached() {
+  if [[ -f "$MONITORING_OUTPUT" ]] && command -v jq &>/dev/null; then
+    local cached
+    cached=$(jq -c '.scripts.pcloud_backup // empty' "$MONITORING_OUTPUT" 2>/dev/null || echo "")
+    if [[ -n "$cached" && "$cached" != "null" && "$cached" != "empty" ]]; then
+      echo "$cached"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 check_pcloud() {
   if [[ ! -x "$PCLOUD_HEALTH_CHECK" ]]; then
     echo "{\"status_code\":3,\"status_text\":\"UNKNOWN\",\"message\":\"pcloud_health_check.sh not found or not executable\"}"
@@ -842,13 +866,26 @@ get_safety_gate_forecast() {
 # Main Aggregation Logic
 # =====================================================
 
-log "Starting status aggregation..."
+log "Starting status aggregation (mode=${AGGREGATE_MODE})..."
+
+LOCK_FILE="/run/monitoring-status-aggregate.lock"
+mkdir -p /run
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+  log "Another aggregate run in progress — skipping (${AGGREGATE_MODE})"
+  exit 0
+fi
 
 log "Checking Live Safety-Gate..."
 check_live_safety_gate
 
-log "Getting Safety-Gate forecast..."
-SG_FORECAST=$(get_safety_gate_forecast)
+if [[ "${AGGREGATE_MODE}" == "quick" ]]; then
+  log "Quick mode: skipping Safety-Gate forecast"
+  SG_FORECAST=""
+else
+  log "Getting Safety-Gate forecast..."
+  SG_FORECAST=$(get_safety_gate_forecast)
+fi
 
 log "Collecting timer status..."
 TIMER_STATUS_JSON=$(collect_timer_status)
@@ -895,7 +932,12 @@ log "Checking RTB wrapper..."
 RTB_JSON=$(check_rtb_wrapper)
 
 log "Checking pCloud backup..."
-PCLOUD_JSON=$(check_pcloud)
+PCLOUD_JSON=""
+if [[ "${AGGREGATE_MODE}" == "quick" ]] && PCLOUD_JSON=$(check_pcloud_cached); then
+  log "Quick mode: reusing cached pCloud health from status.json"
+else
+  PCLOUD_JSON=$(check_pcloud)
+fi
 
 log "Enriching RTB status (pool-mode / DB fallback)..."
 RTB_JSON=$(enrich_rtb_json "$RTB_JSON" "$PCLOUD_JSON")
@@ -980,6 +1022,7 @@ ESC_DASHBOARD_URL=$(escape_json "$DASHBOARD_URL")
 cat > "$MONITORING_OUTPUT" <<EOF
 {
   "timestamp": "$TIMESTAMP",
+  "aggregate_mode": "$AGGREGATE_MODE",
   "hostname": "$HOSTNAME",
   "server_timezone": "$SERVER_TZ",
   "dashboard_url": "$ESC_DASHBOARD_URL",

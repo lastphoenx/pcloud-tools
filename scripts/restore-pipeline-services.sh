@@ -5,6 +5,7 @@ set -euo pipefail
 TIMERS=(
   backup-pipeline.timer
   monitoring-status-update.timer
+  monitoring-status-quick.timer
   monitoring-alert.timer
   entropywatcher-nas.timer
   entropywatcher-nas-av.timer
