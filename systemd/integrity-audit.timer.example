@@ -1,5 +1,5 @@
 [Unit]
-Description=pCloud integrity audit after backup (+105min, 10 snapshots)
+Description=pCloud integrity audit after backup (+105min, INTEGRITY_AUDIT_MAX snapshots)
 Documentation=file:///opt/apps/pcloud-tools/main/docs/POOL_INTEGRITY.md
 
 [Timer]

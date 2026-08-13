@@ -6,12 +6,16 @@ Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 
 | Wann | Was | Wo |
 |------|-----|-----|
-| **Jeder Upload** | Hartes Integrity-Gate (`listfolder`, ~30–60 s) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
+| **Jeder Upload** | Hartes Integrity-Gate (Subprozess: `manifest_stat`, kein Voll-Index) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
 | **Jeder Upload** | `post_upload` in MariaDB | im Gate via `pool_integrity_run.py` (`check_type=post_upload`) |
 | **3×/Tag Timer** | `monthly_audit` (10 Snapshots/Lauf) | `integrity-audit.service` |
 | **Wrapper (optional)** | Zweiter Lauf | nur bei `PCLOUD_POST_UPLOAD_INTEGRITY=1` (Default: `skip`) |
 
-**Log-Marker im Upload:** `[integrity-gate] Post-Upload Integritaet (listfolder)...` — ersetzt `[validate-pool]` / `[validate-stubs]` (~40 Min).
+**Log-Marker im Upload:** `[integrity-gate] Post-Upload Integritaet (Subprozess, manifest_stat)...`
+
+**RAM (Post-Upload):** Verify läuft in einem **eigenen Prozess** — `pcloud_push` hält Manifest/Delta nicht parallel zum Verify. Im Kind: `PCLOUD_VERIFY_STUB_MODE=auto` → ein Snapshot = `manifest_stat` (kein BFS), **kein** `json.loads` der ~867 MB `content_index.json` (nur Pool-SHA-Set + lokales Manifest). Typisch **~2–8 min** statt Multi-GB-RAM-Spike.
+
+**Periodischer Audit (Timer):** weiterhin **BFS** + voller Index-Cache (`INTEGRITY_AUDIT_MAX` Snapshots/Lauf) — dafür ist der RAM-intensive Pfad gedacht, nicht fürs Post-Upload-Gate.
 
 ## Dashboard „Pool-Integrität“
 
@@ -65,8 +69,8 @@ python scripts/utilities/pool_integrity_run.py \
 
 | Unit | Rolle |
 |------|--------|
-| `integrity-audit.service` | oneshot: **INTEGRITY_AUDIT_MAX** Snapshots/Lauf (default 10), Pool-Index-Cache |
-| `integrity-audit.timer` | 3× täglich **05:45, 13:45, 21:45** (+5 min Random) — 105 min nach Backup |
+| `integrity-audit.service` | oneshot: **INTEGRITY_AUDIT_MAX** Snapshots/Lauf (default 2), Pool-Index-Cache, `KillMode=control-group` |
+| `integrity-audit.timer` | 3× täglich **05:45, 13:45, 21:45** (+5 min Random) — **nach** Backup-Fenster (04/12/20); nicht parallel zum Upload+Gate laufen lassen |
 
 ```bash
 cd /opt/apps/pcloud-tools/main

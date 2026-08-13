@@ -10,12 +10,10 @@ User=root
 WorkingDirectory=/opt/apps/pcloud-tools/main
 Environment=MAIN_DIR=/opt/apps/pcloud-tools/main
 Environment=ENV_FILE=/opt/apps/pcloud-tools/main/.env
-Environment=INTEGRITY_AUDIT_MAX=10
+Environment=INTEGRITY_AUDIT_MAX=2
 ExecStart=/opt/apps/pcloud-tools/main/scripts/integrity-audit-next.sh
-# RAM-Schutz: ein Snapshot + gecachter Pool-Index (~18k SHAs)
-MemoryMax=4G
-MemorySwapMax=512M
-OOMScoreAdjust=500
+KillMode=control-group
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target
