@@ -1,7 +1,7 @@
 # Dashboard - Web-UI Monitoring
 
-**Version:** 2.0 (mit Timer-Status & Horizontal Scrolling)  
-**Letzte Aktualisierung:** 21. April 2026
+**Version:** 2.1 (Quick-Status 5 min, Detail-Bereiche einklappbar)  
+**Letzte Aktualisierung:** 13. August 2026
 
 ---
 
@@ -20,7 +20,7 @@ Das **Monitoring Dashboard** ist eine vollständig selbst-gehostete Web-UI für 
 - 🚀 **Kein Framework** - Vanilla HTML/JS (lädt in < 1 Sekunde)
 - 🔒 **Lokal gehostet** - Keine externen Services
 - 📱 **Mobile-First** - Sieht auf dem Smartphone besser aus als am PC
-- 🔄 **Auto-Refresh** - Alle 30 Sekunden aktualisiert
+- 🔄 **Auto-Refresh** — Browser lädt JSON alle **60 Sekunden**; Daten auf dem Server werden separat aktualisiert (siehe unten)
 
 ---
 
@@ -249,8 +249,16 @@ Das Dashboard liest zwei JSON-Dateien:
 
 ### 1. status.json
 **Pfad:** `/opt/apps/monitoring/status.json`  
-**Generiert von:** `aggregate_status.sh` (alle 30s)  
-**Enthält:**
+**Generiert von:** `aggregate_status.sh` via systemd:
+
+| Modus | Timer | Intervall | Inhalt |
+|-------|--------|-----------|--------|
+| **quick** | `monitoring-status-quick.timer` | **alle 5 Min** | Services, RTB-Log, Live Safety-Gate, Timer (~3–30 s) |
+| **full** | `monitoring-status-update.timer` | **alle 15 Min** + nach `backup-pipeline` | zusätzlich RTB `--check-only`, pCloud-Health-Check, Forecast (~1–3 min) |
+
+Feld `aggregate_mode` in JSON: `quick` oder `full`.
+
+**Enthält (Auswahl):**
 - Live-Service-Status (systemd units)
 - RTB Wrapper Status (letzte Backup-Details)
 - pCloud Status (sync-status, pending files)
@@ -299,11 +307,12 @@ Das Dashboard liest zwei JSON-Dateien:
 
 ### 2. reports.json
 **Pfad:** `/opt/apps/monitoring/reports.json`  
-**Generiert von:** `generate_reports.sh` (täglich)  
+**Generiert von:** `generate_reports.sh` via `monitoring-reports.timer` (**alle 15 Min**) + sofort nach `backup-pipeline` (`OnSuccess=monitoring-reports.service`)  
 **Enthält:**
 - EntropyWatcher DB-Daten (echte flagged/missing files)
 - Performance-Statistiken (30d)
-- Recent Backups (letzte 10 Läufe)
+- Recent Backups (letzte 7 SUCCESS im Dashboard-Detail)
+- Pool-Integrität (`pool_integrity` aus MariaDB)
 - Failed Backups (letzte 7 Tage)
 - Phase-Statistiken (Durchschnitts-Dauer pro Phase)
 
@@ -412,30 +421,34 @@ Details: `rtb/README.md` § Excludes, `docs/STORAGE_PATHS.md` § RTB vs. Pipelin
 
 ---
 
+### Detail-Sektionen (einklappbar)
+
+Große Tabellen (**Letzte 7 Tage**, fehlende Dateien, Sprung-Alarme, Timer-Status) sind per Default **zugeklappt** (`<details>`), um Scrollen zu reduzieren. Kacheln oben haben eigene Toggle-Buttons für Kurzlisten.
+
 ### Detail-Sektion: Timer-Status
 
-**Neue Tabelle** (scrollbar auf Smartphone):
+**Tabelle** (scrollbar auf Smartphone):
 - Unit-Name
 - Enabled (enabled/disabled)
 - Active (active/inactive)
 - LastRun (mit Delta "vor X Stunden")
 - NextRun (mit Delta "in X Stunden")
 
-**Auto-Update:** Alle 30 Sekunden mit neuem status.json
+**Daten-Update:** Aus `status.json` (quick alle 5 Min, full alle 15 Min). Header-Datum = neuerer Zeitstempel aus `status.json` oder `reports.json`.
 
 ---
 
 ## 🔄 Auto-Refresh Mechanismus
 
-**Dashboard aktualisiert sich automatisch:**
+**Zwei Ebenen:**
+
+1. **Browser** — lädt `status.json` + `reports.json` alle **60 Sekunden** (`REFRESH_SEC` in `index.html`).
+2. **Server** — JSON-Dateien werden durch systemd-Timer neu erzeugt (siehe Tabelle oben). Häufiges Browser-Polling allein reicht nicht für frische Daten.
 
 ```javascript
-// Alle 30 Sekunden
-setInterval(() => {
-  fetch('/monitoring/status.json?t=' + Date.now())
-    .then(r => r.json())
-    .then(data => render(data));
-}, 30000);
+const REFRESH_SEC = 60;
+const STATUS_URL  = '/monitoring/status.json';
+const REPORTS_URL = '/monitoring/reports.json';
 ```
 
 **Cache-Control Headers:**

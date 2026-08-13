@@ -4,7 +4,7 @@ Web-basiertes Dashboard zur Überwachung aller Backup- und Monitoring-Services.
 
 ## Features
 
-✅ **Echtzeit-Überwachung** - Auto-refresh alle 30 Sekunden  
+✅ **Live-Monitoring** — Browser-Refresh alle **60 s**; `status.json` quick **5 min** / full **15 min**; `reports.json` **15 min** (+ nach Backup)  
 📊 **Übersichtliche Status-Karten** - Systemd Services, RTB, pCloud  
 🎨 **Responsive Design** - Funktioniert auf Desktop, Tablet, Mobile  
 🚦 **Farb-codierte Status** - Grün (OK), Gelb (Warning), Rot (Critical)  
@@ -266,24 +266,37 @@ SYSTEMD_SERVICES=(
 
 **In dashboard/index.html:**
 ```javascript
-const REFRESH_INTERVAL = 60000; // 60 Sekunden statt 30
+const REFRESH_SEC = 60; // Browser-Polling (Sekunden)
 ```
 
-### Timer-Intervall anpassen
+**Hinweis:** Das ändert nur, wie oft die Seite die JSON-Dateien **liest**. Die Generierung von `status.json` / `reports.json` läuft über systemd-Timer (`monitoring-status-quick.timer`, `monitoring-status-update.timer`, `monitoring-reports.timer`).
 
-**Für schnellere Updates (jede Minute statt alle 2 Minuten):**
+### Monitoring-Timer (status.json / reports.json)
 
+| Unit | Intervall | Modus |
+|------|-----------|--------|
+| `monitoring-status-quick.timer` | alle **5 Min** | `AGGREGATE_MODE=quick` |
+| `monitoring-status-update.timer` | alle **15 Min** + nach Backup | `AGGREGATE_MODE=full` |
+| `monitoring-reports.timer` | alle **15 Min** + nach Backup | `generate_reports.sh` |
+
+Installation (pi-nas):
 ```bash
-# Editiere /etc/systemd/system/monitoring-status-update.timer
-[Timer]
-OnCalendar=*:*:00  # Jede Minute (12:00:00, 12:01:00, 12:02:00, ...)
-# Statt: OnCalendar=*:0/2  # Alle 2 Minuten (nur gerade Minuten)
-
+cd /opt/apps/pcloud-tools/main
+sudo cp systemd/monitoring-status-quick.service.example /etc/systemd/system/monitoring-status-quick.service
+sudo cp systemd/monitoring-status-quick.timer.example /etc/systemd/system/monitoring-status-quick.timer
+sudo cp systemd/monitoring-status-update.service.example /etc/systemd/system/monitoring-status-update.service
+sudo cp systemd/monitoring-status-update.timer.example /etc/systemd/system/monitoring-status-update.timer
 sudo systemctl daemon-reload
+sudo systemctl enable --now monitoring-status-quick.timer
 sudo systemctl restart monitoring-status-update.timer
 ```
 
-**Wichtig:** Kürzere Intervalle erhöhen die CPU-Last. Für Production sind 2-5 Minuten empfohlen.
+**Full-Aggregate seltener (nur Beispiel — quick bleibt 5 min):**
+```bash
+# /etc/systemd/system/monitoring-status-update.timer
+OnCalendar=*:0/30   # statt */15
+sudo systemctl daemon-reload && sudo systemctl restart monitoring-status-update.timer
+```
 
 ---
 
@@ -321,7 +334,7 @@ Nach jedem EntropyWatcher-Scan wechselt der Status für **10 Minuten** auf YELLO
 **Implikation fürs Dashboard:**
 - Nach jedem EW-Scan: Dashboard zeigt YELLOW für 10 Minuten (normal!)
 - Live Safety-Gate ≠ historischer Safety-Gate vom Backup-Lauf
-- Timer-Intervall sollte < 10 Minuten sein, sonst miss man Status-Änderungen
+- Timer-Intervall sollte **≤ 10 Minuten** sein (quick-Timer = 5 min), sonst verpasst man EW-Status-Wechsel nach Scans
 ```
 
 ### Farben anpassen

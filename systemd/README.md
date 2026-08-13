@@ -93,6 +93,18 @@ sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-status-update.service.exa
 sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-status-update.timer.example \
         /etc/systemd/system/monitoring-status-update.timer
 
+sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-status-quick.service.example \
+        /etc/systemd/system/monitoring-status-quick.service
+
+sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-status-quick.timer.example \
+        /etc/systemd/system/monitoring-status-quick.timer
+
+sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-reports.service.example \
+        /etc/systemd/system/monitoring-reports.service
+
+sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-reports.timer.example \
+        /etc/systemd/system/monitoring-reports.timer
+
 sudo cp /opt/apps/pcloud-tools/main/systemd/monitoring-alert.service.example \
         /etc/systemd/system/monitoring-alert.service
 
@@ -125,11 +137,15 @@ sudo systemctl daemon-reload
 
 ```bash
 # Enable timers (will auto-start on boot)
+sudo systemctl enable monitoring-status-quick.timer
 sudo systemctl enable monitoring-status-update.timer
+sudo systemctl enable monitoring-reports.timer
 sudo systemctl enable monitoring-alert.timer
 
 # Start timers immediately
+sudo systemctl start monitoring-status-quick.timer
 sudo systemctl start monitoring-status-update.timer
+sudo systemctl start monitoring-reports.timer
 sudo systemctl start monitoring-alert.timer
 
 # Enable dashboard webserver
@@ -194,23 +210,22 @@ journalctl -u monitoring-status-update.timer -f
 
 ## 🎯 Event Triggering
 
-The timer uses `OnUnitActivation` to run **immediately after** monitored services complete:
+**status.json (full):** `monitoring-status-update.timer` mit `OnUnitActivation=backup-pipeline.service` — Full-Aggregate direkt nach Backup-Ende.
+
+**status.json (quick):** `monitoring-status-quick.timer` — alle **5 Minuten** (ohne RTB `--check-only`).
+
+**reports.json:** `backup-pipeline.service` → `OnSuccess=monitoring-reports.service` plus `monitoring-reports.timer` alle **15 Minuten**.
 
 ```
-entropywatcher-nas.service completes → monitoring-status-update.service runs
-backup-pipeline.service completes    → monitoring-status-update.service runs
+backup-pipeline.service completes
+  → monitoring-reports.service (reports.json)
+  → monitoring-status-update.service (full status.json, via timer OnUnitActivation)
 ```
-
-**Sofort nach Backup (reports.json):** In `backup-pipeline.service` unter `[Unit]`:
-```ini
-OnSuccess=monitoring-reports.service
-```
-(Siehe `pcloud-tools/systemd/backup-pipeline.service.example` und `scripts/install-backup-pipeline-systemd.sh`)
 
 **Benefits:**
-- Dashboard shows fresh data seconds after key operations
-- Reduced overhead (no polling)
-- 15-minute fallback ensures regular updates even if services don't run
+- Dashboard-Daten nach Backup ohne 15-Min-Wartezeit (reports + full status)
+- Quick-Timer hält Header-Datum und Service-Status alle 5 min frisch
+- 15-Minuten-Fallback wenn keine Pipeline läuft
 
 ## 🛠️ Troubleshooting
 
