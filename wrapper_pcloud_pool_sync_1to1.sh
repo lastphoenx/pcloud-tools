@@ -448,6 +448,15 @@ build_and_push() {
   local mani_jsonl="${mani}.tmp.jsonl"
   local manifest_exists=0
   local manifest_incomplete=0
+  local archive_mani="${PCLOUD_ARCHIVE_DIR}/manifests/${SNAPNAME}.json"
+
+  # Archiviertes Manifest (z. B. nach fehlgeschlagenem Gate) vor Temp-Scan nutzen
+  if [[ -f "$archive_mani" ]] && jq -e '(.items | type == "array") and ((.items | length) > 0)' "$archive_mani" >/dev/null 2>&1; then
+    if [[ ! -f "$mani" ]]; then
+      cp -f "$archive_mani" "$mani"
+      _log INFO "✓ Manifest aus Archiv: ${SNAPNAME}.json ($(jq '.items | length' "$archive_mani") Items)"
+    fi
+  fi
 
   # Prüfe ob Manifest bereits vollständig vorhanden
   if [[ -f "$mani" ]]; then
@@ -468,8 +477,14 @@ build_and_push() {
 
   local T0=$(date +%s)
   
-  # Nur neu generieren wenn nötig
+  # Nur neu generieren wenn nötig (Finalize-only: nie Full-Scan wenn Manifest da)
   if [[ $manifest_exists -eq 0 ]]; then
+    for _arg in "${EXTRA_PUSH_ARGS[@]}"; do
+      if [[ "$_arg" == "--finalize-only" ]]; then
+        _log ERROR "Finalize-only: kein gültiges Manifest (Temp/Archiv fehlt)"
+        _db_fail_and_return "manifest_missing_finalize"
+      fi
+    done
     _db_phase_log "manifest" "start"
     
     # Smart-Mode: Referenz-Manifest per mtime/size-Deckung waehlen
@@ -685,6 +700,11 @@ if [[ ${#EXTRA_PUSH_ARGS[@]} -gt 0 ]]; then
   _log INFO "Extra push args: ${EXTRA_PUSH_ARGS[*]}"
 fi
 
+FINALIZE_ONLY=0
+for _arg in "${EXTRA_PUSH_ARGS[@]}"; do
+  [[ "$_arg" == "--finalize-only" ]] && FINALIZE_ONLY=1
+done
+
 # Lock holen (mit Timeout) – überspringen wenn bereits von rtb_wrapper gehalten
 if [[ "${BACKUP_PIPELINE_LOCKED:-0}" != "1" ]]; then
   exec 9>"$LOCKFILE"
@@ -692,11 +712,6 @@ if [[ "${BACKUP_PIPELINE_LOCKED:-0}" != "1" ]]; then
     _log WARN "Konnte Lock innerhalb ${WAIT_SEC}s nicht bekommen"
     exit 0
   fi
-fi
-
-if declare -F apply_oom_score_adj &>/dev/null; then
-  apply_oom_score_adj "${PCLOUD_OOM_SCORE_ADJ:--500}"
-  _log INFO "OOM-Schutz: oom_score_adj=${PCLOUD_OOM_SCORE_ADJ:--500} (Upload-Prozess geschützt)"
 fi
 
 _log INFO "========== pCloud Sync 1to1 Start =========="
@@ -751,6 +766,30 @@ if [[ -L "${RTB}/latest" || -d "${RTB}/latest" ]]; then
       sleep "$wait"
     fi
   fi
+fi
+
+# Finalize-only + Target: kein Remote-Vollscan (kein stat pro Snapshot)
+if [[ "$FINALIZE_ONLY" -eq 1 && -n "$TARGET_SNAPSHOT" ]]; then
+  _log INFO "Finalize-only: überspringe Remote-Snapshot-Vollscan"
+  _log INFO "Checking for missing snapshots..."
+  mapfile -t local_snaps < <(local_snapshot_names)
+  if ! printf '%s\n' "${local_snaps[@]}" | grep -qx "$TARGET_SNAPSHOT"; then
+    _log ERROR "Target snapshot not found locally: $TARGET_SNAPSHOT"
+    exit 2
+  fi
+  remote_snaps=()
+  if [[ "$(remote_snapshot_exists "$TARGET_SNAPSHOT")" == "YES" ]]; then
+    remote_snaps=("$TARGET_SNAPSHOT")
+  fi
+  if ! build_and_push "$RTB/$TARGET_SNAPSHOT"; then
+    _log ERROR "Upload von $TARGET_SNAPSHOT fehlgeschlagen"
+    exit 1
+  fi
+  if [[ "$DRY_RUN" != "1" ]] && ! _handle_upload_complete_check "$TARGET_SNAPSHOT"; then
+    exit 1
+  fi
+  _log INFO "========== pCloud Sync 1to1 Complete =========="
+  exit 0
 fi
 
 # Bootstrap (remote leer - Initial Sync)

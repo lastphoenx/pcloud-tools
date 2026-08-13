@@ -56,9 +56,8 @@ class PoolRemoteCache:
         idx_path = f"{dest}/_snapshots/_index/content_index.json"
         t0 = time.time()
         pool_shas = _collect_pool_shas(cfg, pool_root)
-        txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
-        idx = json.loads(txt or "{}")
-        pool_refs = idx.get("pool_refs") or {}
+        idx = _load_remote_json_at(cfg, idx_path)
+        pool_refs = (idx or {}).get("pool_refs") or {}
         dt = time.time() - t0
         _out(
             f"[cache] Pool+Index geladen: {len(pool_shas)} SHA256s, "
@@ -145,6 +144,18 @@ def _collect_stub_paths_subtree_batch(
     return stubs
 
 
+def _load_remote_json_at(cfg: dict, path: str) -> Optional[dict]:
+    """Remote JSON lesen; None wenn Datei fehlt (kein getfilelink-Exception)."""
+    path = pc._norm_remote_path(path)
+    if not pc.stat_file_safe(cfg, path=path):
+        return None
+    try:
+        txt = pc.get_textfile(cfg, path=path, maxbytes=None)
+        return json.loads(txt or "{}")
+    except Exception:
+        return None
+
+
 def _fetch_pool_refs(
     cfg: dict,
     snaps_root: str,
@@ -155,16 +166,16 @@ def _fetch_pool_refs(
     if snapshot_filter and len(snapshot_filter) == 1:
         snap = snapshot_filter[0]
         archive_path = f"{snaps_root}/_index/archive/{snap}_index.json"
-        txt = pc.get_textfile(cfg, path=archive_path, maxbytes=None)
-        if txt:
-            idx = json.loads(txt)
+        idx = _load_remote_json_at(cfg, archive_path)
+        if idx is not None:
             refs = idx.get("pool_refs") or {}
             return refs, f"archive/{snap}_index.json ({len(refs)} refs)"
         return {}, f"archive/{snap}_index.json (noch nicht vorhanden — Manifest-only)"
 
     master_path = f"{snaps_root}/_index/content_index.json"
-    txt = pc.get_textfile(cfg, path=master_path, maxbytes=None)
-    idx = json.loads(txt or "{}")
+    idx = _load_remote_json_at(cfg, master_path)
+    if idx is None:
+        return {}, "content_index.json (fehlt)"
     refs = idx.get("pool_refs") or {}
     return refs, f"content_index.json ({len(refs)} refs)"
 
