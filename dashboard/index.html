@@ -415,6 +415,34 @@
 
     /* ── Detail Sections ── */
     .detail-section { margin-top: 28px; }
+    .detail-collapse {
+      grid-column: 1 / -1;
+      margin-top: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .detail-collapse summary {
+      padding: 12px 16px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      user-select: none;
+    }
+    .detail-collapse summary::-webkit-details-marker { display: none; }
+    .detail-collapse summary::before {
+      content: '\25B8';
+      color: var(--muted);
+      font-size: 11px;
+      transition: transform 0.2s;
+    }
+    .detail-collapse[open] summary::before { transform: rotate(90deg); }
+    .detail-collapse .collapse-body { padding: 0 0 4px 0; }
     .section-heading {
       font-size: 12px; font-weight: 600; color: var(--muted);
       text-transform: uppercase; letter-spacing: 0.8px;
@@ -976,7 +1004,7 @@
 
       if (recent.length > 0) {
         html += '<button class="detail-toggle" id="btn-backup" onclick="toggleDetail(\'backup\')">'
-          + '<span>Letzte Backup-L\xe4ufe</span><span class="arrow">\u25BC</span></button>'
+          + '<span>Letzte 7 Tage</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
           + '<table class="report-table"><thead><tr>'
           + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th><th>GB</th><th>Versuch</th>'
@@ -1103,9 +1131,9 @@
       html += '<div class="service-list">' + items.map(i => svcRow(i)).join('') + '</div>';
 
       if (jumpFiles.length > 0) {
-        html += '<button class="detail-toggle open" id="btn-jumps" onclick="toggleDetail(\'jumps\')">'
+        html += '<button class="detail-toggle" id="btn-jumps" onclick="toggleDetail(\'jumps\')">'
           + '<span>Sprung-Alarme (' + jumpFiles.length + ')</span><span class="arrow">\u25BC</span></button>'
-          + '<div class="tile-detail open" id="detail-jumps"><div class="tile-detail-inner">'
+          + '<div class="tile-detail" id="detail-jumps"><div class="tile-detail-inner">'
           + buildFlaggedJumpTable(jumpFiles)
           + '</div></div>';
       }
@@ -1259,7 +1287,7 @@
       // Backup detail
       const allRecent = ((reports||{}).recent_backups||[]);
       const attemptCounts = backupRunsAttemptCounts(allRecent);
-      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 10);
+      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 7);
       html += '<div class="detail-section">'
         + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
         + '<div class="card-grid">'
@@ -1331,7 +1359,7 @@
       const timers = status.timers || [];
       if (timers.length > 0) {
         html += '<div class="detail-section">'
-          + '<div class="section-heading"><span>\u23F0 Timer-Status</span></div>'
+          + '<div class="section-heading"><span>\u23F0 Timer &amp; Jobs</span></div>'
           + '<div class="card-grid">'
           + detailCardTimers(timers)
           + '</div></div>';
@@ -1536,14 +1564,19 @@
       };
     }
 
+    function collapsiblePanel(summaryHtml, bodyHtml, openByDefault) {
+      const openAttr = openByDefault ? ' open' : '';
+      return '<details class="detail-collapse"' + openAttr + '>'
+        + '<summary>' + summaryHtml + '</summary>'
+        + '<div class="collapse-body">' + bodyHtml + '</div>'
+        + '</details>';
+    }
+
     // ---- Detail card: Recent Backups table ---------------------
 
     function detailCardRecentBackups(recent, attemptCounts) {
       attemptCounts = attemptCounts || {};
-      return '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header"><span>\uD83D\uDCCB Letzte erfolgreiche Backup-L\xe4ufe</span></div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">'
-        + '<div class="integrity-hint" style="margin:8px 12px 4px">Nur SUCCESS, pro Snapshot ein Eintrag. '
+      const body = '<div class="integrity-hint" style="margin:8px 12px 4px">Nur SUCCESS, pro Snapshot ein Eintrag. '
         + 'Retries/Manuell: Badge &bdquo;Retry &times;N&ldquo; (aus DB-Historie).</div>'
         + '<table class="report-table">'
         + '<thead><tr>'
@@ -1559,14 +1592,20 @@
             + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
             + '<td>' + ((attemptCounts[r.snapshot] || 1) > 1 ? attemptCounts[r.snapshot] : '\u2014') + '</td>'
           + '</tr>').join('')
-        + '</tbody></table>'
-        + '</div></div>';
+        + '</tbody></table>';
+      return collapsiblePanel(
+        '\uD83D\uDCCB Letzte 7 Tage \u2014 erfolgreiche Backup-L\u00e4ufe (' + recent.length + ')',
+        body,
+        false
+      );
     }
 
     // ---- Detail card: Missing Files table ----------------------
 
-    function detailCardMissingFiles(files, title) {
+    function detailCardMissingFiles(files, title, collapsible) {
       title = title || ('Fehlende Dateien (' + files.length + ')');
+      const is7d = /7\s*Tage/i.test(title);
+      const useCollapse = collapsible !== false && (is7d || collapsible === true);
       // Group by source for better overview
       const bySource = {};
       files.forEach(f => {
@@ -1575,22 +1614,15 @@
         bySource[src].push(f);
       });
 
-      let html = '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header">'
-        + '<span>\uD83D\uDDD1\uFE0F ' + esc(title) + '</span>'
-        + '<span class="badge running" style="margin-left:8px">' + files.length + ' Dateien</span>'
-        + '</div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">'
-        + '<div class="integrity-hint" style="margin:8px 12px 4px">'
+      let body = '<div class="integrity-hint" style="margin:8px 12px 4px">'
         + 'EntropyWatcher-Integrit&auml;t: Dateien, die im letzten Scan nicht gefunden wurden '
         + '(DB-Stand, nicht pCloud-Backup). Oft Paperless-Thumbnails oder alte Manifest-Pfade &mdash; '
         + 'kein Ransomware-Alarm, solange Safety-Gate GR&Uuml;N ist.'
         + '</div>';
 
-      // Table per source
       Object.keys(bySource).sort().forEach(src => {
         const items = bySource[src];
-        html += '<div style="margin:8px 12px">'
+        body += '<div style="margin:8px 12px">'
           + '<div style="font-size:12px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px">'
           + '<span class="badge ' + src + '">' + src + '</span> (' + items.length + ' Dateien)'
           + '</div>'
@@ -1604,28 +1636,40 @@
           + '</tbody></table></div>';
       });
 
-      html += '</div></div>';
-      return html;
+      if (useCollapse) {
+        return collapsiblePanel(
+          '\uD83D\uDDD1\uFE0F ' + esc(title) + ' <span class="badge running" style="margin-left:4px">' + files.length + '</span>',
+          body,
+          false
+        );
+      }
+      return '<div class="dcard" style="grid-column:1/-1">'
+        + '<div class="dcard-header">'
+        + '<span>\uD83D\uDDD1\uFE0F ' + esc(title) + '</span>'
+        + '<span class="badge running" style="margin-left:8px">' + files.length + ' Dateien</span>'
+        + '</div>'
+        + '<div class="dcard-body" style="padding:0 0 4px 0">' + body + '</div></div>';
     }
 
     // ---- Detail card: Jump alerts --------------------------------
 
     function detailCardFlaggedJumps(files) {
-      return '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header"><span>\uD83D\uDEA8 Sprung-Alarme (' + files.length + ')</span></div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">'
-        + buildFlaggedJumpTable(files)
-        + '</div></div>';
+      return collapsiblePanel(
+        '\uD83D\uDEA8 Sprung-Alarme (' + files.length + ')',
+        buildFlaggedJumpTable(files),
+        false
+      );
     }
 
     function detailCardFlaggedStable(files, total) {
       const totalLbl = total ? (' von ' + total + ' gesamt') : '';
-      return '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header"><span>\uD83D\uDCCA Stabil hoch (' + files.length + ' Beispiele' + totalLbl + ')</span></div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">'
-        + '<div style="font-size:12px;color:var(--muted);padding:8px 12px 0">Erwartet bei Archiven/Stubs — kein aktiver Alarm.</div>'
-        + buildFlaggedStableTable(files)
-        + '</div></div>';
+      const body = '<div style="font-size:12px;color:var(--muted);padding:8px 12px 0">Erwartet bei Archiven/Stubs — kein aktiver Alarm.</div>'
+        + buildFlaggedStableTable(files);
+      return collapsiblePanel(
+        '\uD83D\uDCCA Stabil hoch (' + files.length + ' Beispiele' + totalLbl + ')',
+        body,
+        false
+      );
     }
 
     function detailCardAvEvents(events) {
@@ -1649,27 +1693,20 @@
 
     function detailCardTimers(timers) {
       if (!timers || timers.length === 0) return '';
-      
-      return '<div class="dcard" style="grid-column:1/-1">'
-        + '<div class="dcard-header"><span>\u23F0 EntropyWatcher / Backup-Pipeline Timer-Status</span></div>'
-        + '<div class="dcard-body" style="padding:0 0 4px 0">'
-        + '<table class="report-table">'
+
+      const table = '<table class="report-table">'
         + '<thead><tr>'
         + '<th>Unit</th><th>Enabled</th><th>Active</th><th>LastRun</th><th>NextRun</th>'
         + '</tr></thead><tbody>'
         + timers.map(t => {
-            // Status badge for enabled/active
             const enabledCls = t.enabled === 'enabled' ? 'success' : t.enabled === 'disabled' ? 'failed' : '';
             const activeCls = t.active === 'active' ? 'success' : t.active === 'inactive' ? 'failed' : '';
-            
-            // Format last/next run with delta
             const lastDisplay = t.last_run !== 'n/a' && t.last_delta !== 'n/a'
               ? t.last_run + ' (' + t.last_delta + ')'
               : '\u2014';
             const nextDisplay = t.next_run !== 'n/a' && t.next_delta !== 'n/a'
               ? t.next_run + ' (' + t.next_delta + ')'
               : '\u2014';
-            
             return '<tr>'
               + '<td>' + esc(t.unit || '\u2014') + '</td>'
               + '<td><span class="badge ' + enabledCls + '">' + esc(t.enabled || '\u2014') + '</span></td>'
@@ -1678,8 +1715,13 @@
               + '<td>' + esc(nextDisplay) + '</td>'
               + '</tr>';
           }).join('')
-        + '</tbody></table>'
-        + '</div></div>';
+        + '</tbody></table>';
+
+      return collapsiblePanel(
+        '\u23F0 Timer-Status (' + timers.length + ' Units)',
+        table,
+        false
+      );
     }
 
     // ---- Helper: single detail row -----------------------------
