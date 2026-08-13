@@ -6,16 +6,16 @@ Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 
 | Wann | Was | Wo |
 |------|-----|-----|
-| **Jeder Upload** | Hartes Integrity-Gate (Subprozess: `manifest_stat`, kein Voll-Index) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
+| **Jeder Upload** | Hartes Integrity-Gate (Subprozess: subtree `listfolder`, Snap-Archiv-Index) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
 | **Jeder Upload** | `post_upload` in MariaDB | im Gate via `pool_integrity_run.py` (`check_type=post_upload`) |
 | **3×/Tag Timer** | `monthly_audit` (10 Snapshots/Lauf) | `integrity-audit.service` |
 | **Wrapper (optional)** | Zweiter Lauf | nur bei `PCLOUD_POST_UPLOAD_INTEGRITY=1` (Default: `skip`) |
 
-**Log-Marker im Upload:** `[integrity-gate] Post-Upload Integritaet (Subprozess, manifest_stat)...`
+**Log-Marker:** `[integrity-gate] Post-Upload Integritaet (Subprozess, subtree listfolder)...`
 
-**RAM (Post-Upload):** Verify läuft in einem **eigenen Prozess** — `pcloud_push` hält Manifest/Delta nicht parallel zum Verify. Im Kind: `PCLOUD_VERIFY_STUB_MODE=auto` → ein Snapshot = `manifest_stat` (kein BFS), **kein** `json.loads` der ~867 MB `content_index.json` (nur Pool-SHA-Set + lokales Manifest). Typisch **~2–8 min** statt Multi-GB-RAM-Spike.
+**RAM/Zeit (Post-Upload):** Verify im **eigenen Prozess**. Stubs: `listfolder_safe` pro Top-Level-Ordner (Backup, Paperless, …) — vollständiger Abgleich, typisch **~1–3 Min**, kein BFS pro Ordner, kein 867 MB-Master-Index (stattdessen `_index/archive/<SNAP>_index.json` falls vorhanden).
 
-**Periodischer Audit (Timer):** weiterhin **BFS** + voller Index-Cache (`INTEGRITY_AUDIT_MAX` Snapshots/Lauf) — dafür ist der RAM-intensive Pfad gedacht, nicht fürs Post-Upload-Gate.
+**Periodischer Audit:** voller Master-`content_index.json` + gleicher Stub-Fetch (Subtree-Batches).
 
 ## Dashboard „Pool-Integrität“
 

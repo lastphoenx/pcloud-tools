@@ -1669,9 +1669,8 @@ def _run_verify_subprocess(
     env_file: str,
 ) -> dict:
     """
-    Verify in eigenem Prozess: pcloud_push gibt Manifest/Delta-RAM frei,
-    Kind nutzt manifest_stat + Index-Skip (PCLOUD_VERIFY_STUB_MODE=auto).
-    """
+    Verify in eigenem Prozess: pcloud_push gibt Manifest-RAM frei vor dem Gate.
+  """
     here = os.path.dirname(os.path.abspath(__file__))
     main_dir = os.environ.get("MAIN_DIR", here)
     script = os.path.join(main_dir, "scripts", "utilities", "pool_verify_backup.py")
@@ -1684,15 +1683,13 @@ def _run_verify_subprocess(
         prefix=f"pool_verify_{snapshot_name}_", suffix=".json",
     )
     os.close(fd)
-    proc_env = os.environ.copy()
-    proc_env.setdefault("PCLOUD_VERIFY_STUB_MODE", "auto")
 
     argv = [
         sys.executable,
         script,
         "--env-file",
         env_file,
-        "--dest-root",
+        "--pool-root",
         dest_root,
         "--manifests-dir",
         manifests_dir,
@@ -1702,9 +1699,16 @@ def _run_verify_subprocess(
         json_out,
     ]
     try:
-        subprocess.run(argv, env=proc_env, check=False)
+        proc = subprocess.run(argv, check=False)
+        if not os.path.isfile(json_out) or os.path.getsize(json_out) == 0:
+            raise RuntimeError(
+                f"pool_verify_backup fehlgeschlagen (exit {proc.returncode}), kein JSON-Report"
+            )
         with open(json_out, encoding="utf-8") as f:
-            return json.load(f)
+            result = json.load(f)
+        if proc.returncode != 0 and result.get("ok"):
+            result["ok"] = False
+        return result
     finally:
         try:
             os.unlink(json_out)
@@ -1721,7 +1725,7 @@ def _run_listfolder_integrity_gate(
     dry: bool = False,
 ) -> None:
     """
-    Hartes Post-Upload-Gate: Verify im Subprozess (manifest_stat, kein Voll-Index).
+    Hartes Post-Upload-Gate: Verify im Subprozess (subtree listfolder, Snap-Index).
     Optional Pool-Backfill wie bei validate_pool_snapshot (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX).
     """
     if dry:
@@ -1743,7 +1747,7 @@ def _run_listfolder_integrity_gate(
 
     _ensure_archived_manifest(snapshot_name)
 
-    _log("[integrity-gate] Post-Upload Integritaet (Subprozess, manifest_stat)...")
+    _log("[integrity-gate] Post-Upload Integritaet (Subprozess, subtree listfolder)...")
     t0 = time.time()
 
     # Manifest/Delta im Parent nicht mehr fuer Verify gebraucht — RAM vor Subprozess freigeben

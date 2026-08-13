@@ -260,7 +260,7 @@ Läuft nach **jedem** Modus (Full + Delta). Ohne erfolgreiches Gate kein `.uploa
 
 ```
 Stubs geschrieben
-  → [integrity-gate] pool_verify_backup (Subprozess, manifest_stat, Index-Skip)
+  → [integrity-gate] pool_verify_backup (Subprozess, subtree listfolder)
       → optional Pool-Backfill (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX)
       → pool_integrity_run (post_upload → MariaDB)
   → .upload_complete
