@@ -20,7 +20,7 @@ pCloud-Tools ist eine schlanke, selbst-gehostete Backup-Pipeline, die lokale Rsy
 
 - **Orchestrator** — `rtb_pool_wrapper.sh` (Repo `rtb`) wird vom systemd-Timer ausgelöst. Gemeinsamer **NAS Heavy-Ops-Lock** (`/run/backup_pipeline.lock`) mit ClamAV/Entropy-Scans. Offenes Staged-Resume (`backup.inprogress` + `.rtb_staged_active`) überspringt den Delta-Check. Nach RTB: `wrapper_pcloud_pool_sync_1to1.sh` im Catch-up-Modus (**latest zuerst**, dann Backlog).
 
-- **pCloud-Sync** — `wrapper_pcloud_pool_sync_1to1.sh` orchestriert: Manifest-Erstellung, Pool-Upload und Verifikation pro Snapshot. EntropyWatcher Safety-Gate vor dem Backup. MariaDB-Phasen-Logging, OOM-Schutz (`PCLOUD_OOM_SCORE_ADJ`).
+- **pCloud-Sync** — `wrapper_pcloud_pool_sync_1to1.sh` orchestriert: Manifest-Erstellung, Pool-Upload und Verifikation pro Snapshot. EntropyWatcher Safety-Gate vor dem Backup. MariaDB-Phasen-Logging.
 
 ---
 
