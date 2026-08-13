@@ -13,9 +13,15 @@ Oneshot service that aggregates system status (runs aggregate_status.sh).
 
 ### monitoring-status-update.timer
 Event-triggered timer with fallback schedule:
-- **Triggers after**: entropywatcher-nas, entropywatcher-nas-av, backup-pipeline
-- **Fallback**: Every 15 minutes
-- **Boot**: 2 minutes after system startup
+- **Triggers after**: backup-pipeline completes (`OnUnitActivation`)
+- **Fallback**: Every 15 minutes (full aggregate: RTB --check-only + pCloud health)
+- **Boot**: 10 minutes after system startup
+
+### monitoring-status-quick.service / monitoring-status-quick.timer
+Lightweight status refresh every **5 minutes** (`AGGREGATE_MODE=quick`):
+- Services, RTB log tail, live Safety-Gate, timers — **no** RTB `--check-only` (~1–3 min saved)
+- Reuses cached pCloud health from last full run
+- Skips if another aggregate is already running (`flock`)
 
 ### monitoring-alert.service
 Oneshot service that sends notifications on status changes:

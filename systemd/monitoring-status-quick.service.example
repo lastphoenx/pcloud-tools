@@ -1,29 +1,21 @@
 [Unit]
-Description=Monitoring Status Update - Aggregate system status
+Description=Monitoring Status Update (quick) - Services, log, timers
 Documentation=https://github.com/lastphoenx/pcloud-tools
 After=network.target
-# Run after key services that this monitors
-After=entropywatcher-nas.service
-After=backup-pipeline.service
 
 [Service]
 Type=oneshot
 User=root
 Group=root
 
-# Exit codes: 0=OK, 1=WARNING, 2=CRITICAL
-# All are valid outcomes for a monitoring script
 SuccessExitStatus=0 1 2
 
-# Environment
 WorkingDirectory=/opt/apps/pcloud-tools/main/scripts
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="AGGREGATE_MODE=full"
+Environment="AGGREGATE_MODE=quick"
 
-# Execution
 ExecStart=/opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
 
-# Security
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/apps/monitoring
@@ -39,10 +31,9 @@ ReadOnlyPaths=/var/log/backup
 NoNewPrivileges=true
 PrivateTmp=true
 
-# Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=monitoring-status
+SyslogIdentifier=monitoring-status-quick
 
 [Install]
 WantedBy=multi-user.target
