@@ -22,7 +22,8 @@ Ladezeit (BFS, speicherschonend):
   - listfolder_safe(_pool)         ~1–3s  (flache Liste, nur SHA-Namen)
   - BFS pro Snapshot-Ordner        variabel (kein rekursiver Riesen-JSON-Baum)
   - content_index.json             ~0.5s
-  Bei Post-Upload (--snapshots): Pool+Index+Stubs sequentiell (kein RAM-Spike).
+  Bei Post-Upload (--snapshots): manifest_stat + Pool-only (kein 867MB content_index),
+  optional Subprozess aus pcloud_push (Manifest-RAM frei).
   Set-Operationen fuer ~80k Manifest-Dateien => <1s.
 
 Aufruf:
@@ -75,6 +76,7 @@ class PoolRemoteCache:
         pool_root_raw: str,
         *,
         verbose: bool = False,
+        load_full_index: bool = True,
     ) -> "PoolRemoteCache":
         def _out(msg: str) -> None:
             if verbose:
@@ -93,17 +95,20 @@ class PoolRemoteCache:
             idx = json.loads(txt or "{}")
             return idx.get("pool_refs") or {}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            f_pool = ex.submit(_fetch_pool)
-            f_index = ex.submit(_fetch_index)
-            pool_shas = f_pool.result()
-            pool_refs = f_index.result()
-
-        dt = time.time() - t0
-        _out(
-            f"[cache] Pool+Index geladen: {len(pool_shas)} SHA256s, "
-            f"{len(pool_refs)} pool_refs ({dt:.1f}s)"
-        )
+        pool_shas = _fetch_pool()
+        pool_refs: dict = {}
+        if load_full_index:
+            pool_refs = _fetch_index()
+            dt = time.time() - t0
+            _out(
+                f"[cache] Pool+Index geladen: {len(pool_shas)} SHA256s, "
+                f"{len(pool_refs)} pool_refs ({dt:.1f}s)"
+            )
+        else:
+            dt = time.time() - t0
+            _out(
+                f"[cache] Pool geladen (Index-Skip): {len(pool_shas)} SHA256s ({dt:.1f}s)"
+            )
         return cls(dest=dest, pool_shas=pool_shas, pool_refs=pool_refs)
 
 
@@ -203,11 +208,32 @@ def _verify_sequential_fetch(snapshot_filter: Optional[List[str]]) -> bool:
 
 
 def _verify_stub_mode(snapshot_filter: Optional[List[str]]) -> str:
-    """bfs = Ordner-fuer-Ordner (default); manifest_stat = nur erwartete Stubs per stat."""
-    mode = os.environ.get("PCLOUD_VERIFY_STUB_MODE", "bfs").strip().lower()
+    """
+    auto (default): ein Snapshot → manifest_stat (Post-Upload), sonst bfs.
+    bfs = Remote-BFS + stub_paths-Set (periodischer Audit, viele Snaps).
+    manifest_stat = nur Manifest-Stubs per stat (weniger RAM, kein Vollscan).
+    """
+    mode = os.environ.get("PCLOUD_VERIFY_STUB_MODE", "auto").strip().lower()
+    if mode == "auto":
+        if snapshot_filter and len(snapshot_filter) == 1:
+            return "manifest_stat"
+        return "bfs"
     if mode in ("bfs", "manifest_stat"):
         return mode
     return "bfs"
+
+
+def _should_skip_full_index(
+    snapshot_filter: Optional[List[str]],
+    stub_mode: str,
+) -> bool:
+    """Post-Upload: kein json.loads der 867MB content_index.json (nur Pool-SHA-Set)."""
+    force = os.environ.get("PCLOUD_VERIFY_LOAD_FULL_INDEX", "").strip().lower()
+    if force in ("1", "true", "yes", "on"):
+        return False
+    if snapshot_filter and len(snapshot_filter) == 1 and stub_mode == "manifest_stat":
+        return True
+    return False
 
 
 def _check_stubs_manifest_stat(
@@ -647,20 +673,30 @@ def run_verify(
     sequential = _verify_sequential_fetch(snapshot_filter)
     fetch_workers = _verify_fetch_workers(snapshot_filter)
     use_manifest_stat = stub_mode == "manifest_stat" and bool(snapshot_filter)
+    skip_full_index = _should_skip_full_index(snapshot_filter, stub_mode)
 
     if use_manifest_stat:
         _out("[fetch] Stub-Modus: manifest_stat (kein Remote-Vollscan)")
     else:
         _out(f"[fetch] Stub-Modus: bfs | sequential={sequential} | workers={fetch_workers}")
+    if skip_full_index:
+        _out("[fetch] Index-Skip: kein content_index.json (Post-Upload RAM-Modus)")
 
-    use_cache = remote_cache is not None and remote_cache.matches(dest)
+    use_cache = (
+        remote_cache is not None
+        and remote_cache.matches(dest)
+        and (not skip_full_index or not remote_cache.pool_refs)
+    )
     if use_cache:
         pool_shas = remote_cache.pool_shas  # type: ignore[union-attr]
         pool_refs = remote_cache.pool_refs  # type: ignore[union-attr]
-        _out(
-            f"[fetch] Pool+Index aus Cache ({len(pool_shas)} SHA256s, "
-            f"{len(pool_refs)} pool_refs)"
-        )
+        if pool_refs:
+            _out(
+                f"[fetch] Pool+Index aus Cache ({len(pool_shas)} SHA256s, "
+                f"{len(pool_refs)} pool_refs)"
+            )
+        else:
+            _out(f"[fetch] Pool aus Cache ({len(pool_shas)} SHA256s, Index-Skip)")
 
     def _fetch_pool() -> Set[str]:
         return _collect_pool_shas(cfg, pool_root)
@@ -699,18 +735,27 @@ def run_verify(
             _out("[fetch] Pool...")
             pool_shas = _fetch_pool()
             gc.collect()
-            _out("[fetch] Index...")
-            pool_refs = _fetch_index()
-            gc.collect()
+            if skip_full_index:
+                pool_refs = {}
+                _out("[fetch] Index uebersprungen (nur Manifest-SHA vs Pool)")
+            else:
+                _out("[fetch] Index...")
+                pool_refs = _fetch_index()
+                gc.collect()
             if not use_manifest_stat:
                 _fetch_stubs_sequential()
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=fetch_workers) as ex:
                 f_pool = ex.submit(_fetch_pool)
-                f_index = ex.submit(_fetch_index)
-                pool_refs = f_index.result()
-                pool_shas = f_pool.result()
-                gc.collect()
+                if skip_full_index:
+                    pool_shas = f_pool.result()
+                    pool_refs = {}
+                    gc.collect()
+                else:
+                    f_index = ex.submit(_fetch_index)
+                    pool_shas = f_pool.result()
+                    pool_refs = f_index.result()
+                    gc.collect()
                 if not use_manifest_stat:
                     snap_futures = {snap: ex.submit(_fetch_snap_stubs, snap) for snap in remote_snaps}
                     done = 0
@@ -742,9 +787,10 @@ def run_verify(
 
     dt_fetch = time.time() - t_fetch
     stub_info = "manifest_stat" if use_manifest_stat else str(len(stub_paths))
+    index_info = "skip" if skip_full_index else str(len(pool_refs))
     _out(f"[fetch] Pool: {len(pool_shas)} SHA256s | "
          f"Stubs: {stub_info} | "
-         f"Index: {len(pool_refs)} pool_refs | "
+         f"Index: {index_info} pool_refs | "
          f"{dt_fetch:.1f}s")
     _out("")
 

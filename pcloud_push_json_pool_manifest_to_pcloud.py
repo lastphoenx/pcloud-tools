@@ -49,7 +49,7 @@ Benötigt: pcloud_bin_lib.py im selben Verzeichnis oder PYTHONPATH.
 """
 
 from __future__ import annotations
-import os, sys, json, argparse, time, datetime, hashlib, gc
+import os, sys, json, argparse, time, datetime, hashlib, gc, subprocess, tempfile
 import concurrent.futures
 import threading
 from typing import Dict, Any, Optional, Tuple
@@ -1662,6 +1662,56 @@ def _ensure_archived_manifest(
     return archive_path
 
 
+def _run_verify_subprocess(
+    snapshot_name: str,
+    dest_root: str,
+    manifests_dir: str,
+    env_file: str,
+) -> dict:
+    """
+    Verify in eigenem Prozess: pcloud_push gibt Manifest/Delta-RAM frei,
+    Kind nutzt manifest_stat + Index-Skip (PCLOUD_VERIFY_STUB_MODE=auto).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    main_dir = os.environ.get("MAIN_DIR", here)
+    script = os.path.join(main_dir, "scripts", "utilities", "pool_verify_backup.py")
+    if not os.path.isfile(script):
+        script = os.path.join(here, "scripts", "utilities", "pool_verify_backup.py")
+    if not os.path.isfile(script):
+        raise RuntimeError(f"pool_verify_backup.py nicht gefunden: {script}")
+
+    fd, json_out = tempfile.mkstemp(
+        prefix=f"pool_verify_{snapshot_name}_", suffix=".json",
+    )
+    os.close(fd)
+    proc_env = os.environ.copy()
+    proc_env.setdefault("PCLOUD_VERIFY_STUB_MODE", "auto")
+
+    argv = [
+        sys.executable,
+        script,
+        "--env-file",
+        env_file,
+        "--dest-root",
+        dest_root,
+        "--manifests-dir",
+        manifests_dir,
+        "--snapshots",
+        snapshot_name,
+        "--json-out",
+        json_out,
+    ]
+    try:
+        subprocess.run(argv, env=proc_env, check=False)
+        with open(json_out, encoding="utf-8") as f:
+            return json.load(f)
+    finally:
+        try:
+            os.unlink(json_out)
+        except OSError:
+            pass
+
+
 def _run_listfolder_integrity_gate(
     cfg: dict,
     manifest: dict,
@@ -1671,14 +1721,14 @@ def _run_listfolder_integrity_gate(
     dry: bool = False,
 ) -> None:
     """
-    Hartes Post-Upload-Gate (listfolder, ~30–60s).
+    Hartes Post-Upload-Gate: Verify im Subprozess (manifest_stat, kein Voll-Index).
     Optional Pool-Backfill wie bei validate_pool_snapshot (max PCLOUD_VALIDATE_POOL_BACKFILL_MAX).
     """
     if dry:
         _log("[integrity-gate] (dry-run) uebersprungen")
         return
 
-    run_verify, run_integrity_for_snapshot, PoolRemoteCache = _import_pool_integrity_utils()
+    _, run_integrity_for_snapshot, _ = _import_pool_integrity_utils()
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
     pool_root = f"{dest_root}/_pool"
     archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
@@ -1686,22 +1736,20 @@ def _run_listfolder_integrity_gate(
     integrity_report = os.path.join(archive, "integrity", f"integrity_{snapshot_name}_pending.json")
     env = _push_env_for_integrity()
     backup_run_id = os.environ.get("RUN_ID") or None
+    env_file = os.environ.get("ENV_FILE", os.path.join(
+        os.environ.get("MAIN_DIR", os.path.dirname(os.path.abspath(__file__))),
+        ".env",
+    ))
 
     _ensure_archived_manifest(snapshot_name)
 
-    _log("[integrity-gate] Post-Upload Integritaet (listfolder)...")
+    _log("[integrity-gate] Post-Upload Integritaet (Subprozess, manifest_stat)...")
     t0 = time.time()
 
-    remote_cache = PoolRemoteCache.fetch(cfg, dest_root, verbose=True)
+    # Manifest/Delta im Parent nicht mehr fuer Verify gebraucht — RAM vor Subprozess freigeben
+    gc.collect()
 
-    result = run_verify(
-        cfg,
-        pool_root_raw=dest_root,
-        manifests_dir=manifests_dir,
-        snapshot_filter=[snapshot_name],
-        verbose=True,
-        remote_cache=remote_cache,
-    )
+    result = _run_verify_subprocess(snapshot_name, dest_root, manifests_dir, env_file)
 
     if not result.get("ok"):
         snap_res = (result.get("manifest_vs_pool") or {}).get("per_snapshot", {}).get(snapshot_name, {})
@@ -1721,15 +1769,7 @@ def _run_listfolder_integrity_gate(
                 _log(f"[integrity-gate][backfill] {err}")
             if filled:
                 _log(f"[integrity-gate] Backfill: {filled} nachgeladen — erneuter Check...")
-                remote_cache.refresh_pool(cfg)
-                result = run_verify(
-                    cfg,
-                    pool_root_raw=dest_root,
-                    manifests_dir=manifests_dir,
-                    snapshot_filter=[snapshot_name],
-                    verbose=True,
-                    remote_cache=remote_cache,
-                )
+                result = _run_verify_subprocess(snapshot_name, dest_root, manifests_dir, env_file)
 
     if not result.get("ok"):
         summary = result.get("error_summary") or result.get("error") or "integrity failed"
