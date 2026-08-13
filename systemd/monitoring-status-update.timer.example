@@ -4,6 +4,8 @@ Documentation=https://github.com/lastphoenx/pcloud-tools
 Requires=monitoring-status-update.service
 
 [Timer]
+# After backup-pipeline: fresh status.json (pCloud health, RTB log) without waiting for calendar slot
+OnUnitActivation=backup-pipeline.service
 # Every 15 minutes — check-only takes ~3 min on large NAS; must not overlap
 OnCalendar=*:0/15
 # Startup: after mergerfs/USB are up
