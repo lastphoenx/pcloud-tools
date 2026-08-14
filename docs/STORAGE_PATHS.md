@@ -49,6 +49,7 @@ Unterverzeichnisse (von Pipeline/Wrapper angelegt):
   manifests/              ← ein Manifest pro erfolgreichem Upload: <snap>.json
   indexes/
     content_index_master.json
+    pool_index.sqlite3        ← C1 Delta-Arbeitsindex (optional, Flag default aus)
   deltas/
     delta_verify_<snap>.json
   resume/                 ← Chunked-Upload Resume-State

@@ -322,3 +322,13 @@ sudo systemctl enable --now monitoring-status-quick.timer
 | DB-Wartung Dashboard | `79e5430` |
 | Integrity subtree + subprocess | `c598202`, `e690eb4`, `b4ec812` |
 | Dashboard + monitoring-quick | `0d2c52c`, `7368137` |
+
+---
+
+## 16. C1 Pool-Index SQLite (Hybrid)
+
+Delta-Mode kann `pool_refs` lokal in SQLite halten statt ~100k `_register_snap` auf dem 913-MB-Dict. Remote-Format unverändert (`content_index.json` Chunk-Upload). **Default aus** (`PCLOUD_POOL_INDEX_DB=0`).
+
+- Doku / Migration / Rollback: [POOL_INDEX_DB.md](POOL_INDEX_DB.md)
+- Tag: `pre-c1-pool-index-db-2026-08-14` (`3ab8eea`)
+- Schnell-Rollback: Flag `0` oder `git checkout pre-c1-pool-index-db-2026-08-14`

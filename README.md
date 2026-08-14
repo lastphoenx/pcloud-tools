@@ -266,6 +266,7 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 - **Circuit Breaker** mit Cooldown und Parallelitäts-Ramp (16→12→8 Threads)
 - **`pool_delta_plan.py`** — Delta vs. Full planen inkl. Catch-up-Simulation
 - **DB-Wartung:** `scripts/maintenance_db_cleanup.sh` — Dashboard „Letzte Fehler (7d)“ bereinigen
+- **Pool-Index C1 (optional):** SQLite-Hybrid für Delta (`PCLOUD_POOL_INDEX_DB=0` default) — [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
 - → [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)
 
 **Neu seit April 2026:**  
@@ -359,7 +360,8 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 | Dokument | Inhalt |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architektur, Ablaufkette, Pool-Modi, Tool-Inventar |
-| [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md) | August 2026: Lock, Scout, Integrity-Gate, Manifest-Ref, DB-Wartung |
+| [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md) | August 2026: Lock, Scout, Integrity-Gate, Manifest-Ref, DB-Wartung, C1 Index-DB |
+| [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md) | C1 SQLite Hybrid: Migration, Rollback, Testplan |
 | [docs/pcloud_pool_gc.md](docs/pcloud_pool_gc.md) | Pool GC, Retention, Grace Period |
 | [docs/ENV_VARIABLES.md](docs/ENV_VARIABLES.md) | ENV-Referenz (Scout, Delta, Circuit Breaker) |
 | [docs/SETUP.md](docs/SETUP.md) | Vollständige Installations-Anleitung |

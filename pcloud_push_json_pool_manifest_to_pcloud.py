@@ -591,13 +591,12 @@ def _backup_remote_master_index_before_write(cfg: dict, snapshots_root: str) -> 
         _log(f"[index][warn] Master-Prev-Backup fehlgeschlagen: {e}")
 
 
-def archive_snapshot_index_remote(
-    cfg: dict, snapshots_root: str, index: dict, snapshot_name: str, *, dry: bool = False,
+def _write_snapshot_archive(
+    cfg: dict, snapshots_root: str, snap_idx: dict, snapshot_name: str, *, dry: bool = False,
 ) -> None:
-    """Gefiltertes Snapshot-Archiv unter _index/archive/<snap>_index.json."""
+    """Schreibt ein gefiltertes Snapshot-Archiv nach _index/archive/<snap>_index.json."""
     root = snapshots_root.rstrip("/")
     archive_path = f"{root}/_index/archive/{snapshot_name}_index.json"
-    snap_idx = filter_index_for_snapshot(index, snapshot_name)
     n = len(snap_idx.get("pool_refs") or {})
     if dry:
         _log(f"[dry] archive index: {archive_path} ({n} pool_refs)")
@@ -610,6 +609,61 @@ def archive_snapshot_index_remote(
         obj=snap_idx, minify=False,
     )
     _log(f"[index] ✓ Snapshot-Index archiviert: {archive_path} ({n} pool_refs)")
+
+
+def archive_snapshot_index_remote(
+    cfg: dict, snapshots_root: str, index: dict, snapshot_name: str, *, dry: bool = False,
+) -> None:
+    """Gefiltertes Snapshot-Archiv unter _index/archive/<snap>_index.json."""
+    snap_idx = filter_index_for_snapshot(index, snapshot_name)
+    _write_snapshot_archive(cfg, snapshots_root, snap_idx, snapshot_name, dry=dry)
+
+
+def archive_snapshot_index_remote_from_db(
+    cfg: dict, snapshots_root: str, db, snapshot_name: str, *, dry: bool = False,
+) -> None:
+    snap_idx = db.build_snapshot_index(snapshot_name)
+    _write_snapshot_archive(cfg, snapshots_root, snap_idx, snapshot_name, dry=dry)
+
+
+def _content_index_local_paths() -> Tuple[str, str]:
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    staging_path = os.path.join(archive_dir, "indexes", "staging", "content_index_pending.json")
+    master_path = os.path.join(archive_dir, "indexes", "content_index_master.json")
+    return staging_path, master_path
+
+
+def _upload_index_from_staging(
+    cfg: dict, snapshots_root: str, staging_path: str, *, n_refs: int,
+) -> None:
+    """Prev-Backup + resumable Chunk-Upload von staging_path → remote content_index.json."""
+    idx_dir = f"{snapshots_root.rstrip('/')}/_index"
+    idx_name = "content_index.json"
+    _backup_remote_master_index_before_write(cfg, snapshots_root)
+
+    fid = pc.stat_folderid_fast(cfg, idx_dir)
+    if not fid:
+        fid = pc.ensure_path(cfg, idx_dir)
+
+    remote_path = f"{idx_dir}/{idx_name}"
+    log_every = int(os.environ.get("PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS", "1"))
+    verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
+
+    _log(f"[index] Upload nach pCloud: {remote_path} (pool_refs={n_refs})")
+    t_up = time.time()
+    pc.upload_local_file_resumable(
+        cfg,
+        staging_path,
+        folderid=int(fid),
+        filename=idx_name,
+        remote_path=remote_path,
+        state_key="content_index_json",
+        log_prefix="[index-upload]",
+        log=_log,
+        log_every_chunks=log_every,
+        verify_sha256=verify,
+    )
+    _log(f"[index] ✓ Remote content_index.json ({time.time() - t_up:.1f}s)")
 
 
 def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool=False) -> None:
@@ -631,9 +685,7 @@ def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool
         print(f"[dry] write index: {idx_dir}/{idx_name} (pool_refs={n_refs})")
         return
 
-    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
-    staging_path = os.path.join(archive_dir, "indexes", "staging", "content_index_pending.json")
-    master_path = os.path.join(archive_dir, "indexes", "content_index_master.json")
+    staging_path, master_path = _content_index_local_paths()
 
     _log(f"[index] Schreibe lokal ({n_refs} pool_refs)...")
     t_local = time.time()
@@ -645,32 +697,119 @@ def save_content_index(cfg: dict, snapshots_root: str, index: dict, *, dry: bool
         f"-> {staging_path}"
     )
     _log(f"[index] ✓ Master -> {master_path}")
+    _upload_index_from_staging(cfg, snapshots_root, staging_path, n_refs=n_refs)
 
-    _backup_remote_master_index_before_write(cfg, snapshots_root)
 
-    fid = pc.stat_folderid_fast(cfg, idx_dir)
-    if not fid:
-        fid = pc.ensure_path(cfg, idx_dir)
+def save_content_index_from_db(cfg: dict, snapshots_root: str, db, *, dry: bool = False) -> None:
+    """Streaming-Export aus SQLite → staging/master → bestehender Chunk-Upload."""
+    idx_dir = f"{snapshots_root.rstrip('/')}/_index"
+    n_refs = db.count_shas()
+    if dry:
+        print(f"[dry] write index from db: {idx_dir}/content_index.json (pool_refs={n_refs})")
+        return
 
-    remote_path = f"{idx_dir}/{idx_name}"
-    log_every = int(os.environ.get("PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS", "1"))
-    verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
-
-    _log(f"[index] Upload nach pCloud: {remote_path}")
-    t_up = time.time()
-    pc.upload_local_file_resumable(
-        cfg,
-        staging_path,
-        folderid=int(fid),
-        filename=idx_name,
-        remote_path=remote_path,
-        state_key="content_index_json",
-        log_prefix="[index-upload]",
-        log=_log,
-        log_every_chunks=log_every,
-        verify_sha256=verify,
+    staging_path, master_path = _content_index_local_paths()
+    _log(f"[index] Export aus SQLite ({n_refs} SHAs)...")
+    t_local = time.time()
+    st = db.export_content_index_json(staging_path)
+    os.makedirs(os.path.dirname(master_path), exist_ok=True)
+    tmp_master = master_path + ".tmp"
+    import shutil as _shutil
+    _shutil.copy2(staging_path, tmp_master)
+    os.replace(tmp_master, master_path)
+    try:
+        os.chmod(master_path, 0o644)
+    except OSError:
+        pass
+    db.record_master_fingerprint(master_path)
+    file_size = st.get("bytes") or os.path.getsize(staging_path)
+    _log(
+        f"[index] ✓ Lokal {pc._format_byte_size(file_size)} in {time.time() - t_local:.1f}s "
+        f"-> {staging_path}"
     )
-    _log(f"[index] ✓ Remote content_index.json ({time.time() - t_up:.1f}s)")
+    _log(f"[index] ✓ Master -> {master_path}")
+    _upload_index_from_staging(cfg, snapshots_root, staging_path, n_refs=n_refs)
+
+
+def _pool_index_db_enabled() -> bool:
+    return os.environ.get("PCLOUD_POOL_INDEX_DB", "0") == "1"
+
+
+def _open_pool_index_db_for_run():
+    """Oeffnet die C1-SQLite oder None (Legacy-JSON-Pfad)."""
+    if not _pool_index_db_enabled():
+        return None
+    try:
+        import pool_index_db as pidb
+    except Exception as e:
+        _log(f"[index-db][warn] Import fehlgeschlagen: {e} — Fallback JSON")
+        return None
+
+    auto = os.environ.get("PCLOUD_POOL_INDEX_DB_AUTOIMPORT", "1") != "0"
+    master = pidb.default_master_path()
+    try:
+        db = pidb.open_db(pidb.default_db_path(), create=True)
+    except Exception as e:
+        _log(f"[index-db][warn] DB oeffnen fehlgeschlagen: {e} — Fallback JSON")
+        return None
+
+    try:
+        match = db.master_fingerprint_matches(master)
+        populated = db.count_shas() > 0
+        if match is True and populated:
+            _log(f"[index-db] SQLite bereit ({db.count_shas()} SHAs)")
+            return db
+        if match is False:
+            if auto and os.path.isfile(master):
+                _log("[index-db] Master geaendert (GC/Full-Pool?) → Re-Import")
+                db.import_from_json(master, log=_log)
+                return db
+            _log("[index-db][warn] DB stale, AUTOIMPORT=0 — Fallback JSON")
+            db.close()
+            return None
+        if populated and match is None:
+            _log("[index-db][warn] Master-JSON fehlt — nutze DB")
+            return db
+        if auto and os.path.isfile(master):
+            _log("[index-db] DB leer/neu → Import aus Master")
+            db.import_from_json(master, log=_log)
+            return db
+        _log("[index-db][warn] DB leer und kein Master — Fallback JSON")
+        db.close()
+        return None
+    except Exception as e:
+        _log(f"[index-db][warn] {e} — Fallback JSON")
+        try:
+            db.close()
+        except Exception:
+            pass
+        return None
+
+
+def _delta_merge_basis_refs(
+    db, snapshot_name: str, basis_snapshot_name: str, cur_files: dict,
+    cfg: dict, snapshots_root: str,
+) -> dict:
+    archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    archive_path = os.path.join(
+        archive_dir, "indexes", "archive", f"{basis_snapshot_name}_index.json"
+    )
+    if db.snapshot_pair_count(basis_snapshot_name) == 0 and not os.path.isfile(archive_path):
+        remote = f"{snapshots_root.rstrip('/')}/_index/archive/{basis_snapshot_name}_index.json"
+        try:
+            txt = pc.get_textfile(cfg, path=remote)
+            os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+            with open(archive_path, "w", encoding="utf-8") as f:
+                f.write(txt)
+            _log(f"[index-db] Basis-Archiv geladen: {archive_path}")
+        except Exception as e:
+            _log(f"[index-db][warn] Basis-Archiv nicht ladbar: {e}")
+            archive_path = None
+    st = db.merge_cloned_refs(
+        snapshot_name, basis_snapshot_name, cur_files,
+        archive_json_path=archive_path if archive_path and os.path.isfile(archive_path) else None,
+    )
+    return st
 
 
 def _release_post_validation_memory() -> None:
@@ -702,6 +841,7 @@ def _finalize_after_validation_delta(
     marker_data: dict,
     *,
     dry: bool = False,
+    db=None,
 ) -> None:
     """
     Finalisierung nach Validation (Delta-Mode):
@@ -714,6 +854,16 @@ def _finalize_after_validation_delta(
         return
     _release_post_validation_memory()
     _set_upload_complete_marker(cfg, dest_snapshot_dir, marker_data, dry=dry)
+    if db is not None:
+        save_content_index_from_db(cfg, snapshots_root, db, dry=False)
+        _log("[delta-mode] ✓ content_index.json gespeichert (nach Validation, SQLite)")
+        try:
+            archive_snapshot_index_remote_from_db(
+                cfg, snapshots_root, db, snapshot_name, dry=False
+            )
+        except Exception as e:
+            _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
+        return
     save_content_index(cfg, snapshots_root, index, dry=False)
     _log("[delta-mode] ✓ content_index.json gespeichert (nach Validation)")
     try:
@@ -2237,6 +2387,10 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
     basis_snapshot_dir = f"{snapshots_root}/{basis_snapshot_name}"
     archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    db = None if dry else _open_pool_index_db_for_run()
+    index = None
+    pool_refs: dict = {}
+    _pending_refs: list = []
     
     _log(f"[delta-mode] Snapshot: {snapshot_name}")
     _log(f"[delta-mode] Basis: {basis_snapshot_name}")
@@ -2269,6 +2423,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         if existing_fid:
             if _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
                 _log(f"[info] Snapshot {snapshot_name} bereits vollständig hochgeladen")
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
                 return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
             if pc.stat_file_safe(cfg, path=marker_complete):
                 _log(f"[delta-mode] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
@@ -2287,11 +2446,20 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             # existieren -> Phase 4 ueberspringt alle added-Files als "bereits fertig"
             # -> 0 Stubs geschrieben. Indexstand muss dem Remote-Zustand entsprechen.
             try:
-                _wi_idx = load_content_index(cfg, snapshots_root)
-                _wi_n = _purge_snapshot_refs_from_index(_wi_idx, snapshot_name)
-                if _wi_n > 0:
-                    save_content_index(cfg, snapshots_root, _wi_idx, dry=False)
-                    _log(f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus {_wi_n} pool_refs-Eintraegen entfernt")
+                if db is not None:
+                    _wi_n = db.purge_snapshot(snapshot_name)
+                    if _wi_n > 0:
+                        save_content_index_from_db(cfg, snapshots_root, db, dry=False)
+                        _log(
+                            f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus "
+                            f"{_wi_n} pool_refs-Eintraegen entfernt (SQLite)"
+                        )
+                else:
+                    _wi_idx = load_content_index(cfg, snapshots_root)
+                    _wi_n = _purge_snapshot_refs_from_index(_wi_idx, snapshot_name)
+                    if _wi_n > 0:
+                        save_content_index(cfg, snapshots_root, _wi_idx, dry=False)
+                        _log(f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus {_wi_n} pool_refs-Eintraegen entfernt")
             except Exception as e:
                 _log(f"[delta-mode][warn] Stammdaten-Bereinigung fehlgeschlagen: {e}")
 
@@ -2458,32 +2626,45 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         _log(f"[delta-mode] Phase 4: Verarbeite {len(tasks)} neue/geänderte Files...")
         
         # Index laden
-        import tempfile
-        _local_index_dir = _default_temp_dir()
-        _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
-        os.makedirs(_local_index_dir, exist_ok=True)
-        
         t_idx = time.time()
-        if os.path.exists(_local_index_path):
-            index = load_content_index_local(_local_index_path)
-            _idx_src = "lokal"
+        if db is not None:
+            _purged_refs = db.purge_snapshot(snapshot_name)
+            if _purged_refs > 0 and not dry:
+                _log(
+                    f"[delta-mode] Phase 4: pool_refs bereinigt "
+                    f"({_purged_refs} Eintraege fuer {snapshot_name}, SQLite)"
+                )
+                save_content_index_from_db(cfg, snapshots_root, db, dry=False)
+            _log(
+                f"[delta-mode] Phase 4: Index DB ({db.count_shas()} SHAs) "
+                f"in {time.time() - t_idx:.1f}s"
+            )
         else:
-            index = load_content_index(cfg, snapshots_root)
-            _idx_src = "remote"
-        
-        pool_refs = index.setdefault("pool_refs", {})
-        _log(
-            f"[delta-mode] Phase 4: Index geladen ({len(pool_refs)} pool_refs, {_idx_src}) "
-            f"in {time.time() - t_idx:.1f}s"
-        )
+            import tempfile
+            _local_index_dir = _default_temp_dir()
+            _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
+            os.makedirs(_local_index_dir, exist_ok=True)
 
-        # Nach manuellem Remote-Delete oder fehlgeschlagenem Lauf haengen pool_refs-Eintraege
-        # oft noch im Index, obwohl Stubs fehlen -> Phase 4 wuerde sonst 0 Stubs schreiben.
-        _purged_refs = _purge_snapshot_refs_from_index(index, snapshot_name)
-        if _purged_refs > 0 and not dry:
-            _log(f"[delta-mode] Phase 4: pool_refs bereinigt ({_purged_refs} Eintraege fuer {snapshot_name})")
-            save_content_index_local(_local_index_path, index)
-            save_content_index(cfg, snapshots_root, index, dry=False)
+            if os.path.exists(_local_index_path):
+                index = load_content_index_local(_local_index_path)
+                _idx_src = "lokal"
+            else:
+                index = load_content_index(cfg, snapshots_root)
+                _idx_src = "remote"
+
+            pool_refs = index.setdefault("pool_refs", {})
+            _log(
+                f"[delta-mode] Phase 4: Index geladen ({len(pool_refs)} pool_refs, {_idx_src}) "
+                f"in {time.time() - t_idx:.1f}s"
+            )
+
+            # Nach manuellem Remote-Delete oder fehlgeschlagenem Lauf haengen pool_refs-Eintraege
+            # oft noch im Index, obwohl Stubs fehlen -> Phase 4 wuerde sonst 0 Stubs schreiben.
+            _purged_refs = _purge_snapshot_refs_from_index(index, snapshot_name)
+            if _purged_refs > 0 and not dry:
+                _log(f"[delta-mode] Phase 4: pool_refs bereinigt ({_purged_refs} Eintraege fuer {snapshot_name})")
+                save_content_index_local(_local_index_path, index)
+                save_content_index(cfg, snapshots_root, index, dry=False)
         
         # Stats
         uploaded = 0
@@ -2610,6 +2791,10 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                         _stub_md = pc.stat_file_safe(cfg, path=_stub_remote)
                         if _stub_md and _stub_md.get("fileid"):
                             with _state_lock:
+                                if db is not None:
+                                    _pending_refs.append(
+                                        (sha256, relpath, None, None, file_item.get("size"))
+                                    )
                                 reused += 1
                             return
                     except Exception:
@@ -2620,9 +2805,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                     pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
                     
                     with _state_lock:
-                        _register_snap(pool_refs, sha256, snapshot_name, relpath,
-                                       fileid=pool_fileid, hash=pcloud_hash,
-                                       size=file_item.get("size"))
+                        if db is not None:
+                            _pending_refs.append(
+                                (sha256, relpath, pool_fileid, pcloud_hash, file_item.get("size"))
+                            )
+                        else:
+                            _register_snap(pool_refs, sha256, snapshot_name, relpath,
+                                           fileid=pool_fileid, hash=pcloud_hash,
+                                           size=file_item.get("size"))
                         uploaded += 1
                     
                     _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
@@ -2633,9 +2823,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                         cfg, pool_path_abs, e, context=relpath)
                     if pool_fileid:
                         with _state_lock:
-                            _register_snap(pool_refs, sha256, snapshot_name, relpath,
-                                           fileid=pool_fileid, hash=pcloud_hash,
-                                           size=file_item.get("size"))
+                            if db is not None:
+                                _pending_refs.append(
+                                    (sha256, relpath, pool_fileid, pcloud_hash, file_item.get("size"))
+                                )
+                            else:
+                                _register_snap(pool_refs, sha256, snapshot_name, relpath,
+                                               fileid=pool_fileid, hash=pcloud_hash,
+                                               size=file_item.get("size"))
                             uploaded += 1
                         _queue_stub(relpath, file_item, pool_fileid, pcloud_hash, sha256)
                     else:
@@ -2673,9 +2868,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             _batch_write_stubs(cfg, stubs_to_write, dry=False)
             write_ms = (time.time() - t0) * 1000.0
         
+        if db is not None and _pending_refs and not dry:
+            n_bat = db.register_batch(snapshot_name, _pending_refs)
+            _log(f"[index-db] Phase 4: {n_bat} Refs registriert (added/changed/reused)")
+
         # Auch UNVERAENDERTE (geklonte) Files fuer diesen Snapshot registrieren,
         # sonst fehlt der Snapshot in pool_refs[sha].snapshots -> Validation/GC falsch.
-        if not dry:
+        if not dry and db is None:
             for _it in current_files.values():
                 _sha = _it.get("sha256")
                 if not _sha:
@@ -2693,29 +2892,55 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         stubs = 0
         upload_ms = 0.0
         write_ms = 0.0
-        # Index trotzdem laden + neuen (geklonten) Snapshot fuer ALLE SHAs registrieren
-        # (sonst UnboundLocalError bei Validation + fehlende pool_refs-Eintraege).
-        import tempfile
-        _local_index_dir = _default_temp_dir()
-        _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
-        os.makedirs(_local_index_dir, exist_ok=True)
-        if os.path.exists(_local_index_path):
-            index = load_content_index_local(_local_index_path)
+        if db is not None:
+            db.purge_snapshot(snapshot_name)
         else:
-            index = load_content_index(cfg, snapshots_root)
-        pool_refs = index.setdefault("pool_refs", {})
-        if not dry:
-            _reg = 0
-            for _it in current_files.values():
-                _sha = _it.get("sha256")
-                if not _sha:
-                    continue
-                if snapshot_name not in _snap_names(pool_refs.get(_sha)):
-                    _reg += 1
-                _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
-                               size=_it.get("size"))
-            _log(f"[delta-mode] {_reg} Snapshot-Referenzen im Index ergaenzt (geklonter Snapshot)")
-            # Remote/Local-Index: erst nach Validation (siehe unten)
+            # Index trotzdem laden + neuen (geklonten) Snapshot fuer ALLE SHAs registrieren
+            # (sonst UnboundLocalError bei Validation + fehlende pool_refs-Eintraege).
+            import tempfile
+            _local_index_dir = _default_temp_dir()
+            _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
+            os.makedirs(_local_index_dir, exist_ok=True)
+            if os.path.exists(_local_index_path):
+                index = load_content_index_local(_local_index_path)
+            else:
+                index = load_content_index(cfg, snapshots_root)
+            pool_refs = index.setdefault("pool_refs", {})
+            if not dry:
+                _reg = 0
+                for _it in current_files.values():
+                    _sha = _it.get("sha256")
+                    if not _sha:
+                        continue
+                    if snapshot_name not in _snap_names(pool_refs.get(_sha)):
+                        _reg += 1
+                    _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
+                                   size=_it.get("size"))
+                _log(f"[delta-mode] {_reg} Snapshot-Referenzen im Index ergaenzt (geklonter Snapshot)")
+
+    if db is not None and not dry:
+        cur_sha_by_path = {
+            rp: (it.get("sha256") or "").lower()
+            for rp, it in current_files.items()
+            if it.get("sha256")
+        }
+        st = _delta_merge_basis_refs(
+            db, snapshot_name, basis_snapshot_name, cur_sha_by_path, cfg, snapshots_root,
+        )
+        _log(
+            f"[index-db] Bulk-Merge: {st['merged']} Refs von {basis_snapshot_name} "
+            f"uebernommen ({st.get('skipped_removed', 0)} entfallen, "
+            f"{st.get('skipped_changed', 0)} geaendert) "
+            f"in {st['seconds']:.1f}s [tier={st.get('tier')}]"
+        )
+        if st.get("tier") == "manifest":
+            _log("[index-db][warn] Basis nicht in DB/Archiv — Manifest-Fallback")
+        have, want = db.snapshot_pair_count(snapshot_name), len(cur_sha_by_path)
+        if have != want:
+            raise RuntimeError(
+                f"[index-db] Ref-Invariante verletzt: {have} != {want} "
+                f"(Snapshot NICHT finalisiert)"
+            )
 
     # === POST-UPLOAD VALIDATION (wie Full-Pool-Mode!) ===
     marker_data = {
@@ -2729,42 +2954,58 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         "basis": basis_snapshot_name,
     }
 
-    if not dry:
-        _post_upload_gate(
-            cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
-            dry=dry, mode_label="delta-mode",
-        )
-        _finalize_after_validation_delta(
-            cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry
-        )
+    gate_index = index if index is not None else {"pool_refs": {}}
+    if (
+        db is not None
+        and os.environ.get("PCLOUD_VALIDATE_UPLOAD", "0") == "1"
+        and index is None
+    ):
+        gate_index = db.build_snapshot_index(snapshot_name)
 
-    # === REMOTE INDEX-ARCHIVE: in _finalize_after_validation_delta ===
-
-    # === METRIK-GLOBALS synchronisieren ===
-    # Der Delta-Pfad fuehrt eigene lokale Zaehler; ohne diesen Sync zeigte die globale
-    # [metrics]-Summary uploaded_files=0 trotz erfolgtem Pool-Upload. (MET_POOL_REUSED
-    # wird bereits am Dedup-Treffer in _upload_to_pool hochgezaehlt.)
     try:
-        with _metrics_lock:
-            globals()["MET_UPLOADED_FILES"] += uploaded
-            globals()["MET_STUBS_WRITTEN"] += stubs
-    except Exception:
-        pass
+        if not dry:
+            _post_upload_gate(
+                cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, gate_index,
+                dry=dry, mode_label="delta-mode",
+            )
+            _finalize_after_validation_delta(
+                cfg, snapshots_root, gate_index, snapshot_name, dest_snapshot_dir, marker_data,
+                dry=dry, db=db,
+            )
 
-    total_duration = time.time() - t_start
-    _log(f"[delta-mode] ✓ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
-    _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)}")
-    
-    return {
-        "uploaded": uploaded,
-        "reused": reused,
-        "stubs": stubs,
-        "duration": total_duration,
-        "upload_ms": upload_ms,
-        "write_ms": write_ms,
-        "mode": "delta",
-        "basis": basis_snapshot_name
-    }
+        # === REMOTE INDEX-ARCHIVE: in _finalize_after_validation_delta ===
+
+        # === METRIK-GLOBALS synchronisieren ===
+        # Der Delta-Pfad fuehrt eigene lokale Zaehler; ohne diesen Sync zeigte die globale
+        # [metrics]-Summary uploaded_files=0 trotz erfolgtem Pool-Upload. (MET_POOL_REUSED
+        # wird bereits am Dedup-Treffer in _upload_to_pool hochgezaehlt.)
+        try:
+            with _metrics_lock:
+                globals()["MET_UPLOADED_FILES"] += uploaded
+                globals()["MET_STUBS_WRITTEN"] += stubs
+        except Exception:
+            pass
+
+        total_duration = time.time() - t_start
+        _log(f"[delta-mode] ✓ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
+        _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)}")
+
+        return {
+            "uploaded": uploaded,
+            "reused": reused,
+            "stubs": stubs,
+            "duration": total_duration,
+            "upload_ms": upload_ms,
+            "write_ms": write_ms,
+            "mode": "delta",
+            "basis": basis_snapshot_name
+        }
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False) -> dict:
@@ -2790,47 +3031,82 @@ def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: b
 
     _ensure_archived_manifest(snapshot_name)
 
-    index = load_content_index(cfg, snapshots_root) if not dry else {"pool_refs": {}}
-    pool_refs = index.setdefault("pool_refs", {})
-    n_reg = 0
-    for it in manifest.get("items", []) or []:
-        if it.get("type") != "file":
-            continue
-        sha = it.get("sha256")
-        if not sha:
-            continue
-        rp = it.get("relpath", "")
-        if snapshot_name not in _snap_names(pool_refs.get(sha.lower() if isinstance(sha, str) else sha, {})):
-            n_reg += 1
-        _register_snap(
-            pool_refs, sha, snapshot_name, rp,
-            size=it.get("size"),
-        )
-    if n_reg:
-        _log(f"[finalize-only] {n_reg} pool_refs-Eintraege aus Manifest ergaenzt")
+    db = None if dry else _open_pool_index_db_for_run()
+    index = {"pool_refs": {}}
+    try:
+        if db is not None:
+            cur_files = {}
+            rows = []
+            for it in manifest.get("items", []) or []:
+                if it.get("type") != "file":
+                    continue
+                sha = it.get("sha256")
+                if not sha:
+                    continue
+                rp = it.get("relpath", "")
+                sha_l = sha.lower() if isinstance(sha, str) else sha
+                cur_files[rp] = sha_l
+                rows.append((sha_l, rp, None, None, it.get("size")))
+            n_reg = db.register_batch(snapshot_name, rows)
+            if n_reg:
+                _log(f"[finalize-only] {n_reg} pool_refs-Eintraege aus Manifest ergaenzt (SQLite)")
+            have, want = db.snapshot_pair_count(snapshot_name), len(cur_files)
+            if have != want:
+                raise RuntimeError(
+                    f"[index-db] Ref-Invariante verletzt: {have} != {want} "
+                    f"(finalize-only, Snapshot NICHT finalisiert)"
+                )
+            if os.environ.get("PCLOUD_VALIDATE_UPLOAD", "0") == "1":
+                index = db.build_snapshot_index(snapshot_name)
+        else:
+            index = load_content_index(cfg, snapshots_root) if not dry else {"pool_refs": {}}
+            pool_refs = index.setdefault("pool_refs", {})
+            n_reg = 0
+            for it in manifest.get("items", []) or []:
+                if it.get("type") != "file":
+                    continue
+                sha = it.get("sha256")
+                if not sha:
+                    continue
+                rp = it.get("relpath", "")
+                if snapshot_name not in _snap_names(pool_refs.get(sha.lower() if isinstance(sha, str) else sha, {})):
+                    n_reg += 1
+                _register_snap(
+                    pool_refs, sha, snapshot_name, rp,
+                    size=it.get("size"),
+                )
+            if n_reg:
+                _log(f"[finalize-only] {n_reg} pool_refs-Eintraege aus Manifest ergaenzt")
 
-    t_start = time.time()
-    marker_data = {
-        "snapshot": snapshot_name,
-        "completed_at": time.time(),
-        "uploaded": 0,
-        "stubs": len([i for i in (manifest.get("items") or []) if i.get("type") == "file"]),
-        "reused": 0,
-        "duration": 0,
-        "mode": "finalize-only",
-    }
+        t_start = time.time()
+        marker_data = {
+            "snapshot": snapshot_name,
+            "completed_at": time.time(),
+            "uploaded": 0,
+            "stubs": len([i for i in (manifest.get("items") or []) if i.get("type") == "file"]),
+            "reused": 0,
+            "duration": 0,
+            "mode": "finalize-only",
+        }
 
-    if not dry:
-        _post_upload_gate(
-            cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
-            dry=dry, mode_label="finalize-only",
-        )
-        _finalize_after_validation_delta(
-            cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data, dry=dry,
-        )
+        if not dry:
+            _post_upload_gate(
+                cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
+                dry=dry, mode_label="finalize-only",
+            )
+            _finalize_after_validation_delta(
+                cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data,
+                dry=dry, db=db,
+            )
 
-    _log(f"[finalize-only] ✓ Abgeschlossen ({time.time() - t_start:.1f}s)")
-    return {"uploaded": 0, "stubs": marker_data["stubs"], "mode": "finalize-only"}
+        _log(f"[finalize-only] ✓ Abgeschlossen ({time.time() - t_start:.1f}s)")
+        return {"uploaded": 0, "stubs": marker_data["stubs"], "mode": "finalize-only"}
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False, verbose: bool = False, use_scout: bool = True) -> dict:
