@@ -110,7 +110,7 @@ Vergleicht den Live-Zustand auf pCloud mit dem Master-Index (v2, Pool-Modus). Pr
 ### Lokal (`/srv/pcloud-archive/`)
 ```
 manifests/          ← per-Snapshot-Manifeste (relpath, sha256, mtime, size, inode)
-indexes/            ← content_index_master.json (lokaler Spiegel des Remote-Index)
+indexes/            ← content_index_master.json + optional pool_index.sqlite3 (C1 Delta)
 deltas/             ← tamper-detect Reports
 ```
 

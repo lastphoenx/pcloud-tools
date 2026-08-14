@@ -495,6 +495,18 @@ PCLOUD_POST_UPLOAD_INTEGRITY=skip
 # PCLOUD_VALIDATE_UPLOAD=1
 ```
 
+### `PCLOUD_POOL_INDEX_DB`
+**Beschreibung:** C1 Hybrid: Delta-Mode nutzt lokale SQLite statt 100k `_register_snap` auf dem Master-Dict. Finalize exportiert weiter `content_index.json` (Chunk-Upload). **Default aus.**  
+**Werte:** `0` = heutiger JSON/Dict-Pfad (Default), `1` = SQLite  
+**Siehe:** [POOL_INDEX_DB.md](POOL_INDEX_DB.md)
+
+```bash
+# Nach einmaligem Import auf pi-nas:
+# PCLOUD_POOL_INDEX_DB=1
+# PCLOUD_POOL_INDEX_DB_PATH=/srv/pcloud-archive/indexes/pool_index.sqlite3
+# PCLOUD_POOL_INDEX_DB_AUTOIMPORT=1
+```
+
 ### `PCLOUD_MARKER_VERIFY_RETRIES` / `PCLOUD_MARKER_VERIFY_RETRY_SEC`
 **Beschreibung:** Nach erfolgreichem Upload prüft der Wrapper per API, ob `.upload_complete` auf pCloud existiert. Bei API-/DNS-Fehlern wird retried; danach kein False-FAIL („Marker fehlt“), sondern Warnung und weicher OK-Exit (Upload hatte bereits inline-Validation).  
 **Default:** `5` Versuche, Start-Pause `2` s (exponentiell bis max. 30 s)  

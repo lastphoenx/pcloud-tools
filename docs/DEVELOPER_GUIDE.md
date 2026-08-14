@@ -185,9 +185,12 @@ manifests/                      ← Snapshot-Manifeste (je Snapshot ein JSON)
   <snap>.json                   ← relpath, sha256, mtime, size, inode, source_path
 indexes/
   content_index_master.json     ← lokaler Spiegel des Remote-Index
+  pool_index.sqlite3            ← C1 Delta-Arbeitsindex (optional, siehe POOL_INDEX_DB.md)
 deltas/
   delta_verify_<snap>.json      ← tamper-detect Reports
 ```
+
+**C1 Hybrid (optional):** Delta-Mode kann `pool_refs` in SQLite halten (`PCLOUD_POOL_INDEX_DB=1`) und beim Finalize denselben v2-JSON-Upload nutzen. Default aus. Siehe [POOL_INDEX_DB.md](POOL_INDEX_DB.md).
 
 ---
 
