@@ -101,8 +101,8 @@ _log() {
   local msg="$*"
   local ts; ts="$(date '+%F %T')"
   
-  # Human-readable output (to stdout/file)
-  printf "%s [%s] %s\n" "$ts" "$level" "$msg"
+  # stderr: stdout bleibt frei für $(confirm_remote_upload_complete) / Subprozess-Antworten
+  printf "%s [%s] %s\n" "$ts" "$level" "$msg" >&2
   
   # JSONL output (for monitoring/parsing)
   if [[ "${PCLOUD_ENABLE_JSONL}" == "1" ]]; then
