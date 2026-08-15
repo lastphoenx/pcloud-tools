@@ -278,6 +278,36 @@ PY
 }
 
 # --- Remote Snapshot Listing (Python/REST) ---
+load_remote_snapshot_folders() {
+  "${PY}" - <<'PY'
+import os, sys, re
+sys.path.insert(0, os.environ.get("MAIN_DIR","/opt/apps/pcloud-tools/main"))
+import pcloud_bin_lib as pc
+
+_SNAP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}-")
+
+cfg = pc.effective_config(env_file=os.environ.get("ENV_FILE"))
+snap_root = f"{pc._norm_remote_path(os.environ.get('PCLOUD_DEST','/Backup/rtb_1to1')).rstrip('/')}/_snapshots"
+
+try:
+    js = pc._rest_get(cfg, "listfolder", {"path": snap_root, "nofiles": 1})
+except Exception as e:
+    print(f"__ERR__:{type(e).__name__}:{e}", file=sys.stderr)
+    raise SystemExit(2)
+
+if int(js.get("result", -1)) != 0:
+    raise SystemExit(0)
+
+names = []
+for c in (js.get("metadata") or {}).get("contents", []) or []:
+    name = c.get("name") or ""
+    if c.get("isfolder") and name != "_index" and _SNAP_RE.match(name):
+        names.append(name)
+for n in sorted(names):
+    print(n)
+PY
+}
+
 load_remote_snapshots() {
   "${PY}" - <<'PY'
 import os, sys, json
@@ -290,10 +320,9 @@ snap_root = f"{pc._norm_remote_path(os.environ.get('PCLOUD_DEST','/Backup/rtb_1t
 # listfolder auf snap_root
 try:
     js = pc._rest_get(cfg, "listfolder", {"path": snap_root, "nofiles": 1})
-except Exception:
-    # API down → wie "leer" behandeln (Preflight filtert solche Fälle bereits)
-    print("")
-    raise SystemExit(0)
+except Exception as e:
+    print(f"__ERR__:{type(e).__name__}:{e}", file=sys.stderr)
+    raise SystemExit(2)
 
 if int(js.get("result", -1)) != 0:
     # Ordner existiert evtl. noch nicht: leer zurückgeben
@@ -306,16 +335,36 @@ for c in (js.get("metadata") or {}).get("contents", []) or []:
         snapname = c["name"]
         # Prüfe ob Upload vollständig (.upload_complete Marker vorhanden)
         marker_path = f"{snap_root}/{snapname}/.upload_complete"
-        if pc.upload_complete_matches_snapshot(cfg, marker_path, snapname):
-            names.append(snapname)
+        try:
+            if pc.upload_complete_matches_snapshot(cfg, marker_path, snapname):
+                names.append(snapname)
+        except Exception:
+            pass
 for n in sorted(names):
     print(n)
 PY
 }
 
 remote_has_snapshots() {
-  local out; out="$(load_remote_snapshots || true)"
-  [[ -n "$out" ]] && echo YES || echo NO
+  local out rc folders
+  rc=0
+  out="$(load_remote_snapshots 2>/dev/null)" || rc=$?
+  if [[ "$rc" -eq 2 ]]; then
+    # API-Fehler: nicht „leer“ annehmen — Caller soll Catch-up/Bootstrap abbrechen
+    echo ERR
+    return 1
+  fi
+  if [[ -n "$out" ]]; then
+    echo YES
+    return 0
+  fi
+  rc=0
+  folders="$(load_remote_snapshot_folders 2>/dev/null)" || rc=$?
+  if [[ "$rc" -eq 2 ]]; then
+    echo ERR
+    return 1
+  fi
+  [[ -n "$folders" ]] && echo YES || echo NO
 }
 
 remote_snapshot_exists() {
@@ -792,8 +841,13 @@ if [[ "$FINALIZE_ONLY" -eq 1 && -n "$TARGET_SNAPSHOT" ]]; then
   exit 0
 fi
 
-# Bootstrap (remote leer - Initial Sync)
-if [[ "$(remote_has_snapshots)" == "NO" ]]; then
+# Bootstrap (remote leer - Initial Sync) — NUR wenn listfolder wirklich 0 Snap-Ordner
+_remote_state="$(remote_has_snapshots)" || _remote_state="ERR"
+if [[ "$_remote_state" == "ERR" ]]; then
+  _log ERROR "Remote-Snapshot-Listing fehlgeschlagen (API/Timeout) — kein Bootstrap/Catch-up"
+  exit 2
+fi
+if [[ "$_remote_state" == "NO" ]]; then
   _log INFO "Bootstrap: Remote empty – uploading all local snapshots (initial sync)"
   mapfile -t SNAPS < <(find "$RTB" -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' | sort)
   if [[ ${#SNAPS[@]} -eq 0 ]]; then
@@ -814,6 +868,12 @@ if [[ "$(remote_has_snapshots)" == "NO" ]]; then
     done
     SNAPS=("${filtered[@]}")
     _log INFO "Bootstrap target filter active: uploading all snapshots up to $TARGET_SNAPSHOT (${#SNAPS[@]} total)"
+  fi
+  _bootstrap_max="${PCLOUD_CATCHUP_MAX_PER_RUN:-1}"
+  if [[ -z "$TARGET_SNAPSHOT" && "$_bootstrap_max" =~ ^[0-9]+$ ]] && (( _bootstrap_max > 0 )) && (( ${#SNAPS[@]} > _bootstrap_max )); then
+    _rest=$(( ${#SNAPS[@]} - _bootstrap_max ))
+    _log INFO "Bootstrap limit: ${_bootstrap_max} juengste von ${#SNAPS[@]} Snapshot(s) diesmal (${_rest} Backlog, PCLOUD_CATCHUP_MAX_PER_RUN)"
+    SNAPS=("${SNAPS[@]: -_bootstrap_max}")
   fi
   export PCLOUD_SKIP_FINALIZE=1
   for s in "${SNAPS[@]}"; do
@@ -854,6 +914,26 @@ for s in "${local_snaps[@]}"; do
   [[ "$(is_remote_cached "$s")" == "YES" ]] && continue
   missing_snaps+=("$s")
 done
+
+# Optional: Snapshots dauerhaft vom Catch-up ausnehmen (z. B. Legacy-Full-Backup)
+if [[ -n "${PCLOUD_CATCHUP_SKIP_SNAPSHOTS:-}" && ${#missing_snaps[@]} -gt 0 ]]; then
+  _skip_list=()
+  IFS=',' read -ra _skip_list <<< "${PCLOUD_CATCHUP_SKIP_SNAPSHOTS}"
+  _filtered=()
+  for s in "${missing_snaps[@]}"; do
+  for _skip in "${_skip_list[@]}"; do
+      _skip="${_skip#"${_skip%%[![:space:]]*}"}"
+      _skip="${_skip%"${_skip##*[![:space:]]}"}"
+      [[ -z "$_skip" ]] && continue
+      if [[ "$s" == "$_skip" ]]; then
+        _log INFO "Catch-up skip (PCLOUD_CATCHUP_SKIP_SNAPSHOTS): $s"
+        continue 2
+      fi
+    done
+    _filtered+=("$s")
+  done
+  missing_snaps=("${_filtered[@]}")
+fi
 
 # Ohne explizites Target: latest vor restlichem Backlog (chronologisch)
 if [[ -z "$TARGET_SNAPSHOT" && ${#missing_snaps[@]} -gt 1 ]]; then

@@ -2681,12 +2681,15 @@ def ensure_parent_dirs(cfg: dict, dest_path: str) -> int:
     return ensure_path_cached(cfg, parent)
 
 def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int | None = None) -> dict:
-    """Wie stat_file, aber fängt 2055/Not-Found sauber ab und gibt {} zurück."""
+    """Wie stat_file, aber fängt 2055/Not-Found/Timeout sauber ab und gibt {} zurück."""
     try:
         return stat_file(cfg, path=path, fileid=fileid, with_checksum=False, enrich_path=True) or {}
     except Exception as e:
         msg = str(e)
         if "2055" in msg or "2002" in msg or "not found" in msg.lower():
+            return {}
+        # API langsam/Timeout → wie „nicht gefunden“ (kein Prozess-Crash bei Remote-Listing)
+        if isinstance(e, TimeoutError) or "timed out" in msg.lower() or "timeout" in msg.lower():
             return {}
         raise
 

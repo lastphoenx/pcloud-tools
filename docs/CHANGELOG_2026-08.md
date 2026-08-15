@@ -6,6 +6,25 @@
 
 ---
 
+## 15.08.2026 — Bootstrap-Fehler + 4h-Timeout (pi-nas 04:00-Lauf)
+
+**Symptom:** Nach RTB 04:04 pCloud-API-Timeout beim Remote-Listing → fälschlich „Remote empty“ → Bootstrap lud April/Mai-Snaps; `2026-05-21-040007` (97 GB gmk-evo Full-Pool) bis Stubs ~08:00, dann **Terminated** (systemd `TimeoutStartSec=4h`).
+
+**Fixes (`pcloud-tools`):**
+
+| Fix | Details |
+|-----|---------|
+| `remote_has_snapshots` | Ordner auf pCloud ≠ leer; API-Fehler → Abbruch statt Bootstrap |
+| `load_remote_snapshots` | Timeout pro Snap abfangen; kein Prozess-Crash |
+| `stat_file_safe` | Timeout → `{}` (kein Complete-Marker) |
+| Bootstrap | `PCLOUD_CATCHUP_MAX_PER_RUN` gilt auch im Bootstrap |
+| `PCLOUD_CATCHUP_SKIP_SNAPSHOTS` | Komma-Liste für Legacy-Snaps |
+| `backup-pipeline.service` | `TimeoutStartSec=12h` (war 4h) |
+
+**gmk-evo:** `evo-backup.sh` ist Config-only; 97 GB stammen aus **altem Full-Backup** in RTB-Snap `2026-05-21`. RTB `excludes.txt`: `/Backup/gmk-evo/usr/` etc. Skip in `.env`: `PCLOUD_CATCHUP_SKIP_SNAPSHOTS=2026-05-21-040007`.
+
+---
+
 ## 1. NAS Heavy-Ops-Lock (rsync / pCloud / ClamAV / Entropy)
 
 **Problem:** RTB-Backup (`rsync_tmbackup`), pCloud-Upload und ClamAV-/Entropy-Scans griffen gleichzeitig auf `/srv/nas` zu → I/O-Stürme, OOM-Risiko, instabile pCloud-API.

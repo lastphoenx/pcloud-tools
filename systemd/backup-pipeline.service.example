@@ -34,7 +34,8 @@ IOSchedulingClass=idle
 CPUWeight=100
 IOWeight=50
 
-TimeoutStartSec=4h
+# Catch-up + große Snaps (Stubs/97GB+) können >4h dauern; 4h war Kill um 08:00 bei 04:00-Start
+TimeoutStartSec=12h
 
 [Install]
 WantedBy=multi-user.target
