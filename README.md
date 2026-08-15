@@ -1,11 +1,12 @@
 # pCloud-Tools
 
-Automatisierte, deduplizierte Cloud-Backups für die pCloud-API. Lokale Rsync-Snapshots werden effizient in die Cloud synchronisiert: jede Datei wird genau einmal physisch gespeichert, alle weiteren Snapshots referenzieren sie als Metadaten-Stubs. Ein typischer Nacht-Lauf mit 50 MB Änderungen an einem 90-GB-Bestand dauert wenige Minuten.
+Automatisierte, deduplizierte Cloud-Backups für die pCloud-API im **Pool-Modus**: lokale RTB-Snapshots werden in einen zentralen SHA256-Pool und Snapshot-Stubs auf pCloud synchronisiert — nicht mehr Legacy-1to1 mit `anchor_path` pro Datei.
 
-Läuft vollautomatisch als systemd-Timer auf Linux/Debian (Raspberry Pi). Nach dem initialen Setup ist kein manueller Eingriff nötig.
+**Produktion (pi-nas):** Timer **04:00 / 12:00 / 20:00** → `rtb_pool_wrapper.sh` → `wrapper_pcloud_pool_sync_1to1.sh`. Catch-up fehlender Snapshots: **1 pro Lauf** (`PCLOUD_CATCHUP_MAX_PER_RUN=1`).
 
 → **Architektur & Ablaufkette:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
-→ **Setup-Anleitung:** [docs/SETUP.md](docs/SETUP.md)
+→ **Setup-Anleitung:** [docs/SETUP.md](docs/SETUP.md)  
+→ **Betrieb Cross-Repo (privat):** Doku-Repo `OPERATIONS_2026-08.md`
 
 ---
 
@@ -59,7 +60,9 @@ Don't be surprised by occasionally funny commits, lots of emojis 🚀✨, and ot
 ## 📚 Table of Contents
 
 - [Repositories & Zusammenspiel](#repositories--zusammenspiel)
-- [⚡ Performance](#-performance)
+- [Pool-Modell (kurz)](#pool-modell-kurz)
+- [RAM & C1 SQLite-Index](#ram--c1-sqlite-index)
+- [Durchlaufzeiten & Phasen](#durchlaufzeiten--phasen)
 - [Installation](#installation)
 - [Kern-Tools](#kern-tools)
 - [Wartung & Diagnose](#wartung--diagnose-manuell)
@@ -80,144 +83,93 @@ pCloud-Tools ist Teil einer mehrstufigen Backup-Pipeline. Jedes Repo steht für 
 | **[rsync-time-backup](https://github.com/laurent22/rsync-time-backup)** (extern) | Hardlink-basierte lokale Snapshots |
 | **pCloud-Tools** (dieser Repo) | Deduplizierter Upload lokaler Snapshots in die pCloud |
 
-**Ablaufkette (vollständige Pipeline):**
+**Ablaufkette (pi-nas, Pool-Produktion):**
 ```
-EntropyWatcher + ClamAV  →  RTB Wrapper  →  rtb_staged_backup  →  pCloud-Tools
-      (Safety Gate)          (Trigger)         (Hardlink-Snap)         (Cloud-Sync)
+Safety-Gate (EntropyWatcher)  →  rtb_pool_wrapper.sh  →  rtb_staged_backup  →  wrapper_pcloud_pool_sync_1to1.sh
+     (GREEN/YELLOW)              (NAS-Lock, Trigger)      (~32 rsync-Einheiten)   (Scout / Turbo-Delta / Pool)
 ```
+Gemeinsamer **NAS Heavy-Ops-Lock** (`/run/backup_pipeline.lock`): RTB, pCloud-Upload und ClamAV/Entropy laufen nicht parallel auf `/srv/nas`.  
 (Fallback `RTB_STAGED=0`: vanilla `rsync_tmbackup.sh` statt staged.)
 
 Der Einstiegspunkt für **Pool-Produktion** ist `rtb_pool_wrapper.sh` (rtb-Repo) → `wrapper_pcloud_pool_sync_1to1.sh`.  
 Legacy 1to1: `rtb_wrapper.sh` → `legacy/wrapper_pcloud_sync_1to1.sh` (eingestellt).  
 → Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
-→ Entstehungsgeschichte & Gesamt-Pipeline: [rtb/README.md](https://github.com/lastphoenx/rtb#die-entstehungsgeschichte)
+→ Cross-Repo-Betrieb: [rtb/README.md](https://github.com/lastphoenx/rtb) · [entropy-watcher MONITORING](https://github.com/lastphoenx/entropy-watcher-und-clamav-scanner/blob/main/docs/MONITORING.md)
 
 ---
 
-## ⚡ Performance
+## Pool-Modell (kurz)
 
-**Echte Durchlaufzeiten** (Production-Test mit RTB-NAS-Snapshot: 89.6 GB, 19808 Files, 1101 Ordner):
+| Ort | Inhalt |
+|-----|--------|
+| `_pool/XX/<sha256>` | Physische Datei (dedupliziert, 1× pro SHA) |
+| `_snapshots/<snap>/<path>.meta.json` | Stub (Verweis auf Pool) |
+| `_snapshots/<snap>/.upload_complete` | Snapshot gültig (nach Integrity-Gate) |
+| `_snapshots/_index/content_index.json` | Master-Index `pool_refs` (~700–960 MB) |
 
-### 1️⃣ **Erster Upload (Initial)** — SAFE-MODE
-```
-Phase                Dauer        Anteil   Items              Speed
-─────────────────────────────────────────────────────────────────────────────
-Manifest-Gen.        +10min 31s   -        19808 Files        31 Files/s  ✅
-Ordner anlegen        5min  0s     3%      1101 Ordner        ~3.7/s
-Kleine Dateien        1h  26min   47%      19585 Files        ~3.8/s
-Große Dateien         1h  31min   49%      223 Files (48 GB)  ~8.8 MB/s   ✅
-Stubs schreiben       2min 56s     2%      1724 Stubs         ~9.8/s      ✅
-Finalisierung           <1min     <1%      Index + Delta      -
-─────────────────────────────────────────────────────────────────────────────
-TOTAL                 3h  5min   100%      89.6 GB            -
-```
-
-**Bewertung: SEHR GUT! 🎯**
-- ✅ **Manifest-Speed:** JSON-Streaming funktioniert perfekt (31 Files/s)
-- ✅ **Keine Crashes** trotz großer Dateien (YTS_01_1.VOB mit 1 GB → ~2min = 8.5 MB/s)
-- ✅ **Parallel Uploads** für kleine Dateien (16 Threads) → 30-40% schneller
-- ✅ **Stubs brillant optimiert:** Folder-Cache-Optimierung läuft (225 Parent-FIDs gecacht, 0 neu angelegt!)
-- ✅ **API-Reduktion:** 1 stat statt 225 → 225× Reduktion! 🚀
+**Modi:** Scout → **Turbo-Delta** (Basis-Snapshot klonen + Diff) oder **Full-Pool** (kein passender Basis-Snap). Keine Anchor-Ketten wie im alten 1to1-Modus.
 
 ---
 
-### 2️⃣ **Zweiter Upload (Stub-Phase)** — Partial TURBO-MODE
+## RAM & C1 SQLite-Index
 
-**Aktivierte Optimierungen:**
-- ✅ **Smart Manifest** (`--ref-manifest`): **40× schneller** (10min → 30s)
-  - Reused: 19000+ Files via mtime/size-Cache
-  - Only hash: ~800 neue/geänderte Files
-- ✅ **Folder-Template** (Auto-integrated): **60× schneller** (5min → 5s)
-  - Verwendet `copyfolder` statt 1101× einzelne `ensure_path`
-  - Delta-Korrektur für neue/gelöschte Ordner
-- ✅ **Content-Index** (Resume): Bereits hochgeladene Files → Skip (resumed)
+Auf **8 GB RAM** (Pi 5 + ClamAV ~1,5 GB) sind große Delta-Läufe RAM-kritisch.
 
-**Durchlaufzeit (identischer Snapshot wie Upload 1):**
-```
-Phase                Dauer        Was passiert
-────────────────────────────────────────────────────────────────
-Manifest-Gen.        ~30s         Smart-Mode (mtime/size-Cache) ✅
-Ordner anlegen       ~5s          Folder-Template (copyfolder) ✅
-File-Daten upload    SKIP!        anchor_path im Index → kein Upload! ✅
-Stubs schreiben      ~3min        ALLE 19000 Stubs (1. Mal für Snap2!) ⚠️
-Finalisierung        ~30s         Index-Update (Holder-Registrierung)
-────────────────────────────────────────────────────────────────
-TOTAL                ~5-7min      statt 3h 15min!
-```
+| Komponente | RAM (typisch) | Mitigation |
+|------------|---------------|------------|
+| Legacy Delta (Dict `pool_refs`) | ~900 MB Master-JSON + 100k `_register_snap` | **C1:** `PCLOUD_POOL_INDEX_DB=1` |
+| C1 SQLite (`pool_index.sqlite3`) | ~2–4 GB Spitze beim Lauf; kein 913-MB-Dict für Phase 4 | Bulk-Merge per SQL; `register_batch` statt Dict |
+| Manifest (Smart-Ref) | Streaming / JSONL-Resume | `pcloud_bin_lib` Manifest-Lib |
+| RTB Trigger | früher `rsync -ni` Vollbaum → OOM | **Signature-Trigger** (`RTB_TRIGGER_MODE=signature`, rtb) |
+| Re-Import Master→SQLite | ~15 min, ~4 GB (169k SHAs) | **Re-Import-Skip** via `master_sha256` ([POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)) |
 
-**Warum "File-Daten SKIP"?**  
-Der Content-Index aus Upload 1 enthält bereits:
-- `anchor_path`: `/Backup/rtb_1to1/snapshot1/path/to/file.txt` (physische Datei in pCloud)
-- `fileid`: 12345678 (pCloud's eindeutige ID)
-- `sha256`: abc123... (Hash zur Deduplication)
-
-Beim Upload 2 erkennt das System:
-- ✅ SHA256 bekannt → Datei existiert bereits
-- ✅ anchor_path vorhanden → Keine Upload nötig!
-- ⚠️ ABER: Snapshot 2 braucht eigene Referenz → **Stub schreiben!**
-
-**Das Stub-File** (`file.txt.meta.json`) enthält:
-```json
-{
-  "type": "hardlink",
-  "sha256": "abc123...",
-  "anchor_path": "/Backup/rtb_1to1/snapshot1/path/to/file.txt",
-  "fileid": 12345678,
-  "snapshot": "snapshot2",
-  "relpath": "path/to/file.txt"
-}
-```
-
-→ Alle 19000 Files werden als Stubs geschrieben (~3min mit Thread-Optimierung)  
-→ Kein File-Upload = **Massive Quota-Einsparung!** 💾
-
-**Speedup:** **~25×** vs. Initial-Upload ⚡
-
-**Warum keine Stub-Optimierung?**  
-Beim zweiten Upload existiert noch KEIN Snapshot mit Stubs zum Klonen!  
-→ Alle 19000 Stubs müssen einmalig geschrieben werden (~3min mit Thread-Optimierung)  
-→ **Ab Upload 3: Stub-Cloning aktiv!** (siehe unten)
+**pi-nas:** `PCLOUD_POOL_INDEX_DB=1`, Index auf SSD2 (`/srv/pcloud-archive/indexes/`).  
+Diagnose: `python3 pool_index_db.py status` · Backfill: `python3 pool_index_db.py refresh-meta`
 
 ---
 
-### 3️⃣ **Dritter+ Upload** — FULL TURBO-MODE + Delta-Copy 🚀🚀
+## Durchlaufzeiten & Phasen
 
-**Zusätzliche Optimierung** (aktiviert via `--use-delta-copy`):
-- 🔥 **Stub-Cloning:** Server-seitiges `copyfolder` von vorherigem Snapshot
-  - Cloned: ~19000 Stubs in ~10-15s (statt 3min neu schreiben!)
-  - Nur Delta-Änderungen werden angepasst (neue/gelöschte/geänderte Files)
-- 🔥 **Manifest-Diff:** Präzise Berechnung was sich geändert hat
-  - Added/Modified/Deleted Files → Selective Update
+Zeiten sind **pi-nas Production** (114k Files/Snapshot, ~90 GB RTB-Bestand, pCloud API). Stark abhängig von Delta-Größe, Scout-Basis und Netz.
 
-**Use Case:** Tägliche Snapshots mit wenig Änderungen (z.B. 50-200 MB Delta)
+### Turbo-Delta (typischer Catch-up / Tages-Snap)
 
-**Geschätzte Durchlaufzeit (typischer Nacht-Lauf mit ~50 MB Änderungen):**
-```
-Phase                Dauer        Optimierung
-────────────────────────────────────────────────────────────────
-Manifest-Gen.        ~30s         Smart-Mode
-Ordner anlegen       ~5s          Folder-Template
-copyfolder Basis     ~10-15s      Server-Side Clone (19000 Stubs!) 🔥
-Delta berechnen      ~5s          Manifest-Diff (lokal)
-Neue Files upload    ~1-3min      Nur Delta (50 MB @ ~300 KB/s)
-Obsolete löschen     ~5-10s       Nur gelöschte Files/Stubs
-Index-Update         ~30s         Master-Index
-────────────────────────────────────────────────────────────────
-TOTAL                ~3-5min      statt 3h 15min! 🚀🚀
-```
+Phasen in `pcloud_push_json_pool_manifest_to_pcloud.py`:
 
-**Speedup:** **~35-60×** für inkrementelle Snapshots! 🔥
+| Phase | Was | Dauer (Beispiele) |
+|-------|-----|-------------------|
+| Manifest | Smart-Ref, streaming Scan | ~30 s – 3 min |
+| Scout | bester Remote-Basis-Snap (chronologisch) | ~1–5 s |
+| Phase 1 | `copyfolder` Struktur von Basis | ~14 min (114k Stubs) |
+| Phase 2 | Manifest-Diff lokal | ~1 s |
+| Phase 3 | tote Ordner/Stubs löschen (parallel) | Sekunden – ~30 min (großer falscher Basis-Snap) |
+| Phase 4 | Pool-Uploads + Stub-Schreiben | ~10–50 min (Delta-Größe) |
+| Integrity-Gate | `pool_verify_backup` listfolder | ~20–60 s |
+| Finalize | `.upload_complete` + Index-Export + Chunk-Upload (~960 MB) | ~2 min |
 
-**Kritischer Unterschied vs. Upload 2:**  
-- Upload 2: ~3min Stubs schreiben (alle 19000!)  
-- Upload 3+: ~10s Stubs klonen (copyfolder!) → **18× schneller!** ⚡
+**Referenzlauf 2026-08-15** (`2026-08-15-040158`, Basis `08-14`, 97,7 %, +2627 Files): **~51 min** gesamt; mit unnötigem C1-Re-Import (alter Code) **+15 min**.
 
----
+**Kleines Delta** (wenig Änderungen, gute Basis): oft **~15–35 min**.  
+**Catch-up** mit PBS2/VM-Chunks oder Full-Pool: **1–3+ h** — daher `TimeoutStartSec=12h` auf `backup-pipeline.service`.
 
-**Mehr Details:**
-- Performance-Analyse: [docs/DEVELOPER_GUIDE.md § Performance](docs/DEVELOPER_GUIDE.md#-performance)
-- Delta-Copy Deep Dive: [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md)
-- Chunked-Upload (Large Files): [docs/DEVELOPER_GUIDE.md § Chunked Upload](docs/DEVELOPER_GUIDE.md#-chunked-upload-with-resume-large-file-support)
+### Full-Pool (Scout &lt; 70 % oder kein Basis-Snap)
+
+Alle Pfade/Stubs neu, Pool nur wo SHA fehlt. Erster Snap auf leerem Pool: **~3 h** (89 GB, 19k Files — historischer SAFE-Mode-Test). Catch-up nach Ausfall: eher **30 min – 2 h** pro Snap, abhängig von Wiederverwendung im Pool.
+
+### systemd / Catch-up
+
+| Setting | Wert | Zweck |
+|---------|------|--------|
+| `backup-pipeline.timer` | 04:00, 12:00, 20:00 | 3 Slots/Tag |
+| `PCLOUD_CATCHUP_MAX_PER_RUN` | `1` | max. 1 fehlender Snap pro Lauf |
+| `TimeoutStartSec` | **12h** (war 4h) | kein SIGTERM bei langem Catch-up |
+| `PCLOUD_CATCHUP_SKIP_SNAPSHOTS` | Legacy-Snaps | z. B. `05-21`, `05-28` |
+
+Planung vor Upload: `scripts/utilities/pool_delta_plan.py --missing-only --simulate-catchup`  
+Live-Backlog: `scripts/utilities/pool_audit_status.py --pool-root /Backup/rtb_pool`
+
+**Tiefere Analyse:** [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) · [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)  
+**Legacy 1to1-Performance (historisch):** [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md) — nicht Pool-Produktionspfad.
 
 ---
 
@@ -249,6 +201,7 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 | `pcloud_json_pool_manifest.py` | Manifest-Erstellung Pool (Schema v4, Smart-Hashing) |
 | `pcloud_push_json_pool_manifest_to_pcloud.py` | Pool-Upload: Scout, Turbo-Delta, Full-Pool, Validation |
 | `pcloud_pool_gc.py` | Pool Garbage Collection ([Doku](docs/pcloud_pool_gc.md)) |
+| `pool_index_db.py` | C1 SQLite Hybrid: `status`, `refresh-meta`, Bulk-Merge ([Doku](docs/POOL_INDEX_DB.md)) |
 | `pcloud_bin_lib.py` | pCloud API-Bibliothek (Circuit Breaker, `copyfolder`, Chunked Upload) |
 | `pcloud_path_compat.py` | Pfad-Normalisierung Manifest ↔ pCloud (Whitespace, Skip-Globs) |
 | `pcloud_health_check.sh` | Backup-Status, Quota — Nagios/Zabbix-kompatibel |
@@ -323,7 +276,7 @@ Dashboard, Status-Aggregation und Reports sind implementiert. Auf pi-nas: system
 |---|---|
 | `dashboard/index.html` | Web-Dashboard (60 s Browser-Refresh, Detail-Bereiche einklappbar) |
 | `scripts/aggregate_status.sh` | `status.json` — Modus `quick` (5 min) oder `full` (15 min + nach Backup) |
-| `scripts/generate_reports.sh` | `reports.json` — alle 15 min + nach Backup |
+| `scripts/generate_reports.sh` | `reports.json` — alle 15 min + nach Backup (MariaDB-Historie, **nicht** pCloud-Tile) |
 | `monitoring-status-quick.timer` | Lightweight Status alle 5 min |
 | `monitoring-status-update.timer` | Full Aggregate alle 15 min + `OnUnitActivation=backup-pipeline` |
 | `monitoring-reports.timer` | DB → `reports.json` |
@@ -351,8 +304,10 @@ sudo systemctl enable --now monitoring-dashboard.service
 sudo cp apprise.yml.example /opt/apps/apprise.yml
 ```
 
-→ Dashboard-Setup (nginx): [dashboard/README.md](dashboard/README.md)  
+→ Dashboard-Setup (nginx): [dashboard/README.md](dashboard/README.md) · [docs/DASHBOARD.md](docs/DASHBOARD.md)  
 → Apprise-Konfiguration: [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md)
+
+**Hinweis:** Die pCloud-CRITICAL-Kachel im Dashboard liest **`status.json`** (`aggregate_status.sh` + `pcloud_health_check.sh`), nicht `reports.json`. Der 5-min-Quick-Lauf cached den pCloud-Block — nach langem Backup: `sudo systemctl start monitoring-status-update.service` oder `AGGREGATE_MODE=full ./scripts/aggregate_status.sh`.
 
 ---
 
@@ -380,8 +335,9 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 ## Technologie-Stack
 
 - **OS:** Debian Bookworm (Raspberry Pi 5)
-- **Storage:** 5x 2.5" SATA SSD (Radxa Penta SATA HAT)
-- **Backup:** rsync, JSON-Manifests, pCloud Binary API
-- **Automation:** Bash, systemd-Timer
-- **Monitoring:** Vanilla HTML/JS Dashboard, Apprise (Alerts)
+- **Storage:** 5x 2.5" SATA SSD (Radxa Penta SATA HAT); Pool-Index SQLite auf SSD2 (`/srv/pcloud-archive/`)
+- **Backup:** rsync, JSON-Manifests, pCloud Binary API, SHA256-Pool + Stubs
+- **Index (C1):** SQLite `pool_index.sqlite3` — RAM-Schonung vs. 900 MB Master-Dict ([POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md))
+- **Automation:** Bash, systemd-Timer (`backup-pipeline` 3×/Tag, `TimeoutStartSec=12h`)
+- **Monitoring:** Vanilla HTML/JS Dashboard, Apprise (Alerts); `status.json` vs. `reports.json`
 - **DB:** MariaDB (Backup-Historie, Status-Tracking)
