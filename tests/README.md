@@ -4,7 +4,7 @@ Manuelle / experimentelle Skripte (nicht pytest-CI).
 
 | Datei | Zweck |
 |-------|--------|
-| `test_pool_index_db.py` | C1 SQLite: Import/Merge/Export/Purge (offline, kein pCloud) |
+| `test_pool_index_db.py` | C1 SQLite: Import/Merge/Export/Purge, Re-Import-Skip (offline) |
 | `test_copyfile_deduplication.py` | Prüft pCloud `copyfile` Content-Dedup (Pool-Hypothese) |
 | `test_legacy_deduplication.py` | Legacy-Dedup-Verhalten |
 

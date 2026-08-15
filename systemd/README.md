@@ -43,6 +43,19 @@ Persistent web server for the monitoring dashboard:
 - **Features**: No-cache headers, auto-refresh
 - **User**: YOUR_USER (non-root for security)
 
+### backup-pipeline.service / backup-pipeline.timer
+RTB staged backup + pCloud pool sync (`rtb_pool_wrapper.sh`).
+
+**Timer:** 04:00, 12:00, 20:00 daily.
+
+**Timeout (15.08.2026):** `TimeoutStartSec=12h` in `backup-pipeline.service.example` (war `4h`).  
+Catch-up, große Turbo-Deltas (PBS2-Chunks, viele Stubs) und erster C1-Import können **>4 h** dauern; bei `4h` killt systemd den Push → Snap ohne `.upload_complete`.
+
+```bash
+sudo /opt/apps/pcloud-tools/main/scripts/install-backup-pipeline-systemd.sh
+systemctl show backup-pipeline.service -p TimeoutUSec
+```
+
 ## 🚀 Installation
 
 ### 0. Setup Telegram Notifications (Required for monitoring-alert)

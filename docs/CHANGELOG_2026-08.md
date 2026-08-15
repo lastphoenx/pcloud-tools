@@ -21,7 +21,21 @@
 | `PCLOUD_CATCHUP_SKIP_SNAPSHOTS` | Komma-Liste für Legacy-Snaps |
 | `backup-pipeline.service` | `TimeoutStartSec=12h` (war 4h) |
 
-**gmk-evo:** `evo-backup.sh` ist Config-only; 97 GB stammen aus **altem Full-Backup** in RTB-Snap `2026-05-21`. RTB `excludes.txt`: `/Backup/gmk-evo/usr/` etc. Skip in `.env`: `PCLOUD_CATCHUP_SKIP_SNAPSHOTS=2026-05-21-040007`.
+**gmk-evo:** `evo-backup.sh` ist Config-only; 97 GB stammen aus **altem Full-Backup** in RTB-Snap `2026-05-21`. RTB `excludes.txt`: `/Backup/gmk-evo/usr/` etc. Skip in `.env`: `PCLOUD_CATCHUP_SKIP_SNAPSHOTS=2026-05-21-040007,2026-05-28-023609`.
+
+### 15.08.2026 — Catch-up `08-15` SUCCESS + C1 Re-Import-Skip
+
+**12:00-Lauf:** Turbo-Delta `2026-08-15-040158` (Basis `08-14`, 97,7 %) — Integrity OK, `.upload_complete`, ~51 min (inkl. unnötiger 15-min Re-Import mit altem Code).
+
+| Thema | Details |
+|-------|---------|
+| Re-Import-Skip | `master_sha256` + `master_content_digest` in SQLite-`meta`; Skip wenn GC nur mtime ändert (`a89b5ea`, `ac4de6e`) |
+| CLI | `pool_index_db.py status`, `refresh-meta` |
+| GC-Sync | Nach `delete-snapshots`: `purge-snapshot` + Meta-Refresh (`5942d16`) |
+| Dashboard GAP | `generate_reports.sh` allein reicht **nicht** für pCloud-Kachel → `AGGREGATE_MODE=full` / `monitoring-status-update.service` |
+| MariaDB root | `mysql pcloud_backup -e "…"` ohne `-p` (Socket-Auth) |
+
+**Catch-up Backlog (Timer, 1 Snap/Lauf):** vorauss. 6× Juli `07-20` … `07-25` — Liste live: `pool_audit_status.py`.
 
 ---
 
@@ -346,8 +360,9 @@ sudo systemctl enable --now monitoring-status-quick.timer
 
 ## 16. C1 Pool-Index SQLite (Hybrid)
 
-Delta-Mode kann `pool_refs` lokal in SQLite halten statt ~100k `_register_snap` auf dem 913-MB-Dict. Remote-Format unverändert (`content_index.json` Chunk-Upload). **Default aus** (`PCLOUD_POOL_INDEX_DB=0`).
+Delta-Mode kann `pool_refs` lokal in SQLite halten statt ~100k `_register_snap` auf dem 913-MB-Dict. Remote-Format unverändert (`content_index.json` Chunk-Upload). **Default aus** (`PCLOUD_POOL_INDEX_DB=0`). **pi-nas produktiv:** `1`.
 
 - Doku / Migration / Rollback: [POOL_INDEX_DB.md](POOL_INDEX_DB.md)
 - Tag: `pre-c1-pool-index-db-2026-08-14` (`3ab8eea`)
 - Schnell-Rollback: Flag `0` oder `git checkout pre-c1-pool-index-db-2026-08-14`
+- Re-Import-Skip (15.08.): `a89b5ea`, `ac4de6e` — `can_skip_master_reimport()`, CLI `status` / `refresh-meta`

@@ -258,6 +258,16 @@ Das Dashboard liest zwei JSON-Dateien:
 
 Feld `aggregate_mode` in JSON: `quick` oder `full`.
 
+**Wichtig (15.08.2026):** Die **pCloud-Backup-Kachel** (GAP, Sync-Status, `pcloud_snapshot`) liest **`status.json`** → `pcloud_health_check.sh`, **nicht** `reports.json`.  
+`generate_reports.sh` aktualisiert nur Tabellen (`recent_backups`, Phasen). Nach erfolgreichem Upload:
+
+```bash
+sudo systemctl start monitoring-status-update.service
+# oder: AGGREGATE_MODE=full /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
+```
+
+Der **Quick-Timer** (5 min) übernimmt den pCloud-Block aus der **bestehenden** `status.json` ohne erneuten Health-Check — stale CRITICAL bis Full-Aggregate.
+
 **Enthält (Auswahl):**
 - Live-Service-Status (systemd units)
 - RTB Wrapper Status (letzte Backup-Details)

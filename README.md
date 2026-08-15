@@ -266,7 +266,8 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 - **Circuit Breaker** mit Cooldown und Parallelitäts-Ramp (16→12→8 Threads)
 - **`pool_delta_plan.py`** — Delta vs. Full planen inkl. Catch-up-Simulation
 - **DB-Wartung:** `scripts/maintenance_db_cleanup.sh` — Dashboard „Letzte Fehler (7d)“ bereinigen
-- **Pool-Index C1 (optional):** SQLite-Hybrid für Delta (`PCLOUD_POOL_INDEX_DB=0` default) — [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
+- **Pool-Index C1:** SQLite-Hybrid für Delta (`PCLOUD_POOL_INDEX_DB=1` auf pi-nas; Re-Import-Skip via `master_sha256`) — [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
+- **Pipeline-Timeout:** `backup-pipeline.service` `TimeoutStartSec=12h` (Catch-up >4h)
 - → [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)
 
 **Neu seit April 2026:**  

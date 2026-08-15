@@ -277,7 +277,9 @@ const REFRESH_SEC = 60; // Browser-Polling (Sekunden)
 |------|-----------|--------|
 | `monitoring-status-quick.timer` | alle **5 Min** | `AGGREGATE_MODE=quick` |
 | `monitoring-status-update.timer` | alle **15 Min** + nach Backup | `AGGREGATE_MODE=full` |
-| `monitoring-reports.timer` | alle **15 Min** + nach Backup | `generate_reports.sh` |
+| `monitoring-reports.timer` | alle **15 Min** + nach Backup | `generate_reports.sh` → **reports.json** (Tabellen) |
+
+**pCloud GAP/Sync-Kachel** nutzt **`status.json`** (full aggregate + `pcloud_health_check.sh`), nicht `reports.json`. Nach Upload: `sudo systemctl start monitoring-status-update.service` oder `AGGREGATE_MODE=full ./scripts/aggregate_status.sh`.
 
 Installation (pi-nas):
 ```bash

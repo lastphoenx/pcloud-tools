@@ -192,6 +192,8 @@ deltas/
 
 **C1 Hybrid (optional):** Delta-Mode kann `pool_refs` in SQLite halten (`PCLOUD_POOL_INDEX_DB=1`) und beim Finalize denselben v2-JSON-Upload nutzen. Default aus. Siehe [POOL_INDEX_DB.md](POOL_INDEX_DB.md).
 
+**Re-Import-Skip (15.08.2026):** Vor vollem JSON→SQLite-Import prüft `_open_pool_index_db_for_run()` `can_skip_master_reimport()` — GC-Rewrite mit gleichen Bytes spart ~15 min + ~4 GB RAM. Meta: `master_sha256`, `master_content_digest`. Diagnose: `python3 pool_index_db.py status`.
+
 ---
 
 ## 🚀 Säule 3: Pool-Upload-Engine

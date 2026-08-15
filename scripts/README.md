@@ -34,12 +34,20 @@ Collects monitoring data from all backup and monitoring services into a unified 
 
 **Usage:**
 ```bash
-# Run aggregation (silent)
+# Full aggregate (pCloud health, GAP) — für Dashboard-Sync-Kachel
 ./aggregate_status.sh
+AGGREGATE_MODE=full ./aggregate_status.sh
+
+# Quick mode (default im quick-timer): cached pCloud block
+AGGREGATE_MODE=quick ./aggregate_status.sh
 
 # Verbose mode (shows progress)
 ./aggregate_status.sh --verbose
+```
 
+**vs `generate_reports.sh`:** `status.json` = Live-Kacheln + GAP; `reports.json` = MariaDB-Tabellen. Nach Upload beide oder mindestens **full** `aggregate_status.sh`.
+
+```bash
 # Custom output location
 MONITORING_OUTPUT=/tmp/status.json ./aggregate_status.sh
 ```

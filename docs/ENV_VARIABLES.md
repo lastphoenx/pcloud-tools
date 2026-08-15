@@ -472,6 +472,19 @@ PCLOUD_FIDCACHE_TTL=3600
 PCLOUD_CATCHUP_MAX_PER_RUN=1
 ```
 
+### `PCLOUD_CATCHUP_SKIP_SNAPSHOTS`
+**Beschreibung:** Komma-Liste — Snapshots vom automatischen Catch-up ausnehmen (Legacy-Full-System, manuell gelöscht).  
+**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`
+
+```bash
+PCLOUD_CATCHUP_SKIP_SNAPSHOTS=2026-05-21-040007,2026-05-28-023609
+```
+
+### `backup-pipeline.service` — `TimeoutStartSec`
+**Default (Beispiel-Unit):** `12h` (war `4h` bis 15.08.2026).  
+**Begründung:** Catch-up + große Deltas (PBS2-Chunks, ~97k Stub-Parent-FIDs, C1-Import beim ersten Lauf) können **>4 h** dauern. Kill um 08:00 bei 04:00-Start → partieller Snap ohne `.upload_complete`.  
+**Deploy:** `scripts/install-backup-pipeline-systemd.sh` kopiert `systemd/backup-pipeline.service.example`.
+
 ### `PCLOUD_POST_UPLOAD_INTEGRITY`
 **Beschreibung:** Zusaetzlicher Integritaetslauf im **Wrapper** nach dem Push (redundant). Das **harte Gate** (`listfolder`, ~30–60s) laeuft im Push-Skript vor `.upload_complete`.  
 **Default:** `skip`  
@@ -501,11 +514,21 @@ PCLOUD_POST_UPLOAD_INTEGRITY=skip
 **Siehe:** [POOL_INDEX_DB.md](POOL_INDEX_DB.md)
 
 ```bash
-# Nach einmaligem Import auf pi-nas:
-# PCLOUD_POOL_INDEX_DB=1
-# PCLOUD_POOL_INDEX_DB_PATH=/srv/pcloud-archive/indexes/pool_index.sqlite3
-# PCLOUD_POOL_INDEX_DB_AUTOIMPORT=1
+# pi-nas produktiv:
+PCLOUD_POOL_INDEX_DB=1
+PCLOUD_POOL_INDEX_DB_PATH=/srv/pcloud-archive/indexes/pool_index.sqlite3
+PCLOUD_POOL_INDEX_DB_AUTOIMPORT=1
+PCLOUD_POOL_INDEX_DB_SYNC_ON_GC=1
+PCLOUD_POOL_INDEX_DB_SYNC_MODE=auto
 ```
+
+### `PCLOUD_POOL_INDEX_DB_AUTOIMPORT`
+**Default:** `1` — Bei stale mtime/size: zuerst `can_skip_master_reimport()` (SHA256 + DB-Digest), nur bei echtem Inhalt `import_from_json`.
+
+### `PCLOUD_POOL_INDEX_DB_SYNC_ON_GC` / `PCLOUD_POOL_INDEX_DB_SYNC_MODE`
+Nach `pcloud_pool_gc.py --delete-snapshots` / retention: SQLite per `purge-snapshot` anpassen (`auto`), Meta-Hashes aktualisieren. `import` = voller Re-Import; `skip` = nichts.
+
+**CLI:** `python3 pool_index_db.py status` | `refresh-meta` (Hashes ohne Import).
 
 ### `PCLOUD_MARKER_VERIFY_RETRIES` / `PCLOUD_MARKER_VERIFY_RETRY_SEC`
 **Beschreibung:** Nach erfolgreichem Upload prüft der Wrapper per API, ob `.upload_complete` auf pCloud existiert. Bei API-/DNS-Fehlern wird retried; danach kein False-FAIL („Marker fehlt“), sondern Warnung und weicher OK-Exit (Upload hatte bereits inline-Validation).  
