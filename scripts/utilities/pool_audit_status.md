@@ -46,7 +46,7 @@ Vollständiger Triage-Workflow: [integrity-checks.md](../../../doku/Raspi/raspin
 |--------|-----------|--------|
 | RTB ja, Pcl nein, Cmp nein | Noch nie hochgeladen | Catch-up / Wrapper |
 | RTB ja, Pcl ja, Cmp nein | Unvollständiger Remote-Snapshot | Upload erneut (Pipeline wipet & neu) |
-| RTB nein, Pcl ja, Cmp nein | Zombie (hängender Remote-Ordner) | `pcloud_pool_gc.py --retention-apply` |
+| RTB nein, Pcl ja, Cmp nein | Zombie (hängender Remote-Ordner) | `pcloud_pool_gc.py --delete-snapshots SNAP` (gezielt), **nicht** blind `--retention-apply` bei Zeit-Retention |
 | Cmp ja, Man nein | Upload OK, Manifest fehlt lokal | Re-Upload oder Manifest archivieren |
 | Cmp ja, RTB nein | Lokal per RTB-Retention gelöscht | Normal, Backup auf pCloud bleibt |
 | DB FAILED → COMPLETE | Alter Fehler, inzwischen nachgeholt | Keine Aktion |

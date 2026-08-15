@@ -44,7 +44,7 @@ def _matrix_hint(in_rtb: bool, in_man: bool, in_remote: bool, is_complete: bool)
     if not in_rtb and in_remote and is_complete and not in_man:
         return "Complete; Manifest fehlt lokal"
     if not in_rtb and in_remote and not is_complete:
-        return "Zombie auf pCloud → pool_gc --retention-apply"
+        return "Zombie auf pCloud → pool_gc --delete-snapshots SNAP"
     if in_rtb and is_complete and not in_man:
         return "Complete; Manifest archivieren"
     if not in_remote and is_complete:

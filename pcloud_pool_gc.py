@@ -626,6 +626,107 @@ def _wait_until_snapshot_gone(
         time.sleep(poll_sec)
 
 
+def run_delete_snapshots(
+    cfg: dict,
+    dest_root: str,
+    snap_names: List[str],
+    *,
+    dry: bool = False,
+    run_gc: bool = False,
+    grace_hours: int = 24,
+    verbose: bool = False,
+    env_file: str = ".env",
+) -> dict:
+    """
+    Gezielt einzelne Remote-Snapshots löschen + pool_refs bereinigen.
+    Kein Retention-Modus (zeit/rtb-spiegel) — nur explizit genannte Namen.
+    """
+    dest_root = pc._norm_remote_path(dest_root).rstrip("/")
+    snapshots_root = f"{dest_root}/_snapshots"
+    env_vars = _load_env_file(env_file)
+
+    to_delete = sorted({s.strip() for s in snap_names if s and s.strip()})
+    _log("[delete-snapshots] ===== START =====")
+    if dry:
+        _log("[delete-snapshots] DRY-RUN — keine Loeschungen")
+    if not to_delete:
+        _log("[delete-snapshots] Keine Snapshot-Namen angegeben")
+        return {"deleted": 0, "errors": 0, "to_delete": []}
+
+    remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
+    _log(f"[delete-snapshots] Explizit: {len(to_delete)} | Remote-Ordner: {len(remote_snaps)}")
+
+    poll_sec = int(_env_get(env_vars, "PCLOUD_RETENTION_DELETE_POLL_SEC", "60") or 60)
+    timeout_sec = int(_env_get(env_vars, "PCLOUD_RETENTION_DELETE_TIMEOUT_SEC", "1200") or 1200)
+    errors = 0
+    deleted = 0
+    deleted_snaps: Set[str] = set()
+
+    for snap in to_delete:
+        snap_path = f"{snapshots_root}/{snap}"
+        on_remote = snap in remote_snaps
+        if not on_remote:
+            _log(f"[delete-snapshots][warn] {snap} — kein Remote-Ordner (Index wird bereinigt)")
+            deleted_snaps.add(snap)
+            continue
+        if dry:
+            _log(f"[dry] deletefolderrecursive({snap_path})")
+            _delete_remote_archive_index(cfg, snapshots_root, snap, dry=True)
+            deleted_snaps.add(snap)
+            continue
+        _log(f"[delete-snapshots] Loesche ({len(deleted_snaps) + 1}/{len(to_delete)}): {snap_path}")
+        try:
+            pc.delete_folder(cfg, path=snap_path, recursive=True)
+            _log("[delete-snapshots] API deletefolderrecursive angenommen — prüfe Entfernung …")
+        except Exception as e:
+            _log(f"[delete-snapshots][warn] API delete {snap}: {e} — prüfe per Polling")
+        if _wait_until_snapshot_gone(
+            cfg, snap_path, snap, poll_sec=poll_sec, timeout_sec=timeout_sec,
+        ):
+            deleted += 1
+            deleted_snaps.add(snap)
+            _delete_remote_archive_index(cfg, snapshots_root, snap, dry=False)
+        else:
+            errors += 1
+            _log(f"[delete-snapshots][ERROR] {snap} noch remote — Index nicht bereinigt")
+
+    if deleted_snaps:
+        index, _ = _load_index(cfg, snapshots_root)
+        purge_stats = _purge_snaps_from_index(index, deleted_snaps)
+        _log(
+            f"[delete-snapshots] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
+            f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt"
+        )
+        _save_index(cfg, snapshots_root, index, env_file, dry=dry)
+    else:
+        _log("[delete-snapshots] Index unveraendert")
+
+    remaining_remote = remote_snaps - deleted_snaps if dry else _list_remote_snapshot_names(cfg, snapshots_root)
+    archive_stats = _purge_orphan_archive_indexes(
+        cfg, snapshots_root, remaining_remote, dry=dry,
+    )
+
+    result = {
+        "deleted": deleted,
+        "errors": errors,
+        "to_delete": to_delete,
+        "archive_purge": archive_stats,
+    }
+
+    if run_gc and not dry:
+        _log("[delete-snapshots] Starte Pool-GC …")
+        gc_result = run_pool_gc(
+            cfg, dest_root, dry=False, audit_mode=False,
+            grace_hours=grace_hours, verbose=verbose,
+        )
+        result["gc"] = gc_result
+    elif run_gc and dry:
+        _log("[delete-snapshots] --run-gc mit --dry-run: GC separat ausfuehren")
+
+    _log("[delete-snapshots] ===== DONE =====")
+    return result
+
+
 def run_retention_apply(
     cfg: dict,
     dest_root: str,
@@ -1256,11 +1357,18 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
                         help="Lokales RTB-Verzeichnis (default: RTB aus .env oder /mnt/backup/rtb_nas)")
     parser.add_argument("--run-gc", action="store_true",
                         help="Nach --retention-apply Pool-GC ausfuehren (ohne --dry-run)")
+    parser.add_argument(
+        "--delete-snapshots",
+        metavar="SNAP,...",
+        help="Gezielt Remote-Snapshots löschen (Komma-Liste), Index bereinigen — kein Retention-Modus",
+    )
     
     args = parser.parse_args()
 
     if args.retention_forecast and args.retention_apply:
         parser.error("--retention-forecast und --retention-apply schliessen sich aus")
+    if args.delete_snapshots and (args.retention_forecast or args.retention_apply):
+        parser.error("--delete-snapshots nicht mit --retention-forecast/--retention-apply kombinieren")
 
     pool_root = args.pool_root or args.dest_root
     if not pool_root:
@@ -1292,6 +1400,22 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
             _log("[retention] ⚠ Abgeschlossen mit Fehlern")
             sys.exit(1)
         _log("[retention] ✓ Erfolgreich abgeschlossen")
+        sys.exit(0)
+
+    if args.delete_snapshots:
+        snap_list = [s.strip() for s in args.delete_snapshots.split(",") if s.strip()]
+        result = run_delete_snapshots(
+            cfg, pool_root, snap_list,
+            dry=args.dry_run,
+            run_gc=args.run_gc,
+            grace_hours=args.grace_hours,
+            verbose=args.verbose,
+            env_file=args.env_file,
+        )
+        if result.get("errors", 0) > 0:
+            _log("[delete-snapshots] ⚠ Abgeschlossen mit Fehlern")
+            sys.exit(1)
+        _log("[delete-snapshots] ✓ Erfolgreich abgeschlossen")
         sys.exit(0)
     
     # Run GC
