@@ -721,7 +721,7 @@ def save_content_index_from_db(cfg: dict, snapshots_root: str, db, *, dry: bool 
         os.chmod(master_path, 0o644)
     except OSError:
         pass
-    db.record_master_fingerprint(master_path)
+    db.refresh_master_metadata(master_path)
     file_size = st.get("bytes") or os.path.getsize(staging_path)
     _log(
         f"[index] ✓ Lokal {pc._format_byte_size(file_size)} in {time.time() - t_local:.1f}s "
@@ -761,7 +761,14 @@ def _open_pool_index_db_for_run():
             return db
         if match is False:
             if auto and os.path.isfile(master):
-                _log("[index-db] Master geaendert (GC/Full-Pool?) → Re-Import")
+                if db.can_skip_master_reimport(master):
+                    db.refresh_master_metadata(master)
+                    _log(
+                        f"[index-db] Master unverändert (SHA256) — kein Re-Import "
+                        f"({db.count_shas()} SHAs)"
+                    )
+                    return db
+                _log("[index-db] Master geändert → Re-Import")
                 db.import_from_json(master, log=_log)
                 return db
             _log("[index-db][warn] DB stale, AUTOIMPORT=0 — Fallback JSON")

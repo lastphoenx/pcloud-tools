@@ -45,7 +45,9 @@ Unverändert: Integrity-Gate (Subprozess, `manifest_scoped`), Phase-4-Upload-Par
 | `PCLOUD_POOL_INDEX_DB_SYNC_ON_GC` | `1` | Nach `delete-snapshots` / `retention-apply` SQLite anpassen |
 | `PCLOUD_POOL_INDEX_DB_SYNC_MODE` | `auto` | `auto`=purge gelöschte Snaps; `import`=voller Import; `skip` |
 
-Stale: GC/Retention schreiben Master-JSON. Mit `SYNC_ON_GC=1` werden gelöschte Snapshots per `purge-snapshot` aus SQLite entfernt (schnell). Voller `import` nur bei `SYNC_MODE=import` oder Auto-Import beim nächsten Delta (Master-mtime).
+**Re-Import-Skip:** In `meta` werden `master_sha256` (Datei-Hash, streaming) und `master_content_digest` (logischer DB-Digest) gespeichert. Wenn GC den Master nur neu schreibt (mtime), aber die Bytes gleich sind, kein 13-Min-Import.
+
+Stale: GC/Retention schreiben Master-JSON. Mit `SYNC_ON_GC=1` werden gelöschte Snapshots per `purge-snapshot` aus SQLite entfernt (schnell). Voller `import` nur bei `SYNC_MODE=import` oder wenn Master-Inhalt wirklich geändert hat.
 
 ---
 

@@ -32,6 +32,17 @@ _HASH_INT_MAX = (1 << 63) - 1
 LogFn = Callable[[str], None]
 
 
+def _hash_file_sha256(path: str, block_size: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(block_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def default_db_path() -> str:
     override = os.environ.get("PCLOUD_POOL_INDEX_DB_PATH")
     if override:
@@ -333,7 +344,13 @@ class PoolIndexDB:
             "pairs": int(c.execute("SELECT COUNT(*) FROM snap_refs").fetchone()[0]),
             "seconds": time.time() - t0,
         }
-        self.record_master_fingerprint(json_path)
+        self.refresh_master_metadata(json_path)
+        content_digest = self.digest()["sha256"]
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_content_digest', ?)",
+            (content_digest,),
+        )
+        self.conn.commit()
         if log:
             log(
                 f"[index-db] Import fertig: {st['shas']} SHAs, {st['pairs']} Paare "
@@ -766,6 +783,46 @@ class PoolIndexDB:
             (str(mtime_ns),),
         )
         self.conn.commit()
+
+    def record_master_file_hash(self, master_path: str) -> Optional[str]:
+        if not os.path.isfile(master_path):
+            return None
+        digest = _hash_file_sha256(master_path)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_sha256', ?)",
+            (digest,),
+        )
+        self.conn.commit()
+        return digest
+
+    def refresh_master_metadata(self, master_path: str) -> None:
+        """mtime/size + Datei-SHA256 nach Import oder Skip-Re-Import."""
+        self.record_master_fingerprint(master_path)
+        self.record_master_file_hash(master_path)
+
+    def master_file_sha256_matches(self, master_path: str) -> Optional[bool]:
+        stored = self.get_meta("master_sha256")
+        if not stored or not os.path.isfile(master_path):
+            return None
+        return _hash_file_sha256(master_path) == stored
+
+    def can_skip_master_reimport(self, master_path: str) -> bool:
+        """
+        Re-Import vermeiden wenn Master-Datei byte-identisch (SHA256) und DB konsistent.
+        mtime/size allein reichen nicht — GC schreibt Master oft neu ohne Inhalt zu ändern.
+        """
+        if self.count_shas() == 0:
+            return False
+        if not os.path.isfile(master_path):
+            return False
+        if self.master_fingerprint_matches(master_path) is True:
+            return True
+        if self.master_file_sha256_matches(master_path) is not True:
+            return False
+        stored_digest = self.get_meta("master_content_digest")
+        if stored_digest and self.digest()["sha256"] != stored_digest:
+            return False
+        return True
 
     def master_fingerprint_matches(self, master_path: str) -> Optional[bool]:
         if not os.path.isfile(master_path):

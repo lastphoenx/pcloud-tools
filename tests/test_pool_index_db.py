@@ -366,6 +366,40 @@ class PoolIndexDbTests(unittest.TestCase):
         finally:
             db3.close()
 
+    def test_skip_reimport_on_same_master_bytes(self) -> None:
+        master = os.path.join(self.dir, "master.json")
+        data = _mini_v2()
+        _write_json(master, data)
+        self.db.import_from_json(master)
+        self.assertEqual(self.db.count_shas(), 4)
+
+        time.sleep(0.05)
+        with open(master, "a", encoding="utf-8") as f:
+            f.write("\n")
+        with open(master, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        with open(master, "w", encoding="utf-8") as f:
+            f.write(raw)
+        self.assertFalse(self.db.master_fingerprint_matches(master))
+        self.assertTrue(self.db.can_skip_master_reimport(master))
+
+        self.db.refresh_master_metadata(master)
+        self.assertTrue(self.db.master_fingerprint_matches(master))
+
+    def test_reimport_when_master_content_changes(self) -> None:
+        master = os.path.join(self.dir, "master2.json")
+        _write_json(master, _mini_v2())
+        self.db.import_from_json(master)
+        changed = _mini_v2()
+        changed["pool_refs"]["ee" * 32] = {
+            "fileid": 44,
+            "hash": 2,
+            "size": 4,
+            "snapshots": {"snap-z": ["z.txt"]},
+        }
+        _write_json(master, changed)
+        self.assertFalse(self.db.can_skip_master_reimport(master))
+
 
 if __name__ == "__main__":
     unittest.main()

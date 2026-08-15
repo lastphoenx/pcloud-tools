@@ -537,7 +537,15 @@ def _sync_pool_index_db_after_master(
                 if n:
                     _log(f"[index-db] purge {snap}: {n} snap_refs")
                     total += n
-        _log(f"[index-db] Sync fertig ({total} snap_refs entfernt; voller Re-Import beim nächsten Delta)")
+            if os.path.isfile(master_path):
+                db.refresh_master_metadata(master_path)
+                digest = db.digest()["sha256"]
+                db.conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_content_digest', ?)",
+                    (digest,),
+                )
+                db.conn.commit()
+        _log(f"[index-db] Sync fertig ({total} snap_refs entfernt)")
     except Exception as e:
         _log(f"[index-db][warn] Sync fehlgeschlagen: {e} — nächster Delta-Lauf reimportiert aus Master")
 
