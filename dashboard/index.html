@@ -866,12 +866,23 @@
       return (allRuns || []).slice(0, 15);
     }
 
+    function humanizeBackupError(msg) {
+      if (!msg) return msg;
+      const m = String(msg).trim();
+      if (m === '143' || m === '137') {
+        return m + ' — SIGTERM/SIGKILL (meist systemd TimeoutStartSec)';
+      }
+      if (/^SIGTERM \(143\)/.test(m) || /^SIGKILL \(137\)/.test(m)) return m;
+      if (m === 'upload_failed') return 'Upload fehlgeschlagen (siehe Log)';
+      return m;
+    }
+
     function backupRunStatusBadge(r) {
       const st = r.status || '\u2014';
       const cls = (st || '').toLowerCase();
       let title = '';
       if (st === 'FAILED' && r.error_message) {
-        title = ' title="' + esc(r.error_message) + '"';
+        title = ' title="' + esc(humanizeBackupError(r.error_message)) + '"';
       }
       return '<span class="badge ' + cls + '"' + title + '>' + esc(st) + '</span>';
     }

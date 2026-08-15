@@ -189,6 +189,9 @@ _db_run_end() {
   
   local status="$1"
   local error_msg="${2:-}"
+  if [[ "$status" == "SUCCESS" ]]; then
+    error_msg=""
+  fi
   
   # Escape single quotes for SQL
   error_msg="${error_msg//\'/\'\\''}"
@@ -197,6 +200,54 @@ _db_run_end() {
     _log WARN "Failed to log run end to database"
     return 1
   }
+}
+
+_decode_exit_reason() {
+  local rc="$1"
+  case "$rc" in
+    143)
+      local timeout_sec=""
+      if command -v systemctl &>/dev/null; then
+        timeout_sec="$(systemctl show backup-pipeline.service -p TimeoutUSec --value 2>/dev/null || true)"
+      fi
+      if [[ -n "$timeout_sec" && "$timeout_sec" != "infinity" && "$timeout_sec" =~ ^[0-9]+$ ]]; then
+        local timeout_h
+        timeout_h="$(awk "BEGIN {printf \"%.1f\", ${timeout_sec}/3600000000}")"
+        echo "SIGTERM (143): systemd TimeoutStartSec (~${timeout_h}h) — Upload zu lang"
+      else
+        echo "SIGTERM (143): systemd stop/timeout oder systemctl stop"
+      fi
+      ;;
+    137) echo "SIGKILL (137): erzwungenes Kill (TimeoutStopSec oder kill -9)" ;;
+    130) echo "SIGINT (130): manuell abgebrochen (Ctrl+C)" ;;
+    0)   echo "Script interrupted" ;;
+    *)   echo "Abbruch exit $rc" ;;
+  esac
+}
+
+_cleanup_remote_gc_lock() {
+  [[ -z "${PCLOUD_DEST:-}" ]] && return 0
+  "${PY}" -c "
+import os, sys
+sys.path.insert(0, os.environ.get('MAIN_DIR', '.'))
+from pcloud_push_json_pool_manifest_to_pcloud import remove_gc_lock
+import pcloud_bin_lib as pc
+cfg = pc.effective_config(env_file=os.environ.get('ENV_FILE', '.env'))
+remove_gc_lock(cfg, os.environ.get('PCLOUD_DEST', '/Backup/rtb_pool'))
+" 2>/dev/null || _log WARN "GC-Lock remote nicht entfernt (manuell prüfen: ${PCLOUD_DEST}/.gc_lock)"
+}
+
+_aborted_run_cleanup() {
+  local rc=$?
+  local reason
+  reason="$(_decode_exit_reason "$rc")"
+  _log WARN "Run abgebrochen: $reason"
+  if [[ "${PCLOUD_ENABLE_DB}" == "1" && -n "${RUN_ID:-}" ]]; then
+    _db_run_end FAILED "$reason"
+    RUN_ID=""
+  fi
+  _cleanup_remote_gc_lock
+  exit "$rc"
 }
 
 # Log phase timing
@@ -777,8 +828,8 @@ fi
 # Initialize database
 _db_init
 
-# Trap for cleanup on exit (preserve original non-zero exit code)
-trap '_rc=$?; _db_run_end FAILED "$_rc" "Script interrupted or failed"; exit "$_rc"' INT TERM ERR
+# SIGTERM/SIGINT: lesbare DB-Meldung + GC-Lock entfernen (ERR absichtlich nicht — Upload-Fehler loggen _db_fail_and_return)
+trap _aborted_run_cleanup INT TERM
 
 # Preflight (Status) + Policy im Wrapper
 PF="DOWN"

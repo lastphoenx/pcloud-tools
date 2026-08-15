@@ -114,11 +114,19 @@ check_systemd_service() {
   # ExecMainStatus         = last exit code of the main process (persistent).
   local show_props
   show_props=$(systemctl show "${service_name}.service" \
-    -p InactiveEnterTimestamp,ActiveEnterTimestamp,ExecMainStatus \
+    -p InactiveEnterTimestamp,ActiveEnterTimestamp,ExecMainStatus,Result,TimeoutUSec \
     2>/dev/null || echo "")
 
   if [[ "$show_props" =~ ExecMainStatus=([0-9]+) ]]; then
     exit_code="${BASH_REMATCH[1]}"
+  fi
+  local svc_result=""
+  if [[ "$show_props" =~ Result=([^[:space:]]+) ]]; then
+    svc_result="${BASH_REMATCH[1]}"
+  fi
+  local timeout_usec=""
+  if [[ "$show_props" =~ TimeoutUSec=([0-9]+) ]]; then
+    timeout_usec="${BASH_REMATCH[1]}"
   fi
 
   # Pick the most useful timestamp
@@ -155,6 +163,20 @@ check_systemd_service() {
   if [[ "$service_name" == "backup-pipeline" ]] && [[ "$exit_code" =~ ^[12]$ ]]; then
     exit_code="${exit_code} (blocked)"
     last_message="Safety-Gate blockierte vorherigen Lauf. Live: ${LIVE_SG_STATUS:-N/A}. Nachricht: ${last_message}"
+  elif [[ "$svc_result" == "timeout" ]]; then
+    local timeout_h=""
+    if [[ -n "$timeout_usec" && "$timeout_usec" =~ ^[0-9]+$ ]]; then
+      timeout_h="$(awk "BEGIN {printf \"%.1f\", ${timeout_usec}/3600000000}")"
+    fi
+    exit_code="${exit_code} (systemd-timeout)"
+    if [[ -n "$timeout_h" ]]; then
+      last_message="TimeoutStartSec≈${timeout_h}h — Upload nicht fertig (journal: state=timeout). ${last_message}"
+    else
+      last_message="systemd TimeoutStartSec — Upload nicht fertig. ${last_message}"
+    fi
+  elif [[ "$exit_code" == "143" ]]; then
+    exit_code="143 (SIGTERM)"
+    last_message="SIGTERM — oft systemd TimeoutStartSec oder systemctl stop. ${last_message}"
   elif [[ "$exit_code" != "0" && "$exit_code" != "unknown" ]] && [[ "$exit_code" =~ ^[0-9]+$ ]]; then
     exit_code="${exit_code} (error)"
   fi
