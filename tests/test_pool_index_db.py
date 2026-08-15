@@ -400,6 +400,31 @@ class PoolIndexDbTests(unittest.TestCase):
         _write_json(master, changed)
         self.assertFalse(self.db.can_skip_master_reimport(master))
 
+    def test_snapshot_registered_shas_and_coords(self) -> None:
+        master = os.path.join(self.dir, "m.json")
+        _write_json(master, _mini_v2())
+        self.db.import_from_json(master)
+        aa = "aa" * 32
+        registered = self.db.snapshot_registered_shas("snap-a")
+        self.assertIn(aa, registered)
+        fid, phash, size = self.db.sha_coords(aa)
+        self.assertEqual(fid, 11)
+        self.assertEqual(size, 100)
+        lacking = self.db.shas_lacking_fileid([aa, "dd" * 32, "xx" * 32])
+        self.assertIn("dd" * 32, lacking)
+        self.assertIn("xx" * 32, lacking)
+        self.assertNotIn(aa, lacking)
+
+    def test_update_sha_coords(self) -> None:
+        sha = "ff" * 32
+        self.db.update_sha_coords(sha, 99, 12345, 50)
+        fid, phash, size = self.db.sha_coords(sha)
+        self.assertEqual(fid, 99)
+        self.assertEqual(size, 50)
+        self.db.update_sha_coords(sha, None, None, None)
+        fid2, _, _ = self.db.sha_coords(sha)
+        self.assertEqual(fid2, 99)
+
 
 if __name__ == "__main__":
     unittest.main()

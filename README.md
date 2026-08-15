@@ -131,7 +131,7 @@ Mit `PCLOUD_POOL_INDEX_DB=1` liegt der Arbeitsindex auf der SSD statt als Riesen
 | Thema | Ohne SQLite | Mit SQLite (`PCLOUD_POOL_INDEX_DB=1`) |
 |-------|-------------|----------------------------------------|
 | Index im Upload | ~900 MB JSON + Dict im RAM | Datei `pool_index.sqlite3` auf SSD2 |
-| Snapshot-Registrierung | 100k+ Einzel-Updates im Dict | SQL-Bulk-Updates (`register_batch`) |
+| Turbo-Delta + Full-Pool | Dict + `_register_snap` | SQL-Bulk-Updates (`register_batch`) |
 | RTB „hat sich was geändert?“ | `rsync --dry-run` über alle Dateien → OOM-Risiko | Signature-Scan (`RTB_TRIGGER_MODE=signature` im rtb-Repo) |
 | Manifest-Erstellung | — | Streaming / Resume (kein Voll-Load nötig) |
 

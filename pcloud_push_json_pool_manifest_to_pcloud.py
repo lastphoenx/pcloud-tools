@@ -3185,7 +3185,8 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             remove_gc_lock(cfg, dest_root, dry=dry)
         except Exception as e:
             _log(f"[WARN] Lock-Cleanup fehlgeschlagen: {e}")
-    
+
+    db = None
     try:
         # === Ab hier: Eigentlicher Upload-Code (Lock aktiv!) ===
         
@@ -3217,6 +3218,22 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _log("[pool-mode] Scout übersprungen (Fallback nach Delta-Fehler) → Full-Pool-Mode")
         else:
             _log("[pool-mode] Scout deaktiviert (PCLOUD_SCOUT_ENABLED=0)")
+
+        # Full-Pool: SQLite-Arbeitsindex (Turbo-Delta oeffnet eigenes db-Handle)
+        _pending_refs: list = []
+        if not dry:
+            db = _open_pool_index_db_for_run()
+            if db is not None:
+                _log("[pool-mode] SQLite-Arbeitsindex aktiv (Full-Pool)")
+
+        def _full_pool_db_flush() -> int:
+            if db is None or not _pending_refs:
+                return 0
+            n = db.register_batch(snapshot_name, _pending_refs)
+            _pending_refs.clear()
+            if n:
+                _log(f"[pool-mode][index-db] {n} Refs registriert (batch)")
+            return n
         
         # === Timeout-Protection (wie Original!) ===
         if "timeout" not in cfg or cfg.get("timeout", 0) < 30:
@@ -3298,26 +3315,39 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             except Exception:
                 pass
         
-        # === LOKALER INDEX-CACHE (wie Original!) ===
+        # === LOKALER INDEX-CACHE (Legacy) oder SQLite ===
         import tempfile
         _local_index_dir = _default_temp_dir()
         _local_index_path = os.path.join(_local_index_dir, f"pcloud_pool_index_{snapshot_name}.json")
         os.makedirs(_local_index_dir, exist_ok=True)
-        
-        # Index laden: erst lokal (falls vorhanden), sonst von pCloud
-        if os.path.exists(_local_index_path):
-            _log(f"[resume] Lade lokalen Index: {_local_index_path}")
-            index = load_content_index_local(_local_index_path)
+
+        index = None
+        pool_refs: dict = {}
+
+        if db is not None:
+            if incomplete_upload:
+                _purged = db.purge_snapshot(snapshot_name)
+                if _purged > 0 and not dry:
+                    save_content_index_from_db(cfg, snapshots_root, db, dry=False)
+                    _log(
+                        f"[pool-mode] Stammdaten bereinigt: {snapshot_name} aus "
+                        f"{_purged} pool_refs-Eintraegen (SQLite, Resume)"
+                    )
+            _log(f"[pool-mode] Index DB ({db.count_shas()} SHAs)")
         else:
-            index = load_content_index(cfg, snapshots_root)
-        items = index.setdefault("items", {})
-        
-        # Pool-Refs-Struktur (für Pool-Mode)
-        pool_refs = index.setdefault("pool_refs", {})  # SHA256 → [snapshot1, snapshot2, ...]
+            # Index laden: erst lokal (falls vorhanden), sonst von pCloud
+            if os.path.exists(_local_index_path):
+                _log(f"[resume] Lade lokalen Index: {_local_index_path}")
+                index = load_content_index_local(_local_index_path)
+            else:
+                index = load_content_index(cfg, snapshots_root)
+            items = index.setdefault("items", {})
+            pool_refs = index.setdefault("pool_refs", {})
         
         # ============================================================================
         # === PREFLIGHT: DELTA-BERECHNUNG (VOR Upload!) ===
         # ============================================================================
+        index_changed = False
         _log("[pool-mode] Preflight: Berechne Upload-Delta...")
         t_preflight_start = time.time()
         
@@ -3380,35 +3410,46 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             physical_pool_sha256s = set()
         
         # 3. Index-basierte SHA256s (für Vergleich & Index-Reparatur-Erkennung)
-        index_pool_sha256s = set(pool_refs.keys())
-        _log(f"[preflight] Index: {len(index_pool_sha256s)} SHA256s registriert")
+        if db is not None:
+            index_pool_sha256s_count = db.count_shas()
+            _log(f"[preflight] Index (SQLite): {index_pool_sha256s_count} SHA256s registriert")
+            registered_for_snap = db.snapshot_registered_shas(snapshot_name)
+        else:
+            index_pool_sha256s = set(pool_refs.keys())
+            _log(f"[preflight] Index: {len(index_pool_sha256s)} SHA256s registriert")
+            registered_for_snap = None
         
         # 4. Delta-Liste: SHA256s die PHYSISCH Upload benötigen (nicht mehr Index-basiert!)
         delta_sha256s = set(manifest_sha256_to_item.keys()) - physical_pool_sha256s
         
         # 5. Reused-Liste: SHA256s PHYSISCH im Pool (für diesen Snapshot aber neu)
-        # Prüfe ob bereits für DIESEN Snapshot registriert
-        already_in_snapshot = set()
-        for sha in manifest_sha256_to_item.keys():
-            if snapshot_name in _snap_names(pool_refs.get(sha)):
-                already_in_snapshot.add(sha)
+        if db is not None:
+            already_in_snapshot = set(manifest_sha256_to_item.keys()) & registered_for_snap
+        else:
+            already_in_snapshot = set()
+            for sha in manifest_sha256_to_item.keys():
+                if snapshot_name in _snap_names(pool_refs.get(sha)):
+                    already_in_snapshot.add(sha)
         
         # Echte Reused: Physisch vorhanden, aber nicht für diesen Snapshot
         reused_sha256s = (set(manifest_sha256_to_item.keys()) & physical_pool_sha256s) - already_in_snapshot
         
         # 6. Index-Reparatur-Kandidaten: Physisch vorhanden, aber nicht im Index (oder unvollständig)
-        # Wir betrachten auch Files als reparaturbedürftig, die zwar im Index sind, aber keine fileid haben.
-        needs_index_update = set()
-        for sha in reused_sha256s:
-            entry = pool_refs.get(sha)
-            if not entry or (isinstance(entry, dict) and not entry.get("fileid")):
-                needs_index_update.add(sha)
+        if db is not None:
+            needs_index_update = db.shas_lacking_fileid(list(reused_sha256s))
+        else:
+            needs_index_update = set()
+            for sha in reused_sha256s:
+                entry = pool_refs.get(sha)
+                if not entry or (isinstance(entry, dict) and not entry.get("fileid")):
+                    needs_index_update.add(sha)
         
         if needs_index_update:
             _log(f"[preflight] ⚠️ Index-Reparatur nötig: {len(needs_index_update)} Files im Pool benötigen Metadaten-Erfassung")
             _log(f"[preflight]    → Erfasse fileids via stat_file...")
             for sha in needs_index_update:
-                if dry: continue
+                if dry:
+                    continue
                 try:
                     p_path = f"{dest_root.rstrip('/')}/{_get_pool_path(sha)}"
                     md = pc.stat_file_safe(cfg, path=p_path)
@@ -3416,19 +3457,20 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                         fid = md["fileid"]
                         phash = md.get("hash")
                         size = md.get("size")
-                        
-                        # Coords nachtragen, Snapshots-Map (inkl. relpaths) ERHALTEN
-                        entry = pool_refs.get(sha)
-                        if not isinstance(entry, dict):
-                            entry = {"fileid": None, "hash": None, "size": None,
-                                     "snapshots": {n: [] for n in _snap_names(entry)}}
-                            pool_refs[sha] = entry
-                        elif not isinstance(entry.get("snapshots"), dict):
-                            entry["snapshots"] = {n: [] for n in _snap_names(entry)}
-                        entry["fileid"] = fid
-                        entry["hash"] = phash
-                        entry["size"] = size
-                        index_changed = True
+                        if db is not None:
+                            db.update_sha_coords(sha, fid, phash, size)
+                        else:
+                            entry = pool_refs.get(sha)
+                            if not isinstance(entry, dict):
+                                entry = {"fileid": None, "hash": None, "size": None,
+                                         "snapshots": {n: [] for n in _snap_names(entry)}}
+                                pool_refs[sha] = entry
+                            elif not isinstance(entry.get("snapshots"), dict):
+                                entry["snapshots"] = {n: [] for n in _snap_names(entry)}
+                            entry["fileid"] = fid
+                            entry["hash"] = phash
+                            entry["size"] = size
+                            index_changed = True
                 except Exception:
                     pass
         
@@ -3454,7 +3496,6 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         uploaded = 0
         resumed = len(reused_items)  # Bereits VORAB gezählt (aus Pool wiederverwendet)
         stubs = 0
-        index_changed = False
         stubs_to_write: list[tuple[str, dict]] = []
 
         # === UPLOAD-FUNKTION (Pool-spezifisch, aber wie Original _upload_real_file!) ===
@@ -3827,14 +3868,22 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             _hl_hash = None
             with _state_lock:
                 if ino_key in seen_inodes:
-                    _entry = pool_refs.get(sha)
-                    if isinstance(_entry, dict) and _entry.get("fileid"):
-                        _hl_fileid = _entry.get("fileid")
-                        _hl_hash = _entry.get("hash")
-                        if snapshot_name not in _snap_names(_entry):
-                            index_changed = True
-                        _register_snap(pool_refs, sha, snapshot_name, relpath)
-                        resumed += 1
+                    if db is not None:
+                        _hl_fileid, _hl_hash, _hl_size = db.sha_coords(sha)
+                        if _hl_fileid:
+                            _pending_refs.append(
+                                (sha, relpath, _hl_fileid, _hl_hash, it.get("size"))
+                            )
+                            resumed += 1
+                    else:
+                        _entry = pool_refs.get(sha)
+                        if isinstance(_entry, dict) and _entry.get("fileid"):
+                            _hl_fileid = _entry.get("fileid")
+                            _hl_hash = _entry.get("hash")
+                            if snapshot_name not in _snap_names(_entry):
+                                index_changed = True
+                            _register_snap(pool_refs, sha, snapshot_name, relpath)
+                            resumed += 1
             if _hl_fileid:
                 try:
                     with _metrics_lock:
@@ -3850,9 +3899,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 
                 # Update Pool-Refs (thread-safe) - v2 (snapshots=Map snap->[relpaths])
                 with _state_lock:
-                    _register_snap(pool_refs, sha, snapshot_name, relpath,
-                                   fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
-                    index_changed = True
+                    if db is not None:
+                        _pending_refs.append(
+                            (sha, relpath, pool_fileid, pcloud_hash, it.get("size"))
+                        )
+                    else:
+                        _register_snap(pool_refs, sha, snapshot_name, relpath,
+                                       fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
+                        index_changed = True
                     uploaded += 1
                 
                 # Stub queuen
@@ -3870,9 +3924,14 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                     cfg, pool_path_abs, e, context=relpath)
                 if pool_fileid:
                     with _state_lock:
-                        _register_snap(pool_refs, sha, snapshot_name, relpath,
-                                       fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
-                        index_changed = True
+                        if db is not None:
+                            _pending_refs.append(
+                                (sha, relpath, pool_fileid, pcloud_hash, it.get("size"))
+                            )
+                        else:
+                            _register_snap(pool_refs, sha, snapshot_name, relpath,
+                                           fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
+                            index_changed = True
                         uploaded += 1
                     _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
                 else:
@@ -3888,12 +3947,15 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _count_trigger = _SAVE_INTERVAL > 0 and (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
                 _time_trigger = _SAVE_INTERVAL_TIME > 0 and (_now_save - _t_last_index_save) >= _SAVE_INTERVAL_TIME
                 if not dry and (_count_trigger or _time_trigger):
-                    save_content_index_local(_local_index_path, index)
+                    if db is not None:
+                        _full_pool_db_flush()
+                    else:
+                        save_content_index_local(_local_index_path, index)
                     _last_saved_count = uploaded + resumed + stubs
                     _t_last_index_save = _now_save
                     if os.environ.get("PCLOUD_VERBOSE") == "1":
                         _reason = "count" if _count_trigger else "time"
-                        print(f"[index] Lokal gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
+                        print(f"[index] Zwischenstand gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
         
         def _process_reused_file(it: dict) -> None:
             """
@@ -3908,14 +3970,17 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             if not sha:
                 return
             
-            # Pool-Path und FileID holen - NEU: Erst Index, dann API
+            # Pool-Path und FileID holen - SQLite oder Dict, dann API-Fallback
             pool_fileid = None
             pcloud_hash = None
             
-            entry = pool_refs.get(sha)
-            if isinstance(entry, dict):
-                pool_fileid = entry.get("fileid")
-                pcloud_hash = entry.get("hash")
+            if db is not None:
+                pool_fileid, pcloud_hash, _ = db.sha_coords(sha)
+            else:
+                entry = pool_refs.get(sha)
+                if isinstance(entry, dict):
+                    pool_fileid = entry.get("fileid")
+                    pcloud_hash = entry.get("hash")
             
             if not pool_fileid:
                 # Fallback: API fragen (und Index reparieren)
@@ -3934,11 +3999,16 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _log(f"[ERROR] Reused-File {relpath}: Pool-Metadaten nicht findbar (SHA={sha[:16]}...)")
                 return
 
-            # Update Pool-Refs (Snapshots registrieren) - v2 (snapshots=Map snap->[relpaths])
+            # Snapshot-Referenz registrieren
             with _state_lock:
-                _register_snap(pool_refs, sha, snapshot_name, relpath,
-                               fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
-                index_changed = True
+                if db is not None:
+                    _pending_refs.append(
+                        (sha, relpath, pool_fileid, pcloud_hash, it.get("size"))
+                    )
+                else:
+                    _register_snap(pool_refs, sha, snapshot_name, relpath,
+                                   fileid=pool_fileid, hash=pcloud_hash, size=it.get("size"))
+                    index_changed = True
             
             # Stub queuen
             _queue_stub(relpath, it, pool_fileid, pcloud_hash, sha)
@@ -3991,79 +4061,108 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             write_ms += (time.time() - t0) * 1000.0
         
         # ============================================================================
-        # === INDEX SCHREIBEN (1:1 wie Original!) ===
+        # === FINALIZE: Index + Gate + Complete ===
         # ============================================================================
+        gate_index: dict = {"pool_refs": {}}
         if dry:
-            print(f"[dry] write index: {snapshots_root}/_index/content_index.json (pool_refs={len(pool_refs)})")
+            n_refs = len(pool_refs) if pool_refs else (db.count_shas() if db else 0)
+            print(
+                f"[dry] write index: {snapshots_root}/_index/content_index.json "
+                f"(pool_refs~={n_refs})"
+            )
         else:
-            # Finaler lokaler Save (falls noch Änderungen seit letztem periodischen Save)
-            if index_changed:
-                save_content_index_local(_local_index_path, index)
-                if os.environ.get("PCLOUD_VERBOSE") == "1":
-                    print(f"[index] Finaler lokaler Save vor Upload")
-            
-            # Index hochladen nach pCloud
-            if os.path.exists(_local_index_path):
-                t0 = time.time()
-                save_content_index(cfg, snapshots_root, index, dry=False)
-                dt_ms = (time.time() - t0) * 1000.0
-                write_ms += dt_ms
-                print(f"[timing] index_write_ms={int(dt_ms)}")
-                
-                # Remote archivieren: gefilterter Snapshot-Index (nicht voller Master-Klon)
-                try:
-                    archive_snapshot_index_remote(cfg, snapshots_root, index, snapshot_name, dry=False)
-                except Exception as e:
-                    _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
-                
-                # Master-Index aktualisieren (alle Snapshots zusammen)
-                try:
-                    master_index_path = os.path.join(os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"), "indexes", "content_index_master.json")
-                    os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
-                    save_content_index_local(master_index_path, index)
-                    _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
-                except Exception as e:
-                    _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
-                
-                # Lokale Index-Datei löschen
-                try:
-                    os.remove(_local_index_path)
+            if db is not None:
+                _full_pool_db_flush()
+                want_files = len(manifest_files)
+                have_pairs = db.snapshot_pair_count(snapshot_name)
+                if have_pairs != want_files:
+                    raise RuntimeError(
+                        f"[index-db] Ref-Invariante Full-Pool: {have_pairs} != {want_files} "
+                        f"(Snapshot NICHT finalisiert)"
+                    )
+                gate_index = db.build_snapshot_index(snapshot_name)
+                _log(
+                    f"[pool-mode][index-db] Gate-Index: "
+                    f"{len(gate_index.get('pool_refs', {}))} SHAs im Snapshot-Scope"
+                )
+            elif index is not None:
+                gate_index = index
+                if index_changed:
+                    save_content_index_local(_local_index_path, index)
                     if os.environ.get("PCLOUD_VERBOSE") == "1":
-                        print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
-                except Exception as e:
-                    print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
-        
-        if not dry:
+                        print("[index] Finaler lokaler Save vor Upload")
+                if os.path.exists(_local_index_path):
+                    t0 = time.time()
+                    save_content_index(cfg, snapshots_root, index, dry=False)
+                    dt_ms = (time.time() - t0) * 1000.0
+                    write_ms += dt_ms
+                    print(f"[timing] index_write_ms={int(dt_ms)}")
+                    try:
+                        archive_snapshot_index_remote(
+                            cfg, snapshots_root, index, snapshot_name, dry=False
+                        )
+                    except Exception as e:
+                        _log(f"[index][warn] Remote-Archivierung fehlgeschlagen: {e}")
+                    try:
+                        master_index_path = os.path.join(
+                            os.getenv("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"),
+                            "indexes",
+                            "content_index_master.json",
+                        )
+                        os.makedirs(os.path.dirname(master_index_path), exist_ok=True)
+                        save_content_index_local(master_index_path, index)
+                        _log(f"[index] ✓ Master-Index aktualisiert: {master_index_path}")
+                    except Exception as e:
+                        _log(f"[index][warn] Master-Index-Update fehlgeschlagen: {e}")
+                    try:
+                        os.remove(_local_index_path)
+                        if os.environ.get("PCLOUD_VERBOSE") == "1":
+                            print(f"[index] Lokale Kopie gelöscht: {_local_index_path}")
+                    except Exception as e:
+                        print(f"[warn] Konnte lokale Index-Datei nicht löschen: {e}")
+
             _post_upload_gate(
-                cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
-                dry=dry, mode_label="pool-mode",
+                cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root,
+                gate_index, dry=dry, mode_label="pool-mode",
             )
 
-        # === COMPLETE-MARKER SETZEN (wie Original!) ===
-        if not dry:
-            try:
-                marker_data = {
-                    "snapshot": snapshot_name,
-                    "completed_at": time.time(),
-                    "uploaded": uploaded,
-                    "stubs": stubs,
-                    "resumed": resumed,
-                    "duration": time.time() - t_phase_start,
-                    "mode": "pool"
-                }
-                marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
-                if not marker_fid:
-                    marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-                pc.write_json_to_folderid(cfg, folderid=int(marker_fid), filename=".upload_complete", obj=marker_data, minify=True)
-                _log(f"[info] Upload-Complete-Marker gesetzt: {marker_complete}")
-            except Exception as e:
-                _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
-            
-            # === TIMING-STATS (wie Original!) ===
+            marker_data = {
+                "snapshot": snapshot_name,
+                "completed_at": time.time(),
+                "uploaded": uploaded,
+                "stubs": stubs,
+                "resumed": resumed,
+                "duration": time.time() - t_phase_start,
+                "mode": "pool",
+            }
+            if db is not None:
+                _finalize_after_validation_delta(
+                    cfg, snapshots_root, gate_index, snapshot_name, dest_snapshot_dir,
+                    marker_data, dry=False, db=db,
+                )
+            else:
+                try:
+                    marker_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
+                    if not marker_fid:
+                        marker_fid = pc.ensure_path(cfg, dest_snapshot_dir)
+                    pc.write_json_to_folderid(
+                        cfg, folderid=int(marker_fid), filename=".upload_complete",
+                        obj=marker_data, minify=True,
+                    )
+                    _log(f"[info] Upload-Complete-Marker gesetzt: {marker_complete}")
+                except Exception as e:
+                    _log(f"[warn] Konnte Complete-Marker nicht setzen: {e}")
+
             total_duration = time.time() - t_phase_start
-            _log(f"[pool-mode] Upload abgeschlossen: {uploaded} new anchors, {resumed} reused anchors, {stubs} stubs queued ({total_duration:.1f}s)")
-            _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)} ensure_ms={int(ensure_ms)}")
-            
+            _log(
+                f"[pool-mode] Upload abgeschlossen: {uploaded} new anchors, "
+                f"{resumed} reused anchors, {stubs} stubs queued ({total_duration:.1f}s)"
+            )
+            _log(
+                f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)} "
+                f"ensure_ms={int(ensure_ms)}"
+            )
+
             return {
                 "uploaded": uploaded,
                 "resumed": resumed,
@@ -4071,10 +4170,17 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 "duration": total_duration,
                 "upload_ms": upload_ms,
                 "write_ms": write_ms,
-                "ensure_ms": ensure_ms
+                "ensure_ms": ensure_ms,
+                "mode": "pool",
+                "index_db": db is not None,
             }
         
     finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
         # === CLEANUP: GC-Lock IMMER entfernen (auch bei Fehler!) ===
         _cleanup_lock()
 

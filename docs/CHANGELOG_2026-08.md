@@ -360,7 +360,9 @@ sudo systemctl enable --now monitoring-status-quick.timer
 
 ## 16. C1 Pool-Index SQLite (Hybrid)
 
-Delta-Mode kann `pool_refs` lokal in SQLite halten statt ~100k `_register_snap` auf dem 913-MB-Dict. Remote-Format unverändert (`content_index.json` Chunk-Upload). **Default aus** (`PCLOUD_POOL_INDEX_DB=0`). **pi-nas produktiv:** `1`.
+Delta-Mode und **Full-Pool** können `pool_refs` lokal in SQLite halten statt ~100k `_register_snap` auf dem 913-MB-Dict. Remote-Format unverändert (`content_index.json` Chunk-Upload). **Default aus** (`PCLOUD_POOL_INDEX_DB=0`). **pi-nas produktiv:** `1`.
+
+**Full-Pool-Test:** `PCLOUD_SCOUT_ENABLED=0` + `--upload-only` erzwingt Stub-/Ordner-Pfad mit SQLite (kein `copyfolder`).
 
 - Doku / Migration / Rollback: [POOL_INDEX_DB.md](POOL_INDEX_DB.md)
 - Tag: `pre-c1-pool-index-db-2026-08-14` (`3ab8eea`)

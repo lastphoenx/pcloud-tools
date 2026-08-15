@@ -50,9 +50,10 @@ Alter Delta-Pfad (ohne `PCLOUD_POOL_INDEX_DB`):
 Mit `PCLOUD_POOL_INDEX_DB=1`:
 
 1. Index liegt auf SSD2 als `pool_index.sqlite3` (mit WAL-Dateien `-wal` / `-shm`)
-2. Unveränderte Dateien vom Basis-Snapshot werden per SQL-Bulk-Merge übernommen (nicht einzeln im Dict)
-3. Phase 4 registriert nur neue/geänderte/wiederverwendete Einträge per `register_batch`
-4. Am Ende: Streaming-Export → JSON → bestehender Chunk-Upload nach pCloud
+2. **Turbo-Delta** und **Full-Pool** nutzen SQLite (kein 900-MB-Dict im RAM)
+3. Unveränderte Dateien vom Basis-Snapshot werden per SQL-Bulk-Merge übernommen (Delta)
+4. Full-Pool: `register_batch` statt `_register_snap` auf Dict
+5. Am Ende: Streaming-Export → JSON → bestehender Chunk-Upload nach pCloud
 
 **Unverändert:** Integrity-Gate, parallele Uploads in Phase 4, JSON-Schema in der Cloud.
 

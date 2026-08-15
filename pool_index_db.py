@@ -249,6 +249,83 @@ class PoolIndexDB:
         ).fetchone()
         return int(row[0])
 
+    def snapshot_registered_shas(self, snapshot: str) -> set[str]:
+        """SHA256-Hashes, die fuer diesen Snapshot bereits in snap_refs stehen."""
+        rows = self.conn.execute(
+            """
+            SELECT s.sha FROM snap_refs r
+            JOIN snapshots n ON n.id = r.snap_id
+            JOIN shas s ON s.id = r.sha_id
+            WHERE n.name = ?
+            """,
+            (snapshot,),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def sha_coords(self, sha: str) -> Tuple[Optional[int], Optional[str], Optional[int]]:
+        """Liefert (fileid, hash, size) fuer einen SHA — oder (None, None, None)."""
+        sha_l = (sha or "").lower()
+        if not sha_l:
+            return (None, None, None)
+        row = self.conn.execute(
+            "SELECT fileid, hash, size FROM shas WHERE sha = ?", (sha_l,)
+        ).fetchone()
+        if not row:
+            return (None, None, None)
+        return (row[0], row[1], row[2])
+
+    def shas_lacking_fileid(self, sha_list: List[str]) -> set[str]:
+        """SHAs ohne fileid in shas (oder noch nicht in der DB)."""
+        normalized = [(s or "").lower() for s in sha_list if s]
+        if not normalized:
+            return set()
+        lacking: set[str] = set()
+        chunk_size = 500
+        for i in range(0, len(normalized), chunk_size):
+            chunk = normalized[i : i + chunk_size]
+            ph = ",".join("?" * len(chunk))
+            known = {
+                r[0]
+                for r in self.conn.execute(
+                    f"SELECT sha FROM shas WHERE sha IN ({ph})", chunk
+                ).fetchall()
+            }
+            lacking.update(set(chunk) - known)
+            rows = self.conn.execute(
+                f"SELECT sha FROM shas WHERE sha IN ({ph}) AND fileid IS NULL", chunk
+            ).fetchall()
+            lacking.update(r[0] for r in rows)
+        return lacking
+
+    def update_sha_coords(
+        self,
+        sha: str,
+        fileid: Optional[int],
+        phash: Any,
+        size: Any,
+    ) -> None:
+        """Aktualisiert Pool-Metadaten (fileid/hash/size) ohne Snapshot-Ref."""
+        sha_l = (sha or "").lower()
+        if not sha_l:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO shas(sha, fileid, hash, size) VALUES (?,?,?,?)
+            ON CONFLICT(sha) DO UPDATE SET
+              fileid = CASE
+                WHEN excluded.fileid IS NOT NULL THEN excluded.fileid
+                ELSE shas.fileid END,
+              hash = CASE
+                WHEN excluded.hash IS NOT NULL THEN excluded.hash
+                ELSE shas.hash END,
+              size = CASE
+                WHEN excluded.size IS NOT NULL THEN excluded.size
+                ELSE shas.size END
+            """,
+            (sha_l, fileid, _hash_text(phash), size),
+        )
+        self.conn.commit()
+
     def _ensure_snapshot(self, name: str) -> int:
         self.conn.execute(
             "INSERT OR IGNORE INTO snapshots(name) VALUES (?)", (name,)
