@@ -61,7 +61,7 @@ Don't be surprised by occasionally funny commits, lots of emojis 🚀✨, and ot
 
 - [Repositories & Zusammenspiel](#repositories--zusammenspiel)
 - [Pool-Modell (kurz)](#pool-modell-kurz)
-- [RAM & C1 SQLite-Index](#ram--c1-sqlite-index)
+- [Speicher (RAM) auf dem Raspberry Pi](#speicher-ram-auf-dem-raspberry-pi)
 - [Durchlaufzeiten & Phasen](#durchlaufzeiten--phasen)
 - [Installation](#installation)
 - [Kern-Tools](#kern-tools)
@@ -100,76 +100,108 @@ Legacy 1to1: `rtb_wrapper.sh` → `legacy/wrapper_pcloud_sync_1to1.sh` (eingeste
 
 ## Pool-Modell (kurz)
 
-| Ort | Inhalt |
-|-----|--------|
-| `_pool/XX/<sha256>` | Physische Datei (dedupliziert, 1× pro SHA) |
-| `_snapshots/<snap>/<path>.meta.json` | Stub (Verweis auf Pool) |
-| `_snapshots/<snap>/.upload_complete` | Snapshot gültig (nach Integrity-Gate) |
-| `_snapshots/_index/content_index.json` | Master-Index `pool_refs` (~700–960 MB) |
+pCloud speichert Backups in zwei Schichten:
 
-**Modi:** Scout → **Turbo-Delta** (Basis-Snapshot klonen + Diff) oder **Full-Pool** (kein passender Basis-Snap). Keine Anchor-Ketten wie im alten 1to1-Modus.
+1. **Pool** — die echten Datei-Inhalte, einmal pro SHA256-Hash (`_pool/…`)
+2. **Snapshots** — Verzeichnisstruktur als kleine JSON-Stubs (`_snapshots/<datum>/…`), die nur auf den Pool verweisen
+
+| Ort auf pCloud | Was dort liegt |
+|----------------|----------------|
+| `_pool/XX/<sha256>` | Physische Datei (gleicher Hash = nur eine Kopie) |
+| `_snapshots/<snap>/<pfad>.meta.json` | Stub: „Diese Datei in diesem Snapshot hat Hash X“ |
+| `_snapshots/<snap>/.upload_complete` | Marker: Snapshot vollständig und geprüft |
+| `_snapshots/_index/content_index.json` | Gesamtliste aller Hashes + Snapshot-Zuordnung (~700–960 MB) |
+
+**Upload-Strategie:** Das Tool sucht zuerst einen passenden alten Snapshot in der Cloud (**Scout**). Wenn einer passt, wird die Struktur per `copyfolder` geklont und nur Änderungen nachgezogen (**Turbo-Delta**). Sonst wird alles neu aufgebaut (**Full-Pool**).
 
 ---
 
-## RAM & C1 SQLite-Index
+## Speicher (RAM) auf dem Raspberry Pi
 
-Auf **8 GB RAM** (Pi 5 + ClamAV ~1,5 GB) sind große Delta-Läufe RAM-kritisch.
+**Ausgangslage:** pi-nas hat **8 GB RAM**. ClamAV und EntropyWatcher belegen dauerhaft ~1,5 GB. Beim Cloud-Upload muss das System wissen, welche Datei-Hashes schon im Pool liegen und in welchen Snapshots sie vorkommen — das ist der **Pool-Index** (lokal oft ~900 MB JSON, in der Cloud als `content_index.json`).
 
-| Komponente | RAM (typisch) | Mitigation |
-|------------|---------------|------------|
-| Legacy Delta (Dict `pool_refs`) | ~900 MB Master-JSON + 100k `_register_snap` | **C1:** `PCLOUD_POOL_INDEX_DB=1` |
-| C1 SQLite (`pool_index.sqlite3`) | ~2–4 GB Spitze beim Lauf; kein 913-MB-Dict für Phase 4 | Bulk-Merge per SQL; `register_batch` statt Dict |
-| Manifest (Smart-Ref) | Streaming / JSONL-Resume | `pcloud_bin_lib` Manifest-Lib |
-| RTB Trigger | früher `rsync -ni` Vollbaum → OOM | **Signature-Trigger** (`RTB_TRIGGER_MODE=signature`, rtb) |
-| Re-Import Master→SQLite | ~15 min, ~4 GB (169k SHAs) | **Re-Import-Skip** via `master_sha256` ([POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)) |
+### Problem: Index im RAM
 
-**pi-nas:** `PCLOUD_POOL_INDEX_DB=1`, Index auf SSD2 (`/srv/pcloud-archive/indexes/`).  
-Diagnose: `python3 pool_index_db.py status` · Backfill: `python3 pool_index_db.py refresh-meta`
+Ohne Optimierung lädt der Upload-Prozess diesen Index als großes Python-Dictionary und aktualisiert ihn für jede Datei einzeln. Bei ~114.000 Dateien pro Snapshot reicht das RAM nicht — der Prozess stirbt (OOM) oder wird vom Kernel gekillt.
+
+### Lösung: Index in SQLite (intern „C1“)
+
+Mit `PCLOUD_POOL_INDEX_DB=1` liegt der Arbeitsindex auf der SSD statt als Riesen-Dict im RAM:
+
+| Thema | Ohne SQLite | Mit SQLite (`PCLOUD_POOL_INDEX_DB=1`) |
+|-------|-------------|----------------------------------------|
+| Index im Upload | ~900 MB JSON + Dict im RAM | Datei `pool_index.sqlite3` auf SSD2 |
+| Snapshot-Registrierung | 100k+ Einzel-Updates im Dict | SQL-Bulk-Updates (`register_batch`) |
+| RTB „hat sich was geändert?“ | `rsync --dry-run` über alle Dateien → OOM-Risiko | Signature-Scan (`RTB_TRIGGER_MODE=signature` im rtb-Repo) |
+| Manifest-Erstellung | — | Streaming / Resume (kein Voll-Load nötig) |
+
+**Wichtig:** Nach jedem Lauf wird der Index weiter als JSON nach pCloud hochgeladen. SQLite ist nur der **lokale Arbeits-Index** während des Uploads — nicht ein zweites Backup-Format in der Cloud.
+
+### Re-Import: unnötige 15 Minuten vermeiden
+
+Manchmal schreibt Wartung (z. B. Pool-GC) die lokale Master-JSON neu — gleicher Inhalt, neues Datei-Datum. Früher las das System die komplette JSON erneut ein (~15 min, ~4 GB RAM-Spitze). Heute vergleicht es zuerst Checksummen (`master_sha256`); wenn nichts geändert ist, **kein Re-Import**.
+
+Details: [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
+
+### pi-nas (Produktion)
+
+- `.env`: `PCLOUD_POOL_INDEX_DB=1`
+- Index-Dateien: `/srv/pcloud-archive/indexes/` (SSD2)
+
+```bash
+# Zeigt DB-Größe, SHA-Counts, ob Re-Import übersprungen würde
+python3 pool_index_db.py status
+
+# Fingerprints nachziehen (nach Upgrade, kein voller Re-Import)
+python3 pool_index_db.py refresh-meta
+```
 
 ---
 
 ## Durchlaufzeiten & Phasen
 
-Zeiten sind **pi-nas Production** (114k Files/Snapshot, ~90 GB RTB-Bestand, pCloud API). Stark abhängig von Delta-Größe, Scout-Basis und Netz.
+**Bezugswerte pi-nas:** ~114.000 Dateien pro Snapshot, ~90 GB lokales RTB-Bestand. Die Dauer hängt stark davon ab, wie viel sich geändert hat, welcher Basis-Snapshot in pCloud gewählt wird und wie schnell die API antwortet.
 
-### Turbo-Delta (typischer Catch-up / Tages-Snap)
+### Turbo-Delta (normaler Fall: Tages-Snapshot oder Catch-up)
 
-Phasen in `pcloud_push_json_pool_manifest_to_pcloud.py`:
+Ablauf in `pcloud_push_json_pool_manifest_to_pcloud.py`:
 
-| Phase | Was | Dauer (Beispiele) |
-|-------|-----|-------------------|
-| Manifest | Smart-Ref, streaming Scan | ~30 s – 3 min |
-| Scout | bester Remote-Basis-Snap (chronologisch) | ~1–5 s |
-| Phase 1 | `copyfolder` Struktur von Basis | ~14 min (114k Stubs) |
-| Phase 2 | Manifest-Diff lokal | ~1 s |
-| Phase 3 | tote Ordner/Stubs löschen (parallel) | Sekunden – ~30 min (großer falscher Basis-Snap) |
-| Phase 4 | Pool-Uploads + Stub-Schreiben | ~10–50 min (Delta-Größe) |
-| Integrity-Gate | `pool_verify_backup` listfolder | ~20–60 s |
-| Finalize | `.upload_complete` + Index-Export + Chunk-Upload (~960 MB) | ~2 min |
+| Schritt | Kurz erklärt | Dauer (Beispiele) |
+|---------|--------------|-------------------|
+| Manifest | Dateiliste + Hashes für diesen Snapshot erstellen | ~30 s – 3 min |
+| Scout | Passenden Basis-Snapshot in pCloud suchen | ~1–5 s |
+| Phase 1 | Struktur vom Basis-Snapshot per `copyfolder` klonen | ~14 min (114k Stubs) |
+| Phase 2 | Diff: was ist neu, geändert, gelöscht? | ~1 s |
+| Phase 3 | Obsolete Ordner/Stubs in pCloud löschen | Sekunden – ~30 min* |
+| Phase 4 | Neue/geänderte Dateien in Pool hochladen + Stubs schreiben | ~10–50 min |
+| Integrity-Gate | Prüfen, dass Snapshot vollständig ist | ~20–60 s |
+| Finalize | Marker setzen, Index exportieren, ~960 MB Index hochladen | ~2 min |
 
-**Referenzlauf 2026-08-15** (`2026-08-15-040158`, Basis `08-14`, 97,7 %, +2627 Files): **~51 min** gesamt; mit unnötigem C1-Re-Import (alter Code) **+15 min**.
+\* Phase 3 dauert lang, wenn ein **falscher** Basis-Snapshot gewählt wurde (viele Dateien müssen wieder gelöscht werden).
 
-**Kleines Delta** (wenig Änderungen, gute Basis): oft **~15–35 min**.  
-**Catch-up** mit PBS2/VM-Chunks oder Full-Pool: **1–3+ h** — daher `TimeoutStartSec=12h` auf `backup-pipeline.service`.
+**Referenzlauf 2026-08-15** (Snapshot `2026-08-15-040158`, Basis vom Vortag, 97,7 % Übereinstimmung, +2627 Dateien): **~51 min** gesamt. Mit unnötigem Re-Import (alter Code): **+15 min**.
 
-### Full-Pool (Scout &lt; 70 % oder kein Basis-Snap)
+- **Kleines Delta** (wenig Änderungen): oft **~15–35 min**
+- **Catch-up** mit großen VM-/PBS-Chunks oder Full-Pool: **1–3+ h** → systemd-Timeout **12 h** (`TimeoutStartSec=12h`)
 
-Alle Pfade/Stubs neu, Pool nur wo SHA fehlt. Erster Snap auf leerem Pool: **~3 h** (89 GB, 19k Files — historischer SAFE-Mode-Test). Catch-up nach Ausfall: eher **30 min – 2 h** pro Snap, abhängig von Wiederverwendung im Pool.
+### Full-Pool (kein passender Basis-Snapshot)
 
-### systemd / Catch-up
+Alle Pfade und Stubs werden neu aufgebaut; Dateien im Pool werden nur hochgeladen, wenn der Hash dort noch fehlt. Erster Snapshot auf leerem Pool: historisch **~3 h** (89 GB Test). Catch-up nach Ausfall: typisch **30 min – 2 h** pro Snapshot.
 
-| Setting | Wert | Zweck |
-|---------|------|--------|
-| `backup-pipeline.timer` | 04:00, 12:00, 20:00 | 3 Slots/Tag |
-| `PCLOUD_CATCHUP_MAX_PER_RUN` | `1` | max. 1 fehlender Snap pro Lauf |
-| `TimeoutStartSec` | **12h** (war 4h) | kein SIGTERM bei langem Catch-up |
-| `PCLOUD_CATCHUP_SKIP_SNAPSHOTS` | Legacy-Snaps | z. B. `05-21`, `05-28` |
+### Timer & Catch-up-Einstellungen
 
-Planung vor Upload: `scripts/utilities/pool_delta_plan.py --missing-only --simulate-catchup`  
-Live-Backlog: `scripts/utilities/pool_audit_status.py --pool-root /Backup/rtb_pool`
+| Einstellung | Wert | Bedeutung |
+|-------------|------|-----------|
+| `backup-pipeline.timer` | 04:00, 12:00, 20:00 | drei Backup-Slots pro Tag |
+| `PCLOUD_CATCHUP_MAX_PER_RUN` | `1` | pro Lauf nur **ein** fehlender Snapshot nachziehen |
+| `TimeoutStartSec` | **12 h** (früher 4 h) | lange Catch-ups nicht per SIGTERM abbrechen |
+| `PCLOUD_CATCHUP_SKIP_SNAPSHOTS` | z. B. `05-21`, `05-28` | bestimmte Snapshots überspringen |
 
-**Tiefere Analyse:** [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) · [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)  
-**Legacy 1to1-Performance (historisch):** [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md) — nicht Pool-Produktionspfad.
+**Planung:** `scripts/utilities/pool_delta_plan.py --missing-only --simulate-catchup`  
+**Live-Backlog:** `scripts/utilities/pool_audit_status.py --pool-root /Backup/rtb_pool`
+
+Weiterführend: [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) · [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)  
+Historisch (Legacy 1to1, nicht Pool-Produktion): [docs/DELTA_COPY_ANALYSIS.md](docs/DELTA_COPY_ANALYSIS.md)
 
 ---
 
@@ -201,7 +233,7 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 | `pcloud_json_pool_manifest.py` | Manifest-Erstellung Pool (Schema v4, Smart-Hashing) |
 | `pcloud_push_json_pool_manifest_to_pcloud.py` | Pool-Upload: Scout, Turbo-Delta, Full-Pool, Validation |
 | `pcloud_pool_gc.py` | Pool Garbage Collection ([Doku](docs/pcloud_pool_gc.md)) |
-| `pool_index_db.py` | C1 SQLite Hybrid: `status`, `refresh-meta`, Bulk-Merge ([Doku](docs/POOL_INDEX_DB.md)) |
+| `pool_index_db.py` | SQLite-Arbeitsindex: `status`, `refresh-meta` ([Doku](docs/POOL_INDEX_DB.md)) |
 | `pcloud_bin_lib.py` | pCloud API-Bibliothek (Circuit Breaker, `copyfolder`, Chunked Upload) |
 | `pcloud_path_compat.py` | Pfad-Normalisierung Manifest ↔ pCloud (Whitespace, Skip-Globs) |
 | `pcloud_health_check.sh` | Backup-Status, Quota — Nagios/Zabbix-kompatibel |
@@ -219,7 +251,7 @@ Diese Dateien bilden den produktiven Kern — sie werden automatisch vom Wrapper
 - **Circuit Breaker** mit Cooldown und Parallelitäts-Ramp (16→12→8 Threads)
 - **`pool_delta_plan.py`** — Delta vs. Full planen inkl. Catch-up-Simulation
 - **DB-Wartung:** `scripts/maintenance_db_cleanup.sh` — Dashboard „Letzte Fehler (7d)“ bereinigen
-- **Pool-Index C1:** SQLite-Hybrid für Delta (`PCLOUD_POOL_INDEX_DB=1` auf pi-nas; Re-Import-Skip via `master_sha256`) — [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
+- **SQLite-Arbeitsindex:** `PCLOUD_POOL_INDEX_DB=1` auf pi-nas; Re-Import-Skip via `master_sha256` — [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
 - **Pipeline-Timeout:** `backup-pipeline.service` `TimeoutStartSec=12h` (Catch-up >4h)
 - → [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md)
 
@@ -337,7 +369,7 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 - **OS:** Debian Bookworm (Raspberry Pi 5)
 - **Storage:** 5x 2.5" SATA SSD (Radxa Penta SATA HAT); Pool-Index SQLite auf SSD2 (`/srv/pcloud-archive/`)
 - **Backup:** rsync, JSON-Manifests, pCloud Binary API, SHA256-Pool + Stubs
-- **Index (C1):** SQLite `pool_index.sqlite3` — RAM-Schonung vs. 900 MB Master-Dict ([POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md))
+- **Index (SQLite):** `pool_index.sqlite3` auf SSD — RAM-Schonung beim Upload ([POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md))
 - **Automation:** Bash, systemd-Timer (`backup-pipeline` 3×/Tag, `TimeoutStartSec=12h`)
 - **Monitoring:** Vanilla HTML/JS Dashboard, Apprise (Alerts); `status.json` vs. `reports.json`
 - **DB:** MariaDB (Backup-Historie, Status-Tracking)
