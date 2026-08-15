@@ -42,8 +42,10 @@ Unverändert: Integrity-Gate (Subprozess, `manifest_scoped`), Phase-4-Upload-Par
 | `PCLOUD_POOL_INDEX_DB` | `0` | `1` = Delta/finalize-only nutzen SQLite |
 | `PCLOUD_POOL_INDEX_DB_PATH` | `$PCLOUD_ARCHIVE_DIR/indexes/pool_index.sqlite3` | DB-Pfad |
 | `PCLOUD_POOL_INDEX_DB_AUTOIMPORT` | `1` | Bei stale Fingerprint Master neu einlesen |
+| `PCLOUD_POOL_INDEX_DB_SYNC_ON_GC` | `1` | Nach `delete-snapshots` / `retention-apply` SQLite anpassen |
+| `PCLOUD_POOL_INDEX_DB_SYNC_MODE` | `auto` | `auto`=purge gelöschte Snaps; `import`=voller Import; `skip` |
 
-Stale: GC/Full-Pool/Repair schreiben den Master-JSON, nicht die DB. Nächster Delta-Lauf mit Flag=1 reimportiert automatisch.
+Stale: GC/Retention schreiben Master-JSON. Mit `SYNC_ON_GC=1` werden gelöschte Snapshots per `purge-snapshot` aus SQLite entfernt (schnell). Voller `import` nur bei `SYNC_MODE=import` oder Auto-Import beim nächsten Delta (Master-mtime).
 
 ---
 

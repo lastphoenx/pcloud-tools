@@ -462,7 +462,15 @@ def _purge_orphan_archive_indexes(
     return stats
 
 
-def _save_index(cfg: dict, snapshots_root: str, index: dict, env_file: str, *, dry: bool) -> None:
+def _save_index(
+    cfg: dict,
+    snapshots_root: str,
+    index: dict,
+    env_file: str,
+    *,
+    dry: bool,
+    deleted_snaps: Optional[Set[str]] = None,
+) -> None:
     index_path = f"{snapshots_root}/_index/content_index.json"
     env_vars = _load_env_file(env_file)
     archive_dir = env_vars.get("PCLOUD_ARCHIVE_DIR") or os.environ.get(
@@ -472,6 +480,8 @@ def _save_index(cfg: dict, snapshots_root: str, index: dict, env_file: str, *, d
     if dry:
         _log(f"[dry] write index: {index_path} (pool_refs={len(index.get('pool_refs', {}))})")
         _log(f"[dry] write local master: {master_path}")
+        if deleted_snaps:
+            _log(f"[dry] pool_index_db sync für {len(deleted_snaps)} Snapshot(s)")
         return
     pc.write_json_at_path(cfg, index_path, index)
     os.makedirs(os.path.dirname(master_path), exist_ok=True)
@@ -479,6 +489,57 @@ def _save_index(cfg: dict, snapshots_root: str, index: dict, env_file: str, *, d
         json.dump(index, f, separators=(",", ":"))
     _log(f"[retention] Index aktualisiert: {index_path}")
     _log(f"[retention] Master-Index: {master_path}")
+    _sync_pool_index_db_after_master(master_path, env_vars, deleted_snaps or set(), dry=False)
+
+
+def _pool_index_db_sync_enabled(env_vars: dict) -> bool:
+    if _env_get(env_vars, "PCLOUD_POOL_INDEX_DB", "0") != "1":
+        return False
+    return _env_get(env_vars, "PCLOUD_POOL_INDEX_DB_SYNC_ON_GC", "1") != "0"
+
+
+def _sync_pool_index_db_after_master(
+    master_path: str,
+    env_vars: dict,
+    deleted_snaps: Set[str],
+    *,
+    dry: bool,
+) -> None:
+    """SQLite (C1) an Master-JSON anbinden nach Index-Schreiben durch GC/Retention."""
+    if dry or not _pool_index_db_sync_enabled(env_vars):
+        return
+    mode = (_env_get(env_vars, "PCLOUD_POOL_INDEX_DB_SYNC_MODE", "auto") or "auto").lower()
+    if mode == "skip":
+        return
+    try:
+        import pool_index_db as pidb
+    except Exception as e:
+        _log(f"[index-db][warn] Sync übersprungen (Import): {e}")
+        return
+
+    try:
+        db_path = pidb.default_db_path()
+        if mode == "import":
+            _log("[index-db] Sync: vollständiger Import aus Master (kann Minuten dauern)")
+            with pidb.open_db(db_path, create=True) as db:
+                db.import_from_json(master_path, log=_log)
+            return
+
+        if not deleted_snaps:
+            _log("[index-db] Sync: nichts zu purgen — Master-mtime triggert Auto-Import beim nächsten Delta")
+            return
+
+        _log(f"[index-db] Sync: purge-snapshot für {len(deleted_snaps)} Snapshot(s)")
+        with pidb.open_db(db_path, create=True) as db:
+            total = 0
+            for snap in sorted(deleted_snaps):
+                n = db.purge_snapshot(snap)
+                if n:
+                    _log(f"[index-db] purge {snap}: {n} snap_refs")
+                    total += n
+        _log(f"[index-db] Sync fertig ({total} snap_refs entfernt; voller Re-Import beim nächsten Delta)")
+    except Exception as e:
+        _log(f"[index-db][warn] Sync fehlgeschlagen: {e} — nächster Delta-Lauf reimportiert aus Master")
 
 
 def _list_pool_files(cfg: dict, pool_root: str) -> List[dict]:
@@ -697,7 +758,7 @@ def run_delete_snapshots(
             f"[delete-snapshots] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
             f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt"
         )
-        _save_index(cfg, snapshots_root, index, env_file, dry=dry)
+        _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
     else:
         _log("[delete-snapshots] Index unveraendert")
 
@@ -793,7 +854,7 @@ def run_retention_apply(
         purge_stats = _purge_snaps_from_index(index, deleted_snaps)
         _log(f"[retention] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
              f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt")
-        _save_index(cfg, snapshots_root, index, env_file, dry=dry)
+        _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
     else:
         _log("[retention] Nichts zu loeschen — Index unveraendert")
 
