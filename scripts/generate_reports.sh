@@ -246,7 +246,7 @@ get_recent_backups() {
       COALESCE(error_message, '') AS error_message
     FROM backup_runs
     ORDER BY started_at DESC
-    LIMIT 10;
+    LIMIT 15;
   " 2>/dev/null || echo "")
 
   if [[ -z "$result" ]]; then

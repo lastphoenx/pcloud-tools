@@ -373,6 +373,8 @@
     }
     .badge.success { background: rgba(34,197,94,0.15);  color: var(--green); }
     .badge.failed  { background: rgba(239,68,68,0.15);  color: var(--red); }
+    .report-table tr.row-failed td { background: rgba(239,68,68,0.08); }
+    .report-table tr.row-running td { background: rgba(234,179,8,0.08); }
     .badge.running { background: rgba(59,130,246,0.15); color: var(--blue); }
     .badge.nas     { background: rgba(168,85,247,0.15); color: #a855f7; }
     .badge.os      { background: rgba(59,130,246,0.15); color: var(--blue); }
@@ -848,7 +850,7 @@
         + esc(explain) + '</div>';
     }
 
-    // backup_runs: nur erfolgreiche Läufe in Tabellen; Retry-Zähler aus allen DB-Einträgen
+    // backup_runs: Tabelle zeigt letzte Läufe (alle Status); Retry-Zähler aus allen DB-Einträgen
     function backupRunsAttemptCounts(allRuns) {
       const counts = {};
       (allRuns || []).forEach(function(r) {
@@ -860,16 +862,24 @@
     }
 
     function filterBackupRunsForDisplay(allRuns) {
-      const seen = new Set();
-      const out = [];
-      (allRuns || []).forEach(function(r) {
-        if (r.status !== 'SUCCESS') return;
-        const s = r.snapshot || '';
-        if (!s || seen.has(s)) return;
-        seen.add(s);
-        out.push(r);
-      });
-      return out;
+      // Alle Status (SUCCESS / FAILED / RUNNING) — sortiert wie DB (started_at DESC)
+      return (allRuns || []).slice(0, 15);
+    }
+
+    function backupRunStatusBadge(r) {
+      const st = r.status || '\u2014';
+      const cls = (st || '').toLowerCase();
+      let title = '';
+      if (st === 'FAILED' && r.error_message) {
+        title = ' title="' + esc(r.error_message) + '"';
+      }
+      return '<span class="badge ' + cls + '"' + title + '>' + esc(st) + '</span>';
+    }
+
+    function backupRunRowClass(r) {
+      if (r.status === 'FAILED') return 'row-failed';
+      if (r.status === 'RUNNING') return 'row-running';
+      return '';
     }
 
     function backupRunSnapshotCell(r, attemptCounts) {
@@ -927,7 +937,7 @@
 
       const allRecent = ((reports || {}).recent_backups || []);
       const attemptCounts = backupRunsAttemptCounts(allRecent);
-      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 7);
+      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 10);
       const poolInt  = ((reports || {}).pool_integrity) || {};
       const intSum   = poolInt.summary || {};
       const intSnaps = poolInt.snapshots || [];
@@ -1008,15 +1018,15 @@
 
       if (recent.length > 0) {
         html += '<button class="detail-toggle" id="btn-backup" onclick="toggleDetail(\'backup\')">'
-          + '<span>Letzte 7 Tage</span><span class="arrow">\u25BC</span></button>'
+          + '<span>Letzte Backup-L&auml;ufe</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
           + '<table class="report-table"><thead><tr>'
           + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th><th>GB</th><th>Versuch</th>'
           + '</tr></thead><tbody>'
           + recent.map(r =>
-              '<tr>'
+              '<tr class="' + backupRunRowClass(r) + '">'
             + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
-            + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + (r.status||'\u2014') + '</span></td>'
+            + '<td>' + backupRunStatusBadge(r) + '</td>'
             + '<td>' + fmtTs(r.started_at) + '</td>'
             + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
             + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
@@ -1291,7 +1301,7 @@
       // Backup detail
       const allRecent = ((reports||{}).recent_backups||[]);
       const attemptCounts = backupRunsAttemptCounts(allRecent);
-      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 7);
+      const recent = filterBackupRunsForDisplay(allRecent).slice(0, 10);
       html += '<div class="detail-section">'
         + '<div class="section-heading"><span>\uD83D\uDD04 Backup \u2013 Details</span></div>'
         + '<div class="card-grid">'
@@ -1586,9 +1596,9 @@
         + '<thead><tr>'
         + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th><th>GB</th><th>Versuch</th>'
         + '</tr></thead><tbody>'
-        + recent.map(r => '<tr>'
+        + recent.map(r => '<tr class="' + backupRunRowClass(r) + '">'
             + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
-            + '<td><span class="badge ' + (r.status||'').toLowerCase() + '">' + esc(r.status||'\u2014') + '</span></td>'
+            + '<td>' + backupRunStatusBadge(r) + '</td>'
             + '<td>' + fmtTs(r.started_at) + '</td>'
             + '<td>' + fmtTs(r.finished_at) + '</td>'
             + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
@@ -1598,7 +1608,7 @@
           + '</tr>').join('')
         + '</tbody></table>';
       return collapsiblePanel(
-        '\uD83D\uDCCB Letzte 7 Tage \u2014 erfolgreiche Backup-L\u00e4ufe (' + recent.length + ')',
+        '\uD83D\uDCCB Letzte Backup-L\u00e4ufe (' + recent.length + ')',
         body,
         false
       );
