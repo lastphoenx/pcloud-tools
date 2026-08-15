@@ -349,7 +349,7 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architektur, Ablaufkette, Pool-Modi, Tool-Inventar |
 | [docs/CHANGELOG_2026-08.md](docs/CHANGELOG_2026-08.md) | August 2026: Lock, Scout, Integrity-Gate, Manifest-Ref, DB-Wartung, C1 Index-DB |
-| [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md) | C1 SQLite Hybrid: Migration, Rollback, Testplan |
+| [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md) | SQLite-Arbeitsindex: Migration, Re-Import-Skip, Rollback |
 | [docs/pcloud_pool_gc.md](docs/pcloud_pool_gc.md) | Pool GC, Retention, Grace Period |
 | [docs/ENV_VARIABLES.md](docs/ENV_VARIABLES.md) | ENV-Referenz (Scout, Delta, Circuit Breaker) |
 | [docs/SETUP.md](docs/SETUP.md) | Vollständige Installations-Anleitung |
