@@ -47,6 +47,14 @@ Unverändert: Integrity-Gate (Subprozess, `manifest_scoped`), Phase-4-Upload-Par
 
 **Re-Import-Skip:** In `meta` werden `master_sha256` (Datei-Hash, streaming) und `master_content_digest` (logischer DB-Digest) gespeichert. Wenn GC den Master nur neu schreibt (mtime), aber die Bytes gleich sind, kein 13-Min-Import.
 
+```bash
+# Status inkl. meta + Skip-Checks
+python3 pool_index_db.py status
+
+# Nach git pull / alter DB ohne Hashes: einmalig backfill (liest ~4GB Master, kein Import)
+python3 pool_index_db.py refresh-meta
+```
+
 Stale: GC/Retention schreiben Master-JSON. Mit `SYNC_ON_GC=1` werden gelöschte Snapshots per `purge-snapshot` aus SQLite entfernt (schnell). Voller `import` nur bei `SYNC_MODE=import` oder wenn Master-Inhalt wirklich geändert hat.
 
 ---

@@ -892,13 +892,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_ver.add_argument("--json", required=True)
 
     sub.add_parser("stats", help="Print counts")
-    sub.add_parser("status", help="Alias for stats")
+    p_status = sub.add_parser("status", help="Counts + master meta fingerprints")
+    p_status.add_argument(
+        "--master",
+        default=None,
+        help="Master JSON path (default: PCLOUD_ARCHIVE/indexes/content_index_master.json)",
+    )
+
+    p_refresh = sub.add_parser(
+        "refresh-meta",
+        help="Store master_sha256 + master_content_digest (no re-import)",
+    )
+    p_refresh.add_argument(
+        "--master",
+        default=None,
+        help="Master JSON path (default: content_index_master.json)",
+    )
 
     p_purge = sub.add_parser("purge-snapshot", help="Delete snap_refs for one snapshot")
     p_purge.add_argument("snapshot")
 
     args = ap.parse_args(argv)
     db_path = args.db or default_db_path()
+    master_default = default_master_path()
 
     if args.cmd == "import":
         with open_db(db_path) as db:
@@ -912,15 +928,56 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(st, indent=2))
             return 0
         if args.cmd in ("stats", "status"):
+            master_path = getattr(args, "master", None) or master_default
+            meta_rows = {
+                row[0]: row[1]
+                for row in db.conn.execute(
+                    "SELECT key, value FROM meta WHERE key LIKE 'master%'"
+                )
+            }
+            fp_match = db.master_fingerprint_matches(master_path)
+            sha_match = db.master_file_sha256_matches(master_path)
+            skip = db.can_skip_master_reimport(master_path) if fp_match is False else True
+            out = {
+                "db": db.path,
+                "master": master_path,
+                "shas": db.count_shas(),
+                "snapshots": db.snapshot_names(),
+                "pairs": int(
+                    db.conn.execute("SELECT COUNT(*) FROM snap_refs").fetchone()[0]
+                ),
+                "meta": meta_rows,
+                "checks": {
+                    "fingerprint_match": fp_match,
+                    "file_sha256_match": sha_match,
+                    "can_skip_reimport": skip,
+                },
+            }
+            if args.cmd == "stats":
+                del out["meta"]
+                del out["checks"]
+                del out["master"]
+            print(json.dumps(out, indent=2))
+            return 0
+        if args.cmd == "refresh-meta":
+            master_path = args.master or master_default
+            if not os.path.isfile(master_path):
+                _cli_log(f"Master nicht gefunden: {master_path}")
+                return 1
+            db.refresh_master_metadata(master_path)
+            digest = db.digest()["sha256"]
+            db.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_content_digest', ?)",
+                (digest,),
+            )
+            db.conn.commit()
             print(
                 json.dumps(
                     {
-                        "db": db.path,
+                        "master": master_path,
+                        "master_sha256": db.get_meta("master_sha256"),
+                        "master_content_digest": digest,
                         "shas": db.count_shas(),
-                        "snapshots": db.snapshot_names(),
-                        "pairs": int(
-                            db.conn.execute("SELECT COUNT(*) FROM snap_refs").fetchone()[0]
-                        ),
                     },
                     indent=2,
                 )
