@@ -425,6 +425,27 @@ class PoolIndexDbTests(unittest.TestCase):
         fid2, _, _ = self.db.sha_coords(sha)
         self.assertEqual(fid2, 99)
 
+    def test_register_batch_from_threads(self) -> None:
+        import concurrent.futures
+
+        master = os.path.join(self.dir, "m.json")
+        _write_json(master, _mini_v2())
+        self.db.import_from_json(master)
+        snap = "thread-snap"
+        rows = [
+            ("aa" * 32, "p/one.txt", 11, None, 100),
+            ("bb" * 32, "p/two.txt", 22, None, 200),
+        ]
+
+        def _work(batch):
+            return self.db.register_batch(snap, batch)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futures = [ex.submit(_work, rows) for _ in range(4)]
+            for fut in futures:
+                fut.result()
+        self.assertEqual(self.db.snapshot_pair_count(snap), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

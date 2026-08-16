@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -148,7 +149,9 @@ class PoolIndexDB:
     def __init__(self, path: str):
         self.path = path
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self._lock = threading.RLock()
+        # Full-Pool parallel uploads: register_batch/sha_coords from worker threads
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._apply_pragmas()
         self._init_schema()
@@ -264,15 +267,16 @@ class PoolIndexDB:
 
     def sha_coords(self, sha: str) -> Tuple[Optional[int], Optional[str], Optional[int]]:
         """Liefert (fileid, hash, size) fuer einen SHA — oder (None, None, None)."""
-        sha_l = (sha or "").lower()
-        if not sha_l:
-            return (None, None, None)
-        row = self.conn.execute(
-            "SELECT fileid, hash, size FROM shas WHERE sha = ?", (sha_l,)
-        ).fetchone()
-        if not row:
-            return (None, None, None)
-        return (row[0], row[1], row[2])
+        with self._lock:
+            sha_l = (sha or "").lower()
+            if not sha_l:
+                return (None, None, None)
+            row = self.conn.execute(
+                "SELECT fileid, hash, size FROM shas WHERE sha = ?", (sha_l,)
+            ).fetchone()
+            if not row:
+                return (None, None, None)
+            return (row[0], row[1], row[2])
 
     def shas_lacking_fileid(self, sha_list: List[str]) -> set[str]:
         """SHAs ohne fileid in shas (oder noch nicht in der DB)."""
@@ -441,6 +445,14 @@ class PoolIndexDB:
         rows: Iterable[Tuple[Any, Any, Any, Any, Any]],
     ) -> int:
         """rows: (sha, relpath, fileid, hash, size). Coords fill NULLs only."""
+        with self._lock:
+            return self._register_batch_unlocked(snapshot, rows)
+
+    def _register_batch_unlocked(
+        self,
+        snapshot: str,
+        rows: Iterable[Tuple[Any, Any, Any, Any, Any]],
+    ) -> int:
         batch: List[Tuple[str, str, Any, Optional[str], Any]] = []
         for sha, relpath, fileid, phash, size in rows:
             sha_l = (sha or "").lower()

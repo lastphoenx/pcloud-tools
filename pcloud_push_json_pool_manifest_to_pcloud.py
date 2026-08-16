@@ -3947,15 +3947,17 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
                 _count_trigger = _SAVE_INTERVAL > 0 and (uploaded + resumed + stubs) >= _last_saved_count + _SAVE_INTERVAL
                 _time_trigger = _SAVE_INTERVAL_TIME > 0 and (_now_save - _t_last_index_save) >= _SAVE_INTERVAL_TIME
                 if not dry and (_count_trigger or _time_trigger):
-                    if db is not None:
-                        _full_pool_db_flush()
-                    else:
+                    if db is None:
                         save_content_index_local(_local_index_path, index)
                     _last_saved_count = uploaded + resumed + stubs
                     _t_last_index_save = _now_save
                     if os.environ.get("PCLOUD_VERBOSE") == "1":
                         _reason = "count" if _count_trigger else "time"
-                        print(f"[index] Zwischenstand gespeichert ({_reason}) nach {uploaded + resumed + stubs} Dateien")
+                        dest = "SQLite pending" if db is not None else "lokal"
+                        print(
+                            f"[index] Zwischenstand ({dest}, {_reason}) nach "
+                            f"{uploaded + resumed + stubs} Dateien"
+                        )
         
         def _process_reused_file(it: dict) -> None:
             """
@@ -4033,10 +4035,12 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         else:
             for f in _small_delta:
                 _process_file_item(f)
+        _full_pool_db_flush()
         
         # === GROSSE DELTA-DATEIEN SEQUENTIELL ===
         for f in _large_delta:
             _process_file_item(f)
+        _full_pool_db_flush()
         
         # === REUSED-FILES VERARBEITEN (nur Stubs, kein Upload!) ===
         if reused_items:
@@ -4050,6 +4054,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
             else:
                 for f in reused_items:
                     _process_reused_file(f)
+            _full_pool_db_flush()
         
         # ============================================================================
         # === PHASE 3: BATCH-WRITE STUBS ===
