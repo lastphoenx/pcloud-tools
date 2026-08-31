@@ -45,7 +45,7 @@ Vollständiger Triage-Workflow: [integrity-checks.md](../../../doku/Raspi/raspin
 | Befund | Bedeutung | Aktion |
 |--------|-----------|--------|
 | RTB ja, Pcl nein, Cmp nein | Noch nie hochgeladen | Catch-up / Wrapper |
-| RTB ja, Pcl ja, Cmp nein | Unvollständiger Remote-Snapshot | Upload erneut (Pipeline wipet & neu) |
+| RTB ja, Pcl ja, Cmp nein | Unvollständiger Remote-Snapshot | Retry wipet **dieses Ziel**. Mehrere solche Ordner: Scout darf sie nicht als Basis nehmen — gezielt `--delete-snapshots`, siehe `doku/.../integrity-checks.md` § GAP |
 | RTB nein, Pcl ja, Cmp nein | Zombie (hängender Remote-Ordner) | `pcloud_pool_gc.py --delete-snapshots SNAP` (gezielt), **nicht** blind `--retention-apply` bei Zeit-Retention |
 | Cmp ja, Man nein | Upload OK, Manifest fehlt lokal | Re-Upload oder Manifest archivieren |
 | Cmp ja, RTB nein | Lokal per RTB-Retention gelöscht | Normal, Backup auf pCloud bleibt |

@@ -915,6 +915,31 @@ def list_remote_snapshot_names(cfg: dict, snapshots_root: str) -> set[str]:
         pass
     return out
 
+
+def _filter_complete_remote_snapshots(
+    cfg: dict, snapshots_root: str, remote_snaps: set[str]
+) -> set[str]:
+    """Nur Ordner mit passendem .upload_complete — unvollständige sind keine copyfolder-Basis."""
+    snaps_root = snapshots_root.rstrip("/")
+    names = sorted(s for s in remote_snaps if s)
+    if not names:
+        return set()
+
+    def _ok(snap: str) -> tuple[str, bool]:
+        marker = f"{snaps_root}/{snap}/.upload_complete"
+        try:
+            return snap, bool(_upload_complete_matches_snapshot(cfg, marker, snap))
+        except Exception:
+            return snap, False
+
+    complete: set[str] = set()
+    workers = min(8, max(1, len(names)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for snap, ok in ex.map(_ok, names):
+            if ok:
+                complete.add(snap)
+    return complete
+
 def list_local_snapshot_names(manifest_root: str) -> set[str]:
     """Liest Geschwister-Ordner des gegebenen Snapshot-Roots (RTB-Stil)."""
     base = os.path.dirname(os.path.abspath(manifest_root))  # parent von ".../<snapshot>"
@@ -2164,11 +2189,11 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots
     Findet den effizientesten REMOTE vorhandenen Basis-Snapshot via Jaccard-Ähnlichkeit.
 
     WICHTIG: Kandidaten sind ausschliesslich Snapshots, die REMOTE unter
-    <snapshots_root> tatsaechlich existieren UND fuer die lokal ein Manifest
-    vorliegt (Letzteres wird fuer den Diff zwingend benoetigt). Dadurch ist der
-    gewaehlte Basis-Snapshot garantiert remote klonbar (copyfolder) UND lokal
-    diffbar - der frueher moegliche Fall "Scout waehlt lokal, remote nicht
-    vorhanden -> copyfolder API 2005 -> Endlos-Fallback" kann nicht mehr auftreten.
+    <snapshots_root> tatsaechlich existieren, ein passendes .upload_complete
+    haben UND fuer die lokal ein Manifest vorliegt. Unvollstaendige Remote-Ordner
+    (Fail-Fast, kein Marker) duerfen nicht als copyfolder-Basis dienen — sonst
+    klont Delta das Loch und der Manifest-Diff schreibt die fehlenden Stubs nicht
+    nach. Lokal diffbar bleibt Voraussetzung (sonst copyfolder API 2005).
 
     Strategie (pc.scout_pool_basis):
     - Bevorzugt chronologischen Vorgänger (neuester Remote-Snap mit name < target).
@@ -2184,9 +2209,17 @@ def scout_best_pool_basis(cfg: dict, manifest: dict, archive_dir: str, snapshots
     remote_snaps = list_remote_snapshot_names(cfg, snapshots_root)
     current_name = manifest.get("snapshot")
     remote_snaps.discard(current_name)
+    n_listed = len(remote_snaps)
+    remote_snaps = _filter_complete_remote_snapshots(cfg, snapshots_root, remote_snaps)
+    n_skip = n_listed - len(remote_snaps)
+    if n_skip:
+        _log(
+            f"[scout] {n_skip} unvollstaendige Remote-Ordner ignoriert "
+            f"(kein .upload_complete) — {len(remote_snaps)} Complete-Kandidaten"
+        )
 
     if not remote_snaps:
-        _log(f"[scout] Keine Remote-Snapshots unter {snapshots_root} vorhanden")
+        _log(f"[scout] Keine vollstaendigen Remote-Snapshots unter {snapshots_root}")
         return None, 0.0
 
     current_files = pc.manifest_file_index(manifest)
@@ -2889,9 +2922,10 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _register_snap(pool_refs, _sha, snapshot_name, _it.get("relpath", ""),
                                size=_it.get("size"))
 
-        # Index erst NACH erfolgreicher Validation persistieren (siehe unten).
-        # Vorher nur im RAM: sonst steht der Snapshot in pool_refs obwohl kein
-        # .upload_complete gesetzt wurde -> Retry ueberspringt Stub-Writes.
+        # RAM-Index: unveraenderte Refs nur im Dict, Persist erst nach Gate.
+        # SQLite: register_batch der Delta-Files ist ok (klein). Bulk-Merge der
+        # geklonten Basis erst NACH dem Integrity-Gate — sonst bleiben snap_refs
+        # einer nie-fertigen Basis in der DB und der naechste Lauf merged das Loch.
     else:
         _log("[delta-mode] Keine Änderungen - Snapshot identisch mit Basis")
         uploaded = 0
@@ -2925,31 +2959,6 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                                    size=_it.get("size"))
                 _log(f"[delta-mode] {_reg} Snapshot-Referenzen im Index ergaenzt (geklonter Snapshot)")
 
-    if db is not None and not dry:
-        cur_sha_by_path = {
-            rp: (it.get("sha256") or "").lower()
-            for rp, it in current_files.items()
-            if it.get("sha256")
-        }
-        st = _delta_merge_basis_refs(
-            db, snapshot_name, basis_snapshot_name, cur_sha_by_path, cfg, snapshots_root,
-        )
-        _log(
-            f"[index-db] Bulk-Merge: {st['merged']} Refs von {basis_snapshot_name} "
-            f"uebernommen ({st.get('skipped_removed', 0)} entfallen, "
-            f"{st.get('skipped_changed', 0)} geaendert) "
-            f"in {st['seconds']:.1f}s [tier={st.get('tier')}]"
-        )
-        if st.get("tier") == "manifest":
-            _log("[index-db][warn] Basis nicht in DB/Archiv — Manifest-Fallback")
-        have, want = db.snapshot_pair_count(snapshot_name), len(cur_sha_by_path)
-        if have != want:
-            raise RuntimeError(
-                f"[index-db] Ref-Invariante verletzt: {have} != {want} "
-                f"(Snapshot NICHT finalisiert)"
-            )
-
-    # === POST-UPLOAD VALIDATION (wie Full-Pool-Mode!) ===
     marker_data = {
         "snapshot": snapshot_name,
         "completed_at": time.time(),
@@ -2969,16 +2978,53 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     ):
         gate_index = db.build_snapshot_index(snapshot_name)
 
+    finalized = False
     try:
         if not dry:
             _post_upload_gate(
                 cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, gate_index,
                 dry=dry, mode_label="delta-mode",
             )
+            # Bulk-Merge erst hier: Gate hat Remote-Stubs geprueft. Vorher merged
+            # SQLite die Basis-Refs in den Ziel-Snapshot — bei Gate-Fail bleiben
+            # sie liegen und der naechste Scout/Merge nimmt sie als "vollstaendig".
+            if db is not None:
+                marker_basis = f"{snapshots_root.rstrip('/')}/{basis_snapshot_name}/.upload_complete"
+                if not _upload_complete_matches_snapshot(
+                    cfg, marker_basis, basis_snapshot_name
+                ):
+                    raise RuntimeError(
+                        f"[index-db] Bulk-Merge verweigert: Basis {basis_snapshot_name} "
+                        f"hat kein .upload_complete"
+                    )
+                cur_sha_by_path = {
+                    rp: (it.get("sha256") or "").lower()
+                    for rp, it in current_files.items()
+                    if it.get("sha256")
+                }
+                st = _delta_merge_basis_refs(
+                    db, snapshot_name, basis_snapshot_name, cur_sha_by_path,
+                    cfg, snapshots_root,
+                )
+                _log(
+                    f"[index-db] Bulk-Merge: {st['merged']} Refs von {basis_snapshot_name} "
+                    f"uebernommen ({st.get('skipped_removed', 0)} entfallen, "
+                    f"{st.get('skipped_changed', 0)} geaendert) "
+                    f"in {st['seconds']:.1f}s [tier={st.get('tier')}]"
+                )
+                if st.get("tier") == "manifest":
+                    _log("[index-db][warn] Basis nicht in DB/Archiv — Manifest-Fallback")
+                have, want = db.snapshot_pair_count(snapshot_name), len(cur_sha_by_path)
+                if have != want:
+                    raise RuntimeError(
+                        f"[index-db] Ref-Invariante verletzt: {have} != {want} "
+                        f"(Snapshot NICHT finalisiert)"
+                    )
             _finalize_after_validation_delta(
                 cfg, snapshots_root, gate_index, snapshot_name, dest_snapshot_dir, marker_data,
                 dry=dry, db=db,
             )
+            finalized = True
 
         # === REMOTE INDEX-ARCHIVE: in _finalize_after_validation_delta ===
 
@@ -3009,6 +3055,16 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         }
     finally:
         if db is not None:
+            if not dry and not finalized:
+                try:
+                    n_rb = db.purge_snapshot(snapshot_name)
+                    if n_rb:
+                        _log(
+                            f"[index-db] Gate/Finalize fehlgeschlagen — {n_rb} snap_refs "
+                            f"fuer {snapshot_name} zurueckgerollt (SQLite)"
+                        )
+                except Exception as e:
+                    _log(f"[index-db][warn] Rollback nach Fehlschlag: {e}")
             try:
                 db.close()
             except Exception:
