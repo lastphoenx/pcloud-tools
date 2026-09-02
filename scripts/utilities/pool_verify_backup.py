@@ -4,14 +4,16 @@
 pool_verify_backup.py - Integritaetscheck Source-Manifeste vs. Remote Pool + Stubs.
 
 A) Manifest-SHA vs. Pool-Dateinamen (_pool)
-B) Manifest-Stubs vs. remote listfolder (Subtree-Batches, kein BFS pro Ordner)
+B) Manifest-Stubs vs. remote listfolder — vollstaendig, kein Sample.
 
-Remote-Fetch:
+Remote-Fetch (RAM: ein Subtree gleichzeitig):
   - Pool: listfolder_safe(_pool)
   - Index: ein Snapshot → _index/archive/<snap>_index.json; mehrere → content_index.json
-  - Stubs: listfolder non-recursive auf Snap-Root, dann listfolder_safe pro Top-Level-Ordner
+  - Stubs: Top-Level-Ordner; bei Truncation/Timeout Kinder einzeln (lokal erwartete
+    Anzahl aus dem Manifest). Erst wenn ein Blatt nicht listbar ist → listfolder incomplete,
+    nicht zehntausende „fehlende“ Stubs.
 
-Optional --stub-sample N: Stub-Inhalte gegen Manifest + pool_refs pruefen.
+Optional --stub-sample N: zusaetzlich N Stub-Inhalte lesen (nicht statt Check B).
 """
 from __future__ import annotations
 import os, sys, json, argparse, time, gc
@@ -99,24 +101,125 @@ def _stub_paths_from_flat(flat: list) -> Set[str]:
     return result
 
 
+_MAX_STUB_SPLIT = 8
+
+
+def _folder_rel_prefix(snap_root: str, folder_path: str) -> str:
+    snap_root = snap_root.rstrip("/")
+    folder_path = folder_path.rstrip("/")
+    if folder_path == snap_root:
+        return ""
+    if folder_path.startswith(snap_root + "/"):
+        return folder_path[len(snap_root) + 1 :]
+    return ""
+
+
+def _expected_count_under(relpaths: Set[str], prefix: str) -> int:
+    if not prefix:
+        return len(relpaths)
+    pre = prefix.rstrip("/")
+    n = 0
+    for rp in relpaths:
+        if rp == pre or rp.startswith(pre + "/"):
+            n += 1
+    return n
+
+
+def _list_folder_stubs_complete(
+    cfg: dict,
+    snap_root: str,
+    folder_path: str,
+    expected_relpaths: Set[str],
+    failed: List[str],
+    *,
+    depth: int = 0,
+    progress_cb=None,
+) -> Set[str]:
+    """
+    Alle Stubs unter folder_path. Ein listfolder_safe kann grosse Baeume still
+    kuerzen; wenn die lokale Manifest-Anzahl groesser ist, Kinder einzeln listen
+    (weiter vollstaendig, RAM nur ein Subtree).
+    """
+    prefix = _folder_rel_prefix(snap_root, folder_path)
+    expected_n = (
+        _expected_count_under(expected_relpaths, prefix) if expected_relpaths else None
+    )
+    stubs: Set[str] = set()
+    listed_ok = False
+    try:
+        flat = pc.call_with_backoff(
+            pc.listfolder_safe, cfg, path=folder_path, nofiles=False,
+        )
+        stubs = _stub_paths_from_flat(flat)
+        del flat
+        gc.collect()
+        listed_ok = True
+    except Exception:
+        listed_ok = False
+
+    complete = listed_ok and (expected_n is None or len(stubs) >= expected_n)
+    if complete:
+        return stubs
+
+    if depth >= _MAX_STUB_SPLIT:
+        failed.append(folder_path)
+        return stubs
+
+    try:
+        top = pc.call_with_backoff(
+            pc.listfolder, cfg, path=folder_path, recursive=False, nofiles=False,
+        )
+    except Exception:
+        failed.append(folder_path)
+        return stubs
+
+    split_stubs: Set[str] = set()
+    children = (top.get("metadata") or {}).get("contents") or []
+    n_dirs = sum(1 for c in children if c.get("isfolder"))
+    di = 0
+    for child in children:
+        name = child.get("name", "")
+        child_path = f"{folder_path.rstrip('/')}/{name}"
+        if child.get("isfolder"):
+            di += 1
+            if progress_cb:
+                progress_cb(di, max(n_dirs, 1), child_path)
+            split_stubs |= _list_folder_stubs_complete(
+                cfg,
+                snap_root,
+                child_path,
+                expected_relpaths,
+                failed,
+                depth=depth + 1,
+                progress_cb=progress_cb,
+            )
+        elif name.endswith(".meta.json"):
+            split_stubs.add(pc._norm_remote_path(child_path))
+    gc.collect()
+    return split_stubs if split_stubs else stubs
+
+
 def _collect_stub_paths_subtree_batch(
     cfg: dict,
     snap_path: str,
     *,
     progress_cb=None,
-) -> Set[str]:
+    expected_relpaths: Optional[Set[str]] = None,
+) -> Tuple[Set[str], List[str]]:
     """
-    Stub-Pfade: ein listfolder_safe pro Top-Level-Unterordner (Backup, Paperless, …).
-    Schnell (~1 API-Call pro Bucket), RAM nur fuer einen Subtree — kein BFS pro Ordner.
+    Stub-Pfade: ein Subtree nach dem anderen. Truncation → Split in Kinder.
+    Returns (stubs, failed_subtrees) — failed nur wenn ein Blatt nicht listbar ist.
     """
+    expected_relpaths = expected_relpaths or set()
     root = pc._norm_remote_path(snap_path).rstrip("/")
     stubs: Set[str] = set()
+    failed: List[str] = []
     try:
         top = pc.call_with_backoff(
             pc.listfolder, cfg, path=root, recursive=False, nofiles=False,
         )
     except Exception:
-        return stubs
+        return stubs, [root]
 
     subfolders: List[str] = []
     for child in (top.get("metadata") or {}).get("contents") or []:
@@ -131,17 +234,18 @@ def _collect_stub_paths_subtree_batch(
     for i, folder_path in enumerate(subfolders, start=1):
         if progress_cb:
             progress_cb(i, total, folder_path)
-        try:
-            flat = pc.call_with_backoff(
-                pc.listfolder_safe, cfg, path=folder_path, nofiles=False,
-            )
-            stubs |= _stub_paths_from_flat(flat)
-        except Exception:
-            continue
-        del flat
+        stubs |= _list_folder_stubs_complete(
+            cfg,
+            root,
+            folder_path,
+            expected_relpaths,
+            failed,
+            depth=0,
+            progress_cb=progress_cb,
+        )
         gc.collect()
 
-    return stubs
+    return stubs, failed
 
 
 def _load_remote_json_at(cfg: dict, path: str) -> Optional[dict]:
@@ -522,6 +626,7 @@ def run_verify(
         _out(f"[fetch] Index: {index_src}")
         gc.collect()
 
+    fetch_failed: List[str] = []
     for i, snap in enumerate(remote_snaps, start=1):
         snap_path = f"{snaps_root}/{snap}"
 
@@ -530,12 +635,24 @@ def run_verify(
             _out(f"[fetch]   {snap}: subtree {j}/{total} ({label})")
 
         try:
-            snap_stubs = _collect_stub_paths_subtree_batch(
-                cfg, snap_path, progress_cb=_progress,
+            snap_stubs, failed_subs = _collect_stub_paths_subtree_batch(
+                cfg,
+                snap_path,
+                progress_cb=_progress,
+                expected_relpaths=set((manifests.get(snap) or {}).keys()),
             )
             stub_paths |= snap_stubs
-            _out(f"[fetch] {i}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
+            if failed_subs:
+                fetch_failed.extend(failed_subs)
+                labels = [p.rsplit("/", 1)[-1] or p for p in failed_subs]
+                _out(
+                    f"[warn] {snap}: listfolder unvollständig "
+                    f"({', '.join(labels)}) — {len(snap_stubs)} Stubs, Check B nicht zählbar"
+                )
+            else:
+                _out(f"[fetch] {i}/{len(remote_snaps)} {snap}: {len(snap_stubs)} stubs")
         except Exception as e:
+            fetch_failed.append(snap_path)
             _out(f"[warn] Stub-Fetch fehlgeschlagen fuer {snap}: {e}")
         gc.collect()
 
@@ -578,8 +695,19 @@ def run_verify(
     res_b = check_stubs_vs_index(
         pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
     )
+    fetch_incomplete = bool(fetch_failed)
+    res_b["fetch_incomplete"] = fetch_incomplete
+    res_b["failed_subtrees"] = fetch_failed
     mm = int(res_b.get("manifest_missing_total") or 0)
-    if mm > 0:
+    if fetch_incomplete:
+        nfail = len(fetch_failed)
+        issues += nfail
+        labels = [p.rsplit("/", 1)[-1] or p for p in fetch_failed]
+        _out(
+            f"  [skip] {mm} scheinbar fehlende Stubs nicht gewertet — "
+            f"Listing unvollständig ({nfail} Ordner: {', '.join(labels)})"
+        )
+    elif mm > 0:
         issues += mm
         _out(f"  ✗ {mm} Stub(s) fehlen (Manifest vs. remote)")
         for snap, paths in (res_b.get("manifest_missing_stubs") or {}).items():
@@ -619,7 +747,10 @@ def run_verify(
     summary_parts = []
     if not snapshot_filter and res_a["index_not_in_pool_count"] > 0:
         summary_parts.append(f"{res_a['index_not_in_pool_count']} pool missing")
-    if res_b["manifest_missing_total"] > 0:
+    if fetch_incomplete:
+        labels = [p.rsplit("/", 1)[-1] or p for p in fetch_failed]
+        summary_parts.append("listfolder incomplete: " + ", ".join(labels))
+    elif res_b["manifest_missing_total"] > 0:
         summary_parts.append(f"{res_b['manifest_missing_total']} stubs missing")
     for snap, r in res_a["per_snapshot"].items():
         if r["missing_count"] > 0:

@@ -975,13 +975,24 @@
       const auditNewer = maAt > 0 && (puAt === 0 || maAt >= puAt);
 
       if (ma === 'FAILED' || fr === 'FAILED') {
-        const systematic = maN >= 1000;
+        const sum = String(r.monthly_audit_summary || '');
+        if (/listfolder incomplete/i.test(sum) || maN >= 1000) {
+          return {
+            kind: 'listing_incomplete',
+            badge: 'Listing unvollständig',
+            badgeCls: 'stale',
+            explain: 'Subtree-listfolder hat nur einen Teil der Stubs gesehen (API/Timeout). Pool-Inhalt war OK — kein Datenverlust. Nächster voller Audit überschreibt das.',
+            currentN: maN,
+            currentSrc: 'nur gelistet',
+            histN: 0
+          };
+        }
         return {
           kind: 'audit_fail',
-          badge: 'Audit fehlgeschlagen',
+          badge: maN === 1 ? '1 Abweichung' : 'Audit fehlgeschlagen',
           badgeCls: 'failed',
-          explain: systematic
-            ? 'Sehr viele Abweichungen — meist Index-/Stub-Mismatch, kein Massenverlust.'
+          explain: maN <= 3
+            ? 'Kleine, konkrete Differenz (Stub/Pfad). Report unter /srv/pcloud-archive/integrity/ — kein Massenproblem.'
             : 'Letzter periodischer Check nicht OK. Der Audit-Timer nimmt FAILED zuerst wieder.',
           currentN: maN,
           currentSrc: 'Audit',
@@ -1046,12 +1057,14 @@
     }
 
     function integrityIssuesCell(info) {
+      if (info.kind === 'listing_incomplete') {
+        return '<span class="val yellow">' + fmtCount(info.currentN) + '</span>'
+          + '<span class="integrity-check-meta">scheinbar fehlend</span>'
+          + '<span class="integrity-hist">Listing-Abbruch, keine fehlenden Dateien</span>';
+      }
       if (info.currentN > 0) {
         let html = '<span class="val red">' + fmtCount(info.currentN) + '</span>';
         if (info.currentSrc) html += '<span class="integrity-check-meta">' + esc(info.currentSrc) + '</span>';
-        if (info.currentN >= 1000) {
-          html += '<span class="integrity-hist">kein Datenverlust \u2014 Index-Abgleich</span>';
-        }
         if (info.histN > 0 && info.histN !== info.currentN) {
           html += '<span class="integrity-hist">damals ' + fmtCount(info.histN) + ' (Nach Upload)</span>';
         }
@@ -1219,7 +1232,9 @@
           + '<strong>Lage</strong> = was jetzt gilt. '
           + '<strong>historisch</strong> = alter Gate-Fail, sp\u00e4terer Audit OK. '
           + '<strong>Pr\u00fcfung alt</strong> = Audit OK, &gt;35 Tage her (kein Datenfehler). '
-          + '<strong>Abweichungen</strong> = nur der noch g\u00fcltige Check; 1&nbsp;000+ meist Index-Mismatch.'
+          + '<strong>Listing unvollständig</strong> = listfolder hat einen Ordner übersprungen, keine fehlenden Dateien. '
+          + '<strong>1 Abweichung</strong> = konkreter Stub/Pfad. '
+          + '<strong>Abweichungen</strong> = nur der noch g\u00fcltige Check.'
           + '</div>'
           + '<table class="report-table"><thead><tr>'
           + '<th>Snapshot</th>'
@@ -1233,7 +1248,8 @@
               const ma = r.monthly_audit_status || '\u2014';
               const fr = r.audit_freshness || 'UNKNOWN';
               const info = interpretIntegrity(r);
-              const rowCls = info.kind === 'audit_fail' ? 'row-failed' : (info.kind === 'gate_open' ? 'row-running' : '');
+              const rowCls = info.kind === 'audit_fail' ? 'row-failed'
+                : (info.kind === 'listing_incomplete' || info.kind === 'gate_open' ? 'row-running' : '');
               const tip = [info.explain, r.monthly_audit_summary].filter(Boolean).join(' | ');
               const puExtra = (pu === 'FAILED' && (r.post_upload_issues || 0) > 0)
                 ? '<div class="integrity-check-meta">' + fmtCount(r.post_upload_issues) + ' damals</div>' : '';
@@ -1993,7 +2009,7 @@
         const kind = tr.getAttribute('data-kind') || '';
         let hit = true;
         if (filter === 'pu_fail' || filter === 'pu_open') hit = kind === 'gate_open';
-        else if (filter === 'au_fail') hit = kind === 'audit_fail';
+        else if (filter === 'au_fail') hit = kind === 'audit_fail' || kind === 'listing_incomplete';
         else if (filter === 'stale') hit = kind === 'stale';
         else if (filter === 'au_ok') hit = kind === 'ok' || kind === 'superseded';
         if (filter && filter !== 'all' && !hit) tr.classList.add('integrity-row-dim');
