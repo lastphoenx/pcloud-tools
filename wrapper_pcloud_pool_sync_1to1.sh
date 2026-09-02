@@ -646,6 +646,11 @@ build_and_push() {
   local upload_duration=$(( $(date +%s) - T0 ))
   _db_phase_log "upload" "end" "SUCCESS"
   _db_update_metrics "upload_duration_sec = $upload_duration"
+  local _n_up
+  _n_up=$(grep -oE '\[metrics\] uploaded_files=[0-9]+' "$PCLOUD_LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+$' || true)
+  if [[ -n "${_n_up:-}" ]]; then
+    _db_update_metrics "files_uploaded = ${_n_up}"
+  fi
   [[ "${PCLOUD_TIMING:-0}" == "1" ]] && _log INFO "Upload done (${upload_duration}s)"
 
   # Manifest-Archivierung wird bereits vom Push-Tool erledigt

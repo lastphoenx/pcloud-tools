@@ -942,9 +942,12 @@
       const sgClass    = sgDisplay === 'GREEN' ? 'green' : sgDisplay === 'YELLOW' ? 'yellow' : sgDisplay === 'RED' ? 'red' : sgDisplay === 'UNKNOWN' ? 'yellow' : 'gray';
 
       const perf       = ((reports || {}).performance_stats || {});
-      const successPct = perf.total_runs > 0
-        ? Math.round((perf.successful_runs / perf.total_runs) * 100)
-        : null;
+      const successDenom = (perf.successful_runs || 0) + (perf.unresolved_failed_runs != null ? perf.unresolved_failed_runs : (perf.failed_runs || 0));
+      const successPct = successDenom > 0
+        ? Math.round((perf.successful_runs / successDenom) * 100)
+        : (perf.total_runs > 0
+          ? Math.round((perf.successful_runs / perf.total_runs) * 100)
+          : null);
 
       const allRecent = ((reports || {}).recent_backups || []);
       const attemptCounts = backupRunsAttemptCounts(allRecent);
@@ -952,13 +955,16 @@
       const poolInt  = ((reports || {}).pool_integrity) || {};
       const intSum   = poolInt.summary || {};
       const intSnaps = poolInt.snapshots || [];
-      const intFailed = (intSum.post_upload_failed || 0) + (intSum.audit_failed || 0);
       const intPuFail = intSum.post_upload_failed || 0;
       const intAuFail = intSum.audit_failed || 0;
       const intStale  = intSum.audit_stale || 0;
       const intTotal  = intSum.total || intSnaps.length;
-      if (intFailed > 0 && tileCls === 'ok') tileCls = 'bad';
-      else if ((intStale > 0 || intSum.audit_unknown > 0) && tileCls === 'ok') tileCls = 'warning';
+      const sb = (cloud.checks || {}).sync_backlog || {};
+      const catchupN = sb.catchup_count || 0;
+      const incompleteN = sb.incomplete_count || 0;
+      const zombieN = sb.running_zombies || 0;
+      if (incompleteN > 0 && tileCls === 'ok') tileCls = 'bad';
+      else if ((catchupN > 0 || zombieN > 0) && tileCls === 'ok') tileCls = 'warning';
 
       let html = '<div class="tile">'
         + '<div class="tile-header">'
@@ -991,17 +997,29 @@
         +     rtbLastBackupSummaryHTML(rtb)
         +     rtbExcludePolicyHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
+        +     renderSyncBacklog(sb)
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
         +     (perf.total_runs ? (
-                '<div class="info-row"><span class="lbl">Erfolgsrate 30d</span><span class="val ' + (successPct >= 90 ? 'green' : successPct >= 70 ? 'yellow' : 'red') + '" title="' + (perf.successful_runs||0) + '/' + (perf.total_runs||0) + ' Läufe OK">' + successPct + '%</span></div>'
+                '<div class="info-row"><span class="lbl">Erfolgsrate 30d</span><span class="val ' + (successPct >= 90 ? 'green' : successPct >= 70 ? 'yellow' : 'red') + '" title="' + (perf.successful_runs||0) + ' SUCCESS / ' + successDenom + ' ohne nachgezogenen Erfolg">' + successPct + '%</span></div>'
               + '<div class="info-row"><span class="lbl">\xD8 Dauer</span><span class="val">' + perf.avg_duration_min + ' min</span></div>'
-              + '<div class="info-row"><span class="lbl">Gesamt hochgeladen (30d)</span><span class="val" title="Pool-Mode: oft 0 wenn Bytes nicht in DB">' + perf.total_gb_uploaded + ' GB</span></div>'
+              + (Number(perf.total_gb_uploaded) > 0
+                  ? '<div class="info-row"><span class="lbl">Gesamt hochgeladen (30d)</span><span class="val">' + perf.total_gb_uploaded + ' GB</span></div>'
+                  : '<div class="info-row"><span class="lbl">Dateien hochgeladen (30d)</span><span class="val" title="Pool-Mode: Bytes oft 0; files_uploaded aus [metrics]">' + (perf.files_uploaded_30d || 0) + '</span></div>')
               ) : '')
         +     (rtb.status_source === 'db_fallback' ? (
                 '<div class="info-row"><span class="lbl">RTB-Quelle</span><span class="val yellow" title="rtb_wrapper.log leer — Status aus MariaDB">DB-Fallback</span></div>'
               ) : '')
         +     renderSgExplainBox(sgExplain, sgLive)
         +   '</div>';
+
+      html += '<div class="summary-row summary-row-secondary" style="margin-top:8px">'
+          + '<div class="summary-box ' + (catchupN > 0 ? 'yellow' : 'green') + '" title="Lokale RTB-Snapshots ohne .upload_complete">'
+          + '<div class="big">' + catchupN + '</div><div class="lbl">Catch-up</div></div>'
+          + '<div class="summary-box ' + (incompleteN > 0 ? 'red' : 'green') + '" title="Remote-Ordner ohne .upload_complete (keine Scout-Basis)">'
+          + '<div class="big">' + incompleteN + '</div><div class="lbl">Incomplete</div></div>'
+          + '<div class="summary-box ' + (zombieN > 0 ? 'yellow' : 'green') + '" title="backup_runs RUNNING obwohl Pipeline inactive">'
+          + '<div class="big">' + zombieN + '</div><div class="lbl">DB-RUNNING</div></div>'
+          + '</div>';
 
       if (intSum.total > 0 || intSnaps.length > 0) {
         html += '<div class="summary-row summary-row-secondary" style="margin-top:8px">'
@@ -1491,7 +1509,7 @@
       const ba = (cloud.checks||{}).backup_age || {};
 
       // ---- Sync-Analyse ----
-      const syncRow = buildSyncAnalysis(ba, reports);
+      const syncRow = buildSyncAnalysis(ba, reports, cloud);
       rows += drow('Sync-Status', syncRow.text, syncRow.cls);
 
       if (ba.snapshot_count !== undefined) rows += drow('RTB Snapshots',    String(ba.snapshot_count));
@@ -1505,6 +1523,17 @@
       }
 
       if (ba.message) rows += drow('Health-Check Msg', ba.message, '', 200);
+
+      const sb = (cloud.checks || {}).sync_backlog || {};
+      if ((sb.catchup_count || 0) > 0) {
+        rows += drow('Catch-up', sb.catchup_count + ': ' + (sb.catchup || []).join(', '), 'yellow', 160);
+      }
+      if ((sb.incomplete_count || 0) > 0) {
+        rows += drow('Incomplete Remotes', (sb.incomplete_remote || []).join(', '), 'red', 160);
+      }
+      if ((sb.running_zombies || 0) > 0) {
+        rows += drow('DB RUNNING-Zombie', String(sb.running_zombies), 'yellow');
+      }
 
       // Newest local snapshot: prefer rtb.latest_snapshot (aggregate_status.sh reads filesystem directly)
       // Fall back to ba.rtb_snapshot (pcloud_health_check.sh, same filesystem but separate process)
@@ -1541,14 +1570,29 @@
     // ---- Sync-Analyse: RTB ↔ pCloud ----------------------------
     // Combines health-check data (status.json) with DB data (reports.json)
 
-    function buildSyncAnalysis(ba, reports) {
-      // 1. DB: Upload-Status für neuesten lokalen RTB-Snapshot (nicht blind recent[0])
+    function buildSyncAnalysis(ba, reports, cloud) {
       const localSnap = (ba || {}).rtb_snapshot || '';
       const uploadState = uploadStateForSnapshot(reports, localSnap);
+      const sb = ((cloud || {}).checks || {}).sync_backlog || {};
 
       if (uploadState.kind === 'running') {
         const r = uploadState.run;
         return { text: '\u21BB Upload l\xe4uft (' + (r.snapshot || localSnap) + ') \u2014 .upload_complete noch nicht gesetzt', cls: 'blue' };
+      }
+      if ((sb.incomplete_count || 0) > 0) {
+        return {
+          text: '\u274C Incomplete Remote-Ordner (' + sb.incomplete_count + '): ' + ((sb.incomplete_remote || []).join(', ')),
+          cls: 'red'
+        };
+      }
+      if ((sb.catchup_count || 0) > 0) {
+        return {
+          text: '\u26A0\uFE0F Latest OK, Catch-up ' + sb.catchup_count + ': ' + ((sb.catchup || []).join(', ')),
+          cls: 'yellow'
+        };
+      }
+      if ((sb.running_zombies || 0) > 0) {
+        return { text: '\u26A0\uFE0F backup_runs RUNNING obwohl Pipeline inactive', cls: 'yellow' };
       }
       if (uploadState.kind === 'failed') {
         const r = uploadState.run;
@@ -1556,32 +1600,20 @@
         return { text: '\u274C Upload FEHLGESCHLAGEN: ' + (r.snapshot || localSnap) + err, cls: 'red' };
       }
 
-      // 2. Health-Check status_code
-      const sc = ba ? (typeof ba === 'object' ? undefined : 0) : undefined; // ba is checks.backup_age
-      // pCloud health-check already computed sync via snapshot name comparison
       const msg = (ba||{}).message || '';
       const isInSync = msg.toLowerCase().includes('in sync') || msg.toLowerCase().includes('synchron');
       if (isInSync) {
-        // Check if there's a known gap: snapshot_count > manifest_count means pCloud is missing some
-        const diff = ((ba||{}).snapshot_count||0) - ((ba||{}).manifest_count||0);
-        if (diff > 0) {
-          return { text: '\u26A0\uFE0F Neuester Snapshot OK, aber ' + diff + ' Snapshot(s) fehlen auf pCloud (GAP)', cls: 'yellow' };
-        }
         return { text: '\u2713 Synchron \u2014 pCloud und RTB auf gleichem Stand', cls: 'green' };
       }
 
-      // Not in sync
       const pcloudSnap = (ba||{}).pcloud_snapshot || 'unbekannt';
       const h = (ba||{}).pcloud_age_hours || 0;
-      
-      // Handle "none" case (no DB tracking or no successful backups)
       if (pcloudSnap === 'none' || pcloudSnap === 'unbekannt') {
         return {
           text: '\u26A0\uFE0F pCloud Sync-Status unbekannt (DB-Tracking prüfen: PCLOUD_ENABLE_DB=1)',
           cls: 'yellow'
         };
       }
-      
       const age = h < 48 ? h + 'h' : Math.floor(h/24) + 'd';
       return {
         text: '\u26A0\uFE0F NICHT synchron \u2014 neuester pCloud-Snap: ' + pcloudSnap + ' (' + age + ' alt)',
@@ -1724,7 +1756,8 @@
         + '<th>Unit</th><th>Enabled</th><th>Active</th><th>LastRun</th><th>NextRun</th>'
         + '</tr></thead><tbody>'
         + timers.map(t => {
-            const enabledCls = t.enabled === 'enabled' ? 'success' : t.enabled === 'disabled' ? 'failed' : '';
+            const leftover = t.leftover === true || t.leftover === 'true';
+            const enabledCls = leftover ? 'failed' : (t.enabled === 'enabled' ? 'success' : t.enabled === 'disabled' ? 'failed' : '');
             const activeCls = t.active === 'active' ? 'success' : t.active === 'inactive' ? 'failed' : '';
             const lastDisplay = t.last_run !== 'n/a' && t.last_delta !== 'n/a'
               ? t.last_run + ' (' + t.last_delta + ')'
@@ -1732,8 +1765,9 @@
             const nextDisplay = t.next_run !== 'n/a' && t.next_delta !== 'n/a'
               ? t.next_run + ' (' + t.next_delta + ')'
               : '\u2014';
-            return '<tr>'
-              + '<td>' + esc(t.unit || '\u2014') + '</td>'
+            const unitLabel = leftover ? (t.unit + ' (Alt-Unit \u2014 disable)') : (t.unit || '\u2014');
+            return '<tr' + (leftover ? ' class="failed"' : '') + '>'
+              + '<td>' + esc(unitLabel) + '</td>'
               + '<td><span class="badge ' + enabledCls + '">' + esc(t.enabled || '\u2014') + '</span></td>'
               + '<td><span class="badge ' + activeCls + '">' + esc(t.active || '\u2014') + '</span></td>'
               + '<td>' + esc(lastDisplay) + '</td>'
@@ -2164,6 +2198,29 @@
     function cloudIcon(cloud) {
       const c = cloud.status_code !== undefined ? cloud.status_code : 3;
       return c === 0 ? '\u2713' : c === 1 ? '!' : '\u2717';
+    }
+
+    function renderSyncBacklog(sb) {
+      if (!sb) return '';
+      const n = sb.catchup_count || 0;
+      const inc = sb.incomplete_count || 0;
+      const z = sb.running_zombies || 0;
+      let html = '';
+      const catchupCls = n > 0 ? 'yellow' : 'green';
+      const names = (sb.catchup || []).join(', ');
+      html += '<div class="info-row"><span class="lbl">Catch-up (RTB ohne Marker)</span>'
+        + '<span class="val ' + catchupCls + '" title="' + esc(names || 'keine') + '">'
+        + (n === 0 ? '\u2713 leer' : n + ' Snapshot(s)') + '</span></div>';
+      if (inc > 0) {
+        html += '<div class="info-row"><span class="lbl">Incomplete Remotes</span>'
+          + '<span class="val red" title="' + esc((sb.incomplete_remote || []).join(', ')) + '">'
+          + inc + ' Ordner ohne .upload_complete</span></div>';
+      }
+      if (z > 0) {
+        html += '<div class="info-row"><span class="lbl">DB RUNNING-Zombie</span>'
+          + '<span class="val yellow">' + z + ' (Pipeline inactive)</span></div>';
+      }
+      return html;
     }
 
     function renderPCloudAge(ba) {

@@ -288,24 +288,33 @@ get_performance_stats() {
   local result
   result=$(db_query "
     SELECT
-      COALESCE(total_runs, 0),
-      COALESCE(successful_runs, 0),
-      COALESCE(failed_runs, 0),
-      COALESCE(avg_duration_min, 0),
-      COALESCE(total_gb_uploaded, 0),
-      COALESCE(avg_gb_per_run, 0),
-      COALESCE(gap_backfill_count, 0)
-    FROM v_performance_stats;
+      COALESCE(COUNT(*), 0),
+      COALESCE(SUM(br.status = 'SUCCESS'), 0),
+      COALESCE(SUM(
+        br.status = 'FAILED'
+        AND NOT EXISTS (
+          SELECT 1 FROM backup_runs ok
+          WHERE ok.snapshot_name = br.snapshot_name
+            AND ok.status = 'SUCCESS'
+            AND ok.started_at > br.started_at
+        )
+      ), 0),
+      COALESCE(ROUND(AVG(br.duration_sec) / 60, 2), 0),
+      COALESCE(ROUND(SUM(br.bytes_uploaded) / 1024 / 1024 / 1024, 2), 0),
+      COALESCE(SUM(COALESCE(br.files_uploaded, 0)), 0),
+      COALESCE(SUM(br.gap_backfill_mode), 0)
+    FROM backup_runs br
+    WHERE br.started_at >= DATE_SUB(NOW(), INTERVAL 30 DAY);
   " 2>/dev/null || echo "")
 
   if [[ -z "$result" ]]; then
-    echo "{\"total_runs\":0,\"successful_runs\":0,\"failed_runs\":0,\"avg_duration_min\":0,\"total_gb_uploaded\":0,\"avg_gb_per_run\":0,\"gap_backfill_count\":0}"
+    echo "{\"total_runs\":0,\"successful_runs\":0,\"failed_runs\":0,\"unresolved_failed_runs\":0,\"avg_duration_min\":0,\"total_gb_uploaded\":0,\"files_uploaded_30d\":0,\"gap_backfill_count\":0}"
     return
   fi
 
-  IFS=$'\t' read -r total successful failed avg_dur total_gb avg_gb gap_count <<< "$result"
+  IFS=$'\t' read -r total successful unresolved avg_dur total_gb files_30d gap_count <<< "$result"
 
-  echo "{\"total_runs\":${total},\"successful_runs\":${successful},\"failed_runs\":${failed},\"avg_duration_min\":${avg_dur},\"total_gb_uploaded\":${total_gb},\"avg_gb_per_run\":${avg_gb},\"gap_backfill_count\":${gap_count}}"
+  echo "{\"total_runs\":${total},\"successful_runs\":${successful},\"failed_runs\":${unresolved},\"unresolved_failed_runs\":${unresolved},\"avg_duration_min\":${avg_dur},\"total_gb_uploaded\":${total_gb},\"files_uploaded_30d\":${files_30d},\"gap_backfill_count\":${gap_count}}"
 }
 
 # =====================================================

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
 import re
 import subprocess
@@ -27,9 +28,12 @@ sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 
 _SNAP_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}-\d{6}$")
+_JSON_MODE = False
 
 
 def _log(msg: str) -> None:
+    if _JSON_MODE:
+        return
     print(msg, flush=True)
 
 
@@ -211,6 +215,49 @@ def _query_db_failed(env: Dict[str, str]) -> List[Dict[str, str]]:
         return []
 
 
+def _query_db_running(env: Dict[str, str]) -> List[Dict[str, str]]:
+    """Offene RUNNING-Zeilen (Zombies, wenn die Pipeline nicht laeuft)."""
+    db_pass = env.get("PCLOUD_DB_PASS") or os.environ.get("PCLOUD_DB_PASS", "")
+    if not db_pass:
+        return []
+    host = env.get("PCLOUD_DB_HOST", "localhost")
+    port = env.get("PCLOUD_DB_PORT", "3306")
+    user = env.get("PCLOUD_DB_USER", "pcloud_backup")
+    db = env.get("PCLOUD_DB_NAME", "pcloud_backup")
+    sql = """
+        SELECT run_id, snapshot_name, started_at
+        FROM backup_runs
+        WHERE status = 'RUNNING'
+        ORDER BY started_at;
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "mysql", "-h", host, "-P", port, "-u", user, f"-D{db}",
+                "-N", "-B", "-e", sql,
+            ],
+            env={**os.environ, "MYSQL_PWD": db_pass},
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return []
+        rows = []
+        for line in proc.stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                rows.append({
+                    "run_id": parts[0],
+                    "snapshot_name": parts[1],
+                    "started_at": parts[2],
+                })
+        return rows
+    except Exception:
+        return []
+
+
 def _query_db_summary(env: Dict[str, str]) -> Optional[Dict[str, int]]:
     db_pass = env.get("PCLOUD_DB_PASS") or os.environ.get("PCLOUD_DB_PASS", "")
     if not db_pass:
@@ -245,12 +292,28 @@ def main() -> int:
     ap.add_argument("--manifests-dir", default=None,
                     help="Default: <PCLOUD_ARCHIVE_DIR aus .env>/manifests")
     ap.add_argument("--skip-db", action="store_true", help="MariaDB nicht abfragen")
+    ap.add_argument("--json", action="store_true",
+                    help="Nur kompaktes JSON (Health-Check / Dashboard)")
     ap.add_argument("--workers", type=int, default=8, help="Parallele .upload_complete Checks")
     args = ap.parse_args()
 
+    global _JSON_MODE
+    _JSON_MODE = bool(args.json)
+
     pool_root_raw = args.pool_root or args.dest_root
     if not pool_root_raw:
-        _log("[FAIL] --pool-root erforderlich")
+        if args.json:
+            print(json.dumps({
+                "error": "pool-root required",
+                "catchup_count": 0,
+                "incomplete_count": 0,
+                "running_count": 0,
+                "catchup": [],
+                "incomplete_remote": [],
+                "running": [],
+            }))
+        else:
+            _log("[FAIL] --pool-root erforderlich")
         return 2
     if args.dest_root and not args.pool_root:
         _log("[warn] --dest-root ist deprecated, bitte --pool-root verwenden")
@@ -342,6 +405,23 @@ def main() -> int:
     manifest_no_complete = sorted(manifest_set - complete_set)
     complete_no_manifest = sorted(complete_set - manifest_set)
     remote_no_rtb = sorted(complete_set - rtb_set)
+    running_rows: List[Dict[str, str]] = []
+    if not args.skip_db:
+        running_rows = _query_db_running(env_vars)
+
+    if args.json:
+        payload = {
+            "catchup": catchup,
+            "catchup_count": len(catchup),
+            "incomplete_remote": incomplete_remote,
+            "incomplete_count": len(incomplete_remote),
+            "rtb_count": len(rtb_snaps),
+            "remote_complete_count": len(complete_set),
+            "running": running_rows,
+            "running_count": len(running_rows),
+        }
+        print(json.dumps(payload, ensure_ascii=True), flush=True)
+        return 0
 
     _log("")
     _log("--- Zusammenfassung ---")

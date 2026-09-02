@@ -100,6 +100,7 @@ CHECK_RESULTS[disk_status]=0
 CHECK_RESULTS[disk_message]=""
 CHECK_RESULTS[database_status]=0
 CHECK_RESULTS[database_message]=""
+CHECK_RESULTS[sync_backlog_json]="{\"catchup_count\":0,\"incomplete_count\":0,\"running_count\":0,\"catchup\":[],\"incomplete_remote\":[],\"running\":[]}"
 
 # Helper: Set status (keep highest severity)
 set_status() {
@@ -506,6 +507,107 @@ check_database() {
 }
 
 # =====================================================
+# CHECK 5: Catch-up / Incomplete Remotes / RUNNING-Zombies
+# =====================================================
+check_sync_backlog() {
+  [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[5] Catch-up / Incomplete / DB-RUNNING${NC}"
+
+  local audit_py="${SCRIPT_DIR}/scripts/utilities/pool_audit_status.py"
+  local pool_root="${PCLOUD_DEST:-/Backup/rtb_pool}"
+  local rtb_root="${RTB:-${RTB_SNAPSHOT_DIR:-/mnt/backup/rtb_nas}}"
+  local default_json='{"catchup_count":0,"incomplete_count":0,"running_count":0,"catchup":[],"incomplete_remote":[],"running":[]}'
+  CHECK_RESULTS[sync_backlog_json]="$default_json"
+
+  if [[ ! -f "$audit_py" ]]; then
+    log_issue "WARNING" "pool_audit_status.py fehlt — Catch-up-Check übersprungen"
+    set_status 1
+    return
+  fi
+
+  local py_bin=""
+  if [[ -x /opt/apps/pcloud-tools/venv/bin/python3 ]]; then
+    py_bin=/opt/apps/pcloud-tools/venv/bin/python3
+  elif [[ -x "${SCRIPT_DIR}/../venv/bin/python3" ]]; then
+    py_bin="${SCRIPT_DIR}/../venv/bin/python3"
+  else
+    py_bin="$(command -v python3 || true)"
+  fi
+  if [[ -z "$py_bin" ]]; then
+    log_issue "WARNING" "python3 fehlt — Catch-up-Check übersprungen"
+    set_status 1
+    return
+  fi
+
+  local audit_out rc=0
+  set +e
+  audit_out="$(
+    MAIN_DIR="${SCRIPT_DIR}" "$py_bin" "$audit_py" \
+      --json --env-file "$ENV_FILE" \
+      --pool-root "$pool_root" \
+      --rtb-root "$rtb_root" \
+      2>/dev/null
+  )"
+  rc=$?
+  set -e
+
+  if [[ -z "$audit_out" || "$audit_out" != \{* ]]; then
+    log_issue "WARNING" "Catch-up-Check fehlgeschlagen (API/Skript)"
+    set_status 1
+    return
+  fi
+
+  CHECK_RESULTS[sync_backlog_json]="$audit_out"
+
+  local catchup_n incomplete_n running_n
+  if command -v jq &>/dev/null; then
+    catchup_n=$(echo "$audit_out" | jq -r '.catchup_count // 0')
+    incomplete_n=$(echo "$audit_out" | jq -r '.incomplete_count // 0')
+    running_n=$(echo "$audit_out" | jq -r '.running_count // 0')
+  else
+    catchup_n=0
+    incomplete_n=0
+    running_n=0
+  fi
+
+  local pipeline_state
+  pipeline_state="$(systemctl is-active backup-pipeline.service 2>/dev/null || echo inactive)"
+  local zombie_n=0
+  if [[ "$pipeline_state" != "active" && "$pipeline_state" != "activating" ]]; then
+    zombie_n=$running_n
+  fi
+
+  if command -v jq &>/dev/null; then
+    CHECK_RESULTS[sync_backlog_json]=$(echo "$audit_out" | jq -c \
+      --argjson z "${zombie_n:-0}" \
+      --arg ps "$pipeline_state" \
+      '. + {running_zombies: $z, pipeline: $ps}' 2>/dev/null || echo "$audit_out")
+  fi
+
+  [[ $VERBOSE -eq 1 ]] && echo "  Catch-up: ${catchup_n} | Incomplete remotes: ${incomplete_n} | RUNNING (DB): ${running_n} (Zombies: ${zombie_n})"
+
+  if [[ "${incomplete_n:-0}" -gt 0 ]]; then
+    local names
+    names=$(echo "$audit_out" | jq -r '.incomplete_remote | join(", ")' 2>/dev/null || echo "")
+    log_issue "CRITICAL" "Incomplete Remote-Ordner ohne .upload_complete (${incomplete_n}): ${names}"
+    set_status 2
+  elif [[ "${catchup_n:-0}" -gt 0 ]]; then
+    local names
+    names=$(echo "$audit_out" | jq -r '.catchup | join(", ")' 2>/dev/null || echo "")
+    log_issue "WARNING" "Catch-up: ${catchup_n} lokale RTB-Snapshot(s) ohne .upload_complete: ${names}"
+    set_status 1
+  else
+    log_issue "OK" "Catch-up leer — alle lokalen RTB-Snapshots complete auf pCloud"
+  fi
+
+  if [[ "${zombie_n:-0}" -gt 0 ]]; then
+    local names
+    names=$(echo "$audit_out" | jq -r '[.running[].snapshot_name] | join(", ")' 2>/dev/null || echo "")
+    log_issue "WARNING" "backup_runs RUNNING=${zombie_n} obwohl Pipeline inactive: ${names}"
+    set_status 1
+  fi
+}
+
+# =====================================================
 # Run All Checks
 # =====================================================
 [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}=== pCloud Backup Health Check ===${NC}"
@@ -514,6 +616,7 @@ check_backup_age
 check_pcloud_quota
 check_disk_space
 check_database
+check_sync_backlog
 
 # =====================================================
 # Output Summary
@@ -579,7 +682,8 @@ if [[ $JSON_MODE -eq 1 ]]; then
   echo "      \"status\": ${CHECK_RESULTS[database_status]:-3},"
   echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[database_message]:-Check not run}")\","
   echo "      \"enabled\": \"${PCLOUD_ENABLE_DB}\""
-  echo "    }"
+  echo "    },"
+  echo "    \"sync_backlog\": ${CHECK_RESULTS[sync_backlog_json]}"
   
   echo "  },"
   echo "  \"issues\": ["

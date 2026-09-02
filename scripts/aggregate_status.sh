@@ -757,6 +757,7 @@ collect_timer_status() {
     "entropywatcher-os-av"
     "entropywatcher-os-av-weekly"
     "backup-pipeline"
+    "integrity-audit"
   )
   
   local json_array=()
@@ -827,6 +828,25 @@ TIMER_EOF
     
     json_array+=("$timer_json")
   done
+
+  if systemctl list-unit-files backup-pcloud.timer --no-legend 2>/dev/null | grep -q '^backup-pcloud.timer'; then
+    local bp_en bp_ac
+    bp_en="$(systemctl is-enabled backup-pcloud.timer 2>/dev/null || echo unknown)"
+    bp_ac="$(systemctl is-active backup-pcloud.timer 2>/dev/null || echo unknown)"
+    json_array+=("$(cat <<-TIMER_EOF
+    {
+      "unit": "backup-pcloud.timer",
+      "enabled": "$(escape_json "$bp_en")",
+      "active": "$(escape_json "$bp_ac")",
+      "last_run": "n/a",
+      "last_delta": "n/a",
+      "next_run": "n/a",
+      "next_delta": "n/a",
+      "leftover": true
+    }
+TIMER_EOF
+    )")
+  fi
   
   # Join array elements with commas
   local result="["
