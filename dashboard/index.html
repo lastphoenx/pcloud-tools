@@ -372,10 +372,33 @@
       font-weight: 600;
     }
     .badge.success { background: rgba(34,197,94,0.15);  color: var(--green); }
+    .badge.ok      { background: rgba(34,197,94,0.15);  color: var(--green); }
     .badge.failed  { background: rgba(239,68,68,0.15);  color: var(--red); }
+    .badge.stale   { background: rgba(245,158,11,0.15); color: var(--yellow); }
+    .badge.unknown { background: rgba(148,163,184,0.15); color: var(--muted); }
     .report-table tr.row-failed td { background: rgba(239,68,68,0.08); }
     .report-table tr.row-running td { background: rgba(234,179,8,0.08); }
     .badge.running { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .integrity-explain {
+      display: block;
+      font-size: 10px;
+      color: var(--muted);
+      font-weight: 400;
+      line-height: 1.35;
+      margin-top: 3px;
+      max-width: 280px;
+    }
+    .integrity-hist {
+      display: block;
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .integrity-check-meta {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
     .badge.nas     { background: rgba(168,85,247,0.15); color: #a855f7; }
     .badge.os      { background: rgba(59,130,246,0.15); color: var(--blue); }
 
@@ -922,6 +945,125 @@
       return { kind: 'none' };
     }
 
+    function parseIsoMs(ts) {
+      if (!ts) return 0;
+      const d = Date.parse(ts);
+      return isNaN(d) ? 0 : d;
+    }
+
+    function fmtCount(n) {
+      n = Number(n) || 0;
+      try { return n.toLocaleString('de-DE'); } catch (e) { return String(n); }
+    }
+
+    function integrityStatusBadge(st) {
+      const s = (st || '').trim();
+      if (!s || s === '\u2014') return '<span style="color:var(--muted)">\u2014</span>';
+      const cls = s === 'OK' ? 'success' : s === 'FAILED' ? 'failed' : s === 'STALE' ? 'stale' : 'unknown';
+      return '<span class="badge ' + cls + '">' + esc(s) + '</span>';
+    }
+
+    // Was die Zeile *jetzt* bedeutet — nicht max(alte, neue) Issues.
+    function interpretIntegrity(r) {
+      const pu = r.post_upload_status || '';
+      const ma = r.monthly_audit_status || '';
+      const fr = r.audit_freshness || 'UNKNOWN';
+      const puN = Number(r.post_upload_issues || 0);
+      const maN = Number(r.monthly_audit_issues || 0);
+      const puAt = parseIsoMs(r.post_upload_at);
+      const maAt = parseIsoMs(r.monthly_audit_at);
+      const auditNewer = maAt > 0 && (puAt === 0 || maAt >= puAt);
+
+      if (ma === 'FAILED' || fr === 'FAILED') {
+        const systematic = maN >= 1000;
+        return {
+          kind: 'audit_fail',
+          badge: 'Audit fehlgeschlagen',
+          badgeCls: 'failed',
+          explain: systematic
+            ? 'Sehr viele Abweichungen — meist Index-/Stub-Mismatch, kein Massenverlust.'
+            : 'Letzter periodischer Check nicht OK. Der Audit-Timer nimmt FAILED zuerst wieder.',
+          currentN: maN,
+          currentSrc: 'Audit',
+          histN: pu === 'FAILED' ? puN : 0
+        };
+      }
+      if (pu === 'FAILED' && ma === 'OK' && auditNewer) {
+        return {
+          kind: 'superseded',
+          badge: 'historisch',
+          badgeCls: 'ok',
+          explain: 'Post-Upload damals FAILED, sp\u00e4terer Audit OK. Kein aktuelles Problem.',
+          currentN: 0,
+          currentSrc: '',
+          histN: puN
+        };
+      }
+      if (pu === 'FAILED') {
+        return {
+          kind: 'gate_open',
+          badge: 'Gate-Treffer',
+          badgeCls: 'stale',
+          explain: ma === 'OK'
+            ? 'Post-Upload nach dem letzten Audit FAILED. N\u00e4chster Audit entscheidet.'
+            : 'Integrity-Gate nach Upload FAILED, noch kein sp\u00e4terer Audit OK.',
+          currentN: puN,
+          currentSrc: 'Nach Upload',
+          histN: 0
+        };
+      }
+      if (fr === 'STALE') {
+        return {
+          kind: 'stale',
+          badge: 'Pr\u00fcfung alt',
+          badgeCls: 'stale',
+          explain: 'Letzter Audit OK, aber \u00e4lter als 35 Tage. Inhaltlich unauff\u00e4llig \u2014 Timer hinkt hinterher.',
+          currentN: 0,
+          currentSrc: '',
+          histN: 0
+        };
+      }
+      if (ma === 'OK' || fr === 'OK') {
+        return {
+          kind: 'ok',
+          badge: 'in Ordnung',
+          badgeCls: 'success',
+          explain: 'Letzter Audit OK und nicht \u00e4lter als 35 Tage.',
+          currentN: 0,
+          currentSrc: '',
+          histN: 0
+        };
+      }
+      return {
+        kind: 'unknown',
+        badge: 'kein Audit',
+        badgeCls: 'unknown',
+        explain: 'Noch kein periodischer Check in der DB.',
+        currentN: 0,
+        currentSrc: '',
+        histN: 0
+      };
+    }
+
+    function integrityIssuesCell(info) {
+      if (info.currentN > 0) {
+        let html = '<span class="val red">' + fmtCount(info.currentN) + '</span>';
+        if (info.currentSrc) html += '<span class="integrity-check-meta">' + esc(info.currentSrc) + '</span>';
+        if (info.currentN >= 1000) {
+          html += '<span class="integrity-hist">kein Datenverlust \u2014 Index-Abgleich</span>';
+        }
+        if (info.histN > 0 && info.histN !== info.currentN) {
+          html += '<span class="integrity-hist">damals ' + fmtCount(info.histN) + ' (Nach Upload)</span>';
+        }
+        return html;
+      }
+      if (info.histN > 0) {
+        return '<span style="color:var(--muted)">0</span>'
+          + '<span class="integrity-hist">damals ' + fmtCount(info.histN) + ' (Nach Upload, \u00fcberholt)</span>';
+      }
+      return '<span style="color:var(--muted)">0</span>';
+    }
+
     function tileBackup(rtb, cloud, reports, status) {
       // Use explicit undefined check — status_code=0 is falsy but means "OK"
       const cloudCode = cloud.status_code !== undefined ? cloud.status_code : 3;
@@ -956,6 +1098,8 @@
       const intSum   = poolInt.summary || {};
       const intSnaps = poolInt.snapshots || [];
       const intPuFail = intSum.post_upload_failed || 0;
+      const intPuOpen = (intSum.post_upload_open != null) ? intSum.post_upload_open : intPuFail;
+      const intPuHist = intSum.post_upload_superseded || 0;
       const intAuFail = intSum.audit_failed || 0;
       const intStale  = intSum.audit_stale || 0;
       const intTotal  = intSum.total || intSnaps.length;
@@ -1023,20 +1167,22 @@
 
       if (intSum.total > 0 || intSnaps.length > 0) {
         html += '<div class="summary-row summary-row-secondary" style="margin-top:8px">'
-          + '<div class="summary-box clickable ' + (intPuFail > 0 ? 'red' : 'green') + '" onclick="openIntegrityDetail(\'pu_fail\')" title="Klicken: betroffene Snapshots in der Tabelle">'
-          + '<div class="big">' + intPuFail + '</div><div class="lbl">Post-Upload FAIL</div></div>'
-          + '<div class="summary-box clickable ' + (intAuFail > 0 ? 'red' : 'green') + '" onclick="openIntegrityDetail(\'au_fail\')" title="Klicken: Audit-FAIL in der Tabelle">'
+          + '<div class="summary-box clickable ' + (intPuOpen > 0 ? 'red' : 'green') + '" onclick="openIntegrityDetail(\'pu_open\')" title="Post-Upload FAILED ohne sp\u00e4teren Audit-OK. Klicken: Tabelle filtern.">'
+          + '<div class="big">' + intPuOpen + '</div><div class="lbl">Post-Upload offen</div></div>'
+          + '<div class="summary-box clickable ' + (intAuFail > 0 ? 'red' : 'green') + '" onclick="openIntegrityDetail(\'au_fail\')" title="Periodischer Re-Check FAILED. Klicken: Tabelle filtern.">'
           + '<div class="big">' + intAuFail + '</div><div class="lbl">Audit FAIL</div></div>'
-          + '<div class="summary-box clickable ' + (intStale > 0 ? 'yellow' : 'gray') + '" onclick="openIntegrityDetail(\'stale\')" title="Klicken: veraltete Audits (&gt;35d)">'
-          + '<div class="big">' + intStale + '</div><div class="lbl">Audit STALE</div></div>'
+          + '<div class="summary-box clickable ' + (intStale > 0 ? 'yellow' : 'gray') + '" onclick="openIntegrityDetail(\'stale\')" title="Letzter Audit OK, aber \u00e4lter als 35 Tage. Kein Datenfehler.">'
+          + '<div class="big">' + intStale + '</div><div class="lbl">Pr\u00fcfung alt</div></div>'
           + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'au_ok\')" title="Klicken: Snapshots mit aktuellem Audit OK">'
           + '<div class="big">' + (intSum.audit_ok || 0) + '</div><div class="lbl">Audit OK</div></div>'
           + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'all\')" title="Klicken: alle Snapshots in der Tabelle">'
           + '<div class="big">' + intTotal + '</div><div class="lbl">Snapshots (DB)</div></div>'
           + '</div>';
-        html += '<div class="integrity-hint"><strong>Post-Upload</strong> = nach Backup &middot; '
-          + '<strong>Audit</strong> = periodischer Re-Check (STALE &gt;35d)'
-          + (intSnaps.length < intTotal ? ' &middot; Tabelle: ' + intSnaps.length + ' von ' + intTotal : '')
+        html += '<div class="integrity-hint"><strong>Nachz\u00e4hlung auf pCloud</strong> \u2014 nicht der Live-Sync (Catch-up oben). '
+          + '<strong>Post-Upload offen</strong> = Gate nach Backup noch ohne sp\u00e4teren OK-Audit'
+          + (intPuHist > 0 ? ' \u00b7 ' + intPuHist + '\u00d7 historisch (sp\u00e4ter OK)' : '')
+          + ' \u00b7 <strong>Pr\u00fcfung alt</strong> = letzter Audit OK, &gt;35 Tage her'
+          + (intSnaps.length < intTotal ? ' \u00b7 Tabelle: ' + intSnaps.length + ' von ' + intTotal : '')
           + '</div>';
       } else {
         html += '<div class="integrity-hint" style="margin-top:6px">'
@@ -1069,26 +1215,42 @@
         html += '<button class="detail-toggle" id="btn-integrity" onclick="toggleDetail(\'integrity\')">'
           + '<span>Pool-Integrit&auml;t (' + intSnaps.length + (intTotal > intSnaps.length ? ' / ' + intTotal : '') + ' Snapshots)</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-integrity"><div class="tile-detail-inner">'
+          + '<div class="integrity-hint" style="margin:8px 12px 10px">'
+          + '<strong>Lage</strong> = was jetzt gilt. '
+          + '<strong>historisch</strong> = alter Gate-Fail, sp\u00e4terer Audit OK. '
+          + '<strong>Pr\u00fcfung alt</strong> = Audit OK, &gt;35 Tage her (kein Datenfehler). '
+          + '<strong>Abweichungen</strong> = nur der noch g\u00fcltige Check; 1&nbsp;000+ meist Index-Mismatch.'
+          + '</div>'
           + '<table class="report-table"><thead><tr>'
-          + '<th>Snapshot</th><th>Post-Upload</th><th>Audit</th><th>Frische</th><th>Issues</th>'
+          + '<th>Snapshot</th>'
+          + '<th title="Interpretation aus beiden Checks">Lage</th>'
+          + '<th title="Einmalig nach dem Upload (Integrity-Gate)">Nach Upload</th>'
+          + '<th title="Periodischer Re-Check, 3\u00d7/Tag">Letzter Audit</th>'
+          + '<th title="Nur der Check, der noch gilt \u2014 nicht max(alt, neu)">Abweichungen</th>'
           + '</tr></thead><tbody>'
           + intSnaps.map(r => {
               const pu = r.post_upload_status || '\u2014';
               const ma = r.monthly_audit_status || '\u2014';
               const fr = r.audit_freshness || 'UNKNOWN';
-              const issues = Math.max(r.post_upload_issues || 0, r.monthly_audit_issues || 0);
-              const frCls = fr === 'OK' ? 'success' : fr === 'FAILED' ? 'failed' : fr === 'STALE' ? 'running' : '';
-              const tip = [r.post_upload_summary, r.monthly_audit_summary].filter(Boolean).join(' | ');
-              return '<tr class="integrity-row" data-pu="' + esc(pu) + '" data-au="' + esc(ma) + '" data-fr="' + esc(fr) + '" title="' + esc(tip) + '">'
+              const info = interpretIntegrity(r);
+              const rowCls = info.kind === 'audit_fail' ? 'row-failed' : (info.kind === 'gate_open' ? 'row-running' : '');
+              const tip = [info.explain, r.monthly_audit_summary].filter(Boolean).join(' | ');
+              const puExtra = (pu === 'FAILED' && (r.post_upload_issues || 0) > 0)
+                ? '<div class="integrity-check-meta">' + fmtCount(r.post_upload_issues) + ' damals</div>' : '';
+              const maExtra = (ma === 'FAILED' && (r.monthly_audit_issues || 0) > 0)
+                ? '<div class="integrity-check-meta">' + fmtCount(r.monthly_audit_issues) + ' im Audit</div>' : '';
+              return '<tr class="integrity-row ' + rowCls + '" data-pu="' + esc(pu) + '" data-au="' + esc(ma)
+                + '" data-fr="' + esc(fr) + '" data-kind="' + esc(info.kind) + '" title="' + esc(tip) + '">'
                 + '<td>' + esc(r.snapshot || '\u2014') + '</td>'
-                + '<td><span class="badge ' + pu.toLowerCase() + '">' + esc(pu) + '</span>'
-                + (r.post_upload_at ? '<div style="font-size:10px;color:var(--muted)">' + fmtTs(r.post_upload_at) + '</div>' : '')
-                + '</td>'
-                + '<td><span class="badge ' + ma.toLowerCase() + '">' + esc(ma) + '</span>'
-                + (r.monthly_audit_at ? '<div style="font-size:10px;color:var(--muted)">' + fmtTs(r.monthly_audit_at) + '</div>' : '')
-                + '</td>'
-                + '<td><span class="badge ' + frCls + '">' + esc(fr) + '</span></td>'
-                + '<td>' + (issues > 0 ? '<span class="val red">' + issues + '</span>' : '0') + '</td>'
+                + '<td><span class="badge ' + info.badgeCls + '">' + esc(info.badge) + '</span>'
+                + '<span class="integrity-explain">' + esc(info.explain) + '</span></td>'
+                + '<td>' + integrityStatusBadge(pu)
+                + (r.post_upload_at ? '<div class="integrity-check-meta">' + fmtTs(r.post_upload_at) + '</div>' : '')
+                + puExtra + '</td>'
+                + '<td>' + integrityStatusBadge(ma)
+                + (r.monthly_audit_at ? '<div class="integrity-check-meta">' + fmtTs(r.monthly_audit_at) + '</div>' : '')
+                + maExtra + '</td>'
+                + '<td>' + integrityIssuesCell(info) + '</td>'
                 + '</tr>';
             }).join('')
           + '</tbody></table></div></div>';
@@ -1828,14 +1990,12 @@
       let firstHit = null;
       rows.forEach(tr => {
         tr.classList.remove('integrity-row-dim', 'integrity-row-hit');
-        const pu = tr.getAttribute('data-pu') || '';
-        const au = tr.getAttribute('data-au') || '';
-        const fr = tr.getAttribute('data-fr') || '';
+        const kind = tr.getAttribute('data-kind') || '';
         let hit = true;
-        if (filter === 'pu_fail') hit = pu === 'FAILED';
-        else if (filter === 'au_fail') hit = au === 'FAILED' || fr === 'FAILED';
-        else if (filter === 'stale') hit = fr === 'STALE';
-        else if (filter === 'au_ok') hit = fr === 'OK';
+        if (filter === 'pu_fail' || filter === 'pu_open') hit = kind === 'gate_open';
+        else if (filter === 'au_fail') hit = kind === 'audit_fail';
+        else if (filter === 'stale') hit = kind === 'stale';
+        else if (filter === 'au_ok') hit = kind === 'ok' || kind === 'superseded';
         if (filter && filter !== 'all' && !hit) tr.classList.add('integrity-row-dim');
         else if (filter && filter !== 'all' && hit) {
           tr.classList.add('integrity-row-hit');

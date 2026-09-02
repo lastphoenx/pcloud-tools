@@ -415,6 +415,8 @@ get_phase_stats() {
 # =====================================================
 get_pool_integrity_summary() {
   local result
+  # post_upload_superseded = FAILED Gate, aber späterer Audit OK (kein Live-Problem)
+  # post_upload_open       = FAILED Gate ohne späteren OK-Audit
   result=$(db_query "
     SELECT
       SUM(CASE WHEN audit_freshness = 'OK' THEN 1 ELSE 0 END),
@@ -422,17 +424,29 @@ get_pool_integrity_summary() {
       SUM(CASE WHEN audit_freshness = 'STALE' THEN 1 ELSE 0 END),
       SUM(CASE WHEN audit_freshness = 'UNKNOWN' THEN 1 ELSE 0 END),
       SUM(CASE WHEN post_upload_status = 'FAILED' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN post_upload_status = 'FAILED'
+                AND monthly_audit_status = 'OK'
+                AND monthly_audit_at IS NOT NULL
+                AND (post_upload_at IS NULL OR monthly_audit_at >= post_upload_at)
+           THEN 1 ELSE 0 END),
+      SUM(CASE WHEN post_upload_status = 'FAILED'
+                AND NOT (
+                  monthly_audit_status = 'OK'
+                  AND monthly_audit_at IS NOT NULL
+                  AND (post_upload_at IS NULL OR monthly_audit_at >= post_upload_at)
+                )
+           THEN 1 ELSE 0 END),
       COUNT(*)
     FROM v_snapshot_integrity_status;
   " 2>/dev/null || echo "")
 
   if [[ -z "$result" ]]; then
-    echo "{\"audit_ok\":0,\"audit_failed\":0,\"audit_stale\":0,\"audit_unknown\":0,\"post_upload_failed\":0,\"total\":0}"
+    echo "{\"audit_ok\":0,\"audit_failed\":0,\"audit_stale\":0,\"audit_unknown\":0,\"post_upload_failed\":0,\"post_upload_superseded\":0,\"post_upload_open\":0,\"total\":0}"
     return
   fi
 
-  IFS=$'\t' read -r audit_ok audit_failed audit_stale audit_unknown post_failed total <<< "$result"
-  echo "{\"audit_ok\":${audit_ok:-0},\"audit_failed\":${audit_failed:-0},\"audit_stale\":${audit_stale:-0},\"audit_unknown\":${audit_unknown:-0},\"post_upload_failed\":${post_failed:-0},\"total\":${total:-0}}"
+  IFS=$'\t' read -r audit_ok audit_failed audit_stale audit_unknown post_failed post_superseded post_open total <<< "$result"
+  echo "{\"audit_ok\":${audit_ok:-0},\"audit_failed\":${audit_failed:-0},\"audit_stale\":${audit_stale:-0},\"audit_unknown\":${audit_unknown:-0},\"post_upload_failed\":${post_failed:-0},\"post_upload_superseded\":${post_superseded:-0},\"post_upload_open\":${post_open:-0},\"total\":${total:-0}}"
 }
 
 get_pool_integrity_snapshots() {
@@ -449,6 +463,7 @@ get_pool_integrity_snapshots() {
         'monthly_audit_status', COALESCE(monthly_audit_status, ''),
         'monthly_audit_at', COALESCE($(mdb_ts_sql monthly_audit_at), ''),
         'monthly_audit_issues', COALESCE(monthly_audit_issues, 0),
+        'monthly_audit_summary', COALESCE(LEFT(monthly_audit_summary, 180), ''),
         'audit_freshness', COALESCE(audit_freshness, 'UNKNOWN')
       ) AS j
       FROM v_snapshot_integrity_status
