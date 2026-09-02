@@ -21,6 +21,16 @@ WHERE status = 'RUNNING'
 ORDER BY started_at DESC
 LIMIT 20;
 
+SELECT 'RUNNING mit vorhandenem SUCCESS (werden geloescht, nicht zu FAILED)' AS '';
+SELECT br_run.run_id, br_run.snapshot_name, br_run.started_at AS running_at, br_ok.started_at AS success_at
+FROM backup_runs br_run
+INNER JOIN backup_runs br_ok
+  ON br_ok.snapshot_name = br_run.snapshot_name
+  AND br_ok.status = 'SUCCESS'
+WHERE br_run.status = 'RUNNING'
+ORDER BY br_run.started_at DESC
+LIMIT 20;
+
 SELECT 'FAILED gesamt / letzte 7d' AS '';
 SELECT
   SUM(status = 'FAILED') AS failed_total,
@@ -53,7 +63,18 @@ WHERE started_at < DATE_SUB(NOW(), INTERVAL 90 DAY);
 
 -- =====================================================
 -- 1) RUNNING-Zombies (Crash/Abbruch)
+--     a) Snapshot hat bereits SUCCESS → Zeile loeschen.
+--        Sonst wird RUNNING zu einem NEUEREN FAILED als SUCCESS
+--        und bleibt im Dashboard (7d) + Audit „letzter Lauf = FAILED“.
+--     b) Nie SUCCESS → FAILED (echter Abbruch).
 -- =====================================================
+DELETE br_run
+FROM backup_runs br_run
+INNER JOIN backup_runs br_ok
+  ON br_ok.snapshot_name = br_run.snapshot_name
+  AND br_ok.status = 'SUCCESS'
+WHERE br_run.status = 'RUNNING';
+
 UPDATE backup_runs
 SET status = 'FAILED',
     finished_at = COALESCE(finished_at, NOW()),
@@ -62,6 +83,19 @@ SET status = 'FAILED',
         ' | stale RUNNING bereinigt (Crash/Abbruch)'
     )
 WHERE status = 'RUNNING';
+
+-- FAILED der neuer ist als SUCCESS (alte Cleanup-Artefakte / Abbruch nach Erfolg)
+DELETE br_fail
+FROM backup_runs br_fail
+INNER JOIN backup_runs br_ok
+  ON br_ok.snapshot_name = br_fail.snapshot_name
+  AND br_ok.status = 'SUCCESS'
+  AND br_ok.started_at < br_fail.started_at
+WHERE br_fail.status = 'FAILED'
+  AND (
+    br_fail.error_message LIKE '%stale RUNNING bereinigt%'
+    OR br_fail.error_message LIKE '%upload_aborted%'
+  );
 
 -- =====================================================
 -- 2) Artefakte aus alter Bereinigung aus error_message
