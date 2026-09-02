@@ -416,7 +416,10 @@ def main() -> int:
             "incomplete_remote": incomplete_remote,
             "incomplete_count": len(incomplete_remote),
             "rtb_count": len(rtb_snaps),
+            "remote_complete": sorted(complete_set),
             "remote_complete_count": len(complete_set),
+            "manifests": sorted(manifest_set),
+            "complete_no_manifest": complete_no_manifest,
             "running": running_rows,
             "running_count": len(running_rows),
         }

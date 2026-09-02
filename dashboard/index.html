@@ -964,7 +964,19 @@
     }
 
     // Was die Zeile *jetzt* bedeutet — nicht max(alte, neue) Issues.
-    function interpretIntegrity(r) {
+    // Live-Bestand aus pool_audit_status --json (sync_backlog), nicht MariaDB-Historie.
+    function integrityInventory(sb) {
+      const remote = (sb && sb.remote_complete) || [];
+      const mans = (sb && sb.manifests) || [];
+      return {
+        hasInventory: remote.length > 0,
+        remoteComplete: remote,
+        manifests: mans
+      };
+    }
+
+    function interpretIntegrity(r, inv) {
+      const snap = r.snapshot || '';
       const pu = r.post_upload_status || '';
       const ma = r.monthly_audit_status || '';
       const fr = r.audit_freshness || 'UNKNOWN';
@@ -973,9 +985,38 @@
       const puAt = parseIsoMs(r.post_upload_at);
       const maAt = parseIsoMs(r.monthly_audit_at);
       const auditNewer = maAt > 0 && (puAt === 0 || maAt >= puAt);
+      const sum = String(r.monthly_audit_summary || '');
+      const onRemote = inv && inv.hasInventory
+        ? (inv.remoteComplete || []).indexOf(snap) !== -1
+        : null;
+      const hasMan = inv && inv.hasInventory
+        ? (inv.manifests || []).indexOf(snap) !== -1
+        : null;
+
+      if (onRemote === false || /no_valid_snapshots/i.test(sum)) {
+        return {
+          kind: 'gone',
+          badge: 'nicht mehr auf pCloud',
+          badgeCls: 'unknown',
+          explain: 'Ordner ist per Retention/Pool-GC weg. Die DB-Zeile ist Historie, kein Live-Schaden. Matrix zeigt solche Snaps oft gar nicht.',
+          currentN: 0,
+          currentSrc: '',
+          histN: 0
+        };
+      }
+      if (hasMan === false || /no_manifests/i.test(sum)) {
+        return {
+          kind: 'no_manifest',
+          badge: 'Manifest fehlt',
+          badgeCls: 'stale',
+          explain: 'Complete auf pCloud, aber kein lokales Archiv-Manifest — Check B kann nicht zählen. Kein fehlendes Remote-Backup.',
+          currentN: 0,
+          currentSrc: '',
+          histN: 0
+        };
+      }
 
       if (ma === 'FAILED' || fr === 'FAILED') {
-        const sum = String(r.monthly_audit_summary || '');
         if (/listfolder incomplete/i.test(sum) || maN >= 1000) {
           return {
             kind: 'listing_incomplete',
@@ -1057,6 +1098,9 @@
     }
 
     function integrityIssuesCell(info) {
+      if (info.kind === 'gone' || info.kind === 'no_manifest') {
+        return '<span style="color:var(--muted)">\u2014</span>';
+      }
       if (info.kind === 'listing_incomplete') {
         return '<span class="val yellow">' + fmtCount(info.currentN) + '</span>'
           + '<span class="integrity-check-meta">scheinbar fehlend</span>'
@@ -1113,10 +1157,19 @@
       const intPuFail = intSum.post_upload_failed || 0;
       const intPuOpen = (intSum.post_upload_open != null) ? intSum.post_upload_open : intPuFail;
       const intPuHist = intSum.post_upload_superseded || 0;
-      const intAuFail = intSum.audit_failed || 0;
+      let intAuFail = intSum.audit_failed || 0;
       const intStale  = intSum.audit_stale || 0;
       const intTotal  = intSum.total || intSnaps.length;
       const sb = (cloud.checks || {}).sync_backlog || {};
+      const inv = integrityInventory(sb);
+      const intInfos = intSnaps.map(r => interpretIntegrity(r, inv));
+      let intGone = 0, intNoMan = 0, intAuFailLive = 0;
+      intInfos.forEach(info => {
+        if (info.kind === 'gone') intGone++;
+        else if (info.kind === 'no_manifest') intNoMan++;
+        else if (info.kind === 'audit_fail') intAuFailLive++;
+      });
+      if (inv.hasInventory) intAuFail = intAuFailLive;
       const catchupN = sb.catchup_count || 0;
       const incompleteN = sb.incomplete_count || 0;
       const zombieN = sb.running_zombies || 0;
@@ -1195,6 +1248,8 @@
           + '<strong>Post-Upload offen</strong> = Gate nach Backup noch ohne sp\u00e4teren OK-Audit'
           + (intPuHist > 0 ? ' \u00b7 ' + intPuHist + '\u00d7 historisch (sp\u00e4ter OK)' : '')
           + ' \u00b7 <strong>Pr\u00fcfung alt</strong> = letzter Audit OK, &gt;35 Tage her'
+          + (intGone > 0 ? ' \u00b7 ' + intGone + '\u00d7 nicht mehr auf pCloud (Retention/GC)' : '')
+          + (intNoMan > 0 ? ' \u00b7 ' + intNoMan + '\u00d7 Manifest fehlt (Check nicht m\u00f6glich)' : '')
           + (intSnaps.length < intTotal ? ' \u00b7 Tabelle: ' + intSnaps.length + ' von ' + intTotal : '')
           + '</div>';
       } else {
@@ -1232,7 +1287,9 @@
           + '<strong>Lage</strong> = was jetzt gilt. '
           + '<strong>historisch</strong> = alter Gate-Fail, sp\u00e4terer Audit OK. '
           + '<strong>Pr\u00fcfung alt</strong> = Audit OK, &gt;35 Tage her (kein Datenfehler). '
-          + '<strong>Listing unvollständig</strong> = listfolder hat einen Ordner übersprungen, keine fehlenden Dateien. '
+          + '<strong>nicht mehr auf pCloud</strong> = Retention/GC, DB-Historie. '
+          + '<strong>Manifest fehlt</strong> = Remote complete, lokales JSON weg \u2014 Check nicht m\u00f6glich. '
+          + '<strong>Listing unvollständig</strong> = listfolder-Abbruch, keine fehlenden Dateien. '
           + '<strong>1 Abweichung</strong> = konkreter Stub/Pfad. '
           + '<strong>Abweichungen</strong> = nur der noch g\u00fcltige Check.'
           + '</div>'
@@ -1243,13 +1300,13 @@
           + '<th title="Periodischer Re-Check, 3\u00d7/Tag">Letzter Audit</th>'
           + '<th title="Nur der Check, der noch gilt \u2014 nicht max(alt, neu)">Abweichungen</th>'
           + '</tr></thead><tbody>'
-          + intSnaps.map(r => {
+          + intSnaps.map((r, idx) => {
               const pu = r.post_upload_status || '\u2014';
               const ma = r.monthly_audit_status || '\u2014';
               const fr = r.audit_freshness || 'UNKNOWN';
-              const info = interpretIntegrity(r);
+              const info = intInfos[idx] || interpretIntegrity(r, inv);
               const rowCls = info.kind === 'audit_fail' ? 'row-failed'
-                : (info.kind === 'listing_incomplete' || info.kind === 'gate_open' ? 'row-running' : '');
+                : (info.kind === 'listing_incomplete' || info.kind === 'gate_open' || info.kind === 'no_manifest' ? 'row-running' : '');
               const tip = [info.explain, r.monthly_audit_summary].filter(Boolean).join(' | ');
               const puExtra = (pu === 'FAILED' && (r.post_upload_issues || 0) > 0)
                 ? '<div class="integrity-check-meta">' + fmtCount(r.post_upload_issues) + ' damals</div>' : '';
@@ -2009,9 +2066,11 @@
         const kind = tr.getAttribute('data-kind') || '';
         let hit = true;
         if (filter === 'pu_fail' || filter === 'pu_open') hit = kind === 'gate_open';
-        else if (filter === 'au_fail') hit = kind === 'audit_fail' || kind === 'listing_incomplete';
+        else if (filter === 'au_fail') hit = kind === 'audit_fail';
         else if (filter === 'stale') hit = kind === 'stale';
         else if (filter === 'au_ok') hit = kind === 'ok' || kind === 'superseded';
+        else if (filter === 'gone') hit = kind === 'gone';
+        else if (filter === 'no_manifest') hit = kind === 'no_manifest';
         if (filter && filter !== 'all' && !hit) tr.classList.add('integrity-row-dim');
         else if (filter && filter !== 'all' && hit) {
           tr.classList.add('integrity-row-hit');
