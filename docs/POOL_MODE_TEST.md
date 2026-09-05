@@ -203,7 +203,7 @@ Benefit: Nur 1× pro File, 20× weniger Quota!
 
 ### Neue Datei: `rtb_pool_wrapper.sh`
 
-**Erstellt:** ✅ `c:\Users\tsant\OneDrive\Dokumente\vsc\github_code\rtb\rtb_pool_wrapper.sh`
+**Erstellt:** ✅ `/path/to/github_code/rtb/rtb_pool_wrapper.sh`
 
 **Änderungen:**
 1. Header dokumentiert Pool-Mode

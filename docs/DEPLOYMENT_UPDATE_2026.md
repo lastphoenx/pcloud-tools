@@ -187,7 +187,7 @@ Auf dem **Entwicklungs-PC** (Windows/Linux):
 
 ```bash
 # Im Workspace-Root (github_code/)
-cd c:\Users\tsant\OneDrive\Dokumente\vsc\github_code
+cd /path/to/github_code
 
 # Server starten
 python monitoring-dashboard-server.py
@@ -201,7 +201,7 @@ python monitoring-dashboard-server.py
 ============================================================
 🚀 Monitoring Dashboard Server
 ============================================================
-📁 Document Root: /home/user/projects
+📁 Document Root: /path/to/github_code
 🌐 Port: 8080
 🔗 Dashboard: http://localhost:8080/pcloud-tools/dashboard/index.html
 📚 Docs: http://localhost:8080/entropy-watcher-und-clamav-scanner/docs/
