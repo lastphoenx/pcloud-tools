@@ -26,7 +26,7 @@ sudo cp main/systemd/monitoring-dashboard.service.example /etc/systemd/system/mo
 
 # 2. Service-Datei anpassen (nur User ändern)
 sudo nano /etc/systemd/system/monitoring-dashboard.service
-# Ersetze: YOUR_USER durch tatsächlichen Benutzer (z.B. pi, thomas)
+# Ersetze: YOUR_USER durch tatsächlichen Benutzer (z.B. pi, deploy)
 # Die Pfade sollten bereits korrekt sein:
 #   WorkingDirectory=/opt/apps
 #   ExecStart=/usr/bin/python3 /opt/apps/pcloud-tools/main/monitoring-dashboard-server.py
