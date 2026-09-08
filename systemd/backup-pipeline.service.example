@@ -5,7 +5,8 @@ Description=Backup Pipeline (RTB + pCloud POOL)
 Wants=network-online.target
 After=network-online.target
 RequiresMountsFor=/srv/nas
-OnSuccess=monitoring-reports.service
+# reports.json (Tabellen) + status.json (pCloud-Sync-Kachel) frisch nach Pipeline-Ende
+OnSuccess=monitoring-reports.service monitoring-status-update.service
 
 [Service]
 Type=oneshot

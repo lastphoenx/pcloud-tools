@@ -310,7 +310,7 @@ Dashboard, Status-Aggregation und Reports sind implementiert. Auf pi-nas: system
 | `scripts/aggregate_status.sh` | `status.json` — Modus `quick` (5 min) oder `full` (15 min + nach Backup) |
 | `scripts/generate_reports.sh` | `reports.json` — alle 15 min + nach Backup (MariaDB-Historie, **nicht** pCloud-Tile) |
 | `monitoring-status-quick.timer` | Lightweight Status alle 5 min |
-| `monitoring-status-update.timer` | Full Aggregate alle 15 min + `OnUnitActivation=backup-pipeline` |
+| `monitoring-status-update.timer` | Full Aggregate alle 15 min; nach Backup via `backup-pipeline` `OnSuccess` |
 | `monitoring-reports.timer` | DB → `reports.json` |
 | `scripts/send_aggregated_alert.sh` | Alerts bei Statuswechsel |
 
@@ -339,7 +339,7 @@ sudo cp apprise.yml.example /opt/apps/apprise.yml
 → Dashboard-Setup (nginx): [dashboard/README.md](dashboard/README.md) · [docs/DASHBOARD.md](docs/DASHBOARD.md)  
 → Apprise-Konfiguration: [docs/APPRISE_SETUP.md](docs/APPRISE_SETUP.md)
 
-**Hinweis:** Die pCloud-CRITICAL-Kachel im Dashboard liest **`status.json`** (`aggregate_status.sh` + `pcloud_health_check.sh`), nicht `reports.json`. Der 5-min-Quick-Lauf cached den pCloud-Block — nach langem Backup: `sudo systemctl start monitoring-status-update.service` oder `AGGREGATE_MODE=full ./scripts/aggregate_status.sh`.
+**Hinweis:** Die pCloud-Kachel liest **`status.json`**. Quick cached pCloud nur bei OK; nach Backup-Ende invalidiert der Cache automatisch (oder Full via `OnSuccess`). Manuell: `sudo systemctl start monitoring-status-update.service`.
 
 ---
 

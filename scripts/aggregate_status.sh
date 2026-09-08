@@ -563,6 +563,46 @@ enrich_rtb_json() {
 # =====================================================
 # pCloud Health Check Integration
 # =====================================================
+RTB_WRAPPER_LOG="${RTB_WRAPPER_LOG:-/var/log/backup/rtb_wrapper.log}"
+
+_rtb_log_latest_success_epoch() {
+  [[ -f "$RTB_WRAPPER_LOG" ]] || return 1
+  local ts
+  ts=$(grep -E '^\d{4}-\d{2}-\d{2} .*\[done\].*(Backup-Pipeline komplett|pCloud-Sync erfolgreich)' \
+    "$RTB_WRAPPER_LOG" 2>/dev/null | tail -1 | grep -oP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' || true)
+  [[ -n "$ts" ]] || return 1
+  date -d "$ts" +%s 2>/dev/null || return 1
+}
+
+_status_json_written_epoch() {
+  [[ -f "$MONITORING_OUTPUT" ]] && command -v jq &>/dev/null || return 1
+  local ts
+  ts=$(jq -r '.timestamp // empty' "$MONITORING_OUTPUT" 2>/dev/null || true)
+  [[ -n "$ts" ]] || return 1
+  date -d "$ts" +%s 2>/dev/null || return 1
+}
+
+# Quick mode may reuse pCloud health JSON — unless backup finished or cached state is non-OK.
+pcloud_quick_cache_stale() {
+  local success_ep=0 status_ep=0
+  success_ep=$(_rtb_log_latest_success_epoch 2>/dev/null) || success_ep=0
+  status_ep=$(_status_json_written_epoch 2>/dev/null) || status_ep=0
+
+  if [[ "$success_ep" -gt 0 && ( "$status_ep" -eq 0 || "$success_ep" -gt "$status_ep" ) ]]; then
+    return 0
+  fi
+
+  if [[ -f "$MONITORING_OUTPUT" ]] && command -v jq &>/dev/null; then
+    local code inc
+    code=$(jq -r '.scripts.pcloud_backup.status_code // 0' "$MONITORING_OUTPUT" 2>/dev/null || echo "0")
+    inc=$(jq -r '.scripts.pcloud_backup.checks.sync_backlog.incomplete_count // 0' "$MONITORING_OUTPUT" 2>/dev/null || echo "0")
+    if [[ "${code:-0}" -ge 1 || "${inc:-0}" -gt 0 ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 check_pcloud_cached() {
   if [[ -f "$MONITORING_OUTPUT" ]] && command -v jq &>/dev/null; then
     local cached
@@ -975,8 +1015,11 @@ RTB_JSON=$(check_rtb_wrapper)
 
 log "Checking pCloud backup..."
 PCLOUD_JSON=""
-if [[ "${AGGREGATE_MODE}" == "quick" ]] && PCLOUD_JSON=$(check_pcloud_cached); then
+if [[ "${AGGREGATE_MODE}" == "quick" ]] && PCLOUD_JSON=$(check_pcloud_cached) && ! pcloud_quick_cache_stale; then
   log "Quick mode: reusing cached pCloud health from status.json"
+elif [[ "${AGGREGATE_MODE}" == "quick" ]]; then
+  log "Quick mode: refreshing pCloud health (cache stale or non-OK)"
+  PCLOUD_JSON=$(check_pcloud)
 else
   PCLOUD_JSON=$(check_pcloud)
 fi

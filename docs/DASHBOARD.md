@@ -254,7 +254,7 @@ Das Dashboard liest zwei JSON-Dateien:
 | Modus | Timer | Intervall | Inhalt |
 |-------|--------|-----------|--------|
 | **quick** | `monitoring-status-quick.timer` | **alle 5 Min** | Services, RTB-Log, Live Safety-Gate, Timer (~3–30 s) |
-| **full** | `monitoring-status-update.timer` | **alle 15 Min** + nach `backup-pipeline` | zusätzlich RTB `--check-only`, pCloud-Health-Check, Forecast (~1–3 min) |
+| **full** | `monitoring-status-update.timer` + `backup-pipeline` `OnSuccess` | **alle 15 Min** + nach Pipeline-Ende | RTB `--check-only`, pCloud-Health, Forecast (~3–6 min) |
 
 Feld `aggregate_mode` in JSON: `quick` oder `full`.
 
@@ -266,7 +266,7 @@ sudo systemctl start monitoring-status-update.service
 # oder: AGGREGATE_MODE=full /opt/apps/pcloud-tools/main/scripts/aggregate_status.sh
 ```
 
-Der **Quick-Timer** (5 min) übernimmt den pCloud-Block aus der **bestehenden** `status.json` ohne erneuten Health-Check — stale CRITICAL bis Full-Aggregate.
+Der **Quick-Timer** (5 min) cached den pCloud-Block nur wenn der letzte Health-Check **OK** war und **kein** neuerer Pipeline-Abschluss im `rtb_wrapper.log` liegt. Bei WARNING/CRITICAL/incomplete oder nach Backup-Ende: Quick holt `pcloud_health_check.sh` neu (~30–90 s, ohne RTB-Scan).
 
 **Enthält (Auswahl):**
 - Live-Service-Status (systemd units)

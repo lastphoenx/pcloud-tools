@@ -223,21 +223,21 @@ journalctl -u monitoring-status-update.timer -f
 
 ## 🎯 Event Triggering
 
-**status.json (full):** `monitoring-status-update.timer` mit `OnUnitActivation=backup-pipeline.service` — Full-Aggregate direkt nach Backup-Ende.
+**status.json (full):** `backup-pipeline.service` → `OnSuccess=monitoring-status-update.service` plus `monitoring-status-update.timer` alle **15 Minuten** (Fallback).
 
-**status.json (quick):** `monitoring-status-quick.timer` — alle **5 Minuten** (ohne RTB `--check-only`).
+**status.json (quick):** `monitoring-status-quick.timer` — alle **5 Minuten** (Services/Log; pCloud-Health nur bei Cache-Hit oder nach Refresh-Regeln in `aggregate_status.sh`).
 
 **reports.json:** `backup-pipeline.service` → `OnSuccess=monitoring-reports.service` plus `monitoring-reports.timer` alle **15 Minuten**.
 
 ```
-backup-pipeline.service completes
+backup-pipeline.service completes (SUCCESS)
   → monitoring-reports.service (reports.json)
-  → monitoring-status-update.service (full status.json, via timer OnUnitActivation)
+  → monitoring-status-update.service (full status.json, ~3–6 min)
 ```
 
 **Benefits:**
-- Dashboard-Daten nach Backup ohne 15-Min-Wartezeit (reports + full status)
-- Quick-Timer hält Header-Datum und Service-Status alle 5 min frisch
+- Dashboard pCloud-Kachel nach Backup ohne manuellen Full-Lauf
+- Quick-Timer hält Services frisch; pCloud-Cache wird nach Pipeline-Ende oder bei CRITICAL/WARNING invalidiert
 - 15-Minuten-Fallback wenn keine Pipeline läuft
 
 ## 🛠️ Troubleshooting

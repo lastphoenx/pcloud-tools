@@ -38,7 +38,7 @@ Collects monitoring data from all backup and monitoring services into a unified 
 ./aggregate_status.sh
 AGGREGATE_MODE=full ./aggregate_status.sh
 
-# Quick mode (default im quick-timer): cached pCloud block
+# Quick mode (default im quick-timer): cached pCloud block wenn OK und nicht stale
 AGGREGATE_MODE=quick ./aggregate_status.sh
 
 # Verbose mode (shows progress)
@@ -77,7 +77,7 @@ sudo systemctl enable --now monitoring-status-quick.timer
 sudo systemctl enable --now monitoring-status-update.timer
 ```
 
-**Modi:** `AGGREGATE_MODE=quick` (Default im quick-Service) überspringt RTB `--check-only` und reused pCloud-Health aus letztem Full-Lauf.
+**Modi:** `AGGREGATE_MODE=quick` überspringt RTB `--check-only`. pCloud-Health wird gecached, aber **neu geholt** wenn: Pipeline nach letztem `status.json`-Write fertig wurde, oder cached Status WARNING/CRITICAL/incomplete > 0.
 
 ---
 

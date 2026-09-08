@@ -33,5 +33,9 @@ fi
 sudo systemctl daemon-reload
 
 echo ""
+echo "Hinweis: Für status.json nach Backup auch monitoring-Units deployen:"
+echo "  sudo cp systemd/monitoring-status-update.{service,timer}.example /etc/systemd/system/"
+echo "  sudo systemctl daemon-reload && sudo systemctl restart monitoring-status-update.timer"
+echo ""
 echo "OK. Prüfen (sollte KEIN MemoryMax / KEIN StandardOutput=append zeigen):"
 systemctl cat backup-pipeline.service
