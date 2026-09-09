@@ -123,6 +123,15 @@ PCLOUD_SCOUT_THRESHOLD=0.70
 PCLOUD_DELTA_PLAN_DELETE_FULL=5000
 ```
 
+### `PCLOUD_DELTA_RESUME_INCOMPLETE`
+**Beschreibung:** Verhalten bei unvollständigem Remote-Snapshot (`.upload_started` gesetzt, kein `.upload_complete`).  
+**Werte:** `auto` (Default) = Resume ohne `delete+copyfolder` wenn `.upload_started` zum Snapshot passt; `1` = immer Resume; `0` = immer verwerfen (altes Verhalten).  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py` (Delta-Mode Phase 1)
+
+```bash
+PCLOUD_DELTA_RESUME_INCOMPLETE=auto
+```
+
 ### `PCLOUD_COPYFOLDER_TIMEOUT`
 **Beschreibung:** Socket-Timeout (Sekunden) für `copyfolder` (große Snapshots).  
 **Default:** `700` in Code-Fallback; **pi-nas empfohlen:** `2400`  

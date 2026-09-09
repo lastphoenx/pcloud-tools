@@ -25,6 +25,7 @@ Diese Bibliothek dekodiert **nicht** den kompletten Baum generisch,
 sondern extrahiert gezielt Felder für die verwendeten Methoden.
 """
 
+import errno
 import os
 import ssl
 import socket
@@ -506,6 +507,34 @@ def is_transient_api_error(exc: BaseException) -> bool:
     """True bei typischen Verbindungs-/Rate-Limit-Fehlern (retry-würdig, kein Full-Pool-Fallback)."""
     if isinstance(exc, (ConnectionError, ConnectionResetError, BrokenPipeError, TimeoutError, socket.timeout)):
         return True
+    if isinstance(exc, OSError):
+        errno_val = getattr(exc, "errno", None)
+        if errno_val in (
+            errno.ETIMEDOUT,
+            errno.ECONNRESET,
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.EPIPE,
+            110,  # ETIMEDOUT (Linux) falls errno-Modul abweicht
+            104,  # ECONNRESET
+        ):
+            return True
+    try:
+        import requests.exceptions as _req_exc
+
+        if isinstance(
+            exc,
+            (
+                _req_exc.ConnectionError,
+                _req_exc.Timeout,
+                _req_exc.ChunkedEncodingError,
+                _req_exc.ReadTimeout,
+                _req_exc.ConnectTimeout,
+            ),
+        ):
+            return True
+    except Exception:
+        pass
     if isinstance(exc, ssl.SSLError):
         return True
     msg = str(exc).lower()
@@ -3372,6 +3401,17 @@ def stat_folderid_fast(cfg: dict, path: str) -> int | None:
 
 def upload_complete_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
     """True nur wenn .upload_complete existiert und das snapshot-Feld passt."""
+    if not stat_file_safe(cfg, path=marker_path):
+        return False
+    try:
+        data = _json.loads(get_textfile(cfg, path=marker_path))
+        return str(data.get("snapshot", "")) == str(snapshot_name)
+    except Exception:
+        return False
+
+
+def upload_started_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
+    """True nur wenn .upload_started existiert und das snapshot-Feld passt."""
     if not stat_file_safe(cfg, path=marker_path):
         return False
     try:

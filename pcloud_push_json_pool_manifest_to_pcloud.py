@@ -884,6 +884,36 @@ def _upload_complete_matches_snapshot(cfg: dict, marker_path: str, snapshot_name
     return pc.upload_complete_matches_snapshot(cfg, marker_path, snapshot_name)
 
 
+def _upload_started_matches_snapshot(cfg: dict, marker_path: str, snapshot_name: str) -> bool:
+    """True nur wenn .upload_started existiert und snapshot-Feld passt."""
+    return pc.upload_started_matches_snapshot(cfg, marker_path, snapshot_name)
+
+
+def _delta_resume_incomplete_mode() -> str:
+    """
+    Steuert Resume bei unvollständigem Remote-Snapshot (ohne copyfolder).
+    0/off = immer verwerfen; 1/on = immer resume wenn Ordner existiert;
+    auto (Default) = resume nur wenn .upload_started zum Snapshot passt.
+    """
+    return os.environ.get("PCLOUD_DELTA_RESUME_INCOMPLETE", "auto").strip().lower()
+
+
+def _can_resume_incomplete_delta(
+    cfg: dict,
+    dest_snapshot_dir: str,
+    marker_started: str,
+    snapshot_name: str,
+) -> bool:
+    mode = _delta_resume_incomplete_mode()
+    if mode in ("0", "false", "no", "off"):
+        return False
+    if not pc.stat_folderid_fast(cfg, dest_snapshot_dir):
+        return False
+    if mode in ("1", "true", "yes", "on"):
+        return True
+    return _upload_started_matches_snapshot(cfg, marker_started, snapshot_name)
+
+
 def _purge_snapshot_refs_from_index(index: dict, snapshot_name: str) -> int:
     """Entfernt snapshot_name aus allen pool_refs-Eintraegen. Gibt Anzahl bereinigter SHAs zurueck."""
     pool_refs = index.get("pool_refs", {})
@@ -2454,10 +2484,12 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     
     # Ziel-Status prüfen.
     # - vollständig (.upload_complete vorhanden) -> nichts zu tun
-    # - existiert, aber unvollständig            -> abgebrochener Lauf: komplett
-    #   verwerfen und sauber neu aufsetzen. Resume/Reconcile ist NICHT zuverlässig:
-    #   der content_index wird erst am Ende (aus dem RAM) geschrieben, und listfolder
-    #   liefert noch keine SHA256 zum Abgleich. Daher: fresh start via copyfolder.
+    # - existiert, aber unvollständig:
+    #   * Resume (PCLOUD_DELTA_RESUME_INCOMPLETE=auto|1): Phase 1 copyfolder
+    #     überspringen — nur fehlende Pool-Dateien + Stubs nachziehen (typisch:
+    #     ein Timeout in Phase 4 nach erfolgreichem copyfolder).
+    #   * sonst: komplett verwerfen und fresh start via copyfolder.
+    skip_copyfolder = False
     if not dry:
         existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
         if existing_fid:
@@ -2469,55 +2501,73 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                     except Exception:
                         pass
                 return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
-            if pc.stat_file_safe(cfg, path=marker_complete):
-                _log(f"[delta-mode] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
-                     f"(erwartet {snapshot_name}) → verwerfe und starte sauber neu")
+            if _can_resume_incomplete_delta(cfg, dest_snapshot_dir, marker_started, snapshot_name):
+                skip_copyfolder = True
+                _log(
+                    f"[delta-mode] Resume: unvollständiger Snapshot bleibt erhalten "
+                    f"(mode={_delta_resume_incomplete_mode()}) — überspringe delete+copyfolder"
+                )
             else:
-                _log(f"[delta-mode] Ziel existiert, aber unvollständig (kein .upload_complete) → verwerfe und starte sauber neu")
-            pc.deletefolder_recursive_wait(
-                cfg,
-                path=dest_snapshot_dir,
-                log=_log,
-            )
-
-            # STAMMDATEN BEREINIGEN: snapshot_name aus pool_refs entfernen.
-            # Der Snapshot-Ordner inkl. aller Stubs wurde soeben geloescht. Ohne
-            # Bereinigung wuerden pool_refs[sha].snapshots[snapshot_name] noch
-            # existieren -> Phase 4 ueberspringt alle added-Files als "bereits fertig"
-            # -> 0 Stubs geschrieben. Indexstand muss dem Remote-Zustand entsprechen.
-            try:
-                if db is not None:
-                    _wi_n = db.purge_snapshot(snapshot_name)
-                    if _wi_n > 0:
-                        save_content_index_from_db(cfg, snapshots_root, db, dry=False)
-                        _log(
-                            f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus "
-                            f"{_wi_n} pool_refs-Eintraegen entfernt (SQLite)"
-                        )
+                if pc.stat_file_safe(cfg, path=marker_complete):
+                    _log(
+                        f"[delta-mode] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
+                        f"(erwartet {snapshot_name}) → verwerfe und starte sauber neu"
+                    )
                 else:
-                    _wi_idx = load_content_index(cfg, snapshots_root)
-                    _wi_n = _purge_snapshot_refs_from_index(_wi_idx, snapshot_name)
-                    if _wi_n > 0:
-                        save_content_index(cfg, snapshots_root, _wi_idx, dry=False)
-                        _log(f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus {_wi_n} pool_refs-Eintraegen entfernt")
-            except Exception as e:
-                _log(f"[delta-mode][warn] Stammdaten-Bereinigung fehlgeschlagen: {e}")
+                    _log(
+                        f"[delta-mode] Ziel existiert, aber unvollständig "
+                        f"(kein Resume) → verwerfe und starte sauber neu"
+                    )
+                pc.deletefolder_recursive_wait(
+                    cfg,
+                    path=dest_snapshot_dir,
+                    log=_log,
+                )
 
-            # Lokalen Index-Checkpoint dieses Snapshots verwerfen
-            try:
-                import tempfile as _tf
-                _idx_dir = _default_temp_dir()
-                _idx_path = os.path.join(_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
-                if os.path.exists(_idx_path):
-                    os.remove(_idx_path)
-            except Exception:
-                pass
+                # STAMMDATEN BEREINIGEN: snapshot_name aus pool_refs entfernen.
+                # Der Snapshot-Ordner inkl. aller Stubs wurde soeben geloescht. Ohne
+                # Bereinigung wuerden pool_refs[sha].snapshots[snapshot_name] noch
+                # existieren -> Phase 4 ueberspringt alle added-Files als "bereits fertig"
+                # -> 0 Stubs geschrieben. Indexstand muss dem Remote-Zustand entsprechen.
+                try:
+                    if db is not None:
+                        _wi_n = db.purge_snapshot(snapshot_name)
+                        if _wi_n > 0:
+                            save_content_index_from_db(cfg, snapshots_root, db, dry=False)
+                            _log(
+                                f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus "
+                                f"{_wi_n} pool_refs-Eintraegen entfernt (SQLite)"
+                            )
+                    else:
+                        _wi_idx = load_content_index(cfg, snapshots_root)
+                        _wi_n = _purge_snapshot_refs_from_index(_wi_idx, snapshot_name)
+                        if _wi_n > 0:
+                            save_content_index(cfg, snapshots_root, _wi_idx, dry=False)
+                            _log(
+                                f"[delta-mode] Stammdaten bereinigt: {snapshot_name} aus "
+                                f"{_wi_n} pool_refs-Eintraegen entfernt"
+                            )
+                except Exception as e:
+                    _log(f"[delta-mode][warn] Stammdaten-Bereinigung fehlgeschlagen: {e}")
+
+                # Lokalen Index-Checkpoint dieses Snapshots verwerfen
+                try:
+                    import tempfile as _tf
+                    _idx_dir = _default_temp_dir()
+                    _idx_path = os.path.join(_idx_dir, f"pcloud_pool_index_{snapshot_name}.json")
+                    if os.path.exists(_idx_path):
+                        os.remove(_idx_path)
+                except Exception:
+                    pass
 
     # === PHASE 1: SERVER-SIDE COPY (INSTANT STRUKTUR!) ===
-    _log(f"[delta-mode] Phase 1: Klone Basis-Snapshot...")
+    if skip_copyfolder:
+        _log("[delta-mode] Phase 1: übersprungen (Resume — Struktur bereits remote)")
+    else:
+        _log(f"[delta-mode] Phase 1: Klone Basis-Snapshot...")
     t_copy_start = time.time()
     
-    if not dry:
+    if not dry and not skip_copyfolder:
         copy_attempts = max(1, int(os.environ.get("PCLOUD_COPYFOLDER_ATTEMPTS", "3")))
         copy_err: Exception | None = None
         for copy_try in range(1, copy_attempts + 1):
@@ -2561,19 +2611,21 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             except Exception as _me:
                 if verbose:
                     _log(f"[delta-mode][warn] Marker-Cleanup ({_marker}): {_me}")
-    else:
+    elif dry and not skip_copyfolder:
         _log(f"[dry] copyfolder({basis_snapshot_dir} → {snapshot_name})")
     
-    # Started-Marker setzen
+    # Started-Marker setzen (bei Resume nur wenn noch fehlend)
     if not dry:
         try:
-            pc.put_textfile(cfg, path=marker_started, text=json.dumps({
-                "snapshot": snapshot_name,
-                "started_at": time.time(),
-                "mode": "delta",
-                "basis": basis_snapshot_name,
-                "host": os.uname().nodename
-            }))
+            if not _upload_started_matches_snapshot(cfg, marker_started, snapshot_name):
+                pc.put_textfile(cfg, path=marker_started, text=json.dumps({
+                    "snapshot": snapshot_name,
+                    "started_at": time.time(),
+                    "mode": "delta",
+                    "basis": basis_snapshot_name,
+                    "host": os.uname().nodename,
+                    "resumed": bool(skip_copyfolder),
+                }))
         except Exception as e:
             _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
     
