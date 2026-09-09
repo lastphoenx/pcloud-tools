@@ -889,29 +889,186 @@ def _upload_started_matches_snapshot(cfg: dict, marker_path: str, snapshot_name:
     return pc.upload_started_matches_snapshot(cfg, marker_path, snapshot_name)
 
 
+def _delta_progress_marker_path(dest_snapshot_dir: str) -> str:
+    return f"{dest_snapshot_dir}/.delta_progress"
+
+
+def _read_remote_json_marker(cfg: dict, marker_path: str) -> dict | None:
+    if not pc.stat_file_safe(cfg, path=marker_path):
+        return None
+    try:
+        raw = pc.get_textfile(cfg, path=marker_path)
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _delta_progress_load(
+    cfg: dict,
+    dest_snapshot_dir: str,
+    snapshot_name: str,
+    basis_snapshot_name: str,
+) -> dict:
+    path = _delta_progress_marker_path(dest_snapshot_dir)
+    existing = _read_remote_json_marker(cfg, path)
+    if (
+        existing
+        and int(existing.get("format_version", 0)) >= 1
+        and str(existing.get("snapshot", "")) == str(snapshot_name)
+        and str(existing.get("basis", "")) == str(basis_snapshot_name)
+    ):
+        return existing
+    return {
+        "format_version": 1,
+        "snapshot": snapshot_name,
+        "basis": basis_snapshot_name,
+        "updated_at": time.time(),
+        "phases": {},
+    }
+
+
+def _delta_progress_set_phase(progress: dict, phase: str, status: str, **extra) -> None:
+    entry = {"status": status, "at": time.time()}
+    entry.update(extra)
+    progress.setdefault("phases", {})[phase] = entry
+    progress["updated_at"] = time.time()
+
+
+def _delta_progress_write(
+    cfg: dict, dest_snapshot_dir: str, progress: dict, *, dry: bool = False
+) -> None:
+    if dry:
+        return
+    path = _delta_progress_marker_path(dest_snapshot_dir)
+    try:
+        pc.put_textfile(cfg, path=path, text=json.dumps(progress, separators=(",", ":")))
+    except Exception as e:
+        _log(f"[delta-mode][warn] Konnte .delta_progress nicht schreiben: {e}")
+
+
+def _delta_progress_checkpoint_summary(progress: dict | None) -> dict:
+    if not progress:
+        return {}
+    phases = progress.get("phases") or {}
+    return {
+        phase: (phases.get(phase) or {}).get("status", "missing")
+        for phase in ("copyfolder", "diff", "cleanup", "pool_upload")
+    }
+
+
 def _delta_resume_incomplete_mode() -> str:
     """
     Steuert Resume bei unvollständigem Remote-Snapshot (ohne copyfolder).
     0/off = immer verwerfen; 1/on = immer resume wenn Ordner existiert;
-    auto (Default) = resume nur wenn .upload_started zum Snapshot passt.
+    auto (Default) = resume nur mit nachgewiesenem copyfolder-Checkpoint.
     """
     return os.environ.get("PCLOUD_DELTA_RESUME_INCOMPLETE", "auto").strip().lower()
 
 
-def _can_resume_incomplete_delta(
+def _delta_resume_auto_allowed(
+    *,
+    started: dict | None,
+    progress: dict | None,
+    snapshot_name: str,
+    basis_snapshot_name: str,
+) -> tuple[bool, str, dict, bool]:
+    """
+    Pure Resume-Entscheidung für auto-Mode (ohne API-Calls).
+    Returns: (allowed, reason, checkpoint_summary, skip_phase3)
+    """
+    if not started or str(started.get("snapshot", "")) != str(snapshot_name):
+        return False, ".upload_started fehlt oder Snapshot passt nicht", {}, False
+    if str(started.get("basis", "")) != str(basis_snapshot_name):
+        return (
+            False,
+            f".upload_started basis={started.get('basis')!r} != erwartet {basis_snapshot_name!r}",
+            {},
+            False,
+        )
+
+    if progress and int(progress.get("format_version", 0)) >= 1:
+        if str(progress.get("snapshot", "")) != str(snapshot_name):
+            return False, ".delta_progress snapshot mismatch", {}, False
+        if str(progress.get("basis", "")) != str(basis_snapshot_name):
+            return False, ".delta_progress basis mismatch", {}, False
+        checkpoint = _delta_progress_checkpoint_summary(progress)
+        copy_status = checkpoint.get("copyfolder", "missing")
+        if copy_status != "done":
+            return (
+                False,
+                f".delta_progress copyfolder={copy_status} (erwartet done)",
+                checkpoint,
+                False,
+            )
+        skip_phase3 = checkpoint.get("cleanup") == "done"
+        return True, "checkpoint ok", checkpoint, skip_phase3
+
+    # Legacy-Läufe vor .delta_progress: .upload_started wird erst NACH copyfolder gesetzt.
+    checkpoint = {
+        "copyfolder": "done (legacy, .delta_progress fehlt)",
+        "diff": "unknown",
+        "cleanup": "unknown",
+        "pool_upload": "unknown",
+    }
+    return True, "legacy checkpoint (.upload_started+basis)", checkpoint, False
+
+
+def _assess_delta_resume(
     cfg: dict,
     dest_snapshot_dir: str,
     marker_started: str,
     snapshot_name: str,
-) -> bool:
+    basis_snapshot_name: str,
+) -> dict:
+    """
+    Prüft, ob ein abgebrochener Delta-Lauf ohne delete+copyfolder fortgesetzt werden darf.
+    """
+    result = {
+        "can_resume": False,
+        "skip_copyfolder": False,
+        "skip_phase3": False,
+        "checkpoint": {},
+        "reason": "",
+        "legacy_checkpoint": False,
+    }
     mode = _delta_resume_incomplete_mode()
     if mode in ("0", "false", "no", "off"):
-        return False
+        result["reason"] = "PCLOUD_DELTA_RESUME_INCOMPLETE=0"
+        return result
     if not pc.stat_folderid_fast(cfg, dest_snapshot_dir):
-        return False
+        result["reason"] = "Remote-Snapshot-Ordner fehlt"
+        return result
     if mode in ("1", "true", "yes", "on"):
-        return True
-    return _upload_started_matches_snapshot(cfg, marker_started, snapshot_name)
+        progress = _read_remote_json_marker(cfg, _delta_progress_marker_path(dest_snapshot_dir))
+        result.update(
+            {
+                "can_resume": True,
+                "skip_copyfolder": True,
+                "skip_phase3": _delta_progress_checkpoint_summary(progress).get("cleanup") == "done",
+                "checkpoint": _delta_progress_checkpoint_summary(progress) or {"copyfolder": "forced"},
+                "reason": "forced resume (mode=1)",
+            }
+        )
+        return result
+
+    started = _read_remote_json_marker(cfg, marker_started)
+    progress = _read_remote_json_marker(cfg, _delta_progress_marker_path(dest_snapshot_dir))
+    allowed, reason, checkpoint, skip_phase3 = _delta_resume_auto_allowed(
+        started=started,
+        progress=progress,
+        snapshot_name=snapshot_name,
+        basis_snapshot_name=basis_snapshot_name,
+    )
+    result["reason"] = reason
+    result["checkpoint"] = checkpoint
+    if not allowed:
+        return result
+    result["legacy_checkpoint"] = progress is None
+    result["can_resume"] = True
+    result["skip_copyfolder"] = True
+    result["skip_phase3"] = skip_phase3
+    return result
 
 
 def _purge_snapshot_refs_from_index(index: dict, snapshot_name: str) -> int:
@@ -2490,6 +2647,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     #     ein Timeout in Phase 4 nach erfolgreichem copyfolder).
     #   * sonst: komplett verwerfen und fresh start via copyfolder.
     skip_copyfolder = False
+    skip_phase3 = False
     if not dry:
         existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
         if existing_fid:
@@ -2501,13 +2659,33 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                     except Exception:
                         pass
                 return {"uploaded": 0, "stubs": 0, "resumed": False, "mode": "delta"}
-            if _can_resume_incomplete_delta(cfg, dest_snapshot_dir, marker_started, snapshot_name):
-                skip_copyfolder = True
+            resume_plan = _assess_delta_resume(
+                cfg, dest_snapshot_dir, marker_started, snapshot_name, basis_snapshot_name
+            )
+            if resume_plan["can_resume"]:
+                skip_copyfolder = resume_plan["skip_copyfolder"]
+                skip_phase3 = resume_plan["skip_phase3"]
+                ck = resume_plan.get("checkpoint") or {}
                 _log(
-                    f"[delta-mode] Resume: unvollständiger Snapshot bleibt erhalten "
-                    f"(mode={_delta_resume_incomplete_mode()}) — überspringe delete+copyfolder"
+                    f"[delta-mode] Resume checkpoint: "
+                    f"copyfolder={ck.get('copyfolder', '?')} "
+                    f"diff={ck.get('diff', '?')} "
+                    f"cleanup={ck.get('cleanup', '?')} "
+                    f"pool_upload={ck.get('pool_upload', '?')}"
+                )
+                if resume_plan.get("legacy_checkpoint"):
+                    _log(
+                        "[delta-mode][warn] Legacy-Checkpoint ohne .delta_progress — "
+                        "copyfolder nur implizit (.upload_started+basis); "
+                        "Phase 3 wird erneut ausgeführt"
+                    )
+                _log(
+                    f"[delta-mode] Resume erlaubt (mode={_delta_resume_incomplete_mode()}) — "
+                    f"überspringe delete+copyfolder"
                 )
             else:
+                if resume_plan.get("reason"):
+                    _log(f"[delta-mode] Kein Resume: {resume_plan['reason']}")
                 if pc.stat_file_safe(cfg, path=marker_complete):
                     _log(
                         f"[delta-mode] .upload_complete vorhanden, aber snapshot-Feld passt nicht "
@@ -2600,6 +2778,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 f"(kein Full-Pool-Fallback): {copy_err}"
             ) from copy_err
 
+        _delta_progress = _delta_progress_load(
+            cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+        )
+        _delta_progress_set_phase(
+            _delta_progress, "copyfolder", "done", duration_s=round(copy_duration, 1)
+        )
+        _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
+
         # Vom Basis mitkopierte Status-Marker entfernen. Sonst gilt der frisch
         # geklonte Snapshot faelschlich als 'bereits vollstaendig' (Complete-Marker
         # des Basis) bzw. traegt einen fremden Started-Marker.
@@ -2630,6 +2816,15 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             _log(f"[warn] Konnte Started-Marker nicht setzen: {e}")
     
     # === PHASE 2: MANIFEST-DIFF BERECHNEN ===
+    if not dry and skip_copyfolder:
+        _delta_progress = _delta_progress_load(
+            cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+        )
+        if (_delta_progress.get("phases") or {}).get("copyfolder", {}).get("status") != "done":
+            _delta_progress_set_phase(_delta_progress, "copyfolder", "done", resumed=True)
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
+            _log("[delta-mode] .delta_progress: copyfolder=done nachgetragen (Resume)")
+
     _log("[delta-mode] Phase 2: Berechne Manifest-Diff...")
     t_diff_start = time.time()
     
@@ -2677,10 +2872,26 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     
     diff_duration = time.time() - t_diff_start
     _log(f"[delta-mode] Diff: +{len(added_paths)} -{len(deleted_paths)} Δ{len(changed_paths)} (={len(common_paths)-len(changed_paths)} unverändert) in {diff_duration:.1f}s")
+    if not dry:
+        _delta_progress = _delta_progress_load(
+            cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+        )
+        _delta_progress_set_phase(
+            _delta_progress,
+            "diff",
+            "done",
+            duration_s=round(diff_duration, 1),
+            added=len(added_paths),
+            removed=len(deleted_paths),
+            changed=len(changed_paths),
+        )
+        _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
     
     # === PHASE 3: BEREINIGUNG (Remote-Stubs ohne Pendant im aktuellen Manifest) ===
     paths_to_remove = set(deleted_paths)
-    if not dry:
+    if skip_phase3:
+        _log("[delta-mode] Phase 3: übersprungen (Resume — Bereinigung bereits abgeschlossen)")
+    elif not dry:
         t_stublist = time.time()
         remote_stub_relpaths = _snapshot_stub_relpaths(cfg, dest_snapshot_dir)
         clone_orphans = remote_stub_relpaths - current_paths
@@ -2694,7 +2905,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 f"in {time.time() - t_stublist:.1f}s"
             )
 
-    if paths_to_remove and not dry:
+    if not skip_phase3 and paths_to_remove and not dry:
         _log(f"[delta-mode] Phase 3: Entferne {len(paths_to_remove)} veraltete Einträge...")
         t_cleanup_start = time.time()
         folders_removed, deleted_count = _delta_phase3_cleanup(
@@ -2708,14 +2919,41 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             f"[delta-mode] ✓ Bereinigt: {folders_removed} tote Ordner rekursiv, "
             f"{deleted_count} Einzel-Stubs in {cleanup_duration:.1f}s"
         )
-    elif paths_to_remove:
+        _delta_progress = _delta_progress_load(
+            cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+        )
+        _delta_progress_set_phase(
+            _delta_progress,
+            "cleanup",
+            "done",
+            duration_s=round(cleanup_duration, 1),
+            paths_removed=len(paths_to_remove),
+            folders_removed=folders_removed,
+            stubs_removed=deleted_count,
+        )
+        _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
+    elif not skip_phase3 and paths_to_remove:
         _log(f"[dry] Würde {len(paths_to_remove)} veraltete Einträge entfernen (tote Ordner rekursiv + Einzel-Stubs)")
+    elif not skip_phase3 and not dry:
+        _delta_progress = _delta_progress_load(
+            cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+        )
+        _delta_progress_set_phase(_delta_progress, "cleanup", "done", paths_removed=0)
+        _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
     
     # === PHASE 4: UPDATE (Neue/Geänderte Files verarbeiten) ===
     tasks = list(added_paths | changed_paths)
     
     if tasks:
         _log(f"[delta-mode] Phase 4: Verarbeite {len(tasks)} neue/geänderte Files...")
+        if not dry:
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(
+                _delta_progress, "pool_upload", "in_progress", tasks=len(tasks)
+            )
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
         
         # Index laden
         t_idx = time.time()
@@ -2949,9 +3187,34 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _log(f"[delta-mode][ERROR]   - {_fp}")
             if len(failed) > 10:
                 _log(f"[delta-mode][ERROR]   ... und {len(failed)-10} weitere")
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(
+                _delta_progress,
+                "pool_upload",
+                "failed",
+                failed=len(failed),
+                uploaded=uploaded,
+                reused=reused,
+            )
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
             raise RuntimeError(f"Pool-Upload fehlgeschlagen fuer {len(failed)} Datei(en) - Snapshot nicht finalisiert")
 
         _log(f"[delta-mode] ✓ Files verarbeitet: {uploaded} neue, {reused} wiederverwendet")
+        if not dry:
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(
+                _delta_progress,
+                "pool_upload",
+                "done",
+                uploaded=uploaded,
+                reused=reused,
+                stubs=stubs,
+            )
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
         
         # Stubs schreiben
         if stubs_to_write and not dry:

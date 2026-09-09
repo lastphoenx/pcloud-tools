@@ -124,9 +124,10 @@ PCLOUD_DELTA_PLAN_DELETE_FULL=5000
 ```
 
 ### `PCLOUD_DELTA_RESUME_INCOMPLETE`
-**Beschreibung:** Verhalten bei unvollständigem Remote-Snapshot (`.upload_started` gesetzt, kein `.upload_complete`).  
-**Werte:** `auto` (Default) = Resume ohne `delete+copyfolder` wenn `.upload_started` zum Snapshot passt; `1` = immer Resume; `0` = immer verwerfen (altes Verhalten).  
-**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py` (Delta-Mode Phase 1)
+**Beschreibung:** Verhalten bei unvollständigem Remote-Snapshot (kein `.upload_complete`).  
+**Werte:** `auto` (Default) = Resume nur mit Checkpoint: `.delta_progress` mit `copyfolder=done` und passender `basis`, sonst Legacy-Fallback über `.upload_started+basis` (mit Warnung); `1` = immer Resume; `0` = immer verwerfen (altes Verhalten).  
+**Checkpoint-Datei:** `<snapshot>/.delta_progress` (Phasen: `copyfolder`, `diff`, `cleanup`, `pool_upload`).  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py` (Delta-Mode Phase 1–4)
 
 ```bash
 PCLOUD_DELTA_RESUME_INCOMPLETE=auto
