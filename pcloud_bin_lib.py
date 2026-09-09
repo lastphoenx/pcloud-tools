@@ -503,8 +503,8 @@ def _api_ts_log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
-def is_transient_api_error(exc: BaseException) -> bool:
-    """True bei typischen Verbindungs-/Rate-Limit-Fehlern (retry-würdig, kein Full-Pool-Fallback)."""
+def _is_transient_api_error_one(exc: BaseException) -> bool:
+    """Einzel-Exception (ohne __cause__-Kette) auf Retry-Würdigkeit prüfen."""
     if isinstance(exc, (ConnectionError, ConnectionResetError, BrokenPipeError, TimeoutError, socket.timeout)):
         return True
     if isinstance(exc, OSError):
@@ -530,8 +530,16 @@ def is_transient_api_error(exc: BaseException) -> bool:
                 _req_exc.ChunkedEncodingError,
                 _req_exc.ReadTimeout,
                 _req_exc.ConnectTimeout,
+                _req_exc.RetryError,
             ),
         ):
+            return True
+    except Exception:
+        pass
+    try:
+        from urllib3.exceptions import MaxRetryError
+
+        if isinstance(exc, MaxRetryError):
             return True
     except Exception:
         pass
@@ -541,9 +549,21 @@ def is_transient_api_error(exc: BaseException) -> bool:
     keywords = (
         "socket closed", "connection reset", "connection aborted", "broken pipe",
         "timed out", "timeout", "temporarily unavailable", "eof occurred",
-        "econnreset", "ssl", "5000", "5001",
+        "econnreset", "ssl", "5000", "5001", "max retries exceeded",
     )
     return any(k in msg for k in keywords)
+
+
+def is_transient_api_error(exc: BaseException) -> bool:
+    """True bei typischen Verbindungs-/Rate-Limit-Fehlern (retry-würdig, inkl. __cause__)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_transient_api_error_one(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _circuit_cooldown_sec() -> float:
@@ -3456,6 +3476,12 @@ def call_with_backoff(func, *args, attempts: int = 5, max_sleep: float = 60.0, *
                     f"({type(e).__name__}: {e}), warte {sleep_s:.1f}s ..."
                 )
                 time.sleep(sleep_s)
+            else:
+                _api_ts_log(
+                    f"[retry] {getattr(func, '__name__', func)} "
+                    f"endgültig fehlgeschlagen nach {max_attempts} Versuch(en) "
+                    f"({type(e).__name__}: {e})"
+                )
     raise last_exc
 
 

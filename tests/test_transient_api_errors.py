@@ -23,6 +23,19 @@ class TestTransientApiErrors(unittest.TestCase):
         exc = RuntimeError("uploadfile failed: {'result': 2008, 'error': 'Access denied'}")
         self.assertFalse(pc.is_transient_api_error(exc))
 
+    def test_wrapped_oserror_in_cause_chain(self):
+        root = OSError(110, "Connection timed out")
+        wrapped = RuntimeError("upload failed")
+        wrapped.__cause__ = root
+        self.assertTrue(pc.is_transient_api_error(wrapped))
+
+    def test_max_retry_error_message(self):
+        exc = RuntimeError(
+            "HTTPSConnectionPool(host='eapi.pcloud.com', port=443): "
+            "Max retries exceeded with url: /uploadfile"
+        )
+        self.assertTrue(pc.is_transient_api_error(exc))
+
 
 if __name__ == "__main__":
     unittest.main()
