@@ -953,7 +953,14 @@ def _delta_progress_checkpoint_summary(progress: dict | None) -> dict:
     phases = progress.get("phases") or {}
     return {
         phase: (phases.get(phase) or {}).get("status", "missing")
-        for phase in ("copyfolder", "diff", "cleanup", "pool_upload")
+        for phase in (
+            "copyfolder",
+            "diff",
+            "cleanup",
+            "pool_upload",
+            "stubs",
+            "finalize",
+        )
     }
 
 
@@ -972,26 +979,27 @@ def _delta_resume_auto_allowed(
     progress: dict | None,
     snapshot_name: str,
     basis_snapshot_name: str,
-) -> tuple[bool, str, dict, bool]:
+) -> tuple[bool, str, dict, bool, bool]:
     """
     Pure Resume-Entscheidung für auto-Mode (ohne API-Calls).
-    Returns: (allowed, reason, checkpoint_summary, skip_phase3)
+    Returns: (allowed, reason, checkpoint_summary, skip_phase3, skip_pool_upload)
     """
     if not started or str(started.get("snapshot", "")) != str(snapshot_name):
-        return False, ".upload_started fehlt oder Snapshot passt nicht", {}, False
+        return False, ".upload_started fehlt oder Snapshot passt nicht", {}, False, False
     if str(started.get("basis", "")) != str(basis_snapshot_name):
         return (
             False,
             f".upload_started basis={started.get('basis')!r} != erwartet {basis_snapshot_name!r}",
             {},
             False,
+            False,
         )
 
     if progress and int(progress.get("format_version", 0)) >= 1:
         if str(progress.get("snapshot", "")) != str(snapshot_name):
-            return False, ".delta_progress snapshot mismatch", {}, False
+            return False, ".delta_progress snapshot mismatch", {}, False, False
         if str(progress.get("basis", "")) != str(basis_snapshot_name):
-            return False, ".delta_progress basis mismatch", {}, False
+            return False, ".delta_progress basis mismatch", {}, False, False
         checkpoint = _delta_progress_checkpoint_summary(progress)
         copy_status = checkpoint.get("copyfolder", "missing")
         if copy_status != "done":
@@ -1000,9 +1008,14 @@ def _delta_resume_auto_allowed(
                 f".delta_progress copyfolder={copy_status} (erwartet done)",
                 checkpoint,
                 False,
+                False,
             )
         skip_phase3 = checkpoint.get("cleanup") == "done"
-        return True, "checkpoint ok", checkpoint, skip_phase3
+        skip_pool_upload = (
+            checkpoint.get("pool_upload") == "done"
+            and checkpoint.get("stubs") != "done"
+        )
+        return True, "checkpoint ok", checkpoint, skip_phase3, skip_pool_upload
 
     # Legacy-Läufe vor .delta_progress: .upload_started wird erst NACH copyfolder gesetzt.
     checkpoint = {
@@ -1010,8 +1023,10 @@ def _delta_resume_auto_allowed(
         "diff": "unknown",
         "cleanup": "unknown",
         "pool_upload": "unknown",
+        "stubs": "unknown",
+        "finalize": "unknown",
     }
-    return True, "legacy checkpoint (.upload_started+basis)", checkpoint, False
+    return True, "legacy checkpoint (.upload_started+basis)", checkpoint, False, False
 
 
 def _assess_delta_resume(
@@ -1028,6 +1043,7 @@ def _assess_delta_resume(
         "can_resume": False,
         "skip_copyfolder": False,
         "skip_phase3": False,
+        "skip_pool_upload": False,
         "checkpoint": {},
         "reason": "",
         "legacy_checkpoint": False,
@@ -1041,12 +1057,14 @@ def _assess_delta_resume(
         return result
     if mode in ("1", "true", "yes", "on"):
         progress = _read_remote_json_marker(cfg, _delta_progress_marker_path(dest_snapshot_dir))
+        ck = _delta_progress_checkpoint_summary(progress) or {"copyfolder": "forced"}
         result.update(
             {
                 "can_resume": True,
                 "skip_copyfolder": True,
-                "skip_phase3": _delta_progress_checkpoint_summary(progress).get("cleanup") == "done",
-                "checkpoint": _delta_progress_checkpoint_summary(progress) or {"copyfolder": "forced"},
+                "skip_phase3": ck.get("cleanup") == "done",
+                "skip_pool_upload": ck.get("pool_upload") == "done" and ck.get("stubs") != "done",
+                "checkpoint": ck,
                 "reason": "forced resume (mode=1)",
             }
         )
@@ -1054,7 +1072,7 @@ def _assess_delta_resume(
 
     started = _read_remote_json_marker(cfg, marker_started)
     progress = _read_remote_json_marker(cfg, _delta_progress_marker_path(dest_snapshot_dir))
-    allowed, reason, checkpoint, skip_phase3 = _delta_resume_auto_allowed(
+    allowed, reason, checkpoint, skip_phase3, skip_pool_upload = _delta_resume_auto_allowed(
         started=started,
         progress=progress,
         snapshot_name=snapshot_name,
@@ -1068,6 +1086,7 @@ def _assess_delta_resume(
     result["can_resume"] = True
     result["skip_copyfolder"] = True
     result["skip_phase3"] = skip_phase3
+    result["skip_pool_upload"] = skip_pool_upload
     return result
 
 
@@ -1232,7 +1251,7 @@ def _build_folder_cache_from_tree(cfg: dict, root_path: str) -> dict[str, int]:
     
     return cache
 
-def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = False) -> None:
+def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = False) -> tuple[int, int]:
     """
     Schreibt gesammelte Stubs (.meta.json) in ihre Zielordner (parent folderid + filename).
     'stubs' ist eine Liste von Tuples: (remote_stub_path, payload_dict)
@@ -1242,7 +1261,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     import datetime
 
     if not stubs:
-        return
+        return (0, 0)
 
     pretty = os.environ.get("PCLOUD_PRETTY_JSON", "0") == "1"
     
@@ -1573,6 +1592,7 @@ def _batch_write_stubs(cfg: dict, stubs: list[tuple[str, dict]], *, dry: bool = 
     if _stubs_failed > 0:
         _log(f"[warn] {_stubs_failed} Stubs fehlgeschlagen (von {total_tasks})")
     _log(f"[stubs] ✓ {_stubs_written}/{total_tasks} Stubs erfolgreich ({(_stubs_written/total_tasks*100):.1f}%)")
+    return (_stubs_written, _stubs_failed)
 
 # ----------------- Haupt-Logik -----------------
 
@@ -2606,6 +2626,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         Stats Dict
     """
     t_start = time.time()
+    uploaded = 0
+    reused = 0
+    pool_new = 0
+    pool_dedup = 0
+    stubs = 0
+    upload_ms = 0.0
+    write_ms = 0.0
     
     snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
     dest_root = pc._norm_remote_path(dest_root)
@@ -2648,6 +2675,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     #   * sonst: komplett verwerfen und fresh start via copyfolder.
     skip_copyfolder = False
     skip_phase3 = False
+    skip_pool_upload = False
     if not dry:
         existing_fid = pc.stat_folderid_fast(cfg, dest_snapshot_dir)
         if existing_fid:
@@ -2665,14 +2693,22 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             if resume_plan["can_resume"]:
                 skip_copyfolder = resume_plan["skip_copyfolder"]
                 skip_phase3 = resume_plan["skip_phase3"]
+                skip_pool_upload = resume_plan.get("skip_pool_upload", False)
                 ck = resume_plan.get("checkpoint") or {}
                 _log(
                     f"[delta-mode] Resume checkpoint: "
                     f"copyfolder={ck.get('copyfolder', '?')} "
                     f"diff={ck.get('diff', '?')} "
                     f"cleanup={ck.get('cleanup', '?')} "
-                    f"pool_upload={ck.get('pool_upload', '?')}"
+                    f"pool_upload={ck.get('pool_upload', '?')} "
+                    f"stubs={ck.get('stubs', '?')} "
+                    f"finalize={ck.get('finalize', '?')}"
                 )
+                if skip_pool_upload:
+                    _log(
+                        "[delta-mode] Phase 4 Pool: wird übersprungen "
+                        "(pool_upload=done, stubs unvollständig)"
+                    )
                 if resume_plan.get("legacy_checkpoint"):
                     _log(
                         "[delta-mode][warn] Legacy-Checkpoint ohne .delta_progress — "
@@ -2996,12 +3032,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 save_content_index_local(_local_index_path, index)
                 save_content_index(cfg, snapshots_root, index, dry=False)
         
-        # Stats
-        uploaded = 0
-        reused = 0
-        stubs = 0
-        upload_ms = 0.0
-        write_ms = 0.0
+        # Stats (uploaded/reused/pool_* am Funktionsanfang initialisiert)
         stubs_to_write = []
         failed = []  # relpaths, deren Originaldatei NICHT in den Pool geladen werden konnte
         _state_lock = threading.Lock()
@@ -3035,12 +3066,13 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 )
                 _log(
                     f"[delta-mode] Phase 4: {_done_tasks}/{_total_tasks} ({current_pct}%) | "
-                    f"uploaded={uploaded} reused={reused} failed={len(failed)} | {eta_str} verbleibend"
+                    f"pool_ok={uploaded} pool_new={pool_new} pool_dedup={pool_dedup} "
+                    f"stub_skip={reused} failed={len(failed)} | {eta_str} verbleibend"
                 )
         
         # Upload-Funktion (wie in push_pool_mode)
-        def _upload_to_pool(abs_src: str, sha256: str) -> tuple:
-            nonlocal upload_ms
+        def _upload_to_pool(abs_src: str, sha256: str, *, allow_upload: bool = True) -> tuple:
+            nonlocal upload_ms, pool_new, pool_dedup
             pool_path_rel = _get_pool_path(sha256)
             # Absolute Pfadangabe für Log-Ausgabe und pCloud-Operationen
             pool_path_abs = f"{dest_root.rstrip('/')}/{pool_path_rel}"
@@ -3062,12 +3094,20 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                         globals()["MET_POOL_REUSED"] += 1
                 except Exception:
                     pass
+                with _state_lock:
+                    pool_dedup += 1
                 return (pool_fileid, pcloud_hash)
+
+            if not allow_upload:
+                raise RuntimeError(
+                    f"Pool-Objekt fehlt (Resume stub-only, kein Re-Upload): {pool_path_abs}"
+                )
             
             t0 = time.time()
             res = _upload_file_smart(cfg, abs_src, pool_path_abs, dry=dry)
             with _state_lock:
                 upload_ms += (time.time() - t0) * 1000.0
+                pool_new += 1
             # Sichtbar machen, dass die Originaldatei real in den Pool geschrieben wurde
             # (nur echte Uploads; Dedup-Treffer kehren oben frueher zurueck).
             _log(f"[pool] ✓ Original in Pool geladen: {pool_path_rel}  <- {abs_src}")
@@ -3132,7 +3172,9 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 
                 # Upload zu Pool
                 try:
-                    pool_fileid, pcloud_hash = _upload_to_pool(abs_src, sha256)
+                    pool_fileid, pcloud_hash = _upload_to_pool(
+                        abs_src, sha256, allow_upload=not skip_pool_upload
+                    )
                     
                     with _state_lock:
                         if db is not None:
@@ -3195,13 +3237,18 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 "pool_upload",
                 "failed",
                 failed=len(failed),
-                uploaded=uploaded,
-                reused=reused,
+                pool_ok=uploaded,
+                pool_new=pool_new,
+                pool_dedup=pool_dedup,
+                stub_skip=reused,
             )
             _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
             raise RuntimeError(f"Pool-Upload fehlgeschlagen fuer {len(failed)} Datei(en) - Snapshot nicht finalisiert")
 
-        _log(f"[delta-mode] ✓ Files verarbeitet: {uploaded} neue, {reused} wiederverwendet")
+        _log(
+            f"[delta-mode] ✓ Phase 4 Pool: {uploaded} ok "
+            f"({pool_new} neu, {pool_dedup} dedup, {reused} stub-skip)"
+        )
         if not dry:
             _delta_progress = _delta_progress_load(
                 cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
@@ -3210,18 +3257,57 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 _delta_progress,
                 "pool_upload",
                 "done",
-                uploaded=uploaded,
-                reused=reused,
-                stubs=stubs,
+                pool_ok=uploaded,
+                pool_new=pool_new,
+                pool_dedup=pool_dedup,
+                stub_skip=reused,
+                stubs_queued=stubs,
             )
             _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
         
         # Stubs schreiben
         if stubs_to_write and not dry:
             _log(f"[delta-mode] Schreibe {len(stubs_to_write)} Stubs...")
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(
+                _delta_progress, "stubs", "in_progress", count=len(stubs_to_write)
+            )
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
             t0 = time.time()
-            _batch_write_stubs(cfg, stubs_to_write, dry=False)
+            stubs_written, stubs_failed = _batch_write_stubs(cfg, stubs_to_write, dry=False)
             write_ms = (time.time() - t0) * 1000.0
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            if stubs_failed:
+                _delta_progress_set_phase(
+                    _delta_progress,
+                    "stubs",
+                    "failed",
+                    written=stubs_written,
+                    failed=stubs_failed,
+                )
+                _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
+                raise RuntimeError(
+                    f"Stub-Write fehlgeschlagen fuer {stubs_failed} Datei(en) "
+                    f"(von {len(stubs_to_write)})"
+                )
+            _delta_progress_set_phase(
+                _delta_progress,
+                "stubs",
+                "done",
+                written=stubs_written,
+                duration_s=round(write_ms / 1000.0, 1),
+            )
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
+        elif not dry and not stubs_to_write:
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(_delta_progress, "stubs", "done", written=0)
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
         
         if db is not None and _pending_refs and not dry:
             n_bat = db.register_batch(snapshot_name, _pending_refs)
@@ -3243,11 +3329,6 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
         # einer nie-fertigen Basis in der DB und der naechste Lauf merged das Loch.
     else:
         _log("[delta-mode] Keine Änderungen - Snapshot identisch mit Basis")
-        uploaded = 0
-        reused = 0
-        stubs = 0
-        upload_ms = 0.0
-        write_ms = 0.0
         if db is not None:
             db.purge_snapshot(snapshot_name)
         else:
@@ -3296,6 +3377,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     finalized = False
     try:
         if not dry:
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(_delta_progress, "finalize", "in_progress")
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
             _post_upload_gate(
                 cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, gate_index,
                 dry=dry, mode_label="delta-mode",
@@ -3339,6 +3425,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 cfg, snapshots_root, gate_index, snapshot_name, dest_snapshot_dir, marker_data,
                 dry=dry, db=db,
             )
+            _delta_progress = _delta_progress_load(
+                cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+            )
+            _delta_progress_set_phase(_delta_progress, "finalize", "done")
+            _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
             finalized = True
 
         # === REMOTE INDEX-ARCHIVE: in _finalize_after_validation_delta ===
@@ -3355,7 +3446,11 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             pass
 
         total_duration = time.time() - t_start
-        _log(f"[delta-mode] ✓ Abgeschlossen: {uploaded} neue, {reused} wiederverwendet, {stubs} stubs ({total_duration:.1f}s)")
+        _log(
+            f"[delta-mode] ✓ Abgeschlossen: pool_ok={uploaded} "
+            f"(neu={pool_new}, dedup={pool_dedup}), "
+            f"{stubs} stubs ({total_duration:.1f}s)"
+        )
         _log(f"[timing] upload_ms={int(upload_ms)} write_ms={int(write_ms)}")
 
         return {
@@ -3368,6 +3463,18 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
             "mode": "delta",
             "basis": basis_snapshot_name
         }
+    except Exception:
+        if not dry and not finalized:
+            try:
+                _delta_progress = _delta_progress_load(
+                    cfg, dest_snapshot_dir, snapshot_name, basis_snapshot_name
+                )
+                if (_delta_progress.get("phases") or {}).get("finalize", {}).get("status") != "done":
+                    _delta_progress_set_phase(_delta_progress, "finalize", "failed")
+                    _delta_progress_write(cfg, dest_snapshot_dir, _delta_progress, dry=dry)
+            except Exception:
+                pass
+        raise
     finally:
         if db is not None:
             if not dry and not finalized:
