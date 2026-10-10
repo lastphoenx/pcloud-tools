@@ -251,6 +251,27 @@ class PoolIndexDbTests(unittest.TestCase):
         self.assertEqual(refs["cc" * 32]["snapshots"], {})
         self.assertNotIn("snap-a", refs["bb" * 32]["snapshots"])
 
+    def test_purge_no_commit_rolls_back(self) -> None:
+        src = os.path.join(self.dir, "rb.json")
+        _write_json(src, _mini_v2())
+        self.db.import_from_json(src)
+        before = self.db.snapshot_pair_count("snap-a")
+        self.assertGreater(before, 0)
+        self.db.conn.execute("SAVEPOINT sp_test")
+        self.db.purge_snapshot("snap-a", commit=False)
+        self.assertEqual(self.db.snapshot_pair_count("snap-a"), 0)
+        self.db.conn.execute("ROLLBACK TO SAVEPOINT sp_test")
+        self.assertEqual(self.db.snapshot_pair_count("snap-a"), before)
+
+    def test_snap_ref_count_matches_purge(self) -> None:
+        src = os.path.join(self.dir, "cnt.json")
+        _write_json(src, _mini_v2())
+        self.db.import_from_json(src)
+        self.assertEqual(
+            self.db.snap_ref_count("snap-a"),
+            self.db.snapshot_pair_count("snap-a"),
+        )
+
     def test_build_snapshot_index(self) -> None:
         src = os.path.join(self.dir, "b.json")
         data = _mini_v2()

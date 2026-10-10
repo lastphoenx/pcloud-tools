@@ -93,8 +93,8 @@ def _open_ops_db_if_current(
             "[gc-engine] Ops-DB aktuell (Remote-SHA) — Download/Re-Import übersprungen"
         )
         master_path, _ = master_paths(env_vars)
-        if os.path.isfile(master_path):
-            db.refresh_master_metadata(master_path)
+        if os.path.isfile(master_path) and remote_sha:
+            db.refresh_master_metadata(master_path, known_sha256=remote_sha)
         return db
     if allow_without_remote_sha and not remote_sha:
         log(
@@ -197,7 +197,9 @@ def open_synced_db(
 
     if _ops_db_can_skip_import_after_download(db, master_path, remote_sha):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
-        db.refresh_master_metadata(master_path)
+        db.refresh_master_metadata(
+            master_path, known_sha256=remote_sha or None,
+        )
         return db
 
     log("[gc-engine] Streaming-Import Master → SQLite …")
@@ -223,10 +225,11 @@ def purge_snapshots_in_db(
     snap_names: Iterable[str],
     *,
     log: LogFn,
+    commit: bool = True,
 ) -> Dict[str, int]:
     removed_refs = 0
     for snap in sorted({s.strip() for s in snap_names if s and s.strip()}):
-        n = db.purge_snapshot(snap)
+        n = db.purge_snapshot(snap, commit=commit)
         if n:
             log(f"[gc-engine] purge {snap}: {n} snap_refs")
         removed_refs += n
@@ -241,13 +244,16 @@ def publish_master_index(
     *,
     dry: bool,
     log: LogFn,
+    defer_db_commit: bool = False,
 ) -> Dict[str, int]:
     master_path, staging_path = master_paths(env_vars)
     os.makedirs(os.path.dirname(staging_path), exist_ok=True)
     os.makedirs(os.path.dirname(master_path), exist_ok=True)
-    exp = db.export_content_index_json(staging_path)
+    exp = db.export_content_index_json(
+        staging_path, record_export_meta=not defer_db_commit,
+    )
     os.replace(staging_path, master_path)
-    db.refresh_master_metadata(master_path)
+    db.record_master_meta(master_path, commit=not defer_db_commit)
     n_refs = int(exp.get("shas") or 0)
     log(
         f"[gc-engine] Export lokal: {master_path} "
@@ -299,7 +305,7 @@ def _dry_simulate_purge_on_ops_db(
     *,
     log: LogFn,
 ) -> Dict[str, int]:
-    """Dry-run delete-snapshots / retention: Ops-DB — kein Download, Import, digest."""
+    """Dry-run: nur COUNT — kein DELETE (purge_snapshot commit() bricht SAVEPOINT)."""
     db_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Dry-run: Ops-DB nur lesen (kein Remote-Download): {db_path}")
     if not os.path.isfile(db_path):
@@ -313,15 +319,18 @@ def _dry_simulate_purge_on_ops_db(
         if n_shas == 0:
             log("[gc-engine][ERROR] Ops-DB leer — kein Import überspringen möglich")
             return {"removed_snap_refs": 0}
-        log(f"[gc-engine] Ops-DB bereit ({n_shas} SHAs) — Purge simulieren")
-        db.conn.execute("SAVEPOINT index_purge")
-        stats = purge_snapshots_in_db(db, deleted_snaps, log=log)
+        log(f"[gc-engine] Ops-DB bereit ({n_shas} SHAs) — Purge simulieren (COUNT)")
+        removed_refs = 0
+        for snap in sorted({s.strip() for s in deleted_snaps if s and s.strip()}):
+            n = db.snap_ref_count(snap)
+            if n:
+                log(f"[dry] würde purge {snap}: {n} snap_refs")
+            removed_refs += n
         log(
-            f"[dry] Index-Purge simuliert: {stats['removed_snap_refs']} snap-refs; "
+            f"[dry] Index-Purge simuliert: {removed_refs} snap-refs; "
             f"würde exportieren (~{n_shas} pool_refs), kein Upload"
         )
-        db.conn.execute("ROLLBACK TO SAVEPOINT index_purge")
-        return stats
+        return {"removed_snap_refs": removed_refs}
     finally:
         db.close()
 
@@ -343,12 +352,19 @@ def apply_index_purge_for_deleted_snaps(
     if dry:
         return _dry_simulate_purge_on_ops_db(env_vars, deleted_snaps, log=log)
     db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
+    c = db.conn
     try:
-        db.conn.execute("SAVEPOINT index_purge")
-        stats = purge_snapshots_in_db(db, deleted_snaps, log=log)
-        publish_master_index(cfg, snapshots_root, db, env_vars, dry=False, log=log)
-        db.conn.execute("RELEASE SAVEPOINT index_purge")
+        c.execute("BEGIN IMMEDIATE")
+        stats = purge_snapshots_in_db(db, deleted_snaps, log=log, commit=False)
+        publish_master_index(
+            cfg, snapshots_root, db, env_vars, dry=False, log=log,
+            defer_db_commit=True,
+        )
+        c.commit()
         return stats
+    except Exception:
+        c.rollback()
+        raise
     finally:
         db.close()
 

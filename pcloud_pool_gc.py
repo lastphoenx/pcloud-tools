@@ -1488,6 +1488,17 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         _log("--dest-root ist deprecated, bitte --pool-root verwenden")
     rtb_root = args.rtb_root or env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
 
+    if (
+        gci is None
+        and _env_get(env_vars, "PCLOUD_GC_USE_INDEX_DB", "1") != "0"
+        and not args.audit_mode
+    ):
+        _log(
+            f"[gc-engine][ERROR] pool_gc_index nicht geladen ({_GCI_IMPORT_ERR}) — "
+            "Legacy json.loads/OOM-Risiko. pip install -r requirements.txt (ijson)."
+        )
+        sys.exit(2)
+
     if args.retention_forecast:
         run_retention_forecast(
             cfg, pool_root, rtb_root, verbose=args.verbose, env_file=args.env_file,

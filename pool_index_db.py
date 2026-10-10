@@ -748,18 +748,25 @@ class PoolIndexDB:
             "tier": "manifest",
         }
 
-    def purge_snapshot(self, snapshot: str) -> int:
+    def snap_ref_count(self, snapshot: str) -> int:
+        sid = self._snapshot_id(snapshot)
+        if sid is None:
+            return 0
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM snap_refs WHERE snap_id=?", (sid,)
+            ).fetchone()[0]
+        )
+
+    def purge_snapshot(self, snapshot: str, *, commit: bool = True) -> int:
         sid = self._snapshot_id(snapshot)
         if sid is None:
             return 0
         c = self.conn
-        n = int(
-            c.execute(
-                "SELECT COUNT(*) FROM snap_refs WHERE snap_id=?", (sid,)
-            ).fetchone()[0]
-        )
+        n = self.snap_ref_count(snapshot)
         c.execute("DELETE FROM snap_refs WHERE snap_id=?", (sid,))
-        c.commit()
+        if commit:
+            c.commit()
         return n
 
     def referenced_shas_for_snapshots(self, snap_names: Iterable[str]) -> set[str]:
@@ -813,17 +820,21 @@ class PoolIndexDB:
         )
         return {str(r[0]).lower() for r in rows}
 
+    _SQL_IN_CHUNK = 800  # unter SQLite-Limit 999 (ältere 3.27)
+
     def _sha_ids_for_shas(self, sha_list: Iterable[str]) -> Dict[str, int]:
         unique = list(dict.fromkeys((s or "").lower() for s in sha_list if s))
         if not unique:
             return {}
-        ph = ",".join("?" * len(unique))
-        return {
-            str(r[0]).lower(): int(r[1])
+        out: Dict[str, int] = {}
+        for i in range(0, len(unique), self._SQL_IN_CHUNK):
+            chunk = unique[i : i + self._SQL_IN_CHUNK]
+            ph = ",".join("?" * len(chunk))
             for r in self.conn.execute(
-                f"SELECT sha, id FROM shas WHERE sha IN ({ph})", unique
-            )
-        }
+                f"SELECT sha, id FROM shas WHERE sha IN ({ph})", chunk
+            ):
+                out[str(r[0]).lower()] = int(r[1])
+        return out
 
     def _snapshot_ids_for_names(self, names: Iterable[str]) -> Dict[str, int]:
         unique = sorted({n for n in names if n})
@@ -841,7 +852,7 @@ class PoolIndexDB:
         self,
         json_path: str,
         *,
-        batch_shas: int = 2000,
+        batch_shas: int = 800,
         log: Optional[LogFn] = None,
     ) -> dict:
         """
@@ -856,7 +867,8 @@ class PoolIndexDB:
 
         t0 = time.time()
         if log:
-            log(f"[index-db] Streaming-Import aus {json_path}")
+            backend = getattr(ijson, "backend", "?")
+            log(f"[index-db] Streaming-Import aus {json_path} (ijson backend: {backend})")
 
         self._apply_pragmas(import_fast=True)
         c = self.conn
@@ -1015,7 +1027,7 @@ class PoolIndexDB:
                 entry["snapshots"][snapshot].append(relpath)
         return {"version": 2, "pool_refs": filtered}
 
-    def export_content_index_json(self, out_path: str) -> dict:
+    def export_content_index_json(self, out_path: str, *, record_export_meta: bool = True) -> dict:
         t0 = time.time()
         os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
         tmp = out_path + ".tmp"
@@ -1072,7 +1084,8 @@ class PoolIndexDB:
         except OSError:
             pass
         nbytes = os.path.getsize(out_path)
-        self.set_meta("last_export_at", str(time.time()))
+        if record_export_meta:
+            self.set_meta("last_export_at", str(time.time()))
         return {
             "shas": n_shas,
             "pairs": n_pairs,
@@ -1107,10 +1120,45 @@ class PoolIndexDB:
         self.conn.commit()
         return digest
 
-    def refresh_master_metadata(self, master_path: str) -> None:
+    def record_master_meta(
+        self,
+        master_path: str,
+        *,
+        known_sha256: Optional[str] = None,
+        commit: bool = True,
+    ) -> None:
+        """Fingerprint + SHA256 ohne doppeltes Lesen wenn known_sha256 gesetzt."""
+        c = self.conn
+        if os.path.isfile(master_path):
+            try:
+                st = os.stat(master_path)
+                c.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_size', ?)",
+                    (str(st.st_size),),
+                )
+                mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+                c.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_mtime_ns', ?)",
+                    (str(mtime_ns),),
+                )
+            except OSError:
+                pass
+        sha = (known_sha256 or "").strip().lower()
+        if not sha and os.path.isfile(master_path):
+            sha = _hash_file_sha256(master_path)
+        if sha:
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_sha256', ?)",
+                (sha,),
+            )
+        if commit:
+            c.commit()
+
+    def refresh_master_metadata(
+        self, master_path: str, *, known_sha256: Optional[str] = None
+    ) -> None:
         """mtime/size + Datei-SHA256 nach Import oder Skip-Re-Import."""
-        self.record_master_fingerprint(master_path)
-        self.record_master_file_hash(master_path)
+        self.record_master_meta(master_path, known_sha256=known_sha256, commit=True)
 
     def master_file_sha256_matches(self, master_path: str) -> Optional[bool]:
         stored = self.get_meta("master_sha256")
