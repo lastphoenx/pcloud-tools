@@ -72,8 +72,7 @@ def _ops_db_can_skip_import(
         return True
     if db.master_fingerprint_matches(master_path) is True:
         return True
-    if db.master_file_sha256_matches(master_path) is True:
-        return True
+    # Kein master_file_sha256_matches — liest 2 GB JSON erneut (Pi-minuten, kein Mehrwert).
     return False
 
 
@@ -232,6 +231,40 @@ def _upload_master_resumable(
     log(f"[gc-engine] Upload fertig ({time.time() - t0:.1f}s)")
 
 
+def _dry_simulate_purge_on_ops_db(
+    env_vars: Optional[dict],
+    deleted_snaps: Set[str],
+    *,
+    log: LogFn,
+) -> Dict[str, int]:
+    """Dry-run delete-snapshots: bestehende Ops-DB — kein Download, Import, digest."""
+    db_path = pidb.default_ops_db_path(env_vars)
+    log(f"[gc-engine] Dry-run: Ops-DB nur lesen (kein Remote-Download): {db_path}")
+    if not os.path.isfile(db_path):
+        log(
+            "[gc-engine][ERROR] Ops-DB fehlt — zuerst einmal Lauf mit neuem Code "
+            "(pull) oder Ops-Import; Backup-DB pool_index.sqlite3 wird nicht genutzt."
+        )
+        return {"removed_snap_refs": 0}
+    db = pidb.open_db(db_path, create=False)
+    try:
+        n_shas = db.count_shas()
+        if n_shas == 0:
+            log("[gc-engine][ERROR] Ops-DB leer — kein Import überspringen möglich")
+            return {"removed_snap_refs": 0}
+        log(f"[gc-engine] Ops-DB bereit ({n_shas} SHAs) — Purge simulieren")
+        db.conn.execute("SAVEPOINT index_purge")
+        stats = purge_snapshots_in_db(db, deleted_snaps, log=log)
+        log(
+            f"[dry] Index-Purge simuliert: {stats['removed_snap_refs']} snap-refs; "
+            f"würde exportieren (~{n_shas} pool_refs), kein Upload"
+        )
+        db.conn.execute("ROLLBACK TO SAVEPOINT index_purge")
+        return stats
+    finally:
+        db.close()
+
+
 def apply_index_purge_for_deleted_snaps(
     cfg: dict,
     snapshots_root: str,
@@ -246,18 +279,12 @@ def apply_index_purge_for_deleted_snaps(
     """
     if not deleted_snaps:
         return {"removed_snap_refs": 0}
+    if dry:
+        return _dry_simulate_purge_on_ops_db(env_vars, deleted_snaps, log=log)
     db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
     try:
         db.conn.execute("SAVEPOINT index_purge")
         stats = purge_snapshots_in_db(db, deleted_snaps, log=log)
-        if dry:
-            n = db.count_shas()
-            log(
-                f"[dry] Index-Purge simuliert: {stats['removed_snap_refs']} snap-refs; "
-                f"würde exportieren (~{n} pool_refs), kein Upload"
-            )
-            db.conn.execute("ROLLBACK TO SAVEPOINT index_purge")
-            return stats
         publish_master_index(cfg, snapshots_root, db, env_vars, dry=False, log=log)
         db.conn.execute("RELEASE SAVEPOINT index_purge")
         return stats
