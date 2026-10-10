@@ -963,6 +963,8 @@ def run_pool_gc(
     # ============================================================================
     ref_lookup: Optional[gci.RemoteSnapReferencedShaLookup] = None
     referenced_sha256s: object = set()
+    manifest_protected_store = None
+    manifest_guard_meta: Dict[str, object] = {}
     try:
         remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
         _log("[gc] PHASE 1: Index (gc-engine / SQLite, kein Master-Dict im RAM)")
@@ -977,24 +979,28 @@ def run_pool_gc(
             f"{len(ref_lookup)} unique SHA256 ({scan_duration:.1f}s)"
         )
 
-        manifest_guard_meta: Dict[str, object] = {}
         if mg is not None and pidb is not None:
             ops_db = pidb.default_ops_db_path(env_vars)
             guard = mg.build_gc_manifest_guard(
                 remote_snaps, ops_db, env_vars, log=_log,
             )
+            manifest_protected_store = guard.protected
             manifest_guard_meta = {
                 "manifest_guard_missing_in_ops_db": guard.missing_in_ops_db,
-                "manifest_guard_protected_shas": len(guard.protected_shas),
+                "manifest_guard_zero_refs_in_ops_db": guard.zero_refs_in_ops_db,
+                "manifest_guard_gap_snapshots": guard.manifest_gap_snapshots,
+                "manifest_guard_protected_shas": len(guard.protected),
             }
             if guard.abort_reason:
+                if manifest_protected_store is not None:
+                    manifest_protected_store.close()
                 return {
                     "error": guard.abort_reason,
                     "aborted": True,
                     **manifest_guard_meta,
                 }
             referenced_sha256s = mg.ManifestProtectedShaLookup(
-                ref_lookup, guard.protected_shas,
+                ref_lookup, guard.protected,
             )
         elif _MG_IMPORT_ERR:
             _log(f"[gc-guard][ERROR] Manifest-Guard nicht geladen: {_MG_IMPORT_ERR}")
@@ -1118,6 +1124,8 @@ def run_pool_gc(
         out.update(manifest_guard_meta)
         return out
     finally:
+        if manifest_protected_store is not None:
+            manifest_protected_store.close()
         if ref_lookup is not None:
             ref_lookup.close()
 

@@ -185,5 +185,21 @@ class UploadPendingTests(unittest.TestCase):
         db2.close()
 
 
+class ReferencedShaIterTests(unittest.TestCase):
+    def test_lookup_iter_shas_matches_count(self) -> None:
+        tmp = tempfile.mkdtemp()
+        ops_db = os.path.join(tmp, "pool_index_gc.sqlite3")
+        db = pidb.PoolIndexDB(ops_db)
+        db.register_batch("snap-a", [("aa" * 32, "p", 1, 1, 1)])
+        db.register_batch("snap-b", [("bb" * 32, "q", 2, 2, 2)])
+        db.close()
+        db2 = pidb.PoolIndexDB(ops_db)
+        lookup = gci.RemoteSnapReferencedShaLookup(db2, {"snap-a", "snap-b"})
+        shas = list(lookup.iter_shas())
+        lookup.close()
+        self.assertEqual(len(shas), 2)
+        self.assertEqual(set(shas), {"aa" * 32, "bb" * 32})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,17 @@ class PoolConsistencyLibTests(unittest.TestCase):
         self.assertEqual(r["level"], pcl.LEVEL_CRITICAL)
         self.assertEqual(r["live_missing_ops_db"], ["b"])
 
+    def test_critical_zero_ops_refs(self) -> None:
+        r = pcl.evaluate_pool_consistency(
+            live={"a"},
+            ops_db_names={"a"},
+            backup_db_names={"a"},
+            manifest_names={"a"},
+            live_ops_zero_refs=["a"],
+        )
+        self.assertEqual(r["level"], pcl.LEVEL_CRITICAL)
+        self.assertIn("live_zero_ops_refs:1", r["critical_reasons"])
+
     def test_warn_stale_only(self) -> None:
         r = pcl.evaluate_pool_consistency(
             live={"a"},

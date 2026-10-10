@@ -77,12 +77,14 @@ class StubChecksPerSnapshotTests(unittest.TestCase):
                     "manifest_missing_total": 0,
                     "mode": "manifest_scoped",
                 }
-                _merged, weak, _src = pvb._stub_checks_per_snapshot(
+                merged, weak, _src = pvb._stub_checks_per_snapshot(
                     {}, "/pool/_snapshots", manifests, set(), ["snap-a"],
                 )
         self.assertNotIn("snap-a", weak)
         csi.assert_called_once()
-        self.assertNotEqual(csi.call_args[0][0], {})
+        # Archiv vorhanden, aber 0 pool_refs — kein Weak-Skip, normale Check-B mit leerem Index
+        self.assertEqual(csi.call_args[0][0], {})
+        self.assertNotIn("snap-a", merged.get("index_check_skipped_snapshots") or [])
 
 
 if __name__ == "__main__":

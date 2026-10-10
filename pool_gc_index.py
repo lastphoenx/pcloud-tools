@@ -602,6 +602,11 @@ class RemoteSnapReferencedShaLookup:
     def __len__(self) -> int:
         return self._len
 
+    def iter_shas(self, *, batch_size: int = 8192):
+        yield from self._db.iter_referenced_shas_for_snapshots(
+            self._remote, batch_size=batch_size,
+        )
+
     def close(self) -> None:
         self._db.close()
 

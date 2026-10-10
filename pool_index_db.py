@@ -804,6 +804,34 @@ class PoolIndexDB:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def iter_referenced_shas_for_snapshots(
+        self,
+        snap_names: Iterable[str],
+        *,
+        batch_size: int = 8192,
+    ):
+        """Distinct SHA256 für Snapshots, per fetchmany (kein Millionen-Set)."""
+        names = sorted({n for n in snap_names if n})
+        if not names:
+            return
+        placeholders = ",".join("?" * len(names))
+        cur = self.conn.execute(
+            f"""
+            SELECT DISTINCT s.sha
+            FROM shas s
+            JOIN snap_refs r ON r.sha_id = s.id
+            JOIN snapshots n ON n.id = r.snap_id
+            WHERE n.name IN ({placeholders})
+            """,
+            names,
+        )
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield str(row[0]).lower()
+
     def sha_has_remote_snap_ref(self, sha: str, remote_snaps: set[str]) -> bool:
         """Einzel-SHA-Check ohne volles Referenz-Set im RAM."""
         h = (sha or "").strip().lower()

@@ -91,6 +91,11 @@ def run_check(
     ops_db = pidb.default_ops_db_path(env_vars)
     backup_db = env_vars.get("PCLOUD_POOL_INDEX_DB_PATH") or pidb.default_db_path()
     ops_names = mg.snapshot_names_in_ops_db(ops_db) if os.path.isfile(ops_db) else set()
+    _missing_ops_row, zero_ops_refs = (
+        mg.classify_live_ops_coverage(ops_db, live)
+        if os.path.isfile(ops_db)
+        else (sorted(live), [])
+    )
     backup_names = (
         mg.snapshot_names_in_ops_db(backup_db) if os.path.isfile(backup_db) else set()
     )
@@ -110,8 +115,8 @@ def run_check(
             for pf in pgc._iter_pool_files_by_prefix(cfg, pool_root):
                 pool_shas.add(str(pf.get("name", "")).lower())
             missing = 0
-            for sha in ref_lookup:
-                if str(sha).lower() not in pool_shas:
+            for sha in ref_lookup.iter_shas():
+                if sha not in pool_shas:
                     missing += 1
             pool_gaps = missing
         finally:
@@ -126,7 +131,9 @@ def run_check(
         upload_pending=pending["upload_pending"],
         reapply_purge=pending["reapply_purge"],
         pool_gaps=pool_gaps,
+        live_ops_zero_refs=zero_ops_refs,
     )
+    verdict["live_zero_ops_refs"] = zero_ops_refs
     verdict["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     verdict["ops_db"] = ops_db
     verdict["backup_db"] = backup_db

@@ -21,6 +21,7 @@ def evaluate_pool_consistency(
     upload_pending: bool = False,
     reapply_purge: str = "",
     pool_gaps: Optional[int] = None,
+    live_ops_zero_refs: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Exit-Level: 0 OK, 1 Warnung, 2 kritisch.
@@ -35,10 +36,13 @@ def evaluate_pool_consistency(
     critical: List[str] = []
     warn: List[str] = []
 
+    zero_refs = sorted(live_ops_zero_refs or [])
     if live_missing_ops:
         critical.append(
             f"live_not_in_ops_db:{len(live_missing_ops)}"
         )
+    if zero_refs:
+        critical.append(f"live_zero_ops_refs:{len(zero_refs)}")
     if live_missing_backup:
         critical.append(
             f"live_not_in_backup_db:{len(live_missing_backup)}"
@@ -83,6 +87,7 @@ def evaluate_pool_consistency(
         "backup_db_count": len(backup_db_names),
         "manifest_count": len(manifest_names),
         "live_missing_ops_db": live_missing_ops,
+        "live_zero_ops_refs": zero_refs,
         "live_missing_backup_db": live_missing_backup,
         "live_missing_manifest": live_missing_manifest,
         "stale_ops_snapshots": stale_ops[:20],
