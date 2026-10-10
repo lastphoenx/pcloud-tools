@@ -792,11 +792,35 @@ class PoolIndexDB:
         )
         return {str(r[0]).lower() for r in rows}
 
+    def _sha_ids_for_shas(self, sha_list: Iterable[str]) -> Dict[str, int]:
+        unique = list(dict.fromkeys((s or "").lower() for s in sha_list if s))
+        if not unique:
+            return {}
+        ph = ",".join("?" * len(unique))
+        return {
+            str(r[0]).lower(): int(r[1])
+            for r in self.conn.execute(
+                f"SELECT sha, id FROM shas WHERE sha IN ({ph})", unique
+            )
+        }
+
+    def _snapshot_ids_for_names(self, names: Iterable[str]) -> Dict[str, int]:
+        unique = sorted({n for n in names if n})
+        if not unique:
+            return {}
+        ph = ",".join("?" * len(unique))
+        return {
+            str(r[0]): int(r[1])
+            for r in self.conn.execute(
+                f"SELECT name, id FROM snapshots WHERE name IN ({ph})", unique
+            )
+        }
+
     def import_from_json_streaming(
         self,
         json_path: str,
         *,
-        batch_shas: int = 4000,
+        batch_shas: int = 2000,
         log: Optional[LogFn] = None,
     ) -> dict:
         """
@@ -825,23 +849,23 @@ class PoolIndexDB:
             ref_rows: List[Tuple[str, str, str]] = []
             snap_names: set[str] = set()
             n_shas = 0
+            n_flush = 0
 
             def _flush() -> None:
-                nonlocal sha_rows, ref_rows, snap_names
+                nonlocal sha_rows, ref_rows, snap_names, n_flush
                 if not sha_rows:
                     return
+                snap_list = sorted(snap_names)
                 c.executemany(
                     "INSERT OR IGNORE INTO snapshots(name) VALUES (?)",
-                    [(n,) for n in snap_names],
+                    [(n,) for n in snap_list],
                 )
                 c.executemany(
                     "INSERT OR IGNORE INTO shas(sha, fileid, hash, size) VALUES (?,?,?,?)",
                     sha_rows,
                 )
-                name_to_id = {
-                    r[0]: r[1] for r in c.execute("SELECT name, id FROM snapshots")
-                }
-                sha_to_id = {r[0]: r[1] for r in c.execute("SELECT sha, id FROM shas")}
+                name_to_id = self._snapshot_ids_for_names(snap_list)
+                sha_to_id = self._sha_ids_for_shas(r[0] for r in sha_rows)
                 c.executemany(
                     "INSERT OR IGNORE INTO snap_refs(snap_id, sha_id, relpath) VALUES (?,?,?)",
                     [
@@ -850,6 +874,9 @@ class PoolIndexDB:
                         if snap in name_to_id and sha in sha_to_id
                     ],
                 )
+                n_flush += 1
+                if log and (n_flush == 1 or n_flush % 10 == 0):
+                    log(f"[index-db] Streaming … {n_shas} pool_refs importiert")
                 sha_rows = []
                 ref_rows = []
                 snap_names = set()

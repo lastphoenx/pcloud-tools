@@ -85,6 +85,7 @@ def open_synced_db(
     db = pidb.open_db(db_path, create=True)
     if db.can_skip_master_reimport(master_path):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
+        db.refresh_master_metadata(master_path)
         return db
     log("[gc-engine] Streaming-Import Master → SQLite …")
     db.import_from_json_streaming(master_path, log=log)
