@@ -17,18 +17,21 @@ import missing_blobs_report as mbr  # noqa: E402
 
 class MissingBlobsReportTests(unittest.TestCase):
     def test_missing_shas_from_report(self) -> None:
-        data = {
-            "snapshot": "snap-a",
-            "manifest_vs_pool": {
-                "per_snapshot": {
-                    "snap-a": {"missing_shas": ["aa" * 32], "missing_count": 1},
+        tmp = tempfile.mkdtemp()
+        rep = os.path.join(tmp, "chk_snap-a.json")
+        with open(rep, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "snapshot": "snap-a",
+                    "manifest_vs_pool": {
+                        "per_snapshot": {
+                            "snap-a": {"missing_shas": ["aa" * 32], "missing_count": 1},
+                        },
+                    },
                 },
-            },
-        }
-        self.assertEqual(
-            mbr._missing_shas_from_report(data, "snap-a"),
-            ["aa" * 32],
-        )
+                f,
+            )
+        self.assertEqual(mbr.missing_shas_from_report(rep, "snap-a"), {"aa" * 32})
 
 
 if __name__ == "__main__":

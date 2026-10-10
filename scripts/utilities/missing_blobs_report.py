@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fehlende Pool-Blobs aus pool_integrity_run-JSON (manifest_vs_pool).
+missing_blobs_report.py — nur lesend, RAM-sparsam (ijson).
 
-Liest missing_shas pro Snapshot, mappt per ijson Manifest → relpath/size,
-prüft ob Datei noch unter <rtb-root>/<snapshot>/<relpath> liegt (Nachladen möglich?).
+Liest pool_integrity_run-Reports (--json-out chk_<snap>.json) und zeigt,
+welche Manifest-Dateien eines Snapshots im Pool fehlen, wie gross sie sind und
+ob sie im lokalen RTB-Snapshot noch liegen (Pool-Nachladen moeglich).
+
+Beispiel:
+  python scripts/utilities/missing_blobs_report.py \\
+    2026-07-26-120040 2026-07-31-040049 2026-08-06-172826 \\
+    --reports-dir /tmp --csv /tmp/missing_blobs.csv
 """
 from __future__ import annotations
 
@@ -15,193 +21,164 @@ import glob
 import json
 import os
 import sys
-from typing import Any, Dict, List, Set, Tuple
+from typing import Dict, Iterable, List, Set, Tuple
 
 MAIN_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if MAIN_DIR not in sys.path:
     sys.path.insert(0, MAIN_DIR)
 
-import pcloud_pool_gc as pgc  # noqa: E402
 
-
-def _load_env(path: str) -> dict:
-    return pgc._load_env_file(path)
-
-
-def _snapshot_from_report(data: dict, path: str) -> str:
-    if data.get("snapshot"):
-        return str(data["snapshot"])
-    base = os.path.basename(path)
-    if base.startswith("chk_") and base.endswith(".json"):
-        return base[4:-5]
-    return ""
-
-
-def _missing_shas_from_report(data: dict, snapshot: str) -> List[str]:
-    mvp = data.get("manifest_vs_pool") or {}
-    per = (mvp.get("per_snapshot") or {}).get(snapshot) or {}
-    shas = list(per.get("missing_shas") or [])
+def missing_shas_from_report(path: str, snap: str) -> Set[str]:
+    with open(path, encoding="utf-8") as f:
+        rep = json.load(f)
+    per = (rep.get("manifest_vs_pool") or {}).get("per_snapshot") or {}
+    block = per.get(snap) or {}
+    shas = block.get("missing_shas") or []
     if shas:
-        return [str(s).lower() for s in shas]
-    cnt = int(per.get("missing_count") or 0)
-    if cnt <= 0:
-        return []
-    partial = per.get("missing_from_pool") or []
-    return [str(s).lower() for s in partial]
+        return {str(s).lower() for s in shas}
+    if int(block.get("missing_count") or 0) <= 0:
+        return set()
+    return {str(s).lower() for s in (block.get("missing_from_pool") or [])}
 
 
-def _stream_manifest_meta(
-    manifest_path: str,
-    want: Set[str],
-) -> Dict[str, List[Tuple[str, int]]]:
-    """sha -> [(relpath, size), ...]"""
+def scan_manifest(manifest_path: str, wanted: Set[str]) -> Iterable[Tuple[str, str, int]]:
     import ijson  # type: ignore
 
-    out: Dict[str, List[Tuple[str, int]]] = {}
     with open(manifest_path, "rb") as f:
         for it in ijson.items(f, "items.item"):
             if not isinstance(it, dict) or it.get("type") != "file":
                 continue
             sha = str(it.get("sha256") or "").lower()
-            if sha not in want:
+            if sha not in wanted:
                 continue
-            rel = str(it.get("path") or it.get("relpath") or "").lstrip("/")
-            size = int(it.get("size") or 0)
-            out.setdefault(sha, []).append((rel, size))
-    return out
+            rel = str(it.get("relpath") or it.get("path") or "").strip().lstrip("/")
+            if not rel:
+                continue
+            yield sha, rel, int(it.get("size") or 0)
 
 
-def build_rows(
-    report_paths: List[str],
+def analyze_snapshot(
+    snap: str,
+    *,
+    reports_dir: str,
     manifests_dir: str,
     rtb_root: str,
-) -> Tuple[List[dict], dict]:
-    rows: List[dict] = []
-    summary: Dict[str, Any] = {
-        "reports": len(report_paths),
-        "snapshots_with_gaps": 0,
-        "blob_rows": 0,
+) -> Tuple[List[Tuple[str, str, str, int, bool]], Dict[str, int]]:
+    rep_path = os.path.join(reports_dir, f"chk_{snap}.json")
+    if not os.path.isfile(rep_path):
+        raise FileNotFoundError(f"Report fehlt: {rep_path}")
+    missing = missing_shas_from_report(rep_path, snap)
+    mpath = os.path.join(manifests_dir, f"{snap}.json")
+    if not os.path.isfile(mpath):
+        raise FileNotFoundError(f"Manifest fehlt: {mpath}")
+
+    files = list(scan_manifest(mpath, missing))
+    mapped_shas = {s for s, _r, _z in files}
+    stats = {
+        "missing_shas": len(missing),
+        "manifest_files": len(files),
+        "shas_without_manifest_path": len(missing - mapped_shas),
+        "total_bytes": sum(z for _s, _r, z in files),
         "rtb_present": 0,
-        "appledouble": 0,
-        "total_bytes": 0,
     }
-
-    for rpath in report_paths:
-        with open(rpath, encoding="utf-8") as f:
-            data = json.load(f)
-        snap = _snapshot_from_report(data, rpath)
-        if not snap:
-            continue
-        shas = _missing_shas_from_report(data, snap)
-        if not shas:
-            continue
-        summary["snapshots_with_gaps"] += 1
-        want = set(shas)
-        mpath = os.path.join(manifests_dir, f"{snap}.json")
-        meta: Dict[str, List[Tuple[str, int]]] = {}
-        if os.path.isfile(mpath):
-            meta = _stream_manifest_meta(mpath, want)
-        for sha in shas:
-            paths = meta.get(sha) or [("", 0)]
-            for relpath, size in paths:
-                rtb_file = (
-                    os.path.join(rtb_root, snap, relpath)
-                    if relpath
-                    else ""
-                )
-                rtb_ok = bool(rtb_file and os.path.isfile(rtb_file))
-                if rtb_ok:
-                    summary["rtb_present"] += 1
-                base = os.path.basename(relpath)
-                if base.startswith("._"):
-                    summary["appledouble"] += 1
-                summary["total_bytes"] += size
-                rows.append(
-                    {
-                        "snapshot": snap,
-                        "sha256": sha,
-                        "relpath": relpath,
-                        "size": size,
-                        "rtb_path": rtb_file,
-                        "rtb_present": "yes" if rtb_ok else "no",
-                        "report_json": rpath,
-                    }
-                )
-    summary["blob_rows"] = len(rows)
-    return rows, summary
+    rows: List[Tuple[str, str, str, int, bool]] = []
+    for sha, rel, size in files:
+        rtb_file = os.path.join(rtb_root, snap, rel)
+        ok = os.path.isfile(rtb_file)
+        if ok:
+            stats["rtb_present"] += 1
+        rows.append((snap, sha, rel, size, ok))
+    return rows, stats
 
 
-def _print_rollup(rows: List[dict]) -> None:
-    by_snap = collections.Counter(r["snapshot"] for r in rows)
-    ext = collections.Counter(
-        os.path.splitext(r["relpath"])[1].lower() or "(keine)" for r in rows
-    )
-    top_dirs = collections.Counter()
-    for r in rows:
-        parts = (r["relpath"] or "").split("/")
-        top_dirs[parts[0] if parts and parts[0] else "(root)"] += 1
-    print("pro Snapshot:", dict(by_snap.most_common()))
-    print("Top-Endungen:", ext.most_common(10))
-    print("Top-Ordner:", top_dirs.most_common(10))
-    rtb_yes = sum(1 for r in rows if r["rtb_present"] == "yes")
-    print(f"RTB noch vorhanden: {rtb_yes}/{len(rows)} Zeilen")
+def _print_snapshot_summary(snap: str, stats: Dict[str, int], rows: List[Tuple], rtb_root: str) -> None:
+    by_top = collections.Counter(r.split("/", 1)[0] for _s, r, _z, _ok in rows)
+    by_ext = collections.Counter(os.path.splitext(r)[1].lower() or "(keine)" for _s, r, _z, _ok in rows)
+    print(f"\n== {snap}: {stats['missing_shas']} SHAs fehlen im Pool, "
+          f"{stats['manifest_files']} Manifest-Dateien, {stats['total_bytes']} Bytes")
+    if stats["shas_without_manifest_path"]:
+        print(f"  [warn] {stats['shas_without_manifest_path']} SHA(s) ohne Pfad im Manifest-Stream")
+    print("  nach Ordner :", by_top.most_common(8))
+    print("  nach Endung :", by_ext.most_common(8))
+    n = stats["manifest_files"]
+    print(f"  davon im lokalen RTB vorhanden: {stats['rtb_present']}/{n}  ({rtb_root}/{snap}/...)")
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Fehlende Pool-Blobs aus Integrity-JSON")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
-        "--reports",
-        nargs="+",
-        default=[],
-        help="pool_integrity_run JSON (Glob ok)",
+        "snapshots",
+        nargs="*",
+        help="Snapshot-Namen (leer = aus chk_*.json in --reports-dir)",
     )
-    ap.add_argument("--glob", default="/tmp/chk_*.json", help="wenn --reports leer")
+    ap.add_argument("--reports-dir", default="/tmp", help="Verzeichnis mit chk_<snap>.json")
+    ap.add_argument("--manifests", default=None, help="Default: $PCLOUD_ARCHIVE_DIR/manifests")
+    ap.add_argument("--rtb", default=None, help="Default: $RTB oder /mnt/backup/rtb_nas")
     ap.add_argument("--env-file", default=".env")
     ap.add_argument("--env-dir", default=".")
-    ap.add_argument("--manifests-dir", default=None)
-    ap.add_argument("--rtb-root", default=None)
-    ap.add_argument("--csv", help="CSV-Ausgabe")
+    ap.add_argument("--csv", default="/tmp/missing_blobs.csv")
     args = ap.parse_args()
 
-    paths: List[str] = []
-    for p in args.reports:
-        paths.extend(glob.glob(p))
-    if not paths:
-        paths = sorted(glob.glob(args.glob))
-    if not paths:
-        print("Keine Report-JSONs gefunden.", file=sys.stderr)
-        return 2
+    import pcloud_pool_gc as pgc
 
     env_path = args.env_file
     if not os.path.isabs(env_path):
         env_path = os.path.join(args.env_dir, env_path)
-    env = _load_env(env_path)
+    env = pgc._load_env_file(env_path)
     archive = env.get("PCLOUD_ARCHIVE_DIR") or os.environ.get(
         "PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive",
     )
-    manifests_dir = args.manifests_dir or os.path.join(archive, "manifests")
-    rtb_root = (
-        args.rtb_root
-        or env.get("RTB")
-        or os.environ.get("RTB", "/mnt/backup/rtb_nas")
-    ).rstrip("/")
+    manifests_dir = args.manifests or os.path.join(archive, "manifests")
+    rtb_root = (args.rtb or env.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")).rstrip("/")
 
-    rows, summary = build_rows(paths, manifests_dir, rtb_root)
-    print(json.dumps({**summary, "rtb_root": rtb_root}, indent=2))
-    _print_rollup(rows)
+    snaps: List[str] = list(args.snapshots)
+    if not snaps:
+        for p in sorted(glob.glob(os.path.join(args.reports_dir, "chk_*.json"))):
+            base = os.path.basename(p)
+            snaps.append(base[4:-5])
 
-    if args.csv:
-        fields = [
-            "snapshot", "sha256", "relpath", "size",
-            "rtb_present", "rtb_path", "report_json",
-        ]
-        with open(args.csv, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            w.writerows(rows)
-        print(f"CSV: {args.csv} ({len(rows)} Zeilen)", file=sys.stderr)
+    if not snaps:
+        print("Keine Snapshots (Argumente oder chk_*.json).", file=sys.stderr)
+        return 2
 
-    return 0 if rows else 0
+    all_rows: List[Tuple[str, str, str, int, bool]] = []
+    totals = {"snapshots": 0, "files": 0, "rtb_present": 0, "bytes": 0}
+
+    for snap in snaps:
+        try:
+            rows, stats = analyze_snapshot(
+                snap,
+                reports_dir=args.reports_dir,
+                manifests_dir=manifests_dir,
+                rtb_root=rtb_root,
+            )
+        except FileNotFoundError as e:
+            print(f"[skip] {snap}: {e}", file=sys.stderr)
+            continue
+        if stats["missing_shas"] == 0:
+            print(f"\n== {snap}: keine Pool-Luecken (Manifest vs Pool OK)")
+            continue
+        totals["snapshots"] += 1
+        totals["files"] += stats["manifest_files"]
+        totals["rtb_present"] += stats["rtb_present"]
+        totals["bytes"] += stats["total_bytes"]
+        _print_snapshot_summary(snap, stats, rows, rtb_root)
+        all_rows.extend(rows)
+
+    print(
+        f"\n== gesamt: {totals['snapshots']} Snapshot(s), "
+        f"{totals['files']} Dateien, {totals['bytes']} Bytes, "
+        f"RTB {totals['rtb_present']}/{totals['files']}"
+    )
+
+    with open(args.csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["snapshot", "sha256", "relpath", "size", "in_local_rtb"])
+        for snap, sha, rel, size, ok in all_rows:
+            w.writerow([snap, sha, rel, size, "yes" if ok else "no"])
+    print(f"Details: {args.csv} ({len(all_rows)} Zeilen)")
+
+    return 0
 
 
 if __name__ == "__main__":

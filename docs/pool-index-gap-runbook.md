@@ -26,7 +26,8 @@
 
    ```bash
    /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/missing_blobs_report.py \
-     --glob '/tmp/chk_*.json' --csv /tmp/missing_blobs.csv
+     2026-07-26-120040 2026-07-31-040049 2026-08-06-172826 \
+     --reports-dir /tmp --csv /tmp/missing_blobs.csv
    ```
 
 5. **Schaden prüfen** (optional, pro Snapshot):
