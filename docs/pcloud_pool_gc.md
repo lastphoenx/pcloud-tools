@@ -62,9 +62,11 @@ Während ein Backup läuft, setzt `pcloud_push_json_pool_manifest_to_pcloud.py` 
 
 ### Phase 1: Referenzen laden (gc-engine / SQLite)
 
-Standard (`PCLOUD_GC_USE_INDEX_DB=1`, Default): Ops-Index **`pool_index_gc.sqlite3`** (getrennt von Backup-`pool_index.sqlite3`). **Ein** Fast-Path für Dry und scharf: Remote-`checksumfile` → bei gleichem SHA kein 2-GB-Download/Re-Import; Lesen (Forecast, GC Phase 1) und Schreiben (Purge/Upload) nutzen dieselbe Ops-Logik (`pool_gc_index.py`). Dry-run `delete-snapshots`/`retention`: Purge nur gegen bestehende Ops-DB. Optional: `PCLOUD_GC_INDEX_DB_PATH`.
+Ops-Index **`pool_index_gc.sqlite3`** (getrennt von Backup-`pool_index.sqlite3`). **Ein** Fast-Path für Dry und scharf: Remote-`checksumfile` → bei gleichem SHA kein 2-GB-Download/Re-Import; Lesen (Forecast, GC Phase 1) und Schreiben (Purge/Upload) nutzen `pool_gc_index.py`. GC Phase 1 prüft Referenzen per SQL (`sha_has_remote_snap_ref`), kein millionenfaches SHA-Set im RAM. Dry-run `delete-snapshots`/`retention`: Purge nur gegen bestehende Ops-DB. Optional: `PCLOUD_GC_INDEX_DB_PATH`.
 
-Legacy (`PCLOUD_GC_USE_INDEX_DB=0`, bewusst): lädt `content_index.json` per `json.loads` in den RAM (OOM-Risiko auf 8 GB Pi). Default ist `1`; fehlendes `ijson`/`pool_gc_index` bricht mit Exit 2 ab statt still auf Legacy zu fallen.
+Nach Purge/Export: `upload_pending=1` bis der Master-Upload gelingt; jeder `open_synced_db` / `open_ops_db_for_queries` versucht den Upload erneut. Fehlendes `ijson`/`pool_gc_index` → Exit 2.
+
+`--audit-mode` ist deaktiviert (Stub-Scan / RAM-Set) bis Streaming-Umbau.
 
 **Performance:** Import/Abfrage typisch Sekunden–wenige Minuten; abhängig von Index-Größe und Netz.
 

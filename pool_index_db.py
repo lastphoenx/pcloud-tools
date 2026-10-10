@@ -244,12 +244,13 @@ class PoolIndexDB:
         ).fetchone()
         return None if row is None else row[0]
 
-    def set_meta(self, key: str, value: str) -> None:
+    def set_meta(self, key: str, value: str, *, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
             (key, value),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def count_shas(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM shas").fetchone()[0])
@@ -786,6 +787,43 @@ class PoolIndexDB:
         )
         return {str(r[0]).lower() for r in rows}
 
+    def count_referenced_shas_for_snapshots(self, snap_names: Iterable[str]) -> int:
+        names = sorted({n for n in snap_names if n})
+        if not names:
+            return 0
+        placeholders = ",".join("?" * len(names))
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT s.sha)
+            FROM shas s
+            JOIN snap_refs r ON r.sha_id = s.id
+            JOIN snapshots n ON n.id = r.snap_id
+            WHERE n.name IN ({placeholders})
+            """,
+            names,
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def sha_has_remote_snap_ref(self, sha: str, remote_snaps: set[str]) -> bool:
+        """Einzel-SHA-Check ohne volles Referenz-Set im RAM."""
+        h = (sha or "").strip().lower()
+        if not h or not remote_snaps:
+            return False
+        names = sorted(remote_snaps)
+        ph = ",".join("?" * len(names))
+        row = self.conn.execute(
+            f"""
+            SELECT 1
+            FROM shas s
+            JOIN snap_refs r ON r.sha_id = s.id
+            JOIN snapshots n ON n.id = r.snap_id
+            WHERE s.sha = ? AND n.name IN ({ph})
+            LIMIT 1
+            """,
+            [h] + names,
+        ).fetchone()
+        return row is not None
+
     def orphan_shas_if_snapshots_removed(
         self,
         remote_snaps: set[str],
@@ -853,6 +891,7 @@ class PoolIndexDB:
         json_path: str,
         *,
         batch_shas: int = 800,
+        known_sha256: Optional[str] = None,
         log: Optional[LogFn] = None,
     ) -> dict:
         """
@@ -960,7 +999,7 @@ class PoolIndexDB:
             "seconds": time.time() - t0,
             "streamed": n_shas,
         }
-        self.refresh_master_metadata(json_path)
+        self.refresh_master_metadata(json_path, known_sha256=known_sha256)
         if log:
             log("[index-db] content_digest berechnen (viele snap_refs — kann Minuten dauern) …")
         content_digest = self.digest()["sha256"]
@@ -1084,6 +1123,7 @@ class PoolIndexDB:
         except OSError:
             pass
         nbytes = os.path.getsize(out_path)
+        file_sha256 = _hash_file_sha256(out_path)
         if record_export_meta:
             self.set_meta("last_export_at", str(time.time()))
         return {
@@ -1091,6 +1131,7 @@ class PoolIndexDB:
             "pairs": n_pairs,
             "bytes": nbytes,
             "seconds": time.time() - t0,
+            "file_sha256": file_sha256,
         }
 
     def record_master_fingerprint(self, master_path: str) -> None:

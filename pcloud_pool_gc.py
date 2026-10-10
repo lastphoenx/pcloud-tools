@@ -58,7 +58,6 @@ ARGUMENTE:
 
 from __future__ import annotations
 import os, sys, json, argparse, time, datetime, re
-import concurrent.futures
 import threading
 from typing import Set, Dict, List, Tuple, Optional
 from collections import defaultdict
@@ -87,33 +86,6 @@ except Exception as e:
     _GCI_IMPORT_ERR = str(e)
 else:
     _GCI_IMPORT_ERR = ""
-
-
-# Thread-safe Set für referenced SHA256
-class _RefSet:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.data = set()
-    
-    def add(self, sha256: str):
-        with self.lock:
-            self.data.add(sha256)
-    
-    def update(self, sha256_list: List[str]):
-        with self.lock:
-            self.data.update(sha256_list)
-    
-    def __contains__(self, sha256: str) -> bool:
-        with self.lock:
-            return sha256 in self.data
-    
-    def __len__(self) -> int:
-        with self.lock:
-            return len(self.data)
-    
-    def get_copy(self) -> Set[str]:
-        with self.lock:
-            return self.data.copy()
 
 
 # Thread-safe Stats
@@ -318,72 +290,6 @@ def _retention_safety_abort(
     return None
 
 
-def _load_index(cfg: dict, snapshots_root: str) -> Tuple[dict, dict]:
-    index_path = f"{snapshots_root}/_index/content_index.json"
-    index_content = pc.get_textfile(cfg, path=index_path)
-    index = json.loads(index_content or "{}")
-    pool_refs = index.get("pool_refs") or {}
-    return index, pool_refs
-
-
-def _referenced_shas(pool_refs: dict, active_snapshots: Set[str]) -> Set[str]:
-    """SHAs mit mindestens einem Snapshot in active_snapshots."""
-    refs: Set[str] = set()
-    for sha, entry in pool_refs.items():
-        if _snap_names(entry) & active_snapshots:
-            refs.add(sha.lower())
-    return refs
-
-
-def _shas_orphaned_after_retention(
-    pool_refs: dict,
-    retention_candidates: Set[str],
-    remote_snaps: Set[str],
-) -> Set[str]:
-    """SHAs deren letzte Remote-Snapshot-Referenz durch Retention entfiele."""
-    orphaned: Set[str] = set()
-    for sha, entry in pool_refs.items():
-        on_remote = _snap_names(entry) & remote_snaps
-        if not on_remote:
-            continue
-        if not (on_remote - retention_candidates):
-            orphaned.add(sha.lower())
-    return orphaned
-
-
-def _purge_snaps_from_index(index: dict, snaps_to_remove: Set[str]) -> Dict[str, int]:
-    pool_refs = index.setdefault("pool_refs", {})
-    removed_snap_refs = 0
-    removed_shas = 0
-    for sha in list(pool_refs.keys()):
-        entry = pool_refs.get(sha)
-        if not isinstance(entry, dict):
-            del pool_refs[sha]
-            removed_shas += 1
-            continue
-        snaps = entry.get("snapshots")
-        if isinstance(snaps, dict):
-            for s in snaps_to_remove:
-                if s in snaps:
-                    del snaps[s]
-                    removed_snap_refs += 1
-            if not snaps:
-                del pool_refs[sha]
-                removed_shas += 1
-        elif isinstance(snaps, list):
-            new_list = [s for s in snaps if s not in snaps_to_remove]
-            removed_snap_refs += len(snaps) - len(new_list)
-            if new_list:
-                entry["snapshots"] = new_list
-            else:
-                del pool_refs[sha]
-                removed_shas += 1
-    index["version"] = 2
-    if isinstance(index.get("items"), dict) and not index["items"]:
-        index.pop("items", None)
-    return {"removed_snap_refs": removed_snap_refs, "removed_shas": removed_shas}
-
-
 def _archive_index_remote_path(snapshots_root: str, snap: str) -> str:
     return f"{snapshots_root.rstrip('/')}/_index/archive/{snap}_index.json"
 
@@ -470,36 +376,6 @@ def _purge_orphan_archive_indexes(
     return stats
 
 
-def _save_index(
-    cfg: dict,
-    snapshots_root: str,
-    index: dict,
-    env_file: str,
-    *,
-    dry: bool,
-    deleted_snaps: Optional[Set[str]] = None,
-) -> None:
-    index_path = f"{snapshots_root}/_index/content_index.json"
-    env_vars = _load_env_file(env_file)
-    archive_dir = env_vars.get("PCLOUD_ARCHIVE_DIR") or os.environ.get(
-        "PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive"
-    )
-    master_path = os.path.join(archive_dir, "indexes", "content_index_master.json")
-    if dry:
-        _log(f"[dry] write index: {index_path} (pool_refs={len(index.get('pool_refs', {}))})")
-        _log(f"[dry] write local master: {master_path}")
-        if deleted_snaps:
-            _log(f"[dry] pool_index_db sync für {len(deleted_snaps)} Snapshot(s)")
-        return
-    pc.write_json_at_path(cfg, index_path, index)
-    os.makedirs(os.path.dirname(master_path), exist_ok=True)
-    with open(master_path, "w", encoding="utf-8") as f:
-        json.dump(index, f, separators=(",", ":"))
-    _log(f"[retention] Index aktualisiert: {index_path}")
-    _log(f"[retention] Master-Index: {master_path}")
-    _sync_pool_index_db_after_master(master_path, env_vars, deleted_snaps or set(), dry=False)
-
-
 def _pool_index_db_sync_enabled(env_vars: dict) -> bool:
     if _env_get(env_vars, "PCLOUD_POOL_INDEX_DB", "0") != "1":
         return False
@@ -528,9 +404,9 @@ def _sync_pool_index_db_after_master(
     try:
         db_path = pidb.default_db_path()
         if mode == "import":
-            _log("[index-db] Sync: vollständiger Import aus Master (kann Minuten dauern)")
+            _log("[index-db] Sync: Streaming-Import aus Master (kann Minuten dauern)")
             with pidb.open_db(db_path, create=True) as db:
-                db.import_from_json(master_path, log=_log)
+                db.import_from_json_streaming(master_path, log=_log)
             return
 
         if not deleted_snaps:
@@ -644,19 +520,13 @@ def run_retention_forecast(
     else:
         _log("[retention-forecast] Nichts zu loeschen")
 
-    if gci and gci.gc_engine_enabled(env_vars):
-        db = gci.open_ops_db_for_queries(cfg, snapshots_root, env_vars, log=_log)
-        try:
-            refs_now, refs_after, orphan_shas = gci.retention_index_metrics(
-                db, remote_snaps, set(to_delete),
-            )
-        finally:
-            db.close()
-    else:
-        index, pool_refs = _load_index(cfg, snapshots_root)
-        refs_now = _referenced_shas(pool_refs, remote_snaps)
-        refs_after = _referenced_shas(pool_refs, keep_remote)
-        orphan_shas = _shas_orphaned_after_retention(pool_refs, set(to_delete), remote_snaps)
+    db = gci.open_ops_db_for_queries(cfg, snapshots_root, env_vars, log=_log)
+    try:
+        refs_now, refs_after, orphan_shas = gci.retention_index_metrics(
+            db, remote_snaps, set(to_delete),
+        )
+    finally:
+        db.close()
 
     _log(f"[retention-forecast] Index-SHAs (remote-gebunden): {len(refs_now)}")
     _log(f"[retention-forecast] SHAs nach Retention noch referenziert: {len(refs_after)}")
@@ -801,26 +671,17 @@ def run_delete_snapshots(
 
     if deleted_snaps:
         env_vars = _load_env_file(env_file)
-        if gci and gci.gc_engine_enabled(env_vars):
-            purge_stats = gci.apply_index_purge_for_deleted_snaps(
-                cfg, snapshots_root, env_vars, deleted_snaps, dry=dry, log=_log,
+        purge_stats = gci.apply_index_purge_for_deleted_snaps(
+            cfg, snapshots_root, env_vars, deleted_snaps, dry=dry, log=_log,
+        )
+        _log(
+            f"[delete-snapshots] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
+        )
+        if not dry:
+            master_path, _ = gci.master_paths(env_vars)
+            _sync_pool_index_db_after_master(
+                master_path, env_vars, deleted_snaps, dry=False,
             )
-            _log(
-                f"[delete-snapshots] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
-            )
-            if not dry:
-                master_path, _ = gci.master_paths(env_vars)
-                _sync_pool_index_db_after_master(
-                    master_path, env_vars, deleted_snaps, dry=False,
-                )
-        else:
-            index, _ = _load_index(cfg, snapshots_root)
-            purge_stats = _purge_snaps_from_index(index, deleted_snaps)
-            _log(
-                f"[delete-snapshots] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
-                f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt"
-            )
-            _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
     else:
         _log("[delete-snapshots] Index unveraendert")
 
@@ -912,24 +773,17 @@ def run_retention_apply(
             break
 
     if deleted_snaps:
-        if gci and gci.gc_engine_enabled(env_vars):
-            purge_stats = gci.apply_index_purge_for_deleted_snaps(
-                cfg, snapshots_root, env_vars, deleted_snaps, dry=dry, log=_log,
+        purge_stats = gci.apply_index_purge_for_deleted_snaps(
+            cfg, snapshots_root, env_vars, deleted_snaps, dry=dry, log=_log,
+        )
+        _log(
+            f"[retention] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
+        )
+        if not dry:
+            master_path, _ = gci.master_paths(env_vars)
+            _sync_pool_index_db_after_master(
+                master_path, env_vars, deleted_snaps, dry=False,
             )
-            _log(
-                f"[retention] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
-            )
-            if not dry:
-                master_path, _ = gci.master_paths(env_vars)
-                _sync_pool_index_db_after_master(
-                    master_path, env_vars, deleted_snaps, dry=False,
-                )
-        else:
-            index, _ = _load_index(cfg, snapshots_root)
-            purge_stats = _purge_snaps_from_index(index, deleted_snaps)
-            _log(f"[retention] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
-                 f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt")
-            _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
     else:
         _log("[retention] Nichts zu loeschen — Index unveraendert")
 
@@ -960,109 +814,6 @@ def run_retention_apply(
 
     _log("[retention] ===== DONE =====")
     return result
-
-
-def _load_refs_from_index(
-    cfg: dict,
-    snapshots_root: str,
-    stats: _GCStats,
-    verbose: bool = False
-) -> Set[str]:
-    """
-    Laedt referenzierte SHA256s aus content_index.json (snapshot-aware).
-
-    Nur SHAs deren pool_refs mindestens einen noch existierenden Remote-Snapshot
-    referenzieren zaehlen — stale Index-Eintraege ohne Remote-Ordner blockieren GC nicht.
-    """
-    _log("[gc] PHASE 1: Loading references from content_index.json...")
-    t_start = time.time()
-
-    index_path = f"{snapshots_root}/_index/content_index.json"
-
-    try:
-        if verbose:
-            _log(f"[gc] Downloading {index_path}...")
-
-        index_content = pc.get_textfile(cfg, path=index_path)
-        index = json.loads(index_content)
-        pool_refs = index.get("pool_refs", {})
-
-        if not pool_refs:
-            _log("[gc][WARN] Index enthaelt keine pool_refs! Fallback auf Stub-Scan.")
-            return set()
-
-        remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
-        referenced_sha256s = _referenced_shas(pool_refs, remote_snaps)
-
-        total_refs = sum(len(_snap_names(v)) for v in pool_refs.values())
-        stale_keys = set(pool_refs.keys()) - referenced_sha256s
-
-        duration = time.time() - t_start
-        _log(f"[gc] PHASE 1 DONE: {len(referenced_sha256s)} active SHA256s "
-             f"({len(remote_snaps)} remote snaps, {len(stale_keys)} stale index keys) "
-             f"({duration:.2f}s)")
-
-        return referenced_sha256s
-
-    except Exception as e:
-        _log(f"[gc][ERROR] Failed to load index: {e}")
-        _log("[gc] Fallback auf Stub-Scan (langsam!)...")
-        return set()
-
-
-def _scan_snapshot_for_refs(
-    cfg: dict,
-    snapshot_path: str,
-    ref_set: _RefSet,
-    stats: _GCStats,
-    verbose: bool = False
-) -> None:
-    """
-    Stubs pro Top-Level-Subtree listen (kein einzelner Riesen-recursive listfolder).
-    """
-    try:
-        snapshot_name = snapshot_path.split("/")[-1]
-        if verbose:
-            _log(f"[gc-scan] Scanning snapshot: {snapshot_name}")
-        top = pc.listfolder(cfg, path=snapshot_path, recursive=False, nofiles=True)
-        subtrees = [
-            c for c in (top.get("metadata", {}) or {}).get("contents", []) or []
-            if c.get("isfolder") and c.get("path")
-        ]
-        if not subtrees:
-            subtrees = [{"path": snapshot_path, "name": snapshot_name}]
-        sha256_list: List[str] = []
-        for j, sub in enumerate(subtrees, 1):
-            sub_path = sub.get("path") or snapshot_path
-            label = sub.get("name") or sub_path.rsplit("/", 1)[-1]
-            if verbose and len(subtrees) > 1:
-                _log(f"[gc-scan]   {snapshot_name}: subtree {j}/{len(subtrees)} ({label})")
-            result = pc._rest_get(cfg, "listfolder", {"path": sub_path, "recursive": 1})
-            contents = (result.get("metadata", {}) or {}).get("contents", []) or []
-            stub_files = [
-                c for c in contents
-                if not c.get("isfolder") and (c.get("name") or "").endswith(".meta.json")
-            ]
-            for stub in stub_files:
-                stub_path = stub.get("path")
-                try:
-                    stub_content = pc.get_textfile(cfg, path=stub_path)
-                    stub_data = json.loads(stub_content)
-                    sha256 = stub_data.get("sha256", "").lower()
-                    if sha256:
-                        sha256_list.append(sha256)
-                except Exception as e:
-                    if verbose:
-                        _log(f"[gc-scan][WARN] Failed to read stub {stub_path}: {e}")
-                    stats.inc_errors()
-        ref_set.update(sha256_list)
-        stats.inc_stubs(len(sha256_list))
-        stats.inc_snapshots()
-        if verbose:
-            _log(f"[gc-scan] ✓ {snapshot_name}: {len(sha256_list)} refs")
-    except Exception as e:
-        _log(f"[gc-scan][ERROR] Failed to scan {snapshot_path}: {e}")
-        stats.inc_errors()
 
 
 def _delete_pool_file(
@@ -1147,6 +898,13 @@ def run_pool_gc(
     _log(f"[gc] Pool: {pool_root}")
     _log(f"[gc] Grace Period: {grace_hours}h")
     _log(f"[gc] Dry-Run: {dry}")
+
+    if audit_mode:
+        _log(
+            "[gc][ERROR] --audit-mode ist deaktiviert bis Streaming-Umbau "
+            "(kein millionenfaches Referenz-Set im RAM). Standard-GC nutzen."
+        )
+        return {"error": "audit_mode_disabled", "aborted": True}
     
     # ============================================================================
     # === GC-LOCK CHECK (Race-Protection gegen parallel laufende Backups!) ===
@@ -1195,209 +953,140 @@ def run_pool_gc(
     # ============================================================================
     # === PHASE 1: Sammle referenzierte SHA256s ===
     # ============================================================================
-    if audit_mode:
-        # AUDIT-MODE: Scanne alle Stubs (langsam, aber validiert Index)
-        _log("[gc] PHASE 1: AUDIT-MODE - Scanning all stubs for references...")
-        t_scan_start = time.time()
-        
-        ref_set = _RefSet()
-        
-        try:
-            result = pc._rest_get(cfg, "listfolder", {"path": snapshots_root})
-            metadata = result.get("metadata", {})
-            contents = metadata.get("contents", [])
-            snapshots = [c for c in contents if c.get("isfolder") and not c.get("name") == "content_index.json"]
-            
-            _log(f"[gc] Found {len(snapshots)} snapshots")
-        except Exception as e:
-            _log(f"[gc][ERROR] Failed to list snapshots: {e}")
-            return {"error": str(e)}
-        
-        # Parallel-Scan mit ThreadPoolExecutor
-        max_workers = int(os.environ.get("PCLOUD_GC_WORKERS", "8"))
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for snapshot in snapshots:
-                snapshot_path = snapshot.get("path")
-                future = executor.submit(
-                    _scan_snapshot_for_refs,
-                    cfg,
-                    snapshot_path,
-                    ref_set,
-                    stats,
-                    verbose
-                )
-                futures.append(future)
-            
-            # Warte auf alle Scanner
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    _log(f"[gc][ERROR] Scanner failed: {e}")
-                    stats.inc_errors()
-        
-        referenced_sha256s = ref_set.get_copy()
-        scan_duration = time.time() - t_scan_start
-        scan_stats = stats.get_stats()
-        
-        _log(f"[gc] PHASE 1 DONE: {scan_stats['snapshots_scanned']} snapshots, "
-             f"{scan_stats['stubs_scanned']} stubs, {len(referenced_sha256s)} unique SHA256 ({scan_duration:.1f}s)")
-    
-    else:
+    ref_lookup: Optional[gci.RemoteSnapReferencedShaLookup] = None
+    referenced_sha256s: object = set()
+    try:
         remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
-        if gci and gci.gc_engine_enabled(env_vars):
-            _log("[gc] PHASE 1: Index (gc-engine / SQLite, kein Master-Dict im RAM)")
-            referenced_sha256s = gci.referenced_shas_for_gc(
-                cfg, snapshots_root, env_vars, remote_snaps, log=_log,
+        _log("[gc] PHASE 1: Index (gc-engine / SQLite, kein Master-Dict im RAM)")
+        t_scan_start = time.time()
+        ref_lookup = gci.referenced_shas_for_gc(
+            cfg, snapshots_root, env_vars, remote_snaps, log=_log,
+        )
+        referenced_sha256s = ref_lookup
+        scan_duration = time.time() - t_scan_start
+        _log(
+            f"[gc] PHASE 1 DONE: {len(remote_snaps)} remote snapshots, "
+            f"{len(ref_lookup)} unique SHA256 ({scan_duration:.1f}s)"
+        )
+
+        if len(ref_lookup) == 0:
+            _log(
+                "[gc][ERROR] Keine Referenzen in Ops-Index — Abbruch (Sicherheit). "
+                "Ops-DB leer/inkonsistent oder kein Remote-Sync; kein Stub-Scan-Fallback."
+            )
+            return {"error": "No references found"}
+
+        # ============================================================================
+        # === PHASE 2: Liste alle Pool-Files (REKURSIV, 1 API-Call!) ===
+        # ============================================================================
+        _log("[gc] PHASE 2: Listing pool files (by _pool/XX prefix)...")
+        t_list_start = time.time()
+
+        pool_files_to_delete = []
+        grace_cutoff = time.time() - (grace_hours * 3600) if grace_hours > 0 else 0
+        pool_files_found = 0
+
+        try:
+            _log(f"[gc] Checking references (grace period: {grace_hours}h)...")
+
+            for pool_file in _iter_pool_files_by_prefix(cfg, pool_root):
+                pool_files_found += 1
+                sha256 = pool_file["name"]
+                stats.inc_pool_found()
+
+                if sha256 in referenced_sha256s:
+                    stats.inc_kept()
+                    continue
+
+                if grace_hours > 0 and pool_file.get("modified"):
+                    file_mtime = pc.parse_metadata_modified_ts(pool_file["modified"])
+                    if file_mtime is None:
+                        stats.inc_kept()
+                        if verbose:
+                            _log(f"[gc-grace] Keeping {sha256[:16]}... (modified unparseable)")
+                        continue
+                    if file_mtime > grace_cutoff:
+                        stats.inc_kept()
+                        if verbose:
+                            age_hours = (time.time() - file_mtime) / 3600
+                            _log(
+                                f"[gc-grace] Keeping {sha256[:16]}... "
+                                f"(age: {age_hours:.1f}h < {grace_hours}h)"
+                            )
+                        continue
+
+                pool_files_to_delete.append(pool_file)
+
+            list_duration = time.time() - t_list_start
+            _log(f"[gc] PHASE 2 DONE: {pool_files_found} pool files found ({list_duration:.1f}s)")
+
+        except Exception as e:
+            _log(f"[gc][ERROR] Failed to list pool: {e}")
+            return {"error": str(e)}
+
+        check_stats = stats.get_stats()
+        _log(
+            f"[gc] Check complete: {len(pool_files_to_delete)} to delete, "
+            f"{check_stats['pool_files_kept']} to keep"
+        )
+
+        # ============================================================================
+        # === PHASE 3: Lösche unreferenzierte Pool-Files ===
+        # ============================================================================
+        if pool_files_to_delete:
+            _log(f"[gc] PHASE 3: Deleting {len(pool_files_to_delete)} unreferenced pool files...")
+            t_delete_start = time.time()
+
+            for pool_file in pool_files_to_delete:
+                _delete_pool_file(
+                    cfg,
+                    pool_file["path"],
+                    pool_file["size"],
+                    stats,
+                    dry,
+                    verbose,
+                    fileid=pool_file.get("fileid"),
+                )
+
+            delete_duration = time.time() - t_delete_start
+            delete_stats = stats.get_stats()
+
+            _log(
+                f"[gc] PHASE 3 DONE: {delete_stats['pool_files_deleted']} files deleted, "
+                f"{delete_stats['bytes_freed'] / (1024**3):.2f} GB freed ({delete_duration:.1f}s)"
             )
         else:
-            referenced_sha256s = _load_refs_from_index(cfg, snapshots_root, stats, verbose)
-        
-        # Fallback auf Stub-Scan falls Index-Load fehlschlägt
-        if not referenced_sha256s:
-            _log("[gc] Fallback: Scanning stubs (Index nicht verfügbar)...")
-            
-            ref_set = _RefSet()
-            
-            try:
-                result = pc._rest_get(cfg, "listfolder", {"path": snapshots_root})
-                metadata = result.get("metadata", {})
-                contents = metadata.get("contents", [])
-                snapshots = [c for c in contents if c.get("isfolder")]
-                
-                max_workers = int(os.environ.get("PCLOUD_GC_WORKERS", "8"))
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [
-                        executor.submit(_scan_snapshot_for_refs, cfg, s.get("path"), ref_set, stats, verbose)
-                        for s in snapshots
-                    ]
-                    for future in concurrent.futures.as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            _log(f"[gc][ERROR] Scanner failed: {e}")
-                            stats.inc_errors()
-                
-                referenced_sha256s = ref_set.get_copy()
-            
-            except Exception as e:
-                _log(f"[gc][ERROR] Stub-Scan auch fehlgeschlagen: {e}")
-                return {"error": str(e)}
-    
-    if not referenced_sha256s:
-        _log("[gc][ERROR] Keine Referenzen gefunden! Abbruch (Sicherheit).")
-        return {"error": "No references found"}
-    
-    # ============================================================================
-    # === PHASE 2: Liste alle Pool-Files (REKURSIV, 1 API-Call!) ===
-    # ============================================================================
-    _log("[gc] PHASE 2: Listing pool files (by _pool/XX prefix)...")
-    t_list_start = time.time()
-    
-    pool_files_to_delete = []
-    grace_cutoff = time.time() - (grace_hours * 3600) if grace_hours > 0 else 0
-    pool_files_found = 0
-    
-    try:
-        _log(f"[gc] Checking references (grace period: {grace_hours}h)...")
-        
-        for pool_file in _iter_pool_files_by_prefix(cfg, pool_root):
-            pool_files_found += 1
-            sha256 = pool_file["name"]
-            stats.inc_pool_found()
-            
-            # 1. Referenz-Check
-            if sha256 in referenced_sha256s:
-                # Referenziert → behalten
-                stats.inc_kept()
-                continue
-            
-            # 2. Grace-Period-Check (Race-Protection!)
-            if grace_hours > 0 and pool_file.get("modified"):
-                file_mtime = pc.parse_metadata_modified_ts(pool_file["modified"])
-                if file_mtime is None:
-                    stats.inc_kept()
-                    if verbose:
-                        _log(f"[gc-grace] Keeping {sha256[:16]}... (modified unparseable)")
-                    continue
-                if file_mtime > grace_cutoff:
-                    # File ist jünger als Grace Period → behalten (könnte gerade uploaded sein)
-                    stats.inc_kept()
-                    if verbose:
-                        age_hours = (time.time() - file_mtime) / 3600
-                        _log(f"[gc-grace] Keeping {sha256[:16]}... (age: {age_hours:.1f}h < {grace_hours}h)")
-                    continue
-            
-            # 3. Unreferenziert & alt genug → löschen
-            pool_files_to_delete.append(pool_file)
+            _log("[gc] PHASE 3 SKIPPED: No unreferenced files found")
 
-        list_duration = time.time() - t_list_start
-        _log(f"[gc] PHASE 2 DONE: {pool_files_found} pool files found ({list_duration:.1f}s)")
-    
-    except Exception as e:
-        _log(f"[gc][ERROR] Failed to list pool: {e}")
-        return {"error": str(e)}
-    
-    check_stats = stats.get_stats()
-    _log(f"[gc] Check complete: {len(pool_files_to_delete)} to delete, "
-         f"{check_stats['pool_files_kept']} to keep")
-    
-    # ============================================================================
-    # === PHASE 3: Lösche unreferenzierte Pool-Files ===
-    # ============================================================================
-    if pool_files_to_delete:
-        _log(f"[gc] PHASE 3: Deleting {len(pool_files_to_delete)} unreferenced pool files...")
-        t_delete_start = time.time()
-        
-        for pool_file in pool_files_to_delete:
-            _delete_pool_file(
-                cfg,
-                pool_file["path"],
-                pool_file["size"],
-                stats,
-                dry,
-                verbose,
-                fileid=pool_file.get("fileid"),
-            )
-        
-        delete_duration = time.time() - t_delete_start
-        delete_stats = stats.get_stats()
-        
-        _log(f"[gc] PHASE 3 DONE: {delete_stats['pool_files_deleted']} files deleted, "
-             f"{delete_stats['bytes_freed'] / (1024**3):.2f} GB freed ({delete_duration:.1f}s)")
-    else:
-        _log("[gc] PHASE 3 SKIPPED: No unreferenced files found")
-    
-    # Final Stats
-    duration = time.time() - t_start
-    final_stats = stats.get_stats()
-    
-    _log("[gc] ===== POOL GARBAGE COLLECTION DONE =====")
-    _log(f"[gc] Mode: {'AUDIT' if audit_mode else 'INDEX-BASED'}")
-    _log(f"[gc] Duration: {duration:.1f}s")
-    _log(f"[gc] Unique SHA256 refs: {len(referenced_sha256s)}")
-    _log(f"[gc] Pool files found: {final_stats['pool_files_found']}")
-    _log(f"[gc] Pool files kept: {final_stats['pool_files_kept']}")
-    _log(f"[gc] Pool files deleted: {final_stats['pool_files_deleted']}")
-    _log(f"[gc] Space freed: {final_stats['bytes_freed'] / (1024**3):.2f} GB")
-    _log(f"[gc] Errors: {final_stats['errors']}")
-    
-    if dry:
-        _log("[gc] ⚠ DRY-RUN: Keine echten Löschungen durchgeführt")
-    
-    return {
-        "duration": duration,
-        "mode": "audit" if audit_mode else "index",
-        "unique_refs": len(referenced_sha256s),
-        "pool_files_found": final_stats['pool_files_found'],
-        "pool_files_kept": final_stats['pool_files_kept'],
-        "pool_files_deleted": final_stats['pool_files_deleted'],
-        "bytes_freed": final_stats['bytes_freed'],
-        "errors": final_stats['errors']
-    }
+        duration = time.time() - t_start
+        final_stats = stats.get_stats()
+
+        _log("[gc] ===== POOL GARBAGE COLLECTION DONE =====")
+        _log("[gc] Mode: INDEX-BASED")
+        _log(f"[gc] Duration: {duration:.1f}s")
+        _log(f"[gc] Unique SHA256 refs: {len(referenced_sha256s)}")
+        _log(f"[gc] Pool files found: {final_stats['pool_files_found']}")
+        _log(f"[gc] Pool files kept: {final_stats['pool_files_kept']}")
+        _log(f"[gc] Pool files deleted: {final_stats['pool_files_deleted']}")
+        _log(f"[gc] Space freed: {final_stats['bytes_freed'] / (1024**3):.2f} GB")
+        _log(f"[gc] Errors: {final_stats['errors']}")
+
+        if dry:
+            _log("[gc] ⚠ DRY-RUN: Keine echten Löschungen durchgeführt")
+
+        return {
+            "duration": duration,
+            "mode": "index",
+            "unique_refs": len(referenced_sha256s),
+            "pool_files_found": final_stats["pool_files_found"],
+            "pool_files_kept": final_stats["pool_files_kept"],
+            "pool_files_deleted": final_stats["pool_files_deleted"],
+            "bytes_freed": final_stats["bytes_freed"],
+            "errors": final_stats["errors"],
+        }
+    finally:
+        if ref_lookup is not None:
+            ref_lookup.close()
 
 
 # ---- CLI ----
@@ -1488,14 +1177,10 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         _log("--dest-root ist deprecated, bitte --pool-root verwenden")
     rtb_root = args.rtb_root or env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
 
-    if (
-        gci is None
-        and _env_get(env_vars, "PCLOUD_GC_USE_INDEX_DB", "1") != "0"
-        and not args.audit_mode
-    ):
+    if gci is None:
         _log(
             f"[gc-engine][ERROR] pool_gc_index nicht geladen ({_GCI_IMPORT_ERR}) — "
-            "Legacy json.loads/OOM-Risiko. pip install -r requirements.txt (ijson)."
+            "pip install -r requirements.txt (ijson)."
         )
         sys.exit(2)
 

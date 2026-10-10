@@ -21,6 +21,7 @@ from typing import Callable, Dict, Iterable, Optional, Set
 import pcloud_bin_lib as pc
 
 import pool_index_db as pidb
+from pool_index_db import _hash_file_sha256
 
 LogFn = Callable[[str], None]
 
@@ -29,11 +30,6 @@ def _env_get(env_vars: Optional[dict], key: str, default: str = "") -> str:
     if env_vars and key in env_vars:
         return env_vars[key]
     return os.environ.get(key, default)
-
-
-def gc_engine_enabled(env_vars: Optional[dict] = None) -> bool:
-    """Default an — PCLOUD_GC_USE_INDEX_DB=0 erzwingt Legacy (nicht empfohlen)."""
-    return _env_get(env_vars, "PCLOUD_GC_USE_INDEX_DB", "1") != "0"
 
 
 def master_paths(env_vars: Optional[dict] = None) -> tuple[str, str]:
@@ -62,10 +58,63 @@ def remote_master_sha256(cfg: dict, snapshots_root: str, *, log: LogFn) -> Optio
 
 
 def _ops_db_matches_remote_sha(db: pidb.PoolIndexDB, remote_sha: Optional[str]) -> bool:
+    if db.get_meta("upload_pending") == "1":
+        return False
     if db.count_shas() == 0:
         return False
     stored = (db.get_meta("master_sha256") or "").strip().lower()
     return bool(remote_sha and stored and remote_sha == stored)
+
+
+def maybe_flush_pending_master_upload(
+    cfg: dict,
+    snapshots_root: str,
+    env_vars: Optional[dict],
+    *,
+    log: LogFn,
+) -> bool:
+    """
+    Nach fehlgeschlagenem Master-Upload: lokaler Master/Ops-DB sind neu,
+    Remote noch alt — upload_pending=1 bis Upload gelingt.
+    """
+    db_path = pidb.default_ops_db_path(env_vars)
+    if not os.path.isfile(db_path):
+        return False
+    db = pidb.open_db(db_path, create=False)
+    try:
+        if db.get_meta("upload_pending") != "1":
+            return False
+        master_path, _ = master_paths(env_vars)
+        if not os.path.isfile(master_path):
+            log(
+                "[gc-engine][ERROR] upload_pending gesetzt, Master-Datei fehlt — "
+                f"erwartet: {master_path}"
+            )
+            return False
+        pending_sha = (db.get_meta("master_pending_sha256") or "").strip().lower()
+        n_refs = db.count_shas()
+        log(
+            f"[gc-engine] Ausstehender Master-Upload (upload_pending) — "
+            f"Retry ({n_refs} pool_refs) …"
+        )
+        _upload_master_resumable(cfg, snapshots_root, master_path, n_refs, log=log)
+        file_sha = pending_sha
+        if not file_sha:
+            file_sha = _hash_file_sha256(master_path)
+        db.record_master_meta(master_path, known_sha256=file_sha, commit=False)
+        db.set_meta("upload_pending", "0", commit=False)
+        db.set_meta("master_pending_sha256", "", commit=False)
+        db.conn.commit()
+        log("[gc-engine] Ausstehender Master-Upload abgeschlossen")
+        return True
+    except Exception as e:
+        log(
+            f"[gc-engine][ERROR] Master-Upload (Retry) fehlgeschlagen: {e} — "
+            "upload_pending bleibt gesetzt"
+        )
+        raise
+    finally:
+        db.close()
 
 
 def _open_ops_db_if_current(
@@ -154,6 +203,7 @@ def open_ops_db_for_queries(
     log: LogFn,
 ) -> pidb.PoolIndexDB:
     """Forecast / GC Phase 1 — gleicher Fast-Path wie scharf, nur SQL-Lesen."""
+    maybe_flush_pending_master_upload(cfg, snapshots_root, env_vars, log=log)
     log_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Ops-SQLite (Abfragen): {log_path}")
     current = _open_ops_db_if_current(
@@ -173,6 +223,7 @@ def open_synced_db(
     log: LogFn,
 ) -> pidb.PoolIndexDB:
     """Ops-DB zum Remote-Stand (Download/Import nur wenn nötig)."""
+    maybe_flush_pending_master_upload(cfg, snapshots_root, env_vars, log=log)
     db_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Ops-SQLite (Sync): {db_path}")
 
@@ -209,8 +260,7 @@ def open_synced_db(
         return db
 
     log("[gc-engine] Streaming-Import Master → SQLite …")
-    db.import_from_json_streaming(master_path, log=log)
-    db.refresh_master_metadata(master_path, known_sha256=file_sha)
+    db.import_from_json_streaming(master_path, log=log, known_sha256=file_sha)
     return db
 
 
@@ -248,18 +298,22 @@ def export_master_from_db(
     env_vars: Optional[dict],
     *,
     log: LogFn,
+    replace_master: bool = True,
 ) -> Dict[str, object]:
     master_path, staging_path = master_paths(env_vars)
     os.makedirs(os.path.dirname(staging_path), exist_ok=True)
     os.makedirs(os.path.dirname(master_path), exist_ok=True)
     exp = db.export_content_index_json(staging_path, record_export_meta=False)
-    os.replace(staging_path, master_path)
+    file_sha = str(exp.get("file_sha256") or "")
+    if replace_master:
+        os.replace(staging_path, master_path)
     n_refs = int(exp.get("shas") or 0)
     log(
         f"[gc-engine] Export lokal: {master_path} "
         f"({n_refs} pool_refs, {exp.get('bytes', 0)} bytes, {exp.get('seconds', 0):.1f}s)"
     )
     exp["master_path"] = master_path
+    exp["staging_path"] = staging_path
     return exp
 
 
@@ -351,30 +405,62 @@ def apply_index_purge_for_deleted_snaps(
     db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
     c = db.conn
     master_path = ""
+    file_sha = ""
+    n_refs = 0
     try:
         c.execute("BEGIN IMMEDIATE")
         stats = purge_snapshots_in_db(db, deleted_snaps, log=log, commit=False)
-        exp = export_master_from_db(db, env_vars, log=log)
+        exp = export_master_from_db(db, env_vars, log=log, replace_master=False)
+        staging_path = str(exp["staging_path"])
         master_path = str(exp["master_path"])
+        file_sha = str(exp.get("file_sha256") or "")
         n_refs = int(exp.get("shas") or 0)
+        os.replace(staging_path, master_path)
+        db.set_meta("upload_pending", "1", commit=False)
+        if file_sha:
+            db.set_meta("master_pending_sha256", file_sha, commit=False)
         c.commit()
-        # Upload außerhalb der Transaktion — Ops-DB nicht während Chunk-Upload gesperrt.
-        log("[gc-engine] Ops-DB committed — Upload ohne Write-Lock")
+    except Exception:
+        c.rollback()
+        db.close()
+        raise
+
+    log("[gc-engine] Ops-DB committed (upload_pending) — Master-Upload ohne Write-Lock")
+    try:
         try:
             _upload_master_resumable(cfg, snapshots_root, master_path, n_refs, log=log)
         except Exception:
             log(
                 "[gc-engine][ERROR] Upload fehlgeschlagen — lokaler Master/Ops-DB "
-                "bereits bereinigt, Remote evtl. veraltet; Upload wiederholen."
+                "bereinigt, Remote veraltet; nächster Lauf versucht Upload erneut "
+                "(upload_pending=1)."
             )
             raise
-        db.record_master_meta(master_path)
+        db.record_master_meta(master_path, known_sha256=file_sha or None, commit=False)
+        db.set_meta("upload_pending", "0", commit=False)
+        db.set_meta("master_pending_sha256", "", commit=False)
+        c.commit()
         return stats
-    except Exception:
-        c.rollback()
-        raise
     finally:
         db.close()
+
+
+class RemoteSnapReferencedShaLookup:
+    """Membership-Tests per SQL — kein millionenfaches SHA-Set im RAM."""
+
+    def __init__(self, db: pidb.PoolIndexDB, remote_snaps: Set[str]):
+        self._db = db
+        self._remote = remote_snaps
+        self._len = db.count_referenced_shas_for_snapshots(remote_snaps)
+
+    def __contains__(self, sha: object) -> bool:
+        return self._db.sha_has_remote_snap_ref(str(sha), self._remote)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def close(self) -> None:
+        self._db.close()
 
 
 def referenced_shas_for_gc(
@@ -384,9 +470,6 @@ def referenced_shas_for_gc(
     remote_snaps: Set[str],
     *,
     log: LogFn,
-) -> Set[str]:
+) -> RemoteSnapReferencedShaLookup:
     db = open_ops_db_for_queries(cfg, snapshots_root, env_vars, log=log)
-    try:
-        return db.referenced_shas_for_snapshots(remote_snaps)
-    finally:
-        db.close()
+    return RemoteSnapReferencedShaLookup(db, remote_snaps)
