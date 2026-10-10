@@ -44,15 +44,35 @@ class PoolVerifyFetchTests(unittest.TestCase):
         self.assertIn("archive merge", src)
         self.assertEqual(set(refs.keys()), {"x", "y"})
 
-    def test_fetch_pool_refs_multi_fails_if_archive_missing(self) -> None:
+    def test_fetch_pool_refs_multi_warns_if_archive_missing(self) -> None:
         def _load(_cfg, path):
             if path.endswith("a_index.json"):
                 return {"pool_refs": {"x": {}}}
             return None
 
         with mock.patch.object(pvb, "_load_remote_json_at", side_effect=_load):
-            with self.assertRaises(RuntimeError):
-                pvb._fetch_pool_refs({}, "/snap", ["a", "b"])
+            refs, src = pvb._fetch_pool_refs({}, "/snap", ["a", "b"])
+        self.assertIn("WARN archive fehlt", src)
+        self.assertEqual(set(refs.keys()), {"x"})
+
+    def test_sha_keys_from_ops_db(self) -> None:
+        import sqlite3
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as tf:
+            path = tf.name
+        try:
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                "CREATE TABLE shas (id INTEGER PRIMARY KEY, sha TEXT UNIQUE);"
+                "INSERT INTO shas(sha) VALUES ('aa'), ('BB');"
+            )
+            conn.commit()
+            conn.close()
+            keys = pvb._sha_keys_from_ops_db(path)
+            self.assertEqual(keys, {"aa", "bb"})
+        finally:
+            os.unlink(path)
 
     def test_load_remote_json_propagates_timeout(self) -> None:
         with mock.patch.object(

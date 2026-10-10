@@ -25,6 +25,11 @@ sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 import pcloud_path_compat as ppc
 
+try:
+    import pool_index_db as pidb
+except ImportError:
+    pidb = None  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Remote Pool cache (nur SHA-Set; Index pro Snapshot via Archiv/Master)
 # ---------------------------------------------------------------------------
@@ -266,6 +271,27 @@ def _collect_stub_paths_subtree_batch(
     return stubs, failed
 
 
+def _sha_keys_from_ops_db(db_path: str) -> Set[str]:
+    """Nur SHA-Strings aus Ops/Backup-SQLite (kein pool_refs-Dict, ~MB statt GB)."""
+    import sqlite3
+
+    uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        out: Set[str] = set()
+        cur = conn.execute("SELECT sha FROM shas")
+        while True:
+            rows = cur.fetchmany(50000)
+            if not rows:
+                break
+            for (sha,) in rows:
+                if sha:
+                    out.add(str(sha).lower())
+        return out
+    finally:
+        conn.close()
+
+
 def _load_remote_json_at(cfg: dict, path: str) -> Optional[dict]:
     """Remote JSON lesen; None nur bei echtem Fehlen; Timeout/API-Fehler werden durchgereicht."""
     path = pc._norm_remote_path(path)
@@ -337,9 +363,8 @@ def _fetch_pool_refs(
             _merge_pool_refs(merged, refs)
             parts.append(f"{snap}: {len(refs)} refs")
         if missing:
-            raise RuntimeError(
-                "Archiv-Index fehlt fuer Snapshot(s): "
-                + ", ".join(missing[:8])
+            parts.append(
+                "WARN archive fehlt: " + ", ".join(missing[:8])
                 + (" …" if len(missing) > 8 else "")
             )
         label = "archive merge"
@@ -350,6 +375,72 @@ def _fetch_pool_refs(
         ) + f"; union {len(merged)} shas)"
 
     return {}, "keine Snapshots fuer Archiv-Index"
+
+
+def _merge_manifest_scoped_stub_checks(parts: List[dict]) -> dict:
+    if not parts:
+        return {
+            "expected_stubs": 0,
+            "actual_stubs": 0,
+            "missing_from_index": 0,
+            "missing_from_index_examples": [],
+            "extra_not_in_index": 0,
+            "extra_stub_examples": [],
+            "manifest_missing_stubs": {},
+            "manifest_missing_total": 0,
+            "path_compat_resolved": 0,
+            "mode": "manifest_scoped",
+        }
+    missing_examples: List[str] = []
+    extra_examples: List[str] = []
+    manifest_missing: Dict[str, List[str]] = {}
+    for p in parts:
+        missing_examples.extend(p.get("missing_from_index_examples") or [])
+        extra_examples.extend(p.get("extra_stub_examples") or [])
+        for snap, paths in (p.get("manifest_missing_stubs") or {}).items():
+            manifest_missing.setdefault(snap, []).extend(paths)
+    return {
+        "expected_stubs": sum(int(p.get("expected_stubs") or 0) for p in parts),
+        "actual_stubs": max(int(p.get("actual_stubs") or 0) for p in parts),
+        "missing_from_index": sum(int(p.get("missing_from_index") or 0) for p in parts),
+        "missing_from_index_examples": sorted(set(missing_examples))[:5],
+        "extra_not_in_index": sum(int(p.get("extra_not_in_index") or 0) for p in parts),
+        "extra_stub_examples": extra_examples[:5],
+        "manifest_missing_stubs": manifest_missing,
+        "manifest_missing_total": sum(int(p.get("manifest_missing_total") or 0) for p in parts),
+        "path_compat_resolved": sum(int(p.get("path_compat_resolved") or 0) for p in parts),
+        "mode": "manifest_scoped",
+    }
+
+
+def _stub_checks_per_snapshot(
+    cfg: dict,
+    snaps_root: str,
+    manifests: Dict[str, Dict[str, str]],
+    stub_paths: Set[str],
+    snapshots: List[str],
+) -> Tuple[dict, List[str], str]:
+    """Check B: je ein Archiv-Index, kein Master-Merge im RAM."""
+    parts: List[dict] = []
+    weak: List[str] = []
+    src_parts: List[str] = []
+    for snap in snapshots:
+        if snap not in manifests:
+            continue
+        refs, src = _fetch_pool_refs(cfg, snaps_root, [snap])
+        if "Manifest-only" in src or "fehlt" in src:
+            weak.append(snap)
+        src_parts.append(f"{snap}: {src}")
+        part = check_stubs_vs_index(
+            refs,
+            stub_paths,
+            {snap: manifests[snap]},
+            snapshot_filter={snap},
+        )
+        parts.append(part)
+        del refs
+        gc.collect()
+    return _merge_manifest_scoped_stub_checks(parts), weak, "; ".join(src_parts[:4])
 
 
 def _manifest_stub_path(snaps_root: str, snap: str, relpath: str) -> str:
@@ -686,18 +777,44 @@ def run_verify(
         gc.collect()
 
     _out("[fetch] Index...")
-    index_archive_snaps = (
-        list(snapshot_filter)
-        if snapshot_filter
-        else list(manifests.keys())
-    )
+    pool_refs: dict = {}
+    weak_index_snaps: List[str] = []
+    per_snap_index_src = ""
     try:
-        pool_refs, index_src = _fetch_pool_refs(
-            cfg,
-            snaps_root,
-            snapshot_filter,
-            archive_snapshots=index_archive_snaps if not snapshot_filter else None,
+        ops_db = pidb.default_ops_db_path() if pidb else ""
+        use_ops_keys = (
+            not snapshot_filter
+            and ops_db
+            and os.path.isfile(ops_db)
         )
+        if use_ops_keys:
+            pool_refs_keys = _sha_keys_from_ops_db(ops_db)
+            index_src = f"ops-sqlite ({len(pool_refs_keys)} shas, kein pool_refs-Dict)"
+        elif snapshot_filter and len(snapshot_filter) == 1:
+            pool_refs, index_src = _fetch_pool_refs(cfg, snaps_root, snapshot_filter)
+            pool_refs_keys = set(pool_refs.keys())
+            if "Manifest-only" in index_src:
+                weak_index_snaps.append(snapshot_filter[0])
+        elif snapshot_filter and len(snapshot_filter) > 1:
+            pool_refs_keys = set()
+            for snap in snapshot_filter:
+                refs, src = _fetch_pool_refs(cfg, snaps_root, [snap])
+                pool_refs_keys.update(refs.keys())
+                if "Manifest-only" in src or "fehlt" in src:
+                    weak_index_snaps.append(snap)
+                del refs
+            index_src = f"archive per snap ({len(snapshot_filter)} snaps, {len(pool_refs_keys)} shas)"
+            gc.collect()
+        else:
+            pool_refs_keys = set()
+            index_src = "kein ops-sqlite — SHA-Keys pro Snap-Archiv"
+            for snap in manifests:
+                refs, src = _fetch_pool_refs(cfg, snaps_root, [snap])
+                pool_refs_keys.update(refs.keys())
+                if "Manifest-only" in src or "fehlt" in src:
+                    weak_index_snaps.append(snap)
+                del refs
+            gc.collect()
     except Exception as e:
         _out(f"[FAIL] Index laden: {e}")
         return {
@@ -708,6 +825,12 @@ def run_verify(
             "duration_sec": round(time.time() - t0, 2),
         }
     _out(f"[fetch] Index: {index_src}")
+    if weak_index_snaps:
+        _out(
+            f"[warn] Schwächere Prüfung (kein Archiv-Index): "
+            + ", ".join(weak_index_snaps[:8])
+            + (" …" if len(weak_index_snaps) > 8 else "")
+        )
     gc.collect()
 
     fetch_failed: List[str] = []
@@ -743,7 +866,7 @@ def run_verify(
     dt_fetch = time.time() - t_fetch
     _out(
         f"[fetch] fertig: Pool {len(pool_shas)} SHA | "
-        f"Stubs {len(stub_paths)} | Index {len(pool_refs)} refs | {dt_fetch:.1f}s"
+        f"Stubs {len(stub_paths)} | Index {len(pool_refs_keys)} shas | {dt_fetch:.1f}s"
     )
     _out("")
 
@@ -751,7 +874,7 @@ def run_verify(
 
     _out("=== A) Manifest vs Pool ===")
     t_a = time.time()
-    res_a = check_manifest_vs_pool(manifests, pool_shas, set(pool_refs.keys()))
+    res_a = check_manifest_vs_pool(manifests, pool_shas, pool_refs_keys)
     for snap, r in res_a["per_snapshot"].items():
         status = "✓" if r["missing_count"] == 0 else "✗"
         _out(
@@ -775,10 +898,17 @@ def run_verify(
 
     _out("=== B) Stubs vs Index vs Pool ===")
     t_b = time.time()
-    stub_scope = set(snapshot_filter) if snapshot_filter else None
-    res_b = check_stubs_vs_index(
-        pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
-    )
+    if snapshot_filter and len(snapshot_filter) == 1 and pool_refs:
+        stub_scope = set(snapshot_filter)
+        res_b = check_stubs_vs_index(
+            pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
+        )
+    else:
+        snaps_for_b = list(snapshot_filter) if snapshot_filter else list(manifests.keys())
+        res_b, weak_b, per_snap_index_src = _stub_checks_per_snapshot(
+            cfg, snaps_root, manifests, stub_paths, snaps_for_b,
+        )
+        weak_index_snaps = sorted(set(weak_index_snaps) | set(weak_b))
     fetch_incomplete = bool(fetch_failed)
     res_b["fetch_incomplete"] = fetch_incomplete
     res_b["failed_subtrees"] = fetch_failed
@@ -822,7 +952,10 @@ def run_verify(
     res_c = None
     if stub_sample > 0:
         _out(f"=== C) Stub-Sample ({stub_sample}) ===")
-        res_c = check_stub_sample(cfg, pool_refs, manifests, snaps_root, stub_sample)
+        sample_refs = pool_refs
+        if not sample_refs and snapshot_filter and len(snapshot_filter) == 1:
+            sample_refs, _ = _fetch_pool_refs(cfg, snaps_root, snapshot_filter)
+        res_c = check_stub_sample(cfg, sample_refs, manifests, snaps_root, stub_sample)
         if res_c.get("errors"):
             issues += len(res_c["errors"])
         _out("")
@@ -845,6 +978,8 @@ def run_verify(
         "issues": issues,
         "duration_sec": round(dt_total, 2),
         "snapshots": remote_snaps,
+        "weak_index_snapshots": weak_index_snaps,
+        "index_source": index_src,
         "manifest_vs_pool": res_a,
         "stubs_vs_index": res_b,
         "stub_sample": res_c,

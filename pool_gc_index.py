@@ -451,6 +451,11 @@ def _upload_master_resumable(
     verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
     local_size = os.path.getsize(local_path)
     gc_min_ratio = float(os.environ.get("PCLOUD_GC_INDEX_UPLOAD_MIN_SIZE_RATIO", "0"))
+    if gc_min_ratio > 0:
+        log(
+            "[gc-engine][warn] PCLOUD_GC_INDEX_UPLOAD_MIN_SIZE_RATIO>0 — nach Purge kann "
+            "Upload blockieren (upload_pending); bei Bedarf auf 0 setzen"
+        )
     pc.guard_index_upload_size(
         cfg, remote_path, local_size, min_size_ratio=gc_min_ratio,
     )
