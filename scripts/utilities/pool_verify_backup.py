@@ -25,14 +25,8 @@ sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 import pcloud_path_compat as ppc
 
-try:
-    from index_load_helper import load_content_index_v2 as _load_index_v2_local_first
-except ImportError:
-    _load_index_v2_local_first = None  # type: ignore
-
-
 # ---------------------------------------------------------------------------
-# Remote Pool+Index Cache (Batch-Audit: einmal Pool+Master-Index)
+# Remote Pool cache (nur SHA-Set; Index pro Snapshot via Archiv/Master)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -41,7 +35,6 @@ class PoolRemoteCache:
 
     dest: str
     pool_shas: Set[str]
-    pool_refs: dict = field(default_factory=dict)
     fetched_at: float = field(default_factory=time.time)
 
     def matches(self, pool_root_raw: str) -> bool:
@@ -302,13 +295,6 @@ def _fetch_pool_refs(
         return {}, f"archive/{snap}_index.json (noch nicht vorhanden — Manifest-only)"
 
     master_path = f"{snaps_root}/_index/content_index.json"
-    if _load_index_v2_local_first is not None:
-        try:
-            idx = _load_index_v2_local_first(cfg, snaps_root, prefer_local=True)
-            refs = idx.get("pool_refs") or {}
-            return refs, f"content_index (lokal, {len(refs)} refs)"
-        except Exception:
-            pass
     idx = _load_remote_json_at(cfg, master_path)
     if idx is None:
         return {}, "content_index.json (fehlt)"

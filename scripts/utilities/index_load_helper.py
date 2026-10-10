@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Lokaler Master-Index vor Remote-Download (Utilities, RAM/Netz sparen)."""
+"""
+Index-Laden für Utilities.
+
+- Lokale Master-Datei nur wenn klein genug (PCLOUD_MAX_LOCAL_INDEX_BYTES, Default 64 MiB).
+  Große v2-Master (~2 GB): kein json.load — Remote oder SQLite-Tools nutzen.
+- v1-Utilities (items/holders): nie pool_refs als items maskieren.
+"""
 from __future__ import annotations
 
 import json
@@ -8,6 +14,15 @@ import os
 from typing import Any, Dict, Optional
 
 import pcloud_bin_lib as pc
+
+V2_POOL_INDEX_MSG = (
+    "v2 pool_refs content_index — nutze pool_integrity_run.py / "
+    "pool_verify_backup.py (nicht pcloud_integrity_check / repair_index v1)"
+)
+
+
+def _max_local_index_bytes() -> int:
+    return int(os.environ.get("PCLOUD_MAX_LOCAL_INDEX_BYTES", str(64 * 1024 * 1024)))
 
 
 def _local_master_candidates() -> list[str]:
@@ -27,6 +42,34 @@ def _local_master_candidates() -> list[str]:
     return out
 
 
+def is_v2_pool_index(j: dict) -> bool:
+    if not isinstance(j, dict):
+        return False
+    if int(j.get("version") or 0) == 2:
+        return True
+    pool_refs = j.get("pool_refs")
+    items = j.get("items")
+    if isinstance(pool_refs, dict) and pool_refs:
+        if not items or not isinstance(items, dict) or not items:
+            return True
+    return False
+
+
+def _try_read_local_json(path: str) -> Optional[dict]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_size > _max_local_index_bytes():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return j if isinstance(j, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def load_content_index_v2(
     cfg: dict,
     snapshots_root: str,
@@ -34,21 +77,16 @@ def load_content_index_v2(
     prefer_local: bool = True,
 ) -> Dict[str, Any]:
     """
-    pool_refs-Index (v2). Zuerst lokaler Master auf pi-nas, sonst Remote.
+    v2 pool_refs. Lokale Datei nur unter Größenlimit; sonst Remote (json.load — OOM bei ~2 GB).
     """
     if prefer_local:
         for path in _local_master_candidates():
-            if not os.path.isfile(path):
+            j = _try_read_local_json(path)
+            if j is None:
                 continue
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-                if isinstance(j, dict):
-                    j.setdefault("pool_refs", {})
-                    j.setdefault("version", 2)
-                    return j
-            except (OSError, json.JSONDecodeError):
-                continue
+            j.setdefault("pool_refs", {})
+            j.setdefault("version", 2)
+            return j
     idx_path = f"{snapshots_root.rstrip('/')}/_index/content_index.json"
     txt = pc.get_textfile(cfg, path=idx_path)
     j = json.loads(txt or "{}")
@@ -64,24 +102,28 @@ def load_content_index_legacy_items(
     *,
     prefer_local: bool = True,
 ) -> Dict[str, Any]:
-    """v1 items-Index fuer pcloud_integrity_check."""
+    """
+    v1 items/holders (pre-pool). v2-Master wird nicht auf items gemappt.
+    """
     if prefer_local:
         for path in _local_master_candidates():
-            if not os.path.isfile(path):
+            j = _try_read_local_json(path)
+            if j is None:
                 continue
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-                if isinstance(j, dict):
-                    if "items" not in j or not isinstance(j.get("items"), dict):
-                        j["items"] = j.get("pool_refs") or {}
-                    j.setdefault("version", 1)
-                    return j
-            except (OSError, json.JSONDecodeError):
+            if is_v2_pool_index(j):
                 continue
+            items = j.get("items")
+            if not isinstance(items, dict):
+                continue
+            j.setdefault("version", 1)
+            return j
     idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
     txt = pc.get_textfile(cfg, path=idx_path)
     j = json.loads(txt or '{"version":1,"items":{}}')
+    if not isinstance(j, dict):
+        j = {"version": 1, "items": {}}
+    if is_v2_pool_index(j):
+        raise RuntimeError(V2_POOL_INDEX_MSG)
     if "items" not in j or not isinstance(j.get("items"), dict):
         j["items"] = {}
     return j

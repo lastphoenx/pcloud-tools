@@ -745,6 +745,31 @@ def _abort_legacy_json_index_path(reason: str) -> None:
     sys.exit(2)
 
 
+def _snapshots_root_from_env() -> str:
+    dest = (os.environ.get("PCLOUD_DEST") or "").strip()
+    if not dest:
+        return ""
+    return f"{pc._norm_remote_path(dest).rstrip('/')}/_snapshots"
+
+
+def _bootstrap_backup_db_from_remote_master(
+    cfg: dict,
+    db,
+    master: str,
+) -> None:
+    """Leere/stale DB + fehlender lokaler Master: Remote-Download + Streaming-Import."""
+    import pool_gc_index as gci
+
+    snaps_root = _snapshots_root_from_env()
+    if not snaps_root:
+        _log("[index-db][ERROR] PCLOUD_DEST fehlt — Remote-Master-Bootstrap unmöglich")
+        sys.exit(2)
+    os.makedirs(os.path.dirname(os.path.abspath(master)) or ".", exist_ok=True)
+    _log("[index-db] Lokaler Master fehlt — Download von Remote + Streaming-Import …")
+    file_sha = gci.download_remote_master(cfg, snaps_root, master, log=_log)
+    db.import_from_json_streaming(master, log=_log, known_sha256=file_sha)
+
+
 def _open_pool_index_db_for_run():
     """Oeffnet die C1-SQLite oder None (nur wenn PCLOUD_POOL_INDEX_DB=0)."""
     if not _pool_index_db_enabled():
@@ -757,6 +782,7 @@ def _open_pool_index_db_for_run():
 
     auto = os.environ.get("PCLOUD_POOL_INDEX_DB_AUTOIMPORT", "1") != "0"
     master = pidb.default_master_path()
+    cfg = pc.effective_config()
     try:
         db = pidb.open_db(pidb.default_db_path(), create=True)
     except Exception as e:
@@ -770,7 +796,11 @@ def _open_pool_index_db_for_run():
             _log(f"[index-db] SQLite bereit ({db.count_shas()} SHAs)")
             return db
         if match is False:
-            if auto and os.path.isfile(master):
+            if not auto:
+                _log("[index-db][ERROR] DB stale und AUTOIMPORT=0 — Abbruch")
+                db.close()
+                sys.exit(2)
+            if os.path.isfile(master):
                 if db.can_skip_master_reimport(master):
                     db.refresh_master_metadata(master)
                     _log(
@@ -781,19 +811,21 @@ def _open_pool_index_db_for_run():
                 _log("[index-db] Master geändert → Streaming-Re-Import")
                 db.import_from_json_streaming(master, log=_log)
                 return db
-            _log("[index-db][ERROR] DB stale und kein Auto-Import — Abbruch")
-            db.close()
-            sys.exit(2)
+            _bootstrap_backup_db_from_remote_master(cfg, db, master)
+            return db
         if populated and match is None:
             _log("[index-db][warn] Master-JSON fehlt — nutze DB")
             return db
-        if auto and os.path.isfile(master):
+        if not auto:
+            _log("[index-db][ERROR] DB leer und AUTOIMPORT=0 — Abbruch")
+            db.close()
+            sys.exit(2)
+        if os.path.isfile(master):
             _log("[index-db] DB leer/neu → Streaming-Import aus Master")
             db.import_from_json_streaming(master, log=_log)
             return db
-        _log("[index-db][ERROR] DB leer und kein Master — Abbruch")
-        db.close()
-        sys.exit(2)
+        _bootstrap_backup_db_from_remote_master(cfg, db, master)
+        return db
     except Exception as e:
         _log(f"[index-db][ERROR] {e}")
         try:

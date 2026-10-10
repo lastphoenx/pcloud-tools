@@ -650,6 +650,9 @@ def main():
         from index_load_helper import load_content_index_legacy_items
 
         index = load_content_index_legacy_items(cfg, snaps_root, prefer_local=True)
+    except RuntimeError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(2)
     except Exception as e:
         print(f"[ERROR] Index nicht lesbar: {e}")
         sys.exit(2)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Peak-RSS eines Jobs messen (Linux: /usr/bin/time -v).
+Peak-RSS eines Jobs messen (Linux: Paket ``time`` → /usr/bin/time -v).
 
 Beispiel:
   python scripts/measure_job_rss.py -- python pcloud_pool_gc.py --pool-root /Backup/rtb_pool --dry-run

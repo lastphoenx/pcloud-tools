@@ -163,6 +163,16 @@ def load_index_from_pcloud(cfg: Dict, dest_root: str, snapshot: str) -> List[Dic
         index = pc.read_json_at_path(cfg, index_path, maxbytes=None)
 
         if "items" not in index:
+            if index.get("pool_refs"):
+                log(
+                    "v2 pool_refs Index — Restore nutzt Manifest/Stubs, "
+                    "nicht content_index items (v1)",
+                    "error",
+                )
+                raise IndexLoadError(
+                    "v2 pool_refs Index: --manifest oder pool-mode Restore, "
+                    "nicht load_index_from_pcloud (v1 items)"
+                )
             log("Index ungültig (keine 'items')", "error")
             raise IndexLoadError("Index ungültig (keine 'items')")
         

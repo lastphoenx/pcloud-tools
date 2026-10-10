@@ -43,6 +43,9 @@ def load_remote_index(cfg: dict, snaps_root: str) -> dict:
         from index_load_helper import load_content_index_legacy_items
 
         return load_content_index_legacy_items(cfg, snaps_root, prefer_local=True)
+    except RuntimeError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(2)
     except Exception as e:
         print(f"[ERROR] Index nicht ladbar: {e}", file=sys.stderr)
         sys.exit(2)
