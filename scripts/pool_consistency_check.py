@@ -112,7 +112,7 @@ def run_check(
         )
         try:
             pool_shas = set()
-            for pf in pgc._iter_pool_files_by_prefix(cfg, pool_root):
+            for pf in pgc._iter_pool_files_by_prefix(cfg, pool_root, quiet=True):
                 pool_shas.add(str(pf.get("name", "")).lower())
             missing = 0
             for sha in ref_lookup.iter_shas():

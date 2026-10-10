@@ -462,7 +462,7 @@ def _extract_pool_files_from_tree(obj: dict, pool_root: str, out: List[dict]) ->
         _extract_pool_files_from_tree(child, pool_root, out)
 
 
-def _iter_pool_files_by_prefix(cfg: dict, pool_root: str):
+def _iter_pool_files_by_prefix(cfg: dict, pool_root: str, *, quiet: bool = False):
     """Pool-Dateien pro _pool/XX-Präfix (kein einzelner Riesen-listfolder)."""
     top = pc.listfolder(cfg, path=pool_root, recursive=False, nofiles=True)
     contents = (top.get("metadata", {}) or {}).get("contents", []) or []
@@ -483,7 +483,8 @@ def _iter_pool_files_by_prefix(cfg: dict, pool_root: str):
     for i, child in enumerate(prefixes, 1):
         label = child.get("name", "")
         sub_path = child.get("path") or f"{pool_root.rstrip('/')}/{label}"
-        _log(f"[gc] Pool-Präfix {i}/{len(prefixes)}: {label}")
+        if not quiet:
+            _log(f"[gc] Pool-Präfix {i}/{len(prefixes)}: {label}")
         batch: List[dict] = []
         result = pc.listfolder(cfg, path=sub_path, recursive=True, nofiles=False)
         _extract_pool_files_from_tree(result.get("metadata", {}) or {}, pool_root, batch)

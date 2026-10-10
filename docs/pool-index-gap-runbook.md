@@ -12,7 +12,17 @@
 
    Erwartung bei bekannter Lücke: **Exit 2**, `live_missing_ops_db` listet die betroffenen Namen.
 
-3. **Schaden prüfen** (optional, pro Snapshot):
+3. **Pool-Gaps im Detail** (Index-SHA ohne Pool-Listing, mit Snapshot-Zuordnung):
+
+   ```bash
+   cd /opt/apps/pcloud-tools/main
+   set -a && . ./.env && set +a
+   /opt/apps/pcloud-tools/venv/bin/python pool_gap_report.py --csv /tmp/pool_gaps.csv
+   # optional: echte pCloud-Präsenz pro SHA (159× API)
+   /opt/apps/pcloud-tools/venv/bin/python pool_gap_report.py --verify-stat --csv /tmp/pool_gaps_verify.csv
+   ```
+
+4. **Schaden prüfen** (optional, pro Snapshot):
 
    ```bash
    python scripts/utilities/pool_integrity_run.py --env-file .env \
