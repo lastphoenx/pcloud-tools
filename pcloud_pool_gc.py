@@ -457,8 +457,11 @@ def _iter_pool_files_by_prefix(cfg: dict, pool_root: str):
     top = pc.listfolder(cfg, path=pool_root, recursive=False, nofiles=True)
     contents = (top.get("metadata", {}) or {}).get("contents", []) or []
     prefixes = sorted(
-        c for c in contents
-        if c.get("isfolder") and c.get("name") and len(c.get("name", "")) == 2
+        (
+            c for c in contents
+            if c.get("isfolder") and c.get("name") and len(c.get("name", "")) == 2
+        ),
+        key=lambda c: str(c.get("name") or ""),
     )
     if not prefixes:
         batch: List[dict] = []
