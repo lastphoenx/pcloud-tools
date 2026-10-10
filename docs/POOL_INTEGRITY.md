@@ -8,7 +8,7 @@ Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 |------|-----|-----|
 | **Jeder Upload** | Hartes Integrity-Gate (Subprozess: subtree `listfolder`, Snap-Archiv-Index) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
 | **Jeder Upload** | `post_upload` in MariaDB | im Gate via `pool_integrity_run.py` (`check_type=post_upload`) |
-| **3×/Tag Timer** | `monthly_audit` (10 Snapshots/Lauf) | `integrity-audit.service` |
+| **3×/Tag Timer** | `monthly_audit` (10 Snapshots/Lauf, je Subprozess) | `integrity-audit.service` |
 | **Wrapper (optional)** | Zweiter Lauf | nur bei `PCLOUD_POST_UPLOAD_INTEGRITY=1` (Default: `skip`) |
 
 **Log-Marker:** `[integrity-gate] Post-Upload Integritaet (Subprozess, subtree listfolder)...`
@@ -22,7 +22,7 @@ Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 | Spalte | DB-Quelle | Wann befüllt |
 |--------|-----------|--------------|
 | **Post-Upload** | `backup_runs.integrity_*` | Automatisch nach jedem **erfolgreichen** Upload (`check_type=post_upload`) |
-| **Audit** | `snapshot_integrity_checks` (`monthly_audit`) | 3×/Tag **05:45, 13:45, 21:45** — je **10 Snapshots** (`INTEGRITY_AUDIT_MAX`) |
+| **Audit** | `snapshot_integrity_checks` (`monthly_audit`) | 3×/Tag **05:45, 13:45, 21:45** — je **10 Snapshots** (`INTEGRITY_AUDIT_MAX`, Subprozess je Snap) |
 | **Frische** | berechnet aus `monthly_audit_at` | `OK` / `STALE` (>35 Tage) / `FAILED` / `UNKNOWN` |
 
 View: `v_snapshot_integrity_status` → `generate_reports.sh` → `reports.json` → Dashboard.
@@ -69,7 +69,7 @@ python scripts/utilities/pool_integrity_run.py \
 
 | Unit | Rolle |
 |------|--------|
-| `integrity-audit.service` | oneshot: **INTEGRITY_AUDIT_MAX** Snapshots/Lauf (default 2), Pool-Index-Cache, `KillMode=control-group` |
+| `integrity-audit.service` | oneshot: **INTEGRITY_AUDIT_MAX** Snapshots/Lauf (je `pool_integrity_run.py` Subprozess), `KillMode=control-group` |
 | `integrity-audit.timer` | 3× täglich **05:45, 13:45, 21:45** (+5 min Random) — **nach** Backup-Fenster (04/12/20); nicht parallel zum Upload+Gate laufen lassen |
 
 ```bash
@@ -95,7 +95,7 @@ Priorität für den **nächsten** Snapshot:
 3. Letzter Audit **≥ 35 Tage** alt → STALE, bevorzugt
 4. Sonst ältester Audit-Zeitstempel
 
-**Häufigkeit:** 3×10 = **30 Audits/Tag** → ~87 Snapshots in **~3 Tage** rotiert.
+**Häufigkeit:** 3×10 = **30 Audits/Tag** (Subprozess je Snapshot — kein `PoolRemoteCache` / Master-Index im Parent).
 
 **Performance (gefiltert):** ~8s Stub-API + ~0.2s Checks. Cache = einmaliges `_pool`-listfolder pro Batch; Hauptgewinn = `manifest_scoped` (Check B war ~22s).
 

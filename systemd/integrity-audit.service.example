@@ -10,7 +10,7 @@ User=root
 WorkingDirectory=/opt/apps/pcloud-tools/main
 Environment=MAIN_DIR=/opt/apps/pcloud-tools/main
 Environment=ENV_FILE=/opt/apps/pcloud-tools/main/.env
-Environment=INTEGRITY_AUDIT_MAX=2
+Environment=INTEGRITY_AUDIT_MAX=10
 ExecStart=/opt/apps/pcloud-tools/main/scripts/integrity-audit-next.sh
 KillMode=control-group
 TimeoutStopSec=60

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pick next snapshot for monthly integrity audit and run pool_integrity_run."""
+"""Pick next snapshot(s) for monthly integrity audit and run pool_integrity_run."""
 from __future__ import annotations
 
 import argparse
@@ -16,13 +16,6 @@ ENV_FILE = os.environ.get("ENV_FILE", f"{MAIN_DIR}/.env")
 sys.path.insert(0, MAIN_DIR)
 
 import pcloud_bin_lib as pc  # noqa: E402
-
-_UTIL = os.path.join(MAIN_DIR, "scripts", "utilities")
-if _UTIL not in sys.path:
-    sys.path.insert(0, _UTIL)
-
-from pool_integrity_run import run_integrity_for_snapshot  # noqa: E402
-from pool_verify_backup import PoolRemoteCache  # noqa: E402
 
 
 def _load_env(path: str) -> Dict[str, str]:
@@ -141,9 +134,38 @@ def _pick_many(
     return todo
 
 
+def _integrity_run_script() -> str:
+    path = os.path.join(MAIN_DIR, "scripts", "utilities", "pool_integrity_run.py")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"pool_integrity_run.py nicht gefunden: {path}")
+    return path
+
+
+def _run_monthly_audit_subprocess(snapshot: str, pool_root: str, env_file: str) -> int:
+    """Ein Snapshot in eigenem Prozess (kein Master content_index im Parent-RAM)."""
+    argv = [
+        sys.executable,
+        _integrity_run_script(),
+        "--env-file",
+        env_file,
+        "--pool-root",
+        pool_root,
+        "--snapshot",
+        snapshot,
+        "--check-type",
+        "monthly_audit",
+    ]
+    return subprocess.run(argv, check=False).returncode
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Monthly integrity audit (one or batch)")
-    ap.add_argument("--max", type=int, default=1, help="Snapshots pro Lauf (Batch mit Pool-Cache)")
+    ap.add_argument(
+        "--max",
+        type=int,
+        default=1,
+        help="Snapshots pro Lauf (je eigener Subprozess, kein PoolRemoteCache)",
+    )
     args = ap.parse_args()
 
     env = _load_env(ENV_FILE)
@@ -170,26 +192,18 @@ def main() -> int:
         print("[integrity-audit] Kein Snapshot gewaehlt")
         return 0
 
-    print(f"[integrity-audit] Batch: {len(todo)} Snapshot(s) ({len(remote)} remote complete)")
-
-    cache: Optional[PoolRemoteCache] = None
-    if len(todo) > 1:
-        cache = PoolRemoteCache.fetch(cfg, dest, verbose=True)
+    print(
+        f"[integrity-audit] Batch: {len(todo)} Snapshot(s) ({len(remote)} remote complete), "
+        "Subprozess je Snapshot"
+    )
 
     errors = 0
     for i, snap in enumerate(todo, 1):
         print(f"\n[integrity-audit] [{i}/{len(todo)}] {snap}")
-        ok, _ = run_integrity_for_snapshot(
-            env=env,
-            cfg=cfg,
-            pool_root=dest,
-            snapshot=snap,
-            check_type="monthly_audit",
-            remote_cache=cache,
-            verbose=True,
-        )
-        if not ok:
+        rc = _run_monthly_audit_subprocess(snap, dest, ENV_FILE)
+        if rc != 0:
             errors += 1
+            print(f"[integrity-audit] exit {rc} fuer {snap}", file=sys.stderr)
 
     return 1 if errors else 0
 
