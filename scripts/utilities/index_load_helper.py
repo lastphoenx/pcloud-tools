@@ -57,13 +57,8 @@ def _bytes_look_like_v2_pool_index(head: bytes) -> bool:
     return False
 
 
-def _peek_local_v2_pool_index(path: str) -> bool:
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
-    if st.st_size <= _max_local_index_bytes():
-        return False
+def _local_index_head_looks_v2(path: str) -> bool:
+    """Erste Bytes lesen — kein json.load (auch bei mehr-GB-Mastern)."""
     try:
         with open(path, "rb") as f:
             return _bytes_look_like_v2_pool_index(f.read(_V2_HEAD_PEEK_BYTES))
@@ -146,7 +141,7 @@ def load_content_index_legacy_items(
     """
     if prefer_local:
         for path in _local_master_candidates():
-            if _peek_local_v2_pool_index(path):
+            if _local_index_head_looks_v2(path):
                 raise RuntimeError(V2_POOL_INDEX_MSG)
             j = _try_read_local_json(path)
             if j is None:

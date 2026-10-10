@@ -43,7 +43,7 @@ Beispiel (Index-Check):
 
 from __future__ import annotations
 import os, sys, json, argparse, time, datetime
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---- Logging ----
 def _log(msg: str, *, file=sys.stderr) -> None:
