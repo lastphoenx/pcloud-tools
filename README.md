@@ -145,15 +145,19 @@ Details: [docs/POOL_INDEX_DB.md](docs/POOL_INDEX_DB.md)
 
 ### pi-nas (Produktion)
 
+- **Repo:** `/opt/apps/pcloud-tools/main` · **Python:** `/opt/apps/pcloud-tools/venv/bin/python` (Symlink auf datierte venv, **nicht** `main/.venv`) — siehe [AGENTS.md](AGENTS.md#pi-nas--produktions-layout-nicht-raten)
 - `.env`: `PCLOUD_POOL_INDEX_DB=1`
 - Index-Dateien: `/srv/pcloud-archive/indexes/` (SSD2)
 
 ```bash
+cd /opt/apps/pcloud-tools/main
+PY=/opt/apps/pcloud-tools/venv/bin/python
+
 # Zeigt DB-Größe, SHA-Counts, ob Re-Import übersprungen würde
-python3 pool_index_db.py status
+$PY pool_index_db.py status
 
 # Fingerprints nachziehen (nach Upgrade, kein voller Re-Import)
-python3 pool_index_db.py refresh-meta
+$PY pool_index_db.py refresh-meta
 ```
 
 ---

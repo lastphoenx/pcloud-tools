@@ -1466,14 +1466,16 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         parser.error("--delete-snapshots nicht mit --retention-forecast/--retention-apply kombinieren")
 
     pool_root = args.pool_root or args.dest_root
-    if not pool_root:
-        parser.error("--pool-root erforderlich (--dest-root ist deprecated)")
-    if args.dest_root and not args.pool_root:
-        _log("--dest-root ist deprecated, bitte --pool-root verwenden")
-    
-    # Config laden
     cfg = pc.effective_config(env_file=args.env_file)
     env_vars = _load_env_file(args.env_file)
+    if not pool_root:
+        pool_root = env_vars.get("PCLOUD_DEST") or os.environ.get("PCLOUD_DEST")
+    if not pool_root:
+        parser.error(
+            "--pool-root erforderlich (oder PCLOUD_DEST in --env-file / Umgebung)"
+        )
+    if args.dest_root and not args.pool_root:
+        _log("--dest-root ist deprecated, bitte --pool-root verwenden")
     rtb_root = args.rtb_root or env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
 
     if args.retention_forecast:
