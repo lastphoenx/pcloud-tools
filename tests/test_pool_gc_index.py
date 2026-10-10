@@ -77,10 +77,13 @@ class UploadPendingTests(unittest.TestCase):
         old_remote_sha = db2.get_meta("master_sha256")
         db2.close()
 
-        with mock.patch.object(gci, "_upload_master_resumable"):
-            gci.maybe_flush_pending_master_upload(
-                cfg, snaps_root, self._env(), log=log,
-            )
+        with mock.patch.object(
+            gci, "remote_master_sha256", return_value=old_remote_sha,
+        ):
+            with mock.patch.object(gci, "_upload_master_resumable"):
+                gci.maybe_flush_pending_master_upload(
+                    cfg, snaps_root, self._env(), log=log,
+                )
 
         db3 = pidb.open_db(self.ops_db, create=False)
         self.assertEqual(db3.get_meta("upload_pending"), "0")
@@ -88,6 +91,35 @@ class UploadPendingTests(unittest.TestCase):
         if old_remote_sha:
             self.assertNotEqual(db3.get_meta("master_sha256"), old_remote_sha)
         db3.close()
+
+    def test_retry_aborts_when_remote_index_advanced(self) -> None:
+        db = pidb.open_db(self.ops_db, create=True)
+        db.import_from_json_streaming(self.master)
+        db.set_meta("master_sha256", "aa" * 64)
+        db.set_meta("upload_pending", "1")
+        db.set_meta("master_pending_sha256", "bb" * 64)
+        db.set_meta("upload_pending_snaps", "snap-a")
+        db.close()
+
+        logs: list[str] = []
+
+        def log(msg: str) -> None:
+            logs.append(msg)
+
+        with mock.patch.object(
+            gci, "remote_master_sha256", return_value="cc" * 32,
+        ):
+            with mock.patch.object(gci, "_upload_master_resumable") as up:
+                out = gci.maybe_flush_pending_master_upload(
+                    {}, "/pool/_snapshots", self._env(), log=log,
+                )
+                up.assert_not_called()
+
+        self.assertFalse(out)
+        db2 = pidb.open_db(self.ops_db, create=False)
+        self.assertEqual(db2.get_meta("upload_pending"), "0")
+        self.assertEqual(db2.get_meta("reapply_purge_after_sync"), "snap-a")
+        db2.close()
 
 
 if __name__ == "__main__":

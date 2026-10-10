@@ -1085,9 +1085,15 @@ class PoolIndexDB:
         n_shas = 0
         n_pairs = 0
         first = True
+        file_hasher = hashlib.sha256()
+
+        def _write_out(s: str) -> None:
+            file_hasher.update(s.encode("utf-8"))
 
         with open(tmp, "w", encoding="utf-8", buffering=1024 * 1024) as f:
-            f.write('{"version":2,"pool_refs":{')
+            head = '{"version":2,"pool_refs":{'
+            _write_out(head)
+            f.write(head)
             for sha_id, sha, fileid, phash, size in cur_s:
                 n_shas += 1
                 grouped: Dict[str, List[str]] = {}
@@ -1108,12 +1114,17 @@ class PoolIndexDB:
                 }
                 chunk = json.dumps(sha) + ":" + json.dumps(entry, separators=(",", ":"))
                 if first:
+                    _write_out(chunk)
                     f.write(chunk)
                     first = False
                 else:
+                    _write_out(",")
                     f.write(",")
+                    _write_out(chunk)
                     f.write(chunk)
-            f.write("}}")
+            tail = "}}"
+            _write_out(tail)
+            f.write(tail)
             f.flush()
             os.fsync(f.fileno())
 
@@ -1123,7 +1134,7 @@ class PoolIndexDB:
         except OSError:
             pass
         nbytes = os.path.getsize(out_path)
-        file_sha256 = _hash_file_sha256(out_path)
+        file_sha256 = file_hasher.hexdigest()
         if record_export_meta:
             self.set_meta("last_export_at", str(time.time()))
         return {

@@ -66,6 +66,58 @@ def _ops_db_matches_remote_sha(db: pidb.PoolIndexDB, remote_sha: Optional[str]) 
     return bool(remote_sha and stored and remote_sha == stored)
 
 
+def _abort_stale_pending_upload(
+    db: pidb.PoolIndexDB,
+    *,
+    log: LogFn,
+    remote_sha: str,
+    stored_base: str,
+) -> None:
+    """Remote-Index hat sich geändert — kein Upload des lokalen Pending-Masters."""
+    pending_snaps = (db.get_meta("upload_pending_snaps") or "").strip()
+    log(
+        "[gc-engine][ERROR] upload_pending, aber Remote-Index ist neuer "
+        f"(remote {remote_sha[:16]}… ≠ Basis {stored_base[:16]}…) — "
+        "kein Upload (würde Backup-Index überschreiben). "
+        "Sync von Remote, Purge ggf. erneut."
+    )
+    db.set_meta("upload_pending", "0", commit=False)
+    db.set_meta("master_pending_sha256", "", commit=False)
+    db.set_meta("upload_pending_snaps", "", commit=False)
+    if pending_snaps:
+        db.set_meta("reapply_purge_after_sync", pending_snaps, commit=False)
+    db.conn.commit()
+
+
+def _reapply_purge_after_remote_drift(
+    cfg: dict,
+    snapshots_root: str,
+    env_vars: Optional[dict],
+    *,
+    log: LogFn,
+) -> None:
+    db_path = pidb.default_ops_db_path(env_vars)
+    if not os.path.isfile(db_path):
+        return
+    db = pidb.open_db(db_path, create=False)
+    try:
+        raw = (db.get_meta("reapply_purge_after_sync") or "").strip()
+        if not raw:
+            return
+        snaps = {s.strip() for s in raw.split(",") if s.strip()}
+        db.set_meta("reapply_purge_after_sync", "", commit=True)
+    finally:
+        db.close()
+    if not snaps:
+        return
+    log(
+        f"[gc-engine] Purge nach Remote-Drift erneut ({len(snaps)} Snapshot(s)) …"
+    )
+    apply_index_purge_for_deleted_snaps(
+        cfg, snapshots_root, env_vars, snaps, dry=False, log=log,
+    )
+
+
 def maybe_flush_pending_master_upload(
     cfg: dict,
     snapshots_root: str,
@@ -92,6 +144,24 @@ def maybe_flush_pending_master_upload(
             )
             return False
         pending_sha = (db.get_meta("master_pending_sha256") or "").strip().lower()
+        stored_base = (db.get_meta("master_sha256") or "").strip().lower()
+        remote_now = remote_master_sha256(cfg, snapshots_root, log=log)
+        if remote_now and pending_sha and remote_now == pending_sha:
+            log(
+                "[gc-engine] Remote-Index entspricht pending SHA — "
+                "Upload bereits erfolgt, Pending aufgeräumt"
+            )
+            db.record_master_meta(master_path, known_sha256=pending_sha, commit=False)
+            db.set_meta("upload_pending", "0", commit=False)
+            db.set_meta("master_pending_sha256", "", commit=False)
+            db.set_meta("upload_pending_snaps", "", commit=False)
+            db.conn.commit()
+            return True
+        if stored_base and remote_now and remote_now != stored_base:
+            _abort_stale_pending_upload(
+                db, log=log, remote_sha=remote_now, stored_base=stored_base,
+            )
+            return False
         n_refs = db.count_shas()
         log(
             f"[gc-engine] Ausstehender Master-Upload (upload_pending) — "
@@ -104,6 +174,7 @@ def maybe_flush_pending_master_upload(
         db.record_master_meta(master_path, known_sha256=file_sha, commit=False)
         db.set_meta("upload_pending", "0", commit=False)
         db.set_meta("master_pending_sha256", "", commit=False)
+        db.set_meta("upload_pending_snaps", "", commit=False)
         db.conn.commit()
         log("[gc-engine] Ausstehender Master-Upload abgeschlossen")
         return True
@@ -257,10 +328,12 @@ def open_synced_db(
     if _ops_db_can_skip_import_after_download(db, master_path, file_sha):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
         db.refresh_master_metadata(master_path, known_sha256=file_sha)
+        _reapply_purge_after_remote_drift(cfg, snapshots_root, env_vars, log=log)
         return db
 
     log("[gc-engine] Streaming-Import Master → SQLite …")
     db.import_from_json_streaming(master_path, log=log, known_sha256=file_sha)
+    _reapply_purge_after_remote_drift(cfg, snapshots_root, env_vars, log=log)
     return db
 
 
@@ -377,10 +450,16 @@ def _dry_simulate_purge_on_ops_db(
             if n:
                 log(f"[dry] würde purge {snap}: {n} snap_refs")
             removed_refs += n
-        log(
-            f"[dry] Index-Purge simuliert: {removed_refs} snap-refs; "
-            f"würde exportieren (~{n_shas} pool_refs), kein Upload"
-        )
+        if removed_refs:
+            log(
+                f"[dry] Index-Purge simuliert: {removed_refs} snap-refs; "
+                f"würde exportieren (~{n_shas} pool_refs) + Upload"
+            )
+        else:
+            log(
+                f"[dry] Index-Purge simuliert: 0 snap-refs — "
+                "kein Export/Upload nötig"
+            )
         return {"removed_snap_refs": removed_refs}
     finally:
         db.close()
@@ -402,6 +481,18 @@ def apply_index_purge_for_deleted_snaps(
         return {"removed_snap_refs": 0}
     if dry:
         return _dry_simulate_purge_on_ops_db(env_vars, deleted_snaps, log=log)
+    db_path = pidb.default_ops_db_path(env_vars)
+    if os.path.isfile(db_path):
+        pre = pidb.open_db(db_path, create=False)
+        try:
+            if not any(pre.snap_ref_count(s) for s in deleted_snaps):
+                log(
+                    "[gc-engine] Keine snap-refs für gelöschte Snapshots — "
+                    "Export/Upload übersprungen"
+                )
+                return {"removed_snap_refs": 0}
+        finally:
+            pre.close()
     db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
     c = db.conn
     master_path = ""
@@ -410,6 +501,14 @@ def apply_index_purge_for_deleted_snaps(
     try:
         c.execute("BEGIN IMMEDIATE")
         stats = purge_snapshots_in_db(db, deleted_snaps, log=log, commit=False)
+        if stats["removed_snap_refs"] == 0:
+            c.rollback()
+            log(
+                "[gc-engine] Purge ohne snap-refs — Export/Upload übersprungen"
+            )
+            return stats
+        snap_csv = ",".join(sorted({s.strip() for s in deleted_snaps if s.strip()}))
+        db.set_meta("upload_pending_snaps", snap_csv, commit=False)
         exp = export_master_from_db(db, env_vars, log=log, replace_master=False)
         staging_path = str(exp["staging_path"])
         master_path = str(exp["master_path"])
@@ -439,6 +538,7 @@ def apply_index_purge_for_deleted_snaps(
         db.record_master_meta(master_path, known_sha256=file_sha or None, commit=False)
         db.set_meta("upload_pending", "0", commit=False)
         db.set_meta("master_pending_sha256", "", commit=False)
+        db.set_meta("upload_pending_snaps", "", commit=False)
         c.commit()
         return stats
     finally:

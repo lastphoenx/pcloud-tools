@@ -768,8 +768,8 @@ def _open_pool_index_db_for_run():
                         f"({db.count_shas()} SHAs)"
                     )
                     return db
-                _log("[index-db] Master geändert → Re-Import")
-                db.import_from_json(master, log=_log)
+                _log("[index-db] Master geändert → Streaming-Re-Import")
+                db.import_from_json_streaming(master, log=_log)
                 return db
             _log("[index-db][warn] DB stale, AUTOIMPORT=0 — Fallback JSON")
             db.close()
@@ -778,8 +778,8 @@ def _open_pool_index_db_for_run():
             _log("[index-db][warn] Master-JSON fehlt — nutze DB")
             return db
         if auto and os.path.isfile(master):
-            _log("[index-db] DB leer/neu → Import aus Master")
-            db.import_from_json(master, log=_log)
+            _log("[index-db] DB leer/neu → Streaming-Import aus Master")
+            db.import_from_json_streaming(master, log=_log)
             return db
         _log("[index-db][warn] DB leer und kein Master — Fallback JSON")
         db.close()
