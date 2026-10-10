@@ -3554,10 +3554,29 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 pass
 
 
-def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = False) -> dict:
+def _manifest_pool_file_count(manifest: dict) -> int:
+    n = 0
+    for it in manifest.get("items", []) or []:
+        if it.get("type") != "file":
+            continue
+        if it.get("sha256"):
+            n += 1
+    return n
+
+
+def push_pool_finalize_only(
+    cfg: dict,
+    manifest: dict,
+    dest_root: str,
+    *,
+    dry: bool = False,
+    index_repair: bool = False,
+) -> dict:
     """
     Nur Integrity-Gate + .upload_complete + Index-Upload.
     Fuer abgebrochene Laeufe, bei denen Pool+Stubs bereits remote stehen.
+
+    index_repair: Manifest → SQLite + Master-Upload ohne Integrity-Gate (Pool-Luecken ok).
     """
     snapshot_name = manifest.get("snapshot") or "SNAPSHOT"
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
@@ -3565,12 +3584,39 @@ def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: b
     dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
     pool_root = f"{dest_root}/_pool"
     marker_complete = f"{dest_snapshot_dir}/.upload_complete"
+    want_files = _manifest_pool_file_count(manifest)
+    index_repair = index_repair or os.environ.get("PCLOUD_FINALIZE_INDEX_REPAIR", "0") == "1"
 
     _log(f"[finalize-only] Snapshot {snapshot_name} — Gate + Complete + Index")
 
-    if not dry and _upload_complete_matches_snapshot(cfg, marker_complete, snapshot_name):
-        _log("[finalize-only] Bereits vollständig (.upload_complete)")
-        return {"uploaded": 0, "stubs": 0, "mode": "finalize-only", "skipped": True}
+    if not dry and not index_repair and _upload_complete_matches_snapshot(
+        cfg, marker_complete, snapshot_name
+    ):
+        if _pool_index_db_enabled():
+            db_probe = _open_pool_index_db_for_run(cfg, snapshots_root)
+            try:
+                have_files = db_probe.snapshot_pair_count(snapshot_name)
+            finally:
+                try:
+                    db_probe.close()
+                except Exception:
+                    pass
+            if have_files == want_files and want_files > 0:
+                _log("[finalize-only] Bereits vollständig (.upload_complete + Index)")
+                return {"uploaded": 0, "stubs": 0, "mode": "finalize-only", "skipped": True}
+            raise RuntimeError(
+                f"[finalize-only] .upload_complete ok, Index unvollständig "
+                f"({have_files} != {want_files}) — erneut mit --index-repair"
+            )
+        else:
+            _log("[finalize-only] Bereits vollständig (.upload_complete)")
+            return {"uploaded": 0, "stubs": 0, "mode": "finalize-only", "skipped": True}
+
+    if index_repair:
+        _log(
+            "[finalize-only] Index-Reparatur: Manifest → SQLite + Master "
+            "(Integrity-Gate aus)"
+        )
 
     if not dry and not pc.stat_folderid_fast(cfg, dest_snapshot_dir):
         raise RuntimeError(f"[finalize-only] Remote-Snapshot fehlt: {dest_snapshot_dir}")
@@ -3636,10 +3682,11 @@ def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: b
         }
 
         if not dry:
-            _post_upload_gate(
-                cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
-                dry=dry, mode_label="finalize-only",
-            )
+            if not index_repair:
+                _post_upload_gate(
+                    cfg, manifest, dest_root, snapshot_name, dest_snapshot_dir, pool_root, index,
+                    dry=dry, mode_label="finalize-only",
+                )
             _finalize_after_validation_delta(
                 cfg, snapshots_root, index, snapshot_name, dest_snapshot_dir, marker_data,
                 dry=dry, db=db,
@@ -4814,6 +4861,12 @@ def main() -> None:
         action="store_true",
         help="Nur Integrity-Gate + .upload_complete + Index (Stubs/Pool muessen remote bereits stehen)",
     )
+    ap.add_argument(
+        "--index-repair",
+        action="store_true",
+        help="Mit --finalize-only: Index aus Manifest in SQLite + Master-Upload, ohne Integrity-Gate "
+        "(wenn .upload_complete schon da, aber pool_index.sqlite3 Snap fehlt)",
+    )
 
 
     # pCloud Config
@@ -4873,7 +4926,19 @@ def main() -> None:
     os.environ["PCLOUD_ACTIVE_MANIFEST_PATH"] = os.path.abspath(args.manifest)
 
     if args.finalize_only:
-        push_pool_finalize_only(cfg, manifest, dest_root, dry=bool(args.dry_run))
+        if args.index_repair and args.dry_run:
+            print(
+                "[cli][ERROR] --index-repair erfordert scharfen Lauf (ohne --dry-run)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        push_pool_finalize_only(
+            cfg,
+            manifest,
+            dest_root,
+            dry=bool(args.dry_run),
+            index_repair=bool(args.index_repair),
+        )
     else:
         push_pool_mode(cfg, manifest, dest_root, dry=bool(args.dry_run))
 

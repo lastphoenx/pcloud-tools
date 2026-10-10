@@ -41,6 +41,7 @@
 
 - **Nicht** manuell in `pool_index_gc.sqlite3` „raten“.
 - Archiv-Indizes auf pCloud (`_snapshots/_index/archive/<snap>_index.json`) sind für die drei Lücken-Snapshots **present** — Referenzen von dort bzw. über Backup-Pipeline / `finalize-only` in **Backup-DB** und Remote-Master zurückspielen (Entwickler-Pfad, zuerst auf **Kopie** der Backup-DB testen).
+- Wenn Remote schon `.upload_complete` hat, aber `pool_index.sqlite3` den Snapshot nicht (0 `snap_refs`): **nicht** normales `--finalize-only` (überspringt dann still) — stattdessen **`--finalize-only --index-repair`** (ohne `--dry-run`). Dry-Run zeigt nur die geplanten Refs; scharf schreibt SQLite + Master. Integrity-Gate bleibt aus (bekannte Pool-Lücken bis RTB-Backfill).
 - Nach Master-Sync: Ops-DB folgt per `checksumfile`/Import automatisch.
 
 ## GC wieder freigeben
