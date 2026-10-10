@@ -651,19 +651,13 @@ def _upload_index_from_staging(
     verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
 
     local_size = os.path.getsize(staging_path)
+    min_ratio = float(os.environ.get("PCLOUD_INDEX_UPLOAD_MIN_SIZE_RATIO", "0.5"))
     try:
-        if pc.classify_remote_file_stat(cfg, path=remote_path) == "present":
-            remote_meta = pc.stat_file_safe(cfg, path=remote_path)
-            remote_size = int(remote_meta.get("size") or 0)
-            min_ratio = float(os.environ.get("PCLOUD_INDEX_UPLOAD_MIN_SIZE_RATIO", "0.5"))
-            if remote_size > 0 and local_size < remote_size * min_ratio:
-                _log(
-                    f"[index][ERROR] Neuer Index ({local_size} B) deutlich kleiner als "
-                    f"Remote ({remote_size} B, ratio<{min_ratio}) — Upload abgebrochen"
-                )
-                sys.exit(2)
+        pc.guard_index_upload_size(
+            cfg, remote_path, local_size, min_size_ratio=min_ratio,
+        )
     except Exception as e:
-        _log(f"[index][ERROR] Remote-Index-Größenprüfung fehlgeschlagen: {e}")
+        _log(f"[index][ERROR] {e}")
         sys.exit(2)
 
     _log(f"[index] Upload nach pCloud: {remote_path} (pool_refs={n_refs})")

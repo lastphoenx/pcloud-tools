@@ -44,6 +44,38 @@ class PoolVerifyFetchTests(unittest.TestCase):
         self.assertIn("archive merge", src)
         self.assertEqual(set(refs.keys()), {"x", "y"})
 
+    def test_fetch_pool_refs_multi_fails_if_archive_missing(self) -> None:
+        def _load(_cfg, path):
+            if path.endswith("a_index.json"):
+                return {"pool_refs": {"x": {}}}
+            return None
+
+        with mock.patch.object(pvb, "_load_remote_json_at", side_effect=_load):
+            with self.assertRaises(RuntimeError):
+                pvb._fetch_pool_refs({}, "/snap", ["a", "b"])
+
+    def test_load_remote_json_propagates_timeout(self) -> None:
+        with mock.patch.object(
+            pvb.pc, "classify_remote_file_stat", side_effect=TimeoutError("timed out"),
+        ):
+            with self.assertRaises(TimeoutError):
+                pvb._load_remote_json_at({}, "/snap/_index/archive/x_index.json")
+
+    def test_fetch_all_manifest_snaps_via_archives(self) -> None:
+        archives = {
+            "/snap/_index/archive/s1_index.json": {"pool_refs": {"aa": {}}},
+        }
+
+        def _load(_cfg, path):
+            return archives.get(path)
+
+        with mock.patch.object(pvb, "_load_remote_json_at", side_effect=_load):
+            refs, src = pvb._fetch_pool_refs(
+                {}, "/snap", None, archive_snapshots=["s1"],
+            )
+        self.assertIn("alle remote", src)
+        self.assertIn("aa", refs)
+
 
 if __name__ == "__main__":
     unittest.main()

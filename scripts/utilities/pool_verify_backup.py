@@ -267,18 +267,12 @@ def _collect_stub_paths_subtree_batch(
 
 
 def _load_remote_json_at(cfg: dict, path: str) -> Optional[dict]:
-    """Remote JSON lesen; None wenn Datei fehlt (kein getfilelink-Exception)."""
+    """Remote JSON lesen; None nur bei echtem Fehlen; Timeout/API-Fehler werden durchgereicht."""
     path = pc._norm_remote_path(path)
-    try:
-        if pc.classify_remote_file_stat(cfg, path=path) != "present":
-            return None
-    except Exception:
+    if pc.classify_remote_file_stat(cfg, path=path) != "present":
         return None
-    try:
-        txt = pc.get_textfile(cfg, path=path, maxbytes=None)
-        return json.loads(txt or "{}")
-    except Exception:
-        return None
+    txt = pc.get_textfile(cfg, path=path, maxbytes=None)
+    return json.loads(txt or "{}")
 
 
 def _merge_pool_refs(into: dict, part: dict) -> None:
@@ -309,8 +303,10 @@ def _fetch_pool_refs(
     cfg: dict,
     snaps_root: str,
     snapshot_filter: Optional[List[str]],
+    *,
+    archive_snapshots: Optional[List[str]] = None,
 ) -> Tuple[dict, str]:
-    """pool_refs aus Snap-Archiv-Index (klein) oder Master content_index.json."""
+    """pool_refs aus Snap-Archiv-Indizes (kein 2-GB-Master json.loads)."""
     snaps_root = snaps_root.rstrip("/")
     if snapshot_filter and len(snapshot_filter) == 1:
         snap = snapshot_filter[0]
@@ -321,26 +317,39 @@ def _fetch_pool_refs(
             return refs, f"archive/{snap}_index.json ({len(refs)} refs)"
         return {}, f"archive/{snap}_index.json (noch nicht vorhanden — Manifest-only)"
 
+    snaps_to_load: List[str] = []
     if snapshot_filter and len(snapshot_filter) > 1:
+        snaps_to_load = list(snapshot_filter)
+    elif archive_snapshots:
+        snaps_to_load = list(archive_snapshots)
+
+    if snaps_to_load:
         merged: dict = {}
         parts: List[str] = []
-        for snap in snapshot_filter:
+        missing: List[str] = []
+        for snap in snaps_to_load:
             archive_path = f"{snaps_root}/_index/archive/{snap}_index.json"
             idx = _load_remote_json_at(cfg, archive_path)
             if idx is None:
-                parts.append(f"{snap}: archive fehlt")
+                missing.append(snap)
                 continue
             refs = idx.get("pool_refs") or {}
             _merge_pool_refs(merged, refs)
             parts.append(f"{snap}: {len(refs)} refs")
-        return merged, "archive merge (" + "; ".join(parts) + f"; union {len(merged)} shas)"
+        if missing:
+            raise RuntimeError(
+                "Archiv-Index fehlt fuer Snapshot(s): "
+                + ", ".join(missing[:8])
+                + (" …" if len(missing) > 8 else "")
+            )
+        label = "archive merge"
+        if not snapshot_filter:
+            label = "archive merge (alle remote)"
+        return merged, f"{label} (" + "; ".join(parts[:6]) + (
+            f"; … +{len(parts) - 6} snaps" if len(parts) > 6 else ""
+        ) + f"; union {len(merged)} shas)"
 
-    master_path = f"{snaps_root}/_index/content_index.json"
-    idx = _load_remote_json_at(cfg, master_path)
-    if idx is None:
-        return {}, "content_index.json (fehlt)"
-    refs = idx.get("pool_refs") or {}
-    return refs, f"content_index.json ({len(refs)} refs)"
+    return {}, "keine Snapshots fuer Archiv-Index"
 
 
 def _manifest_stub_path(snaps_root: str, snap: str, relpath: str) -> str:
@@ -677,7 +686,27 @@ def run_verify(
         gc.collect()
 
     _out("[fetch] Index...")
-    pool_refs, index_src = _fetch_pool_refs(cfg, snaps_root, snapshot_filter)
+    index_archive_snaps = (
+        list(snapshot_filter)
+        if snapshot_filter
+        else list(manifests.keys())
+    )
+    try:
+        pool_refs, index_src = _fetch_pool_refs(
+            cfg,
+            snaps_root,
+            snapshot_filter,
+            archive_snapshots=index_archive_snaps if not snapshot_filter else None,
+        )
+    except Exception as e:
+        _out(f"[FAIL] Index laden: {e}")
+        return {
+            "ok": False,
+            "issues": 1,
+            "error": "index_fetch_failed",
+            "detail": str(e),
+            "duration_sec": round(time.time() - t0, 2),
+        }
     _out(f"[fetch] Index: {index_src}")
     gc.collect()
 

@@ -2781,6 +2781,34 @@ def classify_remote_file_stat(
     return "absent"
 
 
+def remote_present_file_size_bytes(cfg: Dict[str, Any], *, path: str) -> Optional[int]:
+    """Dateigröße wenn vorhanden; None wenn absent; Exception bei Timeout/API-Fehler."""
+    if classify_remote_file_stat(cfg, path=path) != "present":
+        return None
+    meta = stat_file(cfg, path=path, with_checksum=False, enrich_path=False) or {}
+    return int(meta.get("size") or 0)
+
+
+def guard_index_upload_size(
+    cfg: Dict[str, Any],
+    remote_path: str,
+    local_size: int,
+    *,
+    min_size_ratio: float,
+) -> None:
+    """Verhindert katastrophales Überschreiben eines großen Remote-Index (min_size_ratio<=0 = aus)."""
+    if min_size_ratio <= 0:
+        return
+    remote_size = remote_present_file_size_bytes(cfg, path=remote_path)
+    if remote_size is None:
+        return
+    if remote_size > 0 and local_size < remote_size * min_size_ratio:
+        raise RuntimeError(
+            f"Index-Upload abgebrochen: neu {local_size} B < "
+            f"{min_size_ratio:g}× remote {remote_size} B ({remote_path})"
+        )
+
+
 def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int | None = None) -> dict:
     """Wie stat_file, aber fängt 2055/Not-Found/Timeout sauber ab und gibt {} zurück."""
     try:

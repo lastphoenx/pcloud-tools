@@ -29,6 +29,18 @@ class ClassifyRemoteFileStatTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 pc.classify_remote_file_stat({"token": "t"}, path="/x")
 
+    def test_guard_upload_blocks_shrink(self) -> None:
+        with mock.patch.object(pc, "remote_present_file_size_bytes", return_value=1000):
+            with self.assertRaises(RuntimeError):
+                pc.guard_index_upload_size(
+                    {}, "/idx/content_index.json", 100, min_size_ratio=0.5,
+                )
+
+    def test_guard_upload_skipped_when_ratio_zero(self) -> None:
+        pc.guard_index_upload_size(
+            {}, "/idx/content_index.json", 1, min_size_ratio=0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

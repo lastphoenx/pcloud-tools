@@ -449,6 +449,11 @@ def _upload_master_resumable(
         fid = pc.ensure_path(cfg, idx_dir)
     log_every = int(os.environ.get("PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS", "1"))
     verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
+    local_size = os.path.getsize(local_path)
+    gc_min_ratio = float(os.environ.get("PCLOUD_GC_INDEX_UPLOAD_MIN_SIZE_RATIO", "0"))
+    pc.guard_index_upload_size(
+        cfg, remote_path, local_size, min_size_ratio=gc_min_ratio,
+    )
     log(f"[gc-engine] Upload: {remote_path} (pool_refs={n_refs})")
     t0 = time.time()
     pc.upload_local_file_resumable(
