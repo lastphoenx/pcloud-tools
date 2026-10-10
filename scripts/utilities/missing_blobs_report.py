@@ -91,9 +91,19 @@ def analyze_snapshot(
     return rows, stats
 
 
-def _print_snapshot_summary(snap: str, stats: Dict[str, int], rows: List[Tuple], rtb_root: str) -> None:
-    by_top = collections.Counter(r.split("/", 1)[0] for _s, r, _z, _ok in rows)
-    by_ext = collections.Counter(os.path.splitext(r)[1].lower() or "(keine)" for _s, r, _z, _ok in rows)
+def _print_snapshot_summary(
+    snap: str,
+    stats: Dict[str, int],
+    rows: List[Tuple[str, str, str, int, bool]],
+    rtb_root: str,
+) -> None:
+    by_top = collections.Counter(
+        rel.split("/", 1)[0] for _snap, _sha, rel, _sz, _ok in rows
+    )
+    by_ext = collections.Counter(
+        os.path.splitext(rel)[1].lower() or "(keine)"
+        for _snap, _sha, rel, _sz, _ok in rows
+    )
     print(f"\n== {snap}: {stats['missing_shas']} SHAs fehlen im Pool, "
           f"{stats['manifest_files']} Manifest-Dateien, {stats['total_bytes']} Bytes")
     if stats["shas_without_manifest_path"]:
