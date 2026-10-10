@@ -7,8 +7,9 @@ Arbeitsspeicher: Remote-Master → Disk (streaming download), pool_refs → SQLi
 (streaming import), Purge/Abfragen per SQL, Export → Master-JSON (streaming write),
 Upload resumable von Disk. Kein volles pool_refs-Dict im RAM.
 
-Gleiche Purge-/Referenz-Logik für dry-run und scharf (dry = kein Upload, DB bleibt
-nach Forecast unverändert via separaten Sync nur lesen).
+Gleiche Purge-/Referenz-Logik für dry-run und scharf (dry = kein Upload/Löschung).
+Dry-run delete-snapshots: nur bestehende Ops-DB. Lesen/Schreiben sonst: ein Sync-Pfad
+(Remote-SHA-Check, kein digest-Marathon).
 """
 from __future__ import annotations
 
@@ -60,19 +61,61 @@ def remote_master_sha256(cfg: dict, snapshots_root: str, *, log: LogFn) -> Optio
         return None
 
 
-def _ops_db_can_skip_import(
+def _ops_db_matches_remote_sha(db: pidb.PoolIndexDB, remote_sha: Optional[str]) -> bool:
+    if db.count_shas() == 0:
+        return False
+    stored = (db.get_meta("master_sha256") or "").strip().lower()
+    return bool(remote_sha and stored and remote_sha == stored)
+
+
+def _open_ops_db_if_current(
+    cfg: dict,
+    snapshots_root: str,
+    env_vars: Optional[dict],
+    *,
+    log: LogFn,
+    allow_without_remote_sha: bool = False,
+) -> Optional[pidb.PoolIndexDB]:
+    """
+    Ops-DB öffnen wenn Remote-SHA zum letzten Import passt (kein Download/Import).
+    """
+    db_path = pidb.default_ops_db_path(env_vars)
+    if not os.path.isfile(db_path):
+        return None
+    db = pidb.open_db(db_path, create=False)
+    n = db.count_shas()
+    if n == 0:
+        db.close()
+        return None
+    remote_sha = remote_master_sha256(cfg, snapshots_root, log=log)
+    if _ops_db_matches_remote_sha(db, remote_sha):
+        log(
+            "[gc-engine] Ops-DB aktuell (Remote-SHA) — Download/Re-Import übersprungen"
+        )
+        master_path, _ = master_paths(env_vars)
+        if os.path.isfile(master_path):
+            db.refresh_master_metadata(master_path)
+        return db
+    if allow_without_remote_sha and not remote_sha:
+        log(
+            f"[gc-engine][warn] Remote-SHA unbekannt — Ops-DB für Lesen ({n} SHAs)"
+        )
+        return db
+    db.close()
+    return None
+
+
+def _ops_db_can_skip_import_after_download(
     db: pidb.PoolIndexDB,
     master_path: str,
     remote_sha: Optional[str],
 ) -> bool:
     if db.count_shas() == 0:
         return False
-    stored = (db.get_meta("master_sha256") or "").strip().lower()
-    if stored and remote_sha and remote_sha == stored:
+    if _ops_db_matches_remote_sha(db, remote_sha):
         return True
     if db.master_fingerprint_matches(master_path) is True:
         return True
-    # Kein master_file_sha256_matches — liest 2 GB JSON erneut (Pi-minuten, kein Mehrwert).
     return False
 
 
@@ -99,6 +142,25 @@ def download_remote_master(
     log(f"[gc-engine] Download fertig ({time.time() - t0:.1f}s, {os.path.getsize(master_path)} bytes)")
 
 
+def open_ops_db_for_queries(
+    cfg: dict,
+    snapshots_root: str,
+    env_vars: Optional[dict],
+    *,
+    log: LogFn,
+) -> pidb.PoolIndexDB:
+    """Forecast / GC Phase 1 — gleicher Fast-Path wie scharf, nur SQL-Lesen."""
+    log_path = pidb.default_ops_db_path(env_vars)
+    log(f"[gc-engine] Ops-SQLite (Abfragen): {log_path}")
+    current = _open_ops_db_if_current(
+        cfg, snapshots_root, env_vars, log=log, allow_without_remote_sha=True,
+    )
+    if current is not None:
+        return current
+    log("[gc-engine] Ops-DB fehlt oder Remote geändert — Sync …")
+    return open_synced_db(cfg, snapshots_root, env_vars, log=log)
+
+
 def open_synced_db(
     cfg: dict,
     snapshots_root: str,
@@ -106,34 +168,34 @@ def open_synced_db(
     *,
     log: LogFn,
 ) -> pidb.PoolIndexDB:
-    """Remote-Master auf Disk, SQLite spiegeln (streaming import wenn nötig)."""
-    master_path, _ = master_paths(env_vars)
+    """Ops-DB zum Remote-Stand (Download/Import nur wenn nötig)."""
     db_path = pidb.default_ops_db_path(env_vars)
-    log(f"[gc-engine] Ops-SQLite (getrennt vom Backup-Index): {db_path}")
-    db = pidb.open_db(db_path, create=True)
+    log(f"[gc-engine] Ops-SQLite (Sync): {db_path}")
 
+    current = _open_ops_db_if_current(
+        cfg, snapshots_root, env_vars, log=log, allow_without_remote_sha=False,
+    )
+    if current is not None:
+        return current
+
+    master_path, _ = master_paths(env_vars)
+    db = pidb.open_db(db_path, create=True)
     remote_sha = remote_master_sha256(cfg, snapshots_root, log=log)
     stored = (db.get_meta("master_sha256") or "").strip().lower()
-    if remote_sha and stored and remote_sha == stored and db.count_shas() > 0:
-        log(
-            "[gc-engine] Remote-Index unverändert (SHA256) — "
-            "Download und Re-Import übersprungen"
-        )
-        if os.path.isfile(master_path):
-            db.refresh_master_metadata(master_path)
-        return db
 
-    if remote_sha and stored and remote_sha != stored:
+    if remote_sha and stored and remote_sha != stored and db.count_shas() > 0:
         log("[gc-engine] Remote-Index geändert seit letztem Ops-Import — Download …")
     elif not stored or db.count_shas() == 0:
         log("[gc-engine] Ops-Index leer oder ohne Fingerprint — Download …")
-    else:
+    elif not remote_sha:
         log("[gc-engine] Remote-SHA unbekannt — Download …")
+    else:
+        log("[gc-engine] Ops-DB nicht mehr aktuell — Download …")
 
     download_remote_master(cfg, snapshots_root, master_path, log=log)
     remote_sha = remote_sha or remote_master_sha256(cfg, snapshots_root, log=log)
 
-    if _ops_db_can_skip_import(db, master_path, remote_sha):
+    if _ops_db_can_skip_import_after_download(db, master_path, remote_sha):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
         db.refresh_master_metadata(master_path)
         return db
@@ -237,13 +299,12 @@ def _dry_simulate_purge_on_ops_db(
     *,
     log: LogFn,
 ) -> Dict[str, int]:
-    """Dry-run delete-snapshots: bestehende Ops-DB — kein Download, Import, digest."""
+    """Dry-run delete-snapshots / retention: Ops-DB — kein Download, Import, digest."""
     db_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Dry-run: Ops-DB nur lesen (kein Remote-Download): {db_path}")
     if not os.path.isfile(db_path):
         log(
-            "[gc-engine][ERROR] Ops-DB fehlt — zuerst einmal Lauf mit neuem Code "
-            "(pull) oder Ops-Import; Backup-DB pool_index.sqlite3 wird nicht genutzt."
+            "[gc-engine][ERROR] Ops-DB fehlt — einmaliger Sync nötig (scharf oder Forecast/GC)."
         )
         return {"removed_snap_refs": 0}
     db = pidb.open_db(db_path, create=False)
@@ -300,7 +361,7 @@ def referenced_shas_for_gc(
     *,
     log: LogFn,
 ) -> Set[str]:
-    db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
+    db = open_ops_db_for_queries(cfg, snapshots_root, env_vars, log=log)
     try:
         return db.referenced_shas_for_snapshots(remote_snaps)
     finally:

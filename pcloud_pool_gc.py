@@ -645,7 +645,7 @@ def run_retention_forecast(
         _log("[retention-forecast] Nichts zu loeschen")
 
     if gci and gci.gc_engine_enabled(env_vars):
-        db = gci.open_synced_db(cfg, snapshots_root, env_vars, log=_log)
+        db = gci.open_ops_db_for_queries(cfg, snapshots_root, env_vars, log=_log)
         try:
             refs_now, refs_after, orphan_shas = gci.retention_index_metrics(
                 db, remote_snaps, set(to_delete),

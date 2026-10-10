@@ -949,6 +949,8 @@ class PoolIndexDB:
             "streamed": n_shas,
         }
         self.refresh_master_metadata(json_path)
+        if log:
+            log("[index-db] content_digest berechnen (viele snap_refs — kann Minuten dauern) …")
         content_digest = self.digest()["sha256"]
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_content_digest', ?)",
