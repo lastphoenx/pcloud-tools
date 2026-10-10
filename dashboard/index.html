@@ -1017,7 +1017,18 @@
       }
 
       if (ma === 'FAILED' || fr === 'FAILED') {
-        if (/listfolder incomplete/i.test(sum) || maN >= 1000) {
+        if (/manifest pool gaps/i.test(sum)) {
+          return {
+            kind: 'pool_gaps',
+            badge: 'Pool-L\u00fccken',
+            badgeCls: 'failed',
+            explain: 'Manifest-SHAs fehlen im _pool (Check A). Kein Listing-Abbruch — Restore aus diesem Snap w\u00e4re f\u00fcr diese Hashes kaputt. Report unter /srv/pcloud-archive/integrity/.',
+            currentN: maN,
+            currentSrc: 'Manifest vs Pool',
+            histN: 0
+          };
+        }
+        if (/listfolder incomplete/i.test(sum)) {
           return {
             kind: 'listing_incomplete',
             badge: 'Listing unvollständig',
@@ -1106,6 +1117,11 @@
           + '<span class="integrity-check-meta">scheinbar fehlend</span>'
           + '<span class="integrity-hist">Listing-Abbruch, keine fehlenden Dateien</span>';
       }
+      if (info.kind === 'pool_gaps') {
+        return '<span class="val red">' + fmtCount(info.currentN) + '</span>'
+          + '<span class="integrity-check-meta">' + esc(info.currentSrc || 'Pool') + '</span>'
+          + '<span class="integrity-hist">fehlende SHA256 im _pool</span>';
+      }
       if (info.currentN > 0) {
         let html = '<span class="val red">' + fmtCount(info.currentN) + '</span>';
         if (info.currentSrc) html += '<span class="integrity-check-meta">' + esc(info.currentSrc) + '</span>';
@@ -1158,27 +1174,34 @@
       let intPuOpen = (intSum.post_upload_open != null) ? intSum.post_upload_open : intPuFail;
       const intPuHist = intSum.post_upload_superseded || 0;
       let intAuFail = intSum.audit_failed || 0;
+      let intAuOk = intSum.audit_ok || 0;
       let intStale  = intSum.audit_stale || 0;
       const intTotal  = intSum.total || intSnaps.length;
       const sb = (cloud.checks || {}).sync_backlog || {};
       const inv = integrityInventory(sb);
       const intInfos = intSnaps.map(r => interpretIntegrity(r, inv));
-      let intGone = 0, intNoMan = 0, intAuFailLive = 0, intPuOpenLive = 0, intStaleLive = 0;
-      intInfos.forEach(info => {
+      let intGone = 0, intNoMan = 0, intPuOpenLive = 0, intStaleLive = 0;
+      intInfos.forEach((info, idx) => {
         if (info.kind === 'gone') intGone++;
         else if (info.kind === 'no_manifest') intNoMan++;
-        else if (info.kind === 'audit_fail') intAuFailLive++;
         else if (info.kind === 'gate_open') intPuOpenLive++;
         else if (info.kind === 'stale') intStaleLive++;
       });
       if (inv.hasInventory) {
-        intAuFail = intAuFailLive;
+        intAuFail = 0;
+        intAuOk = 0;
         intPuOpen = intPuOpenLive;
         intStale = intStaleLive;
+        intSnaps.forEach((r, idx) => {
+          if (intInfos[idx].kind === 'gone') return;
+          const ma = r.monthly_audit_status || '';
+          if (ma === 'FAILED') intAuFail++;
+          else if (ma === 'OK') intAuOk++;
+        });
       }
       const kindRank = {
-        no_manifest: 0, audit_fail: 1, listing_incomplete: 2, gate_open: 3,
-        stale: 4, unknown: 5, ok: 6, superseded: 7, gone: 8
+        no_manifest: 0, pool_gaps: 1, audit_fail: 2, listing_incomplete: 3, gate_open: 4,
+        stale: 5, unknown: 6, ok: 7, superseded: 8, gone: 9
       };
       const intRows = intSnaps.map((r, i) => ({ r: r, info: intInfos[i] }))
         .sort(function(a, b) {
@@ -1257,7 +1280,7 @@
           + '<div class="summary-box clickable ' + (intStale > 0 ? 'yellow' : 'gray') + '" onclick="openIntegrityDetail(\'stale\')" title="Letzter Audit OK, aber \u00e4lter als 35 Tage. Nur noch auf pCloud.">'
           + '<div class="big">' + intStale + '</div><div class="lbl">Pr\u00fcfung alt</div></div>'
           + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'au_ok\')" title="Klicken: Snapshots mit aktuellem Audit OK">'
-          + '<div class="big">' + (intSum.audit_ok || 0) + '</div><div class="lbl">Audit OK</div></div>'
+          + '<div class="big">' + intAuOk + '</div><div class="lbl">Audit OK</div></div>'
           + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'all\')" title="Klicken: Live-Zeilen (GC-Historie aus)">'
           + '<div class="big">' + intTotal + '</div><div class="lbl">Snapshots (DB)</div></div>'
           + '</div>';
@@ -1321,7 +1344,7 @@
               const ma = r.monthly_audit_status || '\u2014';
               const fr = r.audit_freshness || 'UNKNOWN';
               const hideGone = info.kind === 'gone' ? ' style="display:none"' : '';
-              const rowCls = info.kind === 'audit_fail' ? 'row-failed'
+              const rowCls = (info.kind === 'audit_fail' || info.kind === 'pool_gaps') ? 'row-failed'
                 : (info.kind === 'listing_incomplete' || info.kind === 'gate_open' || info.kind === 'no_manifest' ? 'row-running' : '');
               const tip = [info.explain, r.monthly_audit_summary].filter(Boolean).join(' | ');
               const puExtra = (pu === 'FAILED' && (r.post_upload_issues || 0) > 0)
@@ -2091,7 +2114,8 @@
         const kind = tr.getAttribute('data-kind') || '';
         let hit = true;
         if (filter === 'pu_fail' || filter === 'pu_open') hit = kind === 'gate_open';
-        else if (filter === 'au_fail') hit = kind === 'audit_fail';
+        else if (filter === 'au_fail') hit = kind === 'audit_fail' || kind === 'pool_gaps'
+          || tr.getAttribute('data-au') === 'FAILED';
         else if (filter === 'stale') hit = kind === 'stale';
         else if (filter === 'au_ok') hit = kind === 'ok' || kind === 'superseded';
         else if (filter === 'gone') hit = kind === 'gone';
