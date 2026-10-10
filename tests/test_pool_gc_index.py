@@ -121,6 +121,69 @@ class UploadPendingTests(unittest.TestCase):
         self.assertEqual(db2.get_meta("reapply_purge_after_sync"), "snap-a")
         db2.close()
 
+    def test_query_path_does_not_upload_pending(self) -> None:
+        db = pidb.open_db(self.ops_db, create=True)
+        db.import_from_json_streaming(self.master)
+        db.set_meta("upload_pending", "1")
+        db.set_meta("master_pending_sha256", "dd" * 32)
+        db.close()
+        logs: list[str] = []
+
+        def log(msg: str) -> None:
+            logs.append(msg)
+
+        with mock.patch.object(gci, "_open_ops_db_if_current") as cur:
+            cur.return_value = pidb.open_db(self.ops_db, create=False)
+            with mock.patch.object(gci, "_upload_master_resumable") as up:
+                gci.open_ops_db_for_queries(
+                    {}, "/pool/_snapshots", self._env(), log=log,
+                )
+                up.assert_not_called()
+        self.assertTrue(any("nur Lesen" in m for m in logs))
+
+    def test_noop_purge_after_sync_skips_export(self) -> None:
+        db = pidb.open_db(self.ops_db, create=True)
+        db.import_from_json_streaming(self.master)
+        db.close()
+        logs: list[str] = []
+
+        def log(msg: str) -> None:
+            logs.append(msg)
+
+        with mock.patch.object(
+            gci, "open_synced_db",
+            side_effect=lambda *a, **k: pidb.open_db(self.ops_db, create=False),
+        ):
+            with mock.patch.object(gci, "export_master_from_db") as exp:
+                stats = gci.apply_index_purge_for_deleted_snaps(
+                    {},
+                    "/pool/_snapshots",
+                    self._env(),
+                    {"snap-missing"},
+                    dry=False,
+                    log=log,
+                )
+                exp.assert_not_called()
+        self.assertEqual(stats["removed_snap_refs"], 0)
+
+    def test_reapply_keeps_meta_if_purge_fails(self) -> None:
+        db = pidb.open_db(self.ops_db, create=True)
+        db.set_meta("reapply_purge_after_sync", "snap-x,snap-y")
+        db.close()
+
+        with mock.patch.object(
+            gci,
+            "apply_index_purge_for_deleted_snaps",
+            side_effect=RuntimeError("disk"),
+        ):
+            with self.assertRaises(RuntimeError):
+                gci._reapply_purge_after_remote_drift(
+                    {}, "/pool/_snapshots", self._env(), log=lambda _m: None,
+                )
+        db2 = pidb.open_db(self.ops_db, create=False)
+        self.assertEqual(db2.get_meta("reapply_purge_after_sync"), "snap-x,snap-y")
+        db2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

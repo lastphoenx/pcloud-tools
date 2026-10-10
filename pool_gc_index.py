@@ -89,12 +89,31 @@ def _abort_stale_pending_upload(
     db.conn.commit()
 
 
+def _log_deferred_index_repairs(env_vars: Optional[dict], *, log: LogFn) -> None:
+    db_path = pidb.default_ops_db_path(env_vars)
+    if not os.path.isfile(db_path):
+        return
+    db = pidb.open_db(db_path, create=False)
+    try:
+        pending = db.get_meta("upload_pending") == "1"
+        reapply = (db.get_meta("reapply_purge_after_sync") or "").strip()
+        if pending or reapply:
+            log(
+                "[gc-engine][info] Ausstehende Index-Reparatur "
+                f"(upload_pending={pending}, reapply={bool(reapply)}) — "
+                "nur Lesen; scharfer delete-snapshots/Retention/GC-Sync führt Repair aus"
+            )
+    finally:
+        db.close()
+
+
 def _reapply_purge_after_remote_drift(
     cfg: dict,
     snapshots_root: str,
     env_vars: Optional[dict],
     *,
     log: LogFn,
+    repair_writes: bool = True,
 ) -> None:
     db_path = pidb.default_ops_db_path(env_vars)
     if not os.path.isfile(db_path):
@@ -102,12 +121,14 @@ def _reapply_purge_after_remote_drift(
     db = pidb.open_db(db_path, create=False)
     try:
         raw = (db.get_meta("reapply_purge_after_sync") or "").strip()
-        if not raw:
-            return
-        snaps = {s.strip() for s in raw.split(",") if s.strip()}
-        db.set_meta("reapply_purge_after_sync", "", commit=True)
     finally:
         db.close()
+    if not raw:
+        return
+    if not repair_writes:
+        _log_deferred_index_repairs(env_vars, log=log)
+        return
+    snaps = {s.strip() for s in raw.split(",") if s.strip()}
     if not snaps:
         return
     log(
@@ -116,6 +137,11 @@ def _reapply_purge_after_remote_drift(
     apply_index_purge_for_deleted_snaps(
         cfg, snapshots_root, env_vars, snaps, dry=False, log=log,
     )
+    db2 = pidb.open_db(db_path, create=False)
+    try:
+        db2.set_meta("reapply_purge_after_sync", "", commit=True)
+    finally:
+        db2.close()
 
 
 def maybe_flush_pending_master_upload(
@@ -124,6 +150,7 @@ def maybe_flush_pending_master_upload(
     env_vars: Optional[dict],
     *,
     log: LogFn,
+    repair_writes: bool = True,
 ) -> bool:
     """
     Nach fehlgeschlagenem Master-Upload: lokaler Master/Ops-DB sind neu,
@@ -135,6 +162,9 @@ def maybe_flush_pending_master_upload(
     db = pidb.open_db(db_path, create=False)
     try:
         if db.get_meta("upload_pending") != "1":
+            return False
+        if not repair_writes:
+            _log_deferred_index_repairs(env_vars, log=log)
             return False
         master_path, _ = master_paths(env_vars)
         if not os.path.isfile(master_path):
@@ -272,9 +302,12 @@ def open_ops_db_for_queries(
     env_vars: Optional[dict],
     *,
     log: LogFn,
+    repair_writes: bool = False,
 ) -> pidb.PoolIndexDB:
     """Forecast / GC Phase 1 — gleicher Fast-Path wie scharf, nur SQL-Lesen."""
-    maybe_flush_pending_master_upload(cfg, snapshots_root, env_vars, log=log)
+    maybe_flush_pending_master_upload(
+        cfg, snapshots_root, env_vars, log=log, repair_writes=repair_writes,
+    )
     log_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Ops-SQLite (Abfragen): {log_path}")
     current = _open_ops_db_if_current(
@@ -283,7 +316,9 @@ def open_ops_db_for_queries(
     if current is not None:
         return current
     log("[gc-engine] Ops-DB fehlt oder Remote geändert — Sync …")
-    return open_synced_db(cfg, snapshots_root, env_vars, log=log)
+    return open_synced_db(
+        cfg, snapshots_root, env_vars, log=log, repair_writes=repair_writes,
+    )
 
 
 def open_synced_db(
@@ -292,9 +327,12 @@ def open_synced_db(
     env_vars: Optional[dict],
     *,
     log: LogFn,
+    repair_writes: bool = True,
 ) -> pidb.PoolIndexDB:
     """Ops-DB zum Remote-Stand (Download/Import nur wenn nötig)."""
-    maybe_flush_pending_master_upload(cfg, snapshots_root, env_vars, log=log)
+    maybe_flush_pending_master_upload(
+        cfg, snapshots_root, env_vars, log=log, repair_writes=repair_writes,
+    )
     db_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Ops-SQLite (Sync): {db_path}")
 
@@ -328,12 +366,16 @@ def open_synced_db(
     if _ops_db_can_skip_import_after_download(db, master_path, file_sha):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
         db.refresh_master_metadata(master_path, known_sha256=file_sha)
-        _reapply_purge_after_remote_drift(cfg, snapshots_root, env_vars, log=log)
+        _reapply_purge_after_remote_drift(
+            cfg, snapshots_root, env_vars, log=log, repair_writes=repair_writes,
+        )
         return db
 
     log("[gc-engine] Streaming-Import Master → SQLite …")
     db.import_from_json_streaming(master_path, log=log, known_sha256=file_sha)
-    _reapply_purge_after_remote_drift(cfg, snapshots_root, env_vars, log=log)
+    _reapply_purge_after_remote_drift(
+        cfg, snapshots_root, env_vars, log=log, repair_writes=repair_writes,
+    )
     return db
 
 
@@ -481,19 +523,9 @@ def apply_index_purge_for_deleted_snaps(
         return {"removed_snap_refs": 0}
     if dry:
         return _dry_simulate_purge_on_ops_db(env_vars, deleted_snaps, log=log)
-    db_path = pidb.default_ops_db_path(env_vars)
-    if os.path.isfile(db_path):
-        pre = pidb.open_db(db_path, create=False)
-        try:
-            if not any(pre.snap_ref_count(s) for s in deleted_snaps):
-                log(
-                    "[gc-engine] Keine snap-refs für gelöschte Snapshots — "
-                    "Export/Upload übersprungen"
-                )
-                return {"removed_snap_refs": 0}
-        finally:
-            pre.close()
-    db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
+    db = open_synced_db(
+        cfg, snapshots_root, env_vars, log=log, repair_writes=True,
+    )
     c = db.conn
     master_path = ""
     file_sha = ""

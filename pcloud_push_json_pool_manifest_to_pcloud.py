@@ -721,7 +721,8 @@ def save_content_index_from_db(cfg: dict, snapshots_root: str, db, *, dry: bool 
         os.chmod(master_path, 0o644)
     except OSError:
         pass
-    db.refresh_master_metadata(master_path)
+    known_sha = (st.get("file_sha256") or "").strip().lower() or None
+    db.refresh_master_metadata(master_path, known_sha256=known_sha)
     file_size = st.get("bytes") or os.path.getsize(staging_path)
     _log(
         f"[index] ✓ Lokal {pc._format_byte_size(file_size)} in {time.time() - t_local:.1f}s "
@@ -736,22 +737,22 @@ def _pool_index_db_enabled() -> bool:
 
 
 def _open_pool_index_db_for_run():
-    """Oeffnet die C1-SQLite oder None (Legacy-JSON-Pfad)."""
+    """Oeffnet die C1-SQLite oder None (nur wenn PCLOUD_POOL_INDEX_DB=0)."""
     if not _pool_index_db_enabled():
         return None
     try:
         import pool_index_db as pidb
     except Exception as e:
-        _log(f"[index-db][warn] Import fehlgeschlagen: {e} — Fallback JSON")
-        return None
+        _log(f"[index-db][ERROR] Import fehlgeschlagen: {e}")
+        sys.exit(2)
 
     auto = os.environ.get("PCLOUD_POOL_INDEX_DB_AUTOIMPORT", "1") != "0"
     master = pidb.default_master_path()
     try:
         db = pidb.open_db(pidb.default_db_path(), create=True)
     except Exception as e:
-        _log(f"[index-db][warn] DB oeffnen fehlgeschlagen: {e} — Fallback JSON")
-        return None
+        _log(f"[index-db][ERROR] DB oeffnen fehlgeschlagen: {e}")
+        sys.exit(2)
 
     try:
         match = db.master_fingerprint_matches(master)
@@ -771,9 +772,9 @@ def _open_pool_index_db_for_run():
                 _log("[index-db] Master geändert → Streaming-Re-Import")
                 db.import_from_json_streaming(master, log=_log)
                 return db
-            _log("[index-db][warn] DB stale, AUTOIMPORT=0 — Fallback JSON")
+            _log("[index-db][ERROR] DB stale und kein Auto-Import — Abbruch")
             db.close()
-            return None
+            sys.exit(2)
         if populated and match is None:
             _log("[index-db][warn] Master-JSON fehlt — nutze DB")
             return db
@@ -781,16 +782,16 @@ def _open_pool_index_db_for_run():
             _log("[index-db] DB leer/neu → Streaming-Import aus Master")
             db.import_from_json_streaming(master, log=_log)
             return db
-        _log("[index-db][warn] DB leer und kein Master — Fallback JSON")
+        _log("[index-db][ERROR] DB leer und kein Master — Abbruch")
         db.close()
-        return None
+        sys.exit(2)
     except Exception as e:
-        _log(f"[index-db][warn] {e} — Fallback JSON")
+        _log(f"[index-db][ERROR] {e}")
         try:
             db.close()
         except Exception:
             pass
-        return None
+        sys.exit(2)
 
 
 def _delta_merge_basis_refs(

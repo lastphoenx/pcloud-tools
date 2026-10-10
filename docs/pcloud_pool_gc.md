@@ -64,7 +64,7 @@ Während ein Backup läuft, setzt `pcloud_push_json_pool_manifest_to_pcloud.py` 
 
 Ops-Index **`pool_index_gc.sqlite3`** (getrennt von Backup-`pool_index.sqlite3`). **Ein** Fast-Path für Dry und scharf: Remote-`checksumfile` → bei gleichem SHA kein 2-GB-Download/Re-Import; Lesen (Forecast, GC Phase 1) und Schreiben (Purge/Upload) nutzen `pool_gc_index.py`. GC Phase 1 prüft Referenzen per SQL (`sha_has_remote_snap_ref`), kein millionenfaches SHA-Set im RAM. Dry-run `delete-snapshots`/`retention`: Purge nur gegen bestehende Ops-DB. Optional: `PCLOUD_GC_INDEX_DB_PATH`.
 
-Nach Purge/Export: `upload_pending=1` bis der Master-Upload gelingt; jeder `open_synced_db` / `open_ops_db_for_queries` versucht den Upload erneut — **nur** wenn Remote-`checksumfile` noch zur gespeicherten `master_sha256`-Basis passt (sonst Sync von Remote, Purge aus `reapply_purge_after_sync`). Kein Export/Upload bei 0 entfernten snap-refs. Fehlendes `ijson`/`pool_gc_index` → Exit 2.
+Nach Purge/Export: `upload_pending=1` bis der Master-Upload gelingt. **Nur** `open_synced_db(repair_writes=True)` (scharf) führt Retry/Reapply aus; Forecast/GC Phase 1 (`open_ops_db_for_queries`, `repair_writes=False`) loggt Pending und schreibt nicht nach Remote. Retry nur wenn Remote-`checksumfile` noch zur `master_sha256`-Basis passt; sonst Sync + `reapply_purge_after_sync` (Meta bleibt bis Purge-Erfolg). Kein Export/Upload bei 0 snap-refs (nach Sync). Fehlendes `ijson`/`pool_gc_index` → Exit 2.
 
 `--audit-mode` ist deaktiviert (Stub-Scan / RAM-Set) bis Streaming-Umbau.
 
