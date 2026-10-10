@@ -269,13 +269,40 @@ def _collect_stub_paths_subtree_batch(
 def _load_remote_json_at(cfg: dict, path: str) -> Optional[dict]:
     """Remote JSON lesen; None wenn Datei fehlt (kein getfilelink-Exception)."""
     path = pc._norm_remote_path(path)
-    if not pc.stat_file_safe(cfg, path=path):
+    try:
+        if pc.classify_remote_file_stat(cfg, path=path) != "present":
+            return None
+    except Exception:
         return None
     try:
         txt = pc.get_textfile(cfg, path=path, maxbytes=None)
         return json.loads(txt or "{}")
     except Exception:
         return None
+
+
+def _merge_pool_refs(into: dict, part: dict) -> None:
+    """Vereinigt pool_refs aus mehreren Snap-Archiv-Indizes (kein 2-GB-Master)."""
+    for sha, entry in (part or {}).items():
+        if sha not in into:
+            into[sha] = entry
+            continue
+        if not isinstance(into[sha], dict) or not isinstance(entry, dict):
+            into[sha] = entry
+            continue
+        ts = into[sha].get("snapshots")
+        es = entry.get("snapshots")
+        if isinstance(ts, dict) and isinstance(es, dict):
+            for snap, rps in es.items():
+                prev = ts.get(snap) or []
+                if isinstance(prev, list) and isinstance(rps, list):
+                    ts[snap] = list(dict.fromkeys(list(prev) + list(rps)))
+                else:
+                    ts[snap] = rps
+            into[sha]["snapshots"] = ts
+        for key in ("fileid", "size", "hash"):
+            if key in entry and key not in into[sha]:
+                into[sha][key] = entry[key]
 
 
 def _fetch_pool_refs(
@@ -293,6 +320,20 @@ def _fetch_pool_refs(
             refs = idx.get("pool_refs") or {}
             return refs, f"archive/{snap}_index.json ({len(refs)} refs)"
         return {}, f"archive/{snap}_index.json (noch nicht vorhanden — Manifest-only)"
+
+    if snapshot_filter and len(snapshot_filter) > 1:
+        merged: dict = {}
+        parts: List[str] = []
+        for snap in snapshot_filter:
+            archive_path = f"{snaps_root}/_index/archive/{snap}_index.json"
+            idx = _load_remote_json_at(cfg, archive_path)
+            if idx is None:
+                parts.append(f"{snap}: archive fehlt")
+                continue
+            refs = idx.get("pool_refs") or {}
+            _merge_pool_refs(merged, refs)
+            parts.append(f"{snap}: {len(refs)} refs")
+        return merged, "archive merge (" + "; ".join(parts) + f"; union {len(merged)} shas)"
 
     master_path = f"{snaps_root}/_index/content_index.json"
     idx = _load_remote_json_at(cfg, master_path)

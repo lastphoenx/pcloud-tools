@@ -16,7 +16,7 @@ import pcloud_push_json_pool_manifest_to_pcloud as push  # noqa: E402
 class BackupIndexBootstrapTests(unittest.TestCase):
     def test_bootstrap_skips_when_remote_index_missing(self) -> None:
         db = mock.MagicMock()
-        with mock.patch.object(push.pc, "stat_file_safe", return_value={}):
+        with mock.patch.object(push.pc, "classify_remote_file_stat", return_value="absent"):
             with mock.patch("pool_gc_index.download_remote_master") as dl:
                 push._bootstrap_backup_db_from_remote_master(
                     {"token": "t"},
@@ -27,6 +27,21 @@ class BackupIndexBootstrapTests(unittest.TestCase):
         dl.assert_not_called()
         db.import_from_json_streaming.assert_not_called()
 
+    def test_bootstrap_exits_on_stat_timeout_not_empty_db(self) -> None:
+        db = mock.MagicMock()
+        with mock.patch.object(
+            push.pc, "classify_remote_file_stat", side_effect=TimeoutError("timed out"),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                push._bootstrap_backup_db_from_remote_master(
+                    {"token": "t"},
+                    db,
+                    "/tmp/content_index_master.json",
+                    "/backup-root/_snapshots",
+                )
+        self.assertEqual(ctx.exception.code, 2)
+        db.import_from_json_streaming.assert_not_called()
+
     @mock.patch.dict(os.environ, {"PCLOUD_POOL_INDEX_DB": "1"})
     def test_open_pool_index_uses_passed_cfg_not_effective_config(self) -> None:
         db = mock.MagicMock()
@@ -34,7 +49,7 @@ class BackupIndexBootstrapTests(unittest.TestCase):
         db.master_fingerprint_matches.return_value = False
         cfg = {"host": "example", "token": "secret"}
         with mock.patch.object(push.pc, "effective_config", side_effect=AssertionError("no")):
-            with mock.patch.object(push.pc, "stat_file_safe", return_value={}):
+            with mock.patch.object(push.pc, "classify_remote_file_stat", return_value="absent"):
                 with mock.patch("pool_index_db.open_db", return_value=db):
                     with mock.patch(
                         "pool_index_db.default_master_path",

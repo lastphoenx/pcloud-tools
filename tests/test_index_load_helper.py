@@ -30,6 +30,7 @@ class IndexLoadHelperTests(unittest.TestCase):
         # Peek (maxbytes) reicht — kein Voll-Download
         self.assertTrue(all(c.kwargs.get("maxbytes") for c in gt.call_args_list))
 
+    @mock.patch.dict(os.environ, {"PCLOUD_MAX_LOCAL_INDEX_BYTES": "1024"})
     def test_legacy_rejects_large_local_v2_peek(self) -> None:
         import tempfile
 

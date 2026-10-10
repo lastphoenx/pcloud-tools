@@ -2383,6 +2383,27 @@ def get_textfile(cfg: dict, *, path: str | None = None, fileid: int | None = Non
     if maxbytes is not None:
         headers["Range"] = f"bytes=0-{int(maxbytes)-1}"
 
+    if maxbytes is not None:
+        r = session.get(
+            link,
+            headers=headers,
+            timeout=int(cfg.get("timeout", 30)),
+            allow_redirects=True,
+            stream=True,
+        )
+        r.raise_for_status()
+        buf = bytearray()
+        try:
+            for chunk in r.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) >= int(maxbytes):
+                    break
+        finally:
+            r.close()
+        return bytes(buf[: int(maxbytes)]).decode(encoding, errors="replace")
+
     r = session.get(link, headers=headers, timeout=int(cfg.get("timeout", 30)), allow_redirects=True)
     r.raise_for_status()
     return r.content.decode(encoding, errors="replace")
@@ -2729,13 +2750,44 @@ def ensure_parent_dirs(cfg: dict, dest_path: str) -> int:
     parent = dest_path.rsplit("/", 1)[0] or "/"
     return ensure_path_cached(cfg, parent)
 
+def _api_error_is_not_found(msg: str) -> bool:
+    m = msg.lower()
+    return "2055" in msg or "2002" in msg or "not found" in m
+
+
+def classify_remote_file_stat(
+    cfg: Dict[str, Any],
+    *,
+    path: str | None = None,
+    fileid: int | None = None,
+) -> str:
+    """
+    present — Datei existiert (fileid gesetzt)
+    absent — 2055/2002/not found
+    Raises bei Timeout und anderen API-Fehlern (nicht als „fehlend“ werten).
+    """
+    try:
+        meta = stat_file(
+            cfg, path=path, fileid=fileid, with_checksum=False, enrich_path=False,
+        ) or {}
+    except RuntimeError as e:
+        if _api_error_is_not_found(str(e)):
+            return "absent"
+        raise
+    except TimeoutError:
+        raise
+    if meta.get("fileid"):
+        return "present"
+    return "absent"
+
+
 def stat_file_safe(cfg: Dict[str, Any], *, path: str | None = None, fileid: int | None = None) -> dict:
     """Wie stat_file, aber fängt 2055/Not-Found/Timeout sauber ab und gibt {} zurück."""
     try:
         return stat_file(cfg, path=path, fileid=fileid, with_checksum=False, enrich_path=True) or {}
     except Exception as e:
         msg = str(e)
-        if "2055" in msg or "2002" in msg or "not found" in msg.lower():
+        if _api_error_is_not_found(msg):
             return {}
         # API langsam/Timeout → wie „nicht gefunden“ (kein Prozess-Crash bei Remote-Listing)
         if isinstance(e, TimeoutError) or "timed out" in msg.lower() or "timeout" in msg.lower():

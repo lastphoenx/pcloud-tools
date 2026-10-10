@@ -650,6 +650,22 @@ def _upload_index_from_staging(
     log_every = int(os.environ.get("PCLOUD_INDEX_UPLOAD_LOG_EVERY_CHUNKS", "1"))
     verify = os.environ.get("PCLOUD_INDEX_UPLOAD_VERIFY", "1") != "0"
 
+    local_size = os.path.getsize(staging_path)
+    try:
+        if pc.classify_remote_file_stat(cfg, path=remote_path) == "present":
+            remote_meta = pc.stat_file_safe(cfg, path=remote_path)
+            remote_size = int(remote_meta.get("size") or 0)
+            min_ratio = float(os.environ.get("PCLOUD_INDEX_UPLOAD_MIN_SIZE_RATIO", "0.5"))
+            if remote_size > 0 and local_size < remote_size * min_ratio:
+                _log(
+                    f"[index][ERROR] Neuer Index ({local_size} B) deutlich kleiner als "
+                    f"Remote ({remote_size} B, ratio<{min_ratio}) — Upload abgebrochen"
+                )
+                sys.exit(2)
+    except Exception as e:
+        _log(f"[index][ERROR] Remote-Index-Größenprüfung fehlgeschlagen: {e}")
+        sys.exit(2)
+
     _log(f"[index] Upload nach pCloud: {remote_path} (pool_refs={n_refs})")
     t_up = time.time()
     pc.upload_local_file_resumable(
@@ -759,7 +775,12 @@ def _bootstrap_backup_db_from_remote_master(
     import pool_gc_index as gci
 
     remote = _remote_content_index_path(snapshots_root)
-    if not pc.stat_file_safe(cfg, path=remote).get("fileid"):
+    try:
+        stat = pc.classify_remote_file_stat(cfg, path=remote)
+    except Exception as e:
+        _log(f"[index-db][ERROR] Remote-Index stat fehlgeschlagen (kein leerer Bootstrap): {e}")
+        sys.exit(2)
+    if stat == "absent":
         _log(
             "[index-db] Kein Remote-Index — leere SQLite-DB "
             f"(erstes Backup / neues Ziel: {remote})"
