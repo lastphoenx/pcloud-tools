@@ -1,6 +1,7 @@
 # Optional dependency used by pcloud_binary_client.py for automatic .env loading
 python-dotenv>=1.2.3,<2
 requests>=2.34.2
+ijson>=3.2.3,<4
 textual>=0.89.1
 
 # Dependencies for analyze_manifest_duplicates.py

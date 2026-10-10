@@ -60,11 +60,13 @@ Während ein Backup läuft, setzt `pcloud_push_json_pool_manifest_to_pcloud.py` 
 | ≥ 48h (stale) | GC fährt fort (Backup vermutlich abgestürzt) |
 | Kein Lock | GC fährt fort |
 
-### Phase 1: Referenzen laden (Index-basiert, ~8s)
+### Phase 1: Referenzen laden (gc-engine / SQLite)
 
-Lädt `_snapshots/_index/content_index.json` und ermittelt **aktive** SHAs: nur solche, deren `pool_refs`-Eintrag mindestens einen noch existierenden Remote-Snapshot referenziert.
+Standard (`PCLOUD_GC_USE_INDEX_DB=1`, Default): Remote-`content_index.json` → Disk (`download_binaryfile_to`), **Streaming-Import** (`ijson`) in `pool_index.sqlite3`, aktive SHAs per SQL — **kein** volles `pool_refs`-Dict im RAM. Forecast, `--retention-apply`, `--delete-snapshots` und Pool-GC nutzen **dieselbe** Purge-/Referenz-Logik (`pool_gc_index.py`).
 
-**Performance:** ~0,1–10s statt Stunden bei Stub-Scan.
+Legacy (`PCLOUD_GC_USE_INDEX_DB=0`): `json.loads` des Master-Index (OOM-Risiko auf 8 GB Pi).
+
+**Performance:** Import/Abfrage typisch Sekunden–wenige Minuten; abhängig von Index-Größe und Netz.
 
 Beispiel-Log:
 

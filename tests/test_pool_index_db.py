@@ -446,6 +446,33 @@ class PoolIndexDbTests(unittest.TestCase):
                 fut.result()
         self.assertEqual(self.db.snapshot_pair_count(snap), 2)
 
+    def test_streaming_import_matches_bulk(self) -> None:
+        try:
+            import ijson  # noqa: F401
+        except ImportError:
+            self.skipTest("ijson not installed")
+        src = os.path.join(self.dir, "stream.json")
+        _write_json(src, _mini_v2())
+        db_bulk = pidb.open_db(os.path.join(self.dir, "bulk.sqlite3"))
+        db_stream = pidb.open_db(os.path.join(self.dir, "stream.sqlite3"))
+        try:
+            db_bulk.import_from_json(src)
+            db_stream.import_from_json_streaming(src)
+            self.assertEqual(db_bulk.digest()["sha256"], db_stream.digest()["sha256"])
+        finally:
+            db_bulk.close()
+            db_stream.close()
+
+    def test_referenced_and_orphan_shas(self) -> None:
+        src = os.path.join(self.dir, "orph.json")
+        _write_json(src, _mini_v2())
+        self.db.import_from_json(src)
+        remote = {"snap-a", "snap-b", "snap-c"}
+        refs = self.db.referenced_shas_for_snapshots(remote)
+        self.assertIn("aa" * 32, refs)
+        orphan = self.db.orphan_shas_if_snapshots_removed(remote, {"snap-a"})
+        self.assertIn("bb" * 32, orphan)
+
 
 if __name__ == "__main__":
     unittest.main()

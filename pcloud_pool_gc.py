@@ -80,6 +80,14 @@ except Exception as e:
     print(f"Fehler: pcloud_bin_lib konnte nicht importiert werden: {e}", file=sys.stderr)
     sys.exit(2)
 
+try:
+    import pool_gc_index as gci
+except Exception as e:
+    gci = None  # type: ignore
+    _GCI_IMPORT_ERR = str(e)
+else:
+    _GCI_IMPORT_ERR = ""
+
 
 # Thread-safe Set für referenced SHA256
 class _RefSet:
@@ -550,29 +558,52 @@ def _sync_pool_index_db_after_master(
         _log(f"[index-db][warn] Sync fehlgeschlagen: {e} — nächster Delta-Lauf reimportiert aus Master")
 
 
+def _extract_pool_files_from_tree(obj: dict, pool_root: str, out: List[dict]) -> None:
+    if not isinstance(obj, dict):
+        return
+    if not obj.get("isfolder"):
+        filename = (obj.get("name") or "").lower()
+        if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
+            out.append({
+                "name": filename,
+                "path": obj.get("path") or pc.pool_file_remote_path(pool_root, filename),
+                "size": obj.get("size", 0),
+                "modified": obj.get("modified"),
+                "fileid": obj.get("fileid"),
+            })
+        return
+    for child in obj.get("contents", []) or []:
+        _extract_pool_files_from_tree(child, pool_root, out)
+
+
+def _iter_pool_files_by_prefix(cfg: dict, pool_root: str):
+    """Pool-Dateien pro _pool/XX-Präfix (kein einzelner Riesen-listfolder)."""
+    top = pc.listfolder(cfg, path=pool_root, recursive=False, nofiles=True)
+    contents = (top.get("metadata", {}) or {}).get("contents", []) or []
+    prefixes = sorted(
+        c for c in contents
+        if c.get("isfolder") and c.get("name") and len(c.get("name", "")) == 2
+    )
+    if not prefixes:
+        batch: List[dict] = []
+        result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
+        _extract_pool_files_from_tree(result.get("metadata", {}) or {}, pool_root, batch)
+        for p in batch:
+            yield p
+        return
+    for i, child in enumerate(prefixes, 1):
+        label = child.get("name", "")
+        sub_path = child.get("path") or f"{pool_root.rstrip('/')}/{label}"
+        _log(f"[gc] Pool-Präfix {i}/{len(prefixes)}: {label}")
+        batch: List[dict] = []
+        result = pc.listfolder(cfg, path=sub_path, recursive=True, nofiles=False)
+        _extract_pool_files_from_tree(result.get("metadata", {}) or {}, pool_root, batch)
+        for p in batch:
+            yield p
+
+
 def _list_pool_files(cfg: dict, pool_root: str) -> List[dict]:
-    result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
-    pool_files: List[dict] = []
-
-    def _walk(obj: dict) -> None:
-        if not isinstance(obj, dict):
-            return
-        if not obj.get("isfolder"):
-            filename = (obj.get("name") or "").lower()
-            if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
-                pool_files.append({
-                    "name": filename,
-                    "path": obj.get("path") or pc.pool_file_remote_path(pool_root, filename),
-                    "size": obj.get("size", 0),
-                    "modified": obj.get("modified"),
-                    "fileid": obj.get("fileid"),
-                })
-            return
-        for child in obj.get("contents", []) or []:
-            _walk(child)
-
-    _walk(result.get("metadata", {}) or {})
-    return pool_files
+    return list(_iter_pool_files_by_prefix(cfg, pool_root))
 
 
 def run_retention_forecast(
@@ -613,10 +644,19 @@ def run_retention_forecast(
     else:
         _log("[retention-forecast] Nichts zu loeschen")
 
-    index, pool_refs = _load_index(cfg, snapshots_root)
-    refs_now = _referenced_shas(pool_refs, remote_snaps)
-    refs_after = _referenced_shas(pool_refs, keep_remote)
-    orphan_shas = _shas_orphaned_after_retention(pool_refs, set(to_delete), remote_snaps)
+    if gci and gci.gc_engine_enabled(env_vars):
+        db = gci.open_synced_db(cfg, snapshots_root, env_vars, log=_log)
+        try:
+            refs_now, refs_after, orphan_shas = gci.retention_index_metrics(
+                db, remote_snaps, set(to_delete),
+            )
+        finally:
+            db.close()
+    else:
+        index, pool_refs = _load_index(cfg, snapshots_root)
+        refs_now = _referenced_shas(pool_refs, remote_snaps)
+        refs_after = _referenced_shas(pool_refs, keep_remote)
+        orphan_shas = _shas_orphaned_after_retention(pool_refs, set(to_delete), remote_snaps)
 
     _log(f"[retention-forecast] Index-SHAs (remote-gebunden): {len(refs_now)}")
     _log(f"[retention-forecast] SHAs nach Retention noch referenziert: {len(refs_after)}")
@@ -760,13 +800,22 @@ def run_delete_snapshots(
             _log(f"[delete-snapshots][ERROR] {snap} noch remote — Index nicht bereinigt")
 
     if deleted_snaps:
-        index, _ = _load_index(cfg, snapshots_root)
-        purge_stats = _purge_snaps_from_index(index, deleted_snaps)
-        _log(
-            f"[delete-snapshots] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
-            f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt"
-        )
-        _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
+        env_vars = _load_env_file(env_file)
+        if gci and gci.gc_engine_enabled(env_vars):
+            purge_stats = gci.apply_index_purge_for_deleted_snaps(
+                cfg, snapshots_root, env_vars, deleted_snaps, dry=dry, log=_log,
+            )
+            _log(
+                f"[delete-snapshots] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
+            )
+        else:
+            index, _ = _load_index(cfg, snapshots_root)
+            purge_stats = _purge_snaps_from_index(index, deleted_snaps)
+            _log(
+                f"[delete-snapshots] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
+                f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt"
+            )
+            _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
     else:
         _log("[delete-snapshots] Index unveraendert")
 
@@ -786,7 +835,7 @@ def run_delete_snapshots(
         _log("[delete-snapshots] Starte Pool-GC …")
         gc_result = run_pool_gc(
             cfg, dest_root, dry=False, audit_mode=False,
-            grace_hours=grace_hours, verbose=verbose,
+            grace_hours=grace_hours, verbose=verbose, env_file=env_file,
         )
         result["gc"] = gc_result
     elif run_gc and dry:
@@ -858,11 +907,19 @@ def run_retention_apply(
             break
 
     if deleted_snaps:
-        index, _ = _load_index(cfg, snapshots_root)
-        purge_stats = _purge_snaps_from_index(index, deleted_snaps)
-        _log(f"[retention] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
-             f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt")
-        _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
+        if gci and gci.gc_engine_enabled(env_vars):
+            purge_stats = gci.apply_index_purge_for_deleted_snaps(
+                cfg, snapshots_root, env_vars, deleted_snaps, dry=dry, log=_log,
+            )
+            _log(
+                f"[retention] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
+            )
+        else:
+            index, _ = _load_index(cfg, snapshots_root)
+            purge_stats = _purge_snaps_from_index(index, deleted_snaps)
+            _log(f"[retention] Index bereinigt: {purge_stats['removed_snap_refs']} snap-refs, "
+                 f"{purge_stats['removed_shas']} pool_refs-Eintraege entfernt")
+            _save_index(cfg, snapshots_root, index, env_file, dry=dry, deleted_snaps=deleted_snaps)
     else:
         _log("[retention] Nichts zu loeschen — Index unveraendert")
 
@@ -885,7 +942,7 @@ def run_retention_apply(
         _log("[retention] Starte Pool-GC nach Retention...")
         gc_result = run_pool_gc(
             cfg, dest_root, dry=False, audit_mode=False,
-            grace_hours=grace_hours, verbose=verbose,
+            grace_hours=grace_hours, verbose=verbose, env_file=env_file,
         )
         result["gc"] = gc_result
     elif run_gc and dry:
@@ -951,56 +1008,48 @@ def _scan_snapshot_for_refs(
     verbose: bool = False
 ) -> None:
     """
-    Scannt einen Snapshot-Ordner rekursiv nach .meta.json Stubs und sammelt SHA256.
-    
-    Worker-Funktion für ThreadPoolExecutor.
+    Stubs pro Top-Level-Subtree listen (kein einzelner Riesen-recursive listfolder).
     """
     try:
         snapshot_name = snapshot_path.split("/")[-1]
-        
         if verbose:
             _log(f"[gc-scan] Scanning snapshot: {snapshot_name}")
-        
-        # Rekursiv alle Files im Snapshot auflisten
-        result = pc._rest_get(cfg, "listfolder", {
-            "path": snapshot_path,
-            "recursive": 1
-        })
-        
-        metadata = result.get("metadata", {})
-        contents = metadata.get("contents", [])
-        
-        # Filter: nur .meta.json Files
-        stub_files = [c for c in contents if not c.get("isfolder") and c.get("name", "").endswith(".meta.json")]
-        
-        sha256_list = []
-        
-        for stub in stub_files:
-            stub_path = stub.get("path")
-            
-            try:
-                # Download Stub via get_textfile (robust, REST API)
-                stub_content = pc.get_textfile(cfg, path=stub_path)
-                stub_data = json.loads(stub_content)
-                
-                # Extrahiere SHA256
-                sha256 = stub_data.get("sha256", "").lower()
-                if sha256:
-                    sha256_list.append(sha256)
-            
-            except Exception as e:
-                if verbose:
-                    _log(f"[gc-scan][WARN] Failed to read stub {stub_path}: {e}")
-                stats.inc_errors()
-        
-        # Batch-Update (effizienter als einzelne add() calls)
+        top = pc.listfolder(cfg, path=snapshot_path, recursive=False, nofiles=True)
+        subtrees = [
+            c for c in (top.get("metadata", {}) or {}).get("contents", []) or []
+            if c.get("isfolder") and c.get("path")
+        ]
+        if not subtrees:
+            subtrees = [{"path": snapshot_path, "name": snapshot_name}]
+        sha256_list: List[str] = []
+        for j, sub in enumerate(subtrees, 1):
+            sub_path = sub.get("path") or snapshot_path
+            label = sub.get("name") or sub_path.rsplit("/", 1)[-1]
+            if verbose and len(subtrees) > 1:
+                _log(f"[gc-scan]   {snapshot_name}: subtree {j}/{len(subtrees)} ({label})")
+            result = pc._rest_get(cfg, "listfolder", {"path": sub_path, "recursive": 1})
+            contents = (result.get("metadata", {}) or {}).get("contents", []) or []
+            stub_files = [
+                c for c in contents
+                if not c.get("isfolder") and (c.get("name") or "").endswith(".meta.json")
+            ]
+            for stub in stub_files:
+                stub_path = stub.get("path")
+                try:
+                    stub_content = pc.get_textfile(cfg, path=stub_path)
+                    stub_data = json.loads(stub_content)
+                    sha256 = stub_data.get("sha256", "").lower()
+                    if sha256:
+                        sha256_list.append(sha256)
+                except Exception as e:
+                    if verbose:
+                        _log(f"[gc-scan][WARN] Failed to read stub {stub_path}: {e}")
+                    stats.inc_errors()
         ref_set.update(sha256_list)
         stats.inc_stubs(len(sha256_list))
         stats.inc_snapshots()
-        
         if verbose:
             _log(f"[gc-scan] ✓ {snapshot_name}: {len(sha256_list)} refs")
-    
     except Exception as e:
         _log(f"[gc-scan][ERROR] Failed to scan {snapshot_path}: {e}")
         stats.inc_errors()
@@ -1051,7 +1100,8 @@ def run_pool_gc(
     dry: bool = False,
     audit_mode: bool = False,
     grace_hours: int = 24,
-    verbose: bool = False
+    verbose: bool = False,
+    env_file: str = ".env",
 ) -> dict:
     """
     Führt Pool Garbage Collection aus (OPTIMIZED VERSION).
@@ -1079,6 +1129,7 @@ def run_pool_gc(
     dest_root = pc._norm_remote_path(dest_root)
     snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
     pool_root = f"{dest_root.rstrip('/')}/_pool"
+    env_vars = _load_env_file(env_file)
     
     _log("[gc] ===== POOL GARBAGE COLLECTION START =====")
     _log(f"[gc] Mode: {'AUDIT (Deep-Validation)' if audit_mode else 'STANDARD (Index-basiert)'}")
@@ -1185,8 +1236,14 @@ def run_pool_gc(
              f"{scan_stats['stubs_scanned']} stubs, {len(referenced_sha256s)} unique SHA256 ({scan_duration:.1f}s)")
     
     else:
-        # STANDARD-MODE: Index-basiert (ultra-schnell!)
-        referenced_sha256s = _load_refs_from_index(cfg, snapshots_root, stats, verbose)
+        remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
+        if gci and gci.gc_engine_enabled(env_vars):
+            _log("[gc] PHASE 1: Index (gc-engine / SQLite, kein Master-Dict im RAM)")
+            referenced_sha256s = gci.referenced_shas_for_gc(
+                cfg, snapshots_root, env_vars, remote_snaps, log=_log,
+            )
+        else:
+            referenced_sha256s = _load_refs_from_index(cfg, snapshots_root, stats, verbose)
         
         # Fallback auf Stub-Scan falls Index-Load fehlschlägt
         if not referenced_sha256s:
@@ -1227,52 +1284,18 @@ def run_pool_gc(
     # ============================================================================
     # === PHASE 2: Liste alle Pool-Files (REKURSIV, 1 API-Call!) ===
     # ============================================================================
-    _log("[gc] PHASE 2: Listing pool files (recursive)...")
+    _log("[gc] PHASE 2: Listing pool files (by _pool/XX prefix)...")
     t_list_start = time.time()
     
     pool_files_to_delete = []
     grace_cutoff = time.time() - (grace_hours * 3600) if grace_hours > 0 else 0
+    pool_files_found = 0
     
     try:
-        # Rekursives listfolder über kompletten Pool (wie validate_pool_snapshot!)
-        result = pc.listfolder(cfg, path=pool_root, recursive=True, nofiles=False)
-        
-        def _extract_pool_files(obj, pool_files_list: list):
-            """Rekursiv Pool-Files aus listfolder-Tree extrahieren"""
-            if isinstance(obj, dict):
-                # File gefunden
-                if not obj.get("isfolder"):
-                    filename = obj.get("name", "")
-                    filepath = obj.get("path", "")
-                    filesize = obj.get("size", 0)
-                    modified = obj.get("modified")  # Unix-Timestamp
-                    
-                    # Validiere: Pool-Files sind 64 Hex-Zeichen (SHA256)
-                    if len(filename) == 64 and all(c in "0123456789abcdef" for c in filename):
-                        sha = filename.lower()
-                        pool_files_list.append({
-                            "name": sha,
-                            "path": filepath or pc.pool_file_remote_path(pool_root, sha),
-                            "size": filesize,
-                            "modified": modified,
-                            "fileid": obj.get("fileid"),
-                        })
-                
-                # Ordner: Rekursiv durchlaufen
-                for child in obj.get("contents", []):
-                    _extract_pool_files(child, pool_files_list)
-        
-        pool_files = []
-        metadata = result.get("metadata", {})
-        _extract_pool_files(metadata, pool_files)
-        
-        list_duration = time.time() - t_list_start
-        _log(f"[gc] PHASE 2 DONE: {len(pool_files)} pool files found ({list_duration:.1f}s)")
-        
-        # Prüfe jedes Pool-File
         _log(f"[gc] Checking references (grace period: {grace_hours}h)...")
         
-        for pool_file in pool_files:
+        for pool_file in _iter_pool_files_by_prefix(cfg, pool_root):
+            pool_files_found += 1
             sha256 = pool_file["name"]
             stats.inc_pool_found()
             
@@ -1300,6 +1323,9 @@ def run_pool_gc(
             
             # 3. Unreferenziert & alt genug → löschen
             pool_files_to_delete.append(pool_file)
+
+        list_duration = time.time() - t_list_start
+        _log(f"[gc] PHASE 2 DONE: {pool_files_found} pool files found ({list_duration:.1f}s)")
     
     except Exception as e:
         _log(f"[gc][ERROR] Failed to list pool: {e}")
@@ -1494,7 +1520,8 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         dry=args.dry_run,
         audit_mode=args.audit_mode,
         grace_hours=args.grace_hours,
-        verbose=args.verbose
+        verbose=args.verbose,
+        env_file=args.env_file,
     )
     
     # Exit Code

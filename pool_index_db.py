@@ -741,6 +741,179 @@ class PoolIndexDB:
         c.commit()
         return n
 
+    def referenced_shas_for_snapshots(self, snap_names: Iterable[str]) -> set[str]:
+        names = sorted({n for n in snap_names if n})
+        if not names:
+            return set()
+        placeholders = ",".join("?" * len(names))
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT s.sha
+            FROM shas s
+            JOIN snap_refs r ON r.sha_id = s.id
+            JOIN snapshots n ON n.id = r.snap_id
+            WHERE n.name IN ({placeholders})
+            """,
+            names,
+        )
+        return {str(r[0]).lower() for r in rows}
+
+    def orphan_shas_if_snapshots_removed(
+        self,
+        remote_snaps: set[str],
+        snaps_to_remove: set[str],
+    ) -> set[str]:
+        """SHAs deren letzte Remote-Snapshot-Referenz durch Entfernen entfiele."""
+        if not snaps_to_remove or not remote_snaps:
+            return set()
+        keep = remote_snaps - snaps_to_remove
+        if not keep:
+            return self.referenced_shas_for_snapshots(remote_snaps)
+        remote_list = sorted(remote_snaps)
+        keep_list = sorted(keep)
+        pr = ",".join("?" * len(remote_list))
+        pk = ",".join("?" * len(keep_list))
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT s.sha
+            FROM shas s
+            WHERE EXISTS (
+                SELECT 1 FROM snap_refs r
+                JOIN snapshots n ON n.id = r.snap_id
+                WHERE r.sha_id = s.id AND n.name IN ({pr})
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM snap_refs r
+                JOIN snapshots n ON n.id = r.snap_id
+                WHERE r.sha_id = s.id AND n.name IN ({pk})
+            )
+            """,
+            remote_list + keep_list,
+        )
+        return {str(r[0]).lower() for r in rows}
+
+    def import_from_json_streaming(
+        self,
+        json_path: str,
+        *,
+        batch_shas: int = 4000,
+        log: Optional[LogFn] = None,
+    ) -> dict:
+        """
+        pool_refs per ijson-Stream; RAM ~ ein Batch statt volles Dict.
+        """
+        try:
+            import ijson  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "ijson fehlt — pip install ijson (Streaming-Import für GC/Retention)"
+            ) from e
+
+        t0 = time.time()
+        if log:
+            log(f"[index-db] Streaming-Import aus {json_path}")
+
+        self._apply_pragmas(import_fast=True)
+        c = self.conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute("DELETE FROM snap_refs")
+            c.execute("DELETE FROM snapshots")
+            c.execute("DELETE FROM shas")
+
+            sha_rows: List[Tuple[str, Any, Optional[str], Any]] = []
+            ref_rows: List[Tuple[str, str, str]] = []
+            snap_names: set[str] = set()
+            n_shas = 0
+
+            def _flush() -> None:
+                nonlocal sha_rows, ref_rows, snap_names
+                if not sha_rows:
+                    return
+                c.executemany(
+                    "INSERT OR IGNORE INTO snapshots(name) VALUES (?)",
+                    [(n,) for n in snap_names],
+                )
+                c.executemany(
+                    "INSERT OR IGNORE INTO shas(sha, fileid, hash, size) VALUES (?,?,?,?)",
+                    sha_rows,
+                )
+                name_to_id = {
+                    r[0]: r[1] for r in c.execute("SELECT name, id FROM snapshots")
+                }
+                sha_to_id = {r[0]: r[1] for r in c.execute("SELECT sha, id FROM shas")}
+                c.executemany(
+                    "INSERT OR IGNORE INTO snap_refs(snap_id, sha_id, relpath) VALUES (?,?,?)",
+                    [
+                        (name_to_id[snap], sha_to_id[sha], rp)
+                        for sha, snap, rp in ref_rows
+                        if snap in name_to_id and sha in sha_to_id
+                    ],
+                )
+                sha_rows = []
+                ref_rows = []
+                snap_names = set()
+
+            with open(json_path, "rb") as f:
+                for sha_raw, entry in ijson.kvitems(f, "pool_refs"):
+                    sha = (sha_raw or "").lower()
+                    if not sha:
+                        continue
+                    n_shas += 1
+                    fileid, phash, size = _coords(entry)
+                    sha_rows.append((sha, fileid, _hash_text(phash), size))
+                    for snap, rels in _snapshots_map(entry).items():
+                        snap_names.add(snap)
+                        if not rels:
+                            ref_rows.append((sha, snap, ""))
+                        else:
+                            for rp in rels:
+                                ref_rows.append((sha, snap, rp if rp is not None else ""))
+                    if len(sha_rows) >= batch_shas:
+                        _flush()
+
+            _flush()
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('imported_from', ?)",
+                (os.path.abspath(json_path),),
+            )
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('imported_at', ?)",
+                (str(time.time()),),
+            )
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            self._apply_pragmas(import_fast=False)
+
+        try:
+            c.execute("PRAGMA optimize")
+        except sqlite3.Error:
+            pass
+
+        st = {
+            "shas": self.count_shas(),
+            "snapshots": len(self.snapshot_names()),
+            "pairs": int(c.execute("SELECT COUNT(*) FROM snap_refs").fetchone()[0]),
+            "seconds": time.time() - t0,
+            "streamed": n_shas,
+        }
+        self.refresh_master_metadata(json_path)
+        content_digest = self.digest()["sha256"]
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('master_content_digest', ?)",
+            (content_digest,),
+        )
+        self.conn.commit()
+        if log:
+            log(
+                f"[index-db] Streaming-Import fertig: {st['shas']} SHAs, "
+                f"{st['pairs']} Paare in {st['seconds']:.1f}s"
+            )
+        return st
+
     def prune_snapshots(self, keep_names: Iterable[str]) -> int:
         keep = set(keep_names)
         names = self.snapshot_names()
