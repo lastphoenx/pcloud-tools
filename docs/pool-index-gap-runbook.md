@@ -49,8 +49,8 @@
 ```bash
 python scripts/utilities/pool_recover_from_rtb.py \
   --csv /srv/pcloud-archive/missing_blobs_2026-10-10.csv \
-  --rtb-snapshot 2026-08-06-172826 --env-file .env --dry-run
-# scharf ohne --dry-run; danach pool_integrity_run für die drei Snapshots
+  --rtb-snapshot 2026-08-06-172826 --env-file .env --dry-run --workers 8
+# scharf: gleiche Flags ohne --dry-run (Pi: PCLOUD_UPLOAD_THREADS / --workers)
 ```
 
 ## GC wieder freigeben
