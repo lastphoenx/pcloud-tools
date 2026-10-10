@@ -125,8 +125,8 @@ def download_remote_master(
     master_path: str,
     *,
     log: LogFn,
-) -> None:
-    """RAM-schonend: getfilelink + Chunk-Write auf Disk."""
+) -> str:
+    """RAM-schonend: getfilelink + Chunk-Write auf Disk. Returns: SHA256 der Datei."""
     remote = remote_index_path(snapshots_root)
     os.makedirs(os.path.dirname(os.path.abspath(master_path)) or ".", exist_ok=True)
     tmp = master_path + ".downloading"
@@ -137,9 +137,13 @@ def download_remote_master(
             pass
     log(f"[gc-engine] Lade Remote-Index → {master_path}")
     t0 = time.time()
-    pc.download_binaryfile_to(cfg, path=remote, local_path=tmp)
+    file_sha = pc.download_binaryfile_to(cfg, path=remote, local_path=tmp).strip().lower()
     os.replace(tmp, master_path)
-    log(f"[gc-engine] Download fertig ({time.time() - t0:.1f}s, {os.path.getsize(master_path)} bytes)")
+    log(
+        f"[gc-engine] Download fertig ({time.time() - t0:.1f}s, "
+        f"{os.path.getsize(master_path)} bytes, sha256={file_sha[:16]}…)"
+    )
+    return file_sha
 
 
 def open_ops_db_for_queries(
@@ -180,30 +184,33 @@ def open_synced_db(
 
     master_path, _ = master_paths(env_vars)
     db = pidb.open_db(db_path, create=True)
-    remote_sha = remote_master_sha256(cfg, snapshots_root, log=log)
+    remote_sha_hint = remote_master_sha256(cfg, snapshots_root, log=log)
     stored = (db.get_meta("master_sha256") or "").strip().lower()
 
-    if remote_sha and stored and remote_sha != stored and db.count_shas() > 0:
+    if remote_sha_hint and stored and remote_sha_hint != stored and db.count_shas() > 0:
         log("[gc-engine] Remote-Index geändert seit letztem Ops-Import — Download …")
     elif not stored or db.count_shas() == 0:
         log("[gc-engine] Ops-Index leer oder ohne Fingerprint — Download …")
-    elif not remote_sha:
+    elif not remote_sha_hint:
         log("[gc-engine] Remote-SHA unbekannt — Download …")
     else:
         log("[gc-engine] Ops-DB nicht mehr aktuell — Download …")
 
-    download_remote_master(cfg, snapshots_root, master_path, log=log)
-    remote_sha = remote_sha or remote_master_sha256(cfg, snapshots_root, log=log)
-
-    if _ops_db_can_skip_import_after_download(db, master_path, remote_sha):
-        log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
-        db.refresh_master_metadata(
-            master_path, known_sha256=remote_sha or None,
+    file_sha = download_remote_master(cfg, snapshots_root, master_path, log=log)
+    if remote_sha_hint and file_sha != remote_sha_hint:
+        log(
+            "[gc-engine][warn] Remote-Index während Download geändert "
+            "(checksumfile ≠ Stream-SHA) — nutze Datei-SHA"
         )
+
+    if _ops_db_can_skip_import_after_download(db, master_path, file_sha):
+        log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
+        db.refresh_master_metadata(master_path, known_sha256=file_sha)
         return db
 
     log("[gc-engine] Streaming-Import Master → SQLite …")
     db.import_from_json_streaming(master_path, log=log)
+    db.refresh_master_metadata(master_path, known_sha256=file_sha)
     return db
 
 
@@ -236,33 +243,23 @@ def purge_snapshots_in_db(
     return {"removed_snap_refs": removed_refs}
 
 
-def publish_master_index(
-    cfg: dict,
-    snapshots_root: str,
+def export_master_from_db(
     db: pidb.PoolIndexDB,
     env_vars: Optional[dict],
     *,
-    dry: bool,
     log: LogFn,
-    defer_db_commit: bool = False,
-) -> Dict[str, int]:
+) -> Dict[str, object]:
     master_path, staging_path = master_paths(env_vars)
     os.makedirs(os.path.dirname(staging_path), exist_ok=True)
     os.makedirs(os.path.dirname(master_path), exist_ok=True)
-    exp = db.export_content_index_json(
-        staging_path, record_export_meta=not defer_db_commit,
-    )
+    exp = db.export_content_index_json(staging_path, record_export_meta=False)
     os.replace(staging_path, master_path)
-    db.record_master_meta(master_path, commit=not defer_db_commit)
     n_refs = int(exp.get("shas") or 0)
     log(
         f"[gc-engine] Export lokal: {master_path} "
         f"({n_refs} pool_refs, {exp.get('bytes', 0)} bytes, {exp.get('seconds', 0):.1f}s)"
     )
-    if dry:
-        log(f"[dry] upload skipped: {remote_index_path(snapshots_root)}")
-        return exp
-    _upload_master_resumable(cfg, snapshots_root, master_path, n_refs, log=log)
+    exp["master_path"] = master_path
     return exp
 
 
@@ -353,14 +350,25 @@ def apply_index_purge_for_deleted_snaps(
         return _dry_simulate_purge_on_ops_db(env_vars, deleted_snaps, log=log)
     db = open_synced_db(cfg, snapshots_root, env_vars, log=log)
     c = db.conn
+    master_path = ""
     try:
         c.execute("BEGIN IMMEDIATE")
         stats = purge_snapshots_in_db(db, deleted_snaps, log=log, commit=False)
-        publish_master_index(
-            cfg, snapshots_root, db, env_vars, dry=False, log=log,
-            defer_db_commit=True,
-        )
+        exp = export_master_from_db(db, env_vars, log=log)
+        master_path = str(exp["master_path"])
+        n_refs = int(exp.get("shas") or 0)
         c.commit()
+        # Upload außerhalb der Transaktion — Ops-DB nicht während Chunk-Upload gesperrt.
+        log("[gc-engine] Ops-DB committed — Upload ohne Write-Lock")
+        try:
+            _upload_master_resumable(cfg, snapshots_root, master_path, n_refs, log=log)
+        except Exception:
+            log(
+                "[gc-engine][ERROR] Upload fehlgeschlagen — lokaler Master/Ops-DB "
+                "bereits bereinigt, Remote evtl. veraltet; Upload wiederholen."
+            )
+            raise
+        db.record_master_meta(master_path)
         return stats
     except Exception:
         c.rollback()
