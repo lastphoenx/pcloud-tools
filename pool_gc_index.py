@@ -383,13 +383,14 @@ def retention_index_metrics(
     db: pidb.PoolIndexDB,
     remote_snaps: Set[str],
     snaps_to_remove: Set[str],
-) -> tuple[Set[str], Set[str], Set[str]]:
-    """Gleiche Semantik wie _referenced_shas + _shas_orphaned_after_retention."""
-    refs_now = db.referenced_shas_for_snapshots(remote_snaps)
+) -> tuple[int, int, int, int]:
+    """Counts + geschätzte Orphan-Bytes per SQL (kein millionenfaches SHA-Set)."""
+    n_now = db.count_referenced_shas_for_snapshots(remote_snaps)
     keep = remote_snaps - snaps_to_remove
-    refs_after = db.referenced_shas_for_snapshots(keep)
-    orphan = db.orphan_shas_if_snapshots_removed(remote_snaps, snaps_to_remove)
-    return refs_now, refs_after, orphan
+    n_after = db.count_referenced_shas_for_snapshots(keep)
+    n_orphan = db.count_orphan_shas_if_snapshots_removed(remote_snaps, snaps_to_remove)
+    orphan_bytes = db.sum_orphan_bytes_if_snapshots_removed(remote_snaps, snaps_to_remove)
+    return n_now, n_after, n_orphan, orphan_bytes
 
 
 def purge_snapshots_in_db(

@@ -5,7 +5,7 @@
 Spalte 1 (Dashboard Post-Upload): check_type=manual -> backup_runs.integrity_*
 Spalte 2 (Dashboard Audit):       check_type=monthly_audit -> snapshot_integrity_checks
 
-Pool+Index wird einmal pro Batch gecacht (siehe PoolRemoteCache).
+Je Snapshot ein Subprozess (wie integrity-audit-next), kein PoolRemoteCache im Parent.
 
 Beispiele:
   python scripts/integrity-backfill.py --env-file .env --dry-run
@@ -28,8 +28,6 @@ if _UTIL not in sys.path:
     sys.path.insert(0, _UTIL)
 
 import pcloud_bin_lib as pc  # noqa: E402
-from pool_integrity_run import run_integrity_for_snapshot  # noqa: E402
-from pool_verify_backup import PoolRemoteCache  # noqa: E402
 
 ENV_FILE = os.environ.get("ENV_FILE", f"{MAIN_DIR}/.env")
 
@@ -122,30 +120,49 @@ def _post_upload_done(env: Dict[str, str]) -> Set[str]:
     return set(rows)
 
 
+def _integrity_run_script() -> str:
+    path = os.path.join(MAIN_DIR, "scripts", "utilities", "pool_integrity_run.py")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    return path
+
+
+def _run_integrity_subprocess(
+    snap: str,
+    dest: str,
+    env_file: str,
+    check_type: str,
+) -> int:
+    argv = [
+        sys.executable,
+        _integrity_run_script(),
+        "--env-file",
+        env_file,
+        "--pool-root",
+        dest,
+        "--snapshot",
+        snap,
+        "--check-type",
+        check_type,
+    ]
+    return subprocess.run(argv, check=False).returncode
+
+
 def _run_batch(
     env: Dict[str, str],
-    cfg: dict,
     dest: str,
     snaps: List[str],
     check_type: str,
+    env_file: str,
 ) -> int:
     if not snaps:
         return 0
-    print(f"\n[batch] Pool+Index Cache laden ({len(snaps)} Snapshot(s))...")
-    cache = PoolRemoteCache.fetch(cfg, dest, verbose=True)
+    print(f"\n[batch] {len(snaps)} Snapshot(s), Subprozess je Snapshot")
     errors = 0
     for i, snap in enumerate(snaps, 1):
         print(f"\n[{i}/{len(snaps)}] {snap}")
-        ok, _ = run_integrity_for_snapshot(
-            env=env,
-            cfg=cfg,
-            pool_root=dest,
-            snapshot=snap,
-            check_type=check_type,
-            remote_cache=cache,
-            verbose=True,
-        )
-        if not ok:
+        rc = _run_integrity_subprocess(snap, dest, env_file, check_type)
+        if rc != 0:
             errors += 1
     return errors
 
@@ -200,19 +217,19 @@ def main() -> int:
         est = (len(need_pu) if args.post_upload else 0) + (len(need_audit) if args.audit else 0)
         if not args.post_upload and not args.audit:
             est = len(need_pu) + len(need_audit)
-        print(f"\nGeschaetzt ~{est * 1.5} min mit Cache (~1.5 min/Snapshot statt ~2)")
+        print(f"\nGeschaetzt ~{est * 1.5} min (Subprozess je Snapshot)")
         return 0
 
     errors = 0
     if args.post_upload:
         todo = need_pu[: args.max] if args.max > 0 else need_pu
         print(f"\n=== Post-Upload Backfill ({len(todo)} Snapshot(s)) ===")
-        errors += _run_batch(env, cfg, dest, todo, "manual")
+        errors += _run_batch(env, dest, todo, "manual", args.env_file)
 
     if args.audit:
         todo = need_audit[: args.max] if args.max > 0 else need_audit
         print(f"\n=== Monthly-Audit Backfill ({len(todo)} Snapshot(s)) ===")
-        errors += _run_batch(env, cfg, dest, todo, "monthly_audit")
+        errors += _run_batch(env, dest, todo, "monthly_audit", args.env_file)
 
     print(f"\nFertig. Fehler: {errors}")
     print("Dashboard: sudo scripts/generate_reports.sh && sudo systemctl restart monitoring-dashboard.service")

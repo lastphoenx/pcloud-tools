@@ -824,6 +824,83 @@ class PoolIndexDB:
         ).fetchone()
         return row is not None
 
+    def count_orphan_shas_if_snapshots_removed(
+        self,
+        remote_snaps: set[str],
+        snaps_to_remove: set[str],
+    ) -> int:
+        if not snaps_to_remove or not remote_snaps:
+            return 0
+        keep = remote_snaps - snaps_to_remove
+        if not keep:
+            return self.count_referenced_shas_for_snapshots(remote_snaps)
+        remote_list = sorted(remote_snaps)
+        keep_list = sorted(keep)
+        pr = ",".join("?" * len(remote_list))
+        pk = ",".join("?" * len(keep_list))
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT s.sha)
+            FROM shas s
+            WHERE EXISTS (
+                SELECT 1 FROM snap_refs r
+                JOIN snapshots n ON n.id = r.snap_id
+                WHERE r.sha_id = s.id AND n.name IN ({pr})
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM snap_refs r
+                JOIN snapshots n ON n.id = r.snap_id
+                WHERE r.sha_id = s.id AND n.name IN ({pk})
+            )
+            """,
+            remote_list + keep_list,
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def sum_orphan_bytes_if_snapshots_removed(
+        self,
+        remote_snaps: set[str],
+        snaps_to_remove: set[str],
+    ) -> int:
+        if not snaps_to_remove or not remote_snaps:
+            return 0
+        keep = remote_snaps - snaps_to_remove
+        if not keep:
+            row = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(s.size), 0)
+                FROM shas s
+                WHERE EXISTS (
+                    SELECT 1 FROM snap_refs r
+                    JOIN snapshots n ON n.id = r.snap_id
+                    WHERE r.sha_id = s.id
+                )
+                """
+            ).fetchone()
+            return int(row[0]) if row else 0
+        remote_list = sorted(remote_snaps)
+        keep_list = sorted(keep)
+        pr = ",".join("?" * len(remote_list))
+        pk = ",".join("?" * len(keep_list))
+        row = self.conn.execute(
+            f"""
+            SELECT COALESCE(SUM(s.size), 0)
+            FROM shas s
+            WHERE EXISTS (
+                SELECT 1 FROM snap_refs r
+                JOIN snapshots n ON n.id = r.snap_id
+                WHERE r.sha_id = s.id AND n.name IN ({pr})
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM snap_refs r
+                JOIN snapshots n ON n.id = r.snap_id
+                WHERE r.sha_id = s.id AND n.name IN ({pk})
+            )
+            """,
+            remote_list + keep_list,
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def orphan_shas_if_snapshots_removed(
         self,
         remote_snaps: set[str],

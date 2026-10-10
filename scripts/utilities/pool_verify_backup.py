@@ -25,6 +25,11 @@ sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
 import pcloud_bin_lib as pc
 import pcloud_path_compat as ppc
 
+try:
+    from index_load_helper import load_content_index_v2 as _load_index_v2_local_first
+except ImportError:
+    _load_index_v2_local_first = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Remote Pool+Index Cache (Batch-Audit: einmal Pool+Master-Index)
@@ -32,11 +37,11 @@ import pcloud_path_compat as ppc
 
 @dataclass
 class PoolRemoteCache:
-    """Gecachter _pool-SHA-Set + content_index pool_refs fuer mehrere Verify-Laeufe."""
+    """Gecachter _pool-SHA-Set (kein Master content_index im RAM)."""
 
     dest: str
     pool_shas: Set[str]
-    pool_refs: dict
+    pool_refs: dict = field(default_factory=dict)
     fetched_at: float = field(default_factory=time.time)
 
     def matches(self, pool_root_raw: str) -> bool:
@@ -55,17 +60,14 @@ class PoolRemoteCache:
 
         dest = pc._norm_remote_path(pool_root_raw).rstrip("/")
         pool_root = f"{dest}/_pool"
-        idx_path = f"{dest}/_snapshots/_index/content_index.json"
         t0 = time.time()
         pool_shas = _collect_pool_shas(cfg, pool_root)
-        idx = _load_remote_json_at(cfg, idx_path)
-        pool_refs = (idx or {}).get("pool_refs") or {}
         dt = time.time() - t0
         _out(
-            f"[cache] Pool+Index geladen: {len(pool_shas)} SHA256s, "
-            f"{len(pool_refs)} pool_refs ({dt:.1f}s)"
+            f"[cache] Pool-SHAs geladen: {len(pool_shas)} ({dt:.1f}s) "
+            "(Index pro Snapshot via Archiv/Master)"
         )
-        return cls(dest=dest, pool_shas=pool_shas, pool_refs=pool_refs)
+        return cls(dest=dest, pool_shas=pool_shas)
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +84,35 @@ def _sha_from_pool_entry(child: dict) -> Optional[str]:
 
 
 def _collect_pool_shas(cfg: dict, pool_root: str) -> Set[str]:
-    flat = pc.call_with_backoff(pc.listfolder_safe, cfg, path=pool_root, nofiles=False)
+    """Pool-SHAs per _pool/XX-Prefix (kein einzelner Riesen-listfolder im RAM)."""
     result: Set[str] = set()
-    for child in flat:
-        sha = _sha_from_pool_entry(child)
-        if sha:
-            result.add(sha)
+    top = pc.listfolder(cfg, path=pool_root, recursive=False, nofiles=True)
+    contents = (top.get("metadata", {}) or {}).get("contents", []) or []
+    prefixes = [
+        c for c in contents
+        if c.get("isfolder") and c.get("name") and len(str(c.get("name"))) == 2
+    ]
+    if not prefixes:
+        flat = pc.call_with_backoff(
+            pc.listfolder_safe, cfg, path=pool_root, nofiles=False,
+        )
+        for child in flat:
+            sha = _sha_from_pool_entry(child)
+            if sha:
+                result.add(sha)
+        return result
+    for child in prefixes:
+        label = child.get("name", "")
+        sub_path = child.get("path") or f"{pool_root.rstrip('/')}/{label}"
+        flat = pc.call_with_backoff(
+            pc.listfolder_safe, cfg, path=sub_path, nofiles=False,
+        )
+        for entry in flat:
+            sha = _sha_from_pool_entry(entry)
+            if sha:
+                result.add(sha)
+        del flat
+        gc.collect()
     return result
 
 
@@ -277,6 +302,13 @@ def _fetch_pool_refs(
         return {}, f"archive/{snap}_index.json (noch nicht vorhanden — Manifest-only)"
 
     master_path = f"{snaps_root}/_index/content_index.json"
+    if _load_index_v2_local_first is not None:
+        try:
+            idx = _load_index_v2_local_first(cfg, snaps_root, prefer_local=True)
+            refs = idx.get("pool_refs") or {}
+            return refs, f"content_index (lokal, {len(refs)} refs)"
+        except Exception:
+            pass
     idx = _load_remote_json_at(cfg, master_path)
     if idx is None:
         return {}, "content_index.json (fehlt)"
@@ -617,14 +649,10 @@ def run_verify(
         _out(f"[fetch] Pool: {len(pool_shas)} SHA256s")
         gc.collect()
 
-    if use_cache and not single_snap:
-        pool_refs = remote_cache.pool_refs  # type: ignore[union-attr]
-        index_src = f"cache ({len(pool_refs)} pool_refs)"
-    else:
-        _out("[fetch] Index...")
-        pool_refs, index_src = _fetch_pool_refs(cfg, snaps_root, snapshot_filter)
-        _out(f"[fetch] Index: {index_src}")
-        gc.collect()
+    _out("[fetch] Index...")
+    pool_refs, index_src = _fetch_pool_refs(cfg, snaps_root, snapshot_filter)
+    _out(f"[fetch] Index: {index_src}")
+    gc.collect()
 
     fetch_failed: List[str] = []
     for i, snap in enumerate(remote_snaps, start=1):

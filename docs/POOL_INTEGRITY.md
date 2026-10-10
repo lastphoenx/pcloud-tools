@@ -40,7 +40,7 @@ cd /opt/apps/pcloud-tools/main
 source /opt/apps/pcloud-tools/venv/bin/activate
 set -a; source .env; set +a
 
-# Planung (~2 min/Snapshot):
+# Planung (~1.5 min/Snapshot, Subprozess je Snapshot):
 python scripts/integrity-backfill.py --env-file .env --dry-run
 
 # Empfohlen: batches (Pi 8GB, nachts):

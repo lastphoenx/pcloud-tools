@@ -645,10 +645,11 @@ def main():
     print(f"Destination: {snaps_root}")
     print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    # Index laden
+    # Index laden (lokaler Master zuerst)
     try:
-        idx_txt = pc.get_textfile(cfg, path=f"{snaps_root}/_index/content_index.json")
-        index = json.loads(idx_txt or '{"version":1,"items":{}}')
+        from index_load_helper import load_content_index_legacy_items
+
+        index = load_content_index_legacy_items(cfg, snaps_root, prefer_local=True)
     except Exception as e:
         print(f"[ERROR] Index nicht lesbar: {e}")
         sys.exit(2)

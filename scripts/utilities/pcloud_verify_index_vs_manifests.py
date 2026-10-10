@@ -100,6 +100,10 @@ def load_remote_index(cfg: dict, snaps_root: str, index_file: str = "content_ind
         idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
     
     try:
+        if not is_archive:
+            from index_load_helper import load_content_index_legacy_items
+
+            return load_content_index_legacy_items(cfg, snaps_root, prefer_local=True)
         txt = pc.get_textfile(cfg, path=idx_path, maxbytes=None)
         index = json.loads(txt or '{"version":1,"items":{}}')
         if not isinstance(index, dict):

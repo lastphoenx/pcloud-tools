@@ -486,6 +486,7 @@ def load_content_index(cfg: dict, snapshots_root: str) -> dict:
     - Ein 'result'≠0 im JSON gilt als API-Fehler (dann leerer Index).
     - Fehlt 'result' völlig (Normalfall bei echter Index-Datei) → OK.
     """
+    _abort_legacy_json_index_path("load_content_index aufgerufen ohne SQLite-DB")
     idx_path = f"{snapshots_root.rstrip('/')}/_index/content_index.json"
     try:
         txt = pc.get_textfile(cfg, path=idx_path)
@@ -734,6 +735,14 @@ def save_content_index_from_db(cfg: dict, snapshots_root: str, db, *, dry: bool 
 
 def _pool_index_db_enabled() -> bool:
     return os.environ.get("PCLOUD_POOL_INDEX_DB", "0") == "1"
+
+
+def _abort_legacy_json_index_path(reason: str) -> None:
+    """PCLOUD_POOL_INDEX_DB=1: kein json.loads des Remote-Masters im Backup."""
+    if not _pool_index_db_enabled():
+        return
+    _log(f"[index-db][ERROR] {reason} — Abbruch (kein JSON-Fallback bei PCLOUD_POOL_INDEX_DB=1)")
+    sys.exit(2)
 
 
 def _open_pool_index_db_for_run():

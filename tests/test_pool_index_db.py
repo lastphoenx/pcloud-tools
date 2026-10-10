@@ -493,6 +493,14 @@ class PoolIndexDbTests(unittest.TestCase):
         self.assertIn("aa" * 32, refs)
         orphan = self.db.orphan_shas_if_snapshots_removed(remote, {"snap-a"})
         self.assertIn("bb" * 32, orphan)
+        self.assertEqual(
+            self.db.count_orphan_shas_if_snapshots_removed(remote, {"snap-a"}),
+            len(orphan),
+        )
+        self.assertGreaterEqual(
+            self.db.sum_orphan_bytes_if_snapshots_removed(remote, {"snap-a"}),
+            200,
+        )
 
 
 if __name__ == "__main__":

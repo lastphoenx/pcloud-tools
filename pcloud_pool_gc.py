@@ -522,29 +522,24 @@ def run_retention_forecast(
 
     db = gci.open_ops_db_for_queries(cfg, snapshots_root, env_vars, log=_log)
     try:
-        refs_now, refs_after, orphan_shas = gci.retention_index_metrics(
+        n_refs_now, n_refs_after, n_orphan, reclaim_bytes = gci.retention_index_metrics(
             db, remote_snaps, set(to_delete),
         )
     finally:
         db.close()
 
-    _log(f"[retention-forecast] Index-SHAs (remote-gebunden): {len(refs_now)}")
-    _log(f"[retention-forecast] SHAs nach Retention noch referenziert: {len(refs_after)}")
-    _log(f"[retention-forecast] Pool-GC-Kandidaten (neu): {len(orphan_shas)}")
+    _log(f"[retention-forecast] Index-SHAs (remote-gebunden): {n_refs_now}")
+    _log(f"[retention-forecast] SHAs nach Retention noch referenziert: {n_refs_after}")
+    _log(f"[retention-forecast] Pool-GC-Kandidaten (neu): {n_orphan}")
 
-    pool_files = _list_pool_files(cfg, pool_root)
-    pool_by_name = {p["name"]: p for p in pool_files}
-    reclaim_bytes = sum(pool_by_name.get(s, {}).get("size", 0) for s in orphan_shas if s in pool_by_name)
-    missing_in_pool = sum(1 for s in orphan_shas if s not in pool_by_name)
-
-    _log(f"[retention-forecast] Pool-Einsparung (simuliert): "
-         f"{reclaim_bytes / (1024**3):.2f} GB ({len(orphan_shas) - missing_in_pool} Dateien)")
-    if missing_in_pool:
-        _log(f"[retention-forecast] [warn] {missing_in_pool} Kandidaten-SHAs nicht physisch im Pool")
-
-    current_unreferenced = {p["name"] for p in pool_files if p["name"] not in refs_now}
-    _log(f"[retention-forecast] Aktueller GC ohne Retention: {len(current_unreferenced)} Pool-Dateien "
-         f"({sum(p['size'] for p in pool_files if p['name'] in current_unreferenced) / (1024**3):.2f} GB)")
+    _log(
+        f"[retention-forecast] Pool-Einsparung (Index-Größen, simuliert): "
+        f"{reclaim_bytes / (1024**3):.2f} GB ({n_orphan} SHAs)"
+    )
+    _log(
+        "[retention-forecast] Hinweis: Einsparung aus Ops-DB sizes; "
+        "physischer Pool-Abgleich nur via Pool-GC"
+    )
 
     _log("[retention-forecast] Empfehlung:")
     if to_delete:
@@ -558,7 +553,7 @@ def run_retention_forecast(
         "local_snaps": len(local_snaps),
         "remote_snaps": len(remote_snaps),
         "to_delete": to_delete,
-        "orphan_shas": len(orphan_shas),
+        "orphan_shas": n_orphan,
         "reclaim_bytes": reclaim_bytes,
     }
 

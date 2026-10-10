@@ -38,23 +38,14 @@ def load_delta_report(path: str) -> dict:
 
 
 def load_remote_index(cfg: dict, snaps_root: str) -> dict:
-    """Lädt content_index.json von pCloud."""
-    idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+    """Lädt content_index (lokaler Master zuerst, sonst Remote)."""
     try:
-        txt = pc.get_textfile(cfg, path=idx_path)
-        j = json.loads(txt or '{"version":1,"items":{}}')
-        if not isinstance(j, dict):
-            j = {"version": 1, "items": {}}
+        from index_load_helper import load_content_index_legacy_items
+
+        return load_content_index_legacy_items(cfg, snaps_root, prefer_local=True)
     except Exception as e:
-        print(f"[ERROR] Remote-Index nicht ladbar: {e}", file=sys.stderr)
+        print(f"[ERROR] Index nicht ladbar: {e}", file=sys.stderr)
         sys.exit(2)
-    
-    if "items" not in j or not isinstance(j["items"], dict):
-        j["items"] = {}
-    if "version" not in j:
-        j["version"] = 1
-    
-    return j
 
 
 def repair_index(index: dict, missing_anchors: List[dict], snaps_root: str, *, cleanup_all: bool = False) -> Dict[str, Any]:
