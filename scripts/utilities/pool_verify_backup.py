@@ -394,15 +394,20 @@ def _merge_manifest_scoped_stub_checks(parts: List[dict]) -> dict:
     missing_examples: List[str] = []
     extra_examples: List[str] = []
     manifest_missing: Dict[str, List[str]] = {}
+    skipped_index: List[str] = []
     for p in parts:
-        missing_examples.extend(p.get("missing_from_index_examples") or [])
-        extra_examples.extend(p.get("extra_stub_examples") or [])
+        if p.get("index_check_skipped") and p.get("skipped_snapshot"):
+            skipped_index.append(str(p["skipped_snapshot"]))
+        if not p.get("index_check_skipped"):
+            missing_examples.extend(p.get("missing_from_index_examples") or [])
+            extra_examples.extend(p.get("extra_stub_examples") or [])
         for snap, paths in (p.get("manifest_missing_stubs") or {}).items():
             manifest_missing.setdefault(snap, []).extend(paths)
+    active = [p for p in parts if not p.get("index_check_skipped")]
     return {
-        "expected_stubs": sum(int(p.get("expected_stubs") or 0) for p in parts),
-        "actual_stubs": max(int(p.get("actual_stubs") or 0) for p in parts),
-        "missing_from_index": sum(int(p.get("missing_from_index") or 0) for p in parts),
+        "expected_stubs": sum(int(p.get("expected_stubs") or 0) for p in active),
+        "actual_stubs": max((int(p.get("actual_stubs") or 0) for p in active), default=0),
+        "missing_from_index": sum(int(p.get("missing_from_index") or 0) for p in active),
         "missing_from_index_examples": sorted(set(missing_examples))[:5],
         "extra_not_in_index": sum(int(p.get("extra_not_in_index") or 0) for p in parts),
         "extra_stub_examples": extra_examples[:5],
@@ -410,6 +415,7 @@ def _merge_manifest_scoped_stub_checks(parts: List[dict]) -> dict:
         "manifest_missing_total": sum(int(p.get("manifest_missing_total") or 0) for p in parts),
         "path_compat_resolved": sum(int(p.get("path_compat_resolved") or 0) for p in parts),
         "mode": "manifest_scoped",
+        "index_check_skipped_snapshots": skipped_index,
     }
 
 
@@ -428,15 +434,37 @@ def _stub_checks_per_snapshot(
         if snap not in manifests:
             continue
         refs, src = _fetch_pool_refs(cfg, snaps_root, [snap])
-        if "Manifest-only" in src or "fehlt" in src:
+        weak_index = (
+            not refs
+            or "Manifest-only" in src
+            or "noch nicht vorhanden" in src
+            or "archive fehlt" in src
+        )
+        if weak_index:
             weak.append(snap)
         src_parts.append(f"{snap}: {src}")
-        part = check_stubs_vs_index(
-            refs,
-            stub_paths,
-            {snap: manifests[snap]},
-            snapshot_filter={snap},
-        )
+        snap_manifest = {snap: manifests[snap]}
+        if weak_index:
+            part = check_stubs_vs_index(
+                {},
+                stub_paths,
+                snaps_root,
+                snap_manifest,
+                snapshot_filter={snap},
+            )
+            part["index_check_skipped"] = True
+            part["skipped_snapshot"] = snap
+            part["missing_from_index"] = 0
+            part["missing_from_index_examples"] = []
+            part["mode"] = "manifest_scoped_weak_index"
+        else:
+            part = check_stubs_vs_index(
+                refs,
+                stub_paths,
+                snaps_root,
+                snap_manifest,
+                snapshot_filter={snap},
+            )
         parts.append(part)
         del refs
         gc.collect()
@@ -780,16 +808,20 @@ def run_verify(
     pool_refs: dict = {}
     weak_index_snaps: List[str] = []
     per_snap_index_src = ""
+    use_ops_keys = False
     try:
         ops_db = pidb.default_ops_db_path() if pidb else ""
-        use_ops_keys = (
+        use_ops_keys = bool(
             not snapshot_filter
             and ops_db
             and os.path.isfile(ops_db)
         )
         if use_ops_keys:
             pool_refs_keys = _sha_keys_from_ops_db(ops_db)
-            index_src = f"ops-sqlite ({len(pool_refs_keys)} shas, kein pool_refs-Dict)"
+            index_src = (
+                f"ops-sqlite {ops_db} ({len(pool_refs_keys)} shas, kein pool_refs-Dict) — "
+                "kann hinter Remote-Master/Backup-Index zurückliegen"
+            )
         elif snapshot_filter and len(snapshot_filter) == 1:
             pool_refs, index_src = _fetch_pool_refs(cfg, snaps_root, snapshot_filter)
             pool_refs_keys = set(pool_refs.keys())
@@ -825,6 +857,11 @@ def run_verify(
             "duration_sec": round(time.time() - t0, 2),
         }
     _out(f"[fetch] Index: {index_src}")
+    if use_ops_keys:
+        _out(
+            "[fetch] Hinweis: Check A nutzt Ops-DB-SHA-Menge; "
+            "Abgleich mit live Remote-Master kann abweichen bis GC/Backup synchron ist."
+        )
     if weak_index_snaps:
         _out(
             f"[warn] Schwächere Prüfung (kein Archiv-Index): "
@@ -898,8 +935,8 @@ def run_verify(
 
     _out("=== B) Stubs vs Index vs Pool ===")
     t_b = time.time()
+    stub_scope = set(snapshot_filter) if snapshot_filter else None
     if snapshot_filter and len(snapshot_filter) == 1 and pool_refs:
-        stub_scope = set(snapshot_filter)
         res_b = check_stubs_vs_index(
             pool_refs, stub_paths, snaps_root, manifests, snapshot_filter=stub_scope,
         )
@@ -909,6 +946,13 @@ def run_verify(
             cfg, snaps_root, manifests, stub_paths, snaps_for_b,
         )
         weak_index_snaps = sorted(set(weak_index_snaps) | set(weak_b))
+        skipped_b = res_b.get("index_check_skipped_snapshots") or []
+        if skipped_b:
+            _out(
+                f"  [info] Index-Check B übersprungen (kein Archiv): "
+                + ", ".join(skipped_b[:8])
+                + (" …" if len(skipped_b) > 8 else "")
+            )
     fetch_incomplete = bool(fetch_failed)
     res_b["fetch_incomplete"] = fetch_incomplete
     res_b["failed_subtrees"] = fetch_failed
