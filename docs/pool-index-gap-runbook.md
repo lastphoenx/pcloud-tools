@@ -22,7 +22,14 @@
    /opt/apps/pcloud-tools/venv/bin/python pool_gap_report.py --verify-stat --csv /tmp/pool_gaps_verify.csv
    ```
 
-4. **Schaden prüfen** (optional, pro Snapshot):
+4. **Fehlende Blobs auswerten** (nach `pool_integrity_run` → `/tmp/chk_*.json`):
+
+   ```bash
+   /opt/apps/pcloud-tools/venv/bin/python scripts/utilities/missing_blobs_report.py \
+     --glob '/tmp/chk_*.json' --csv /tmp/missing_blobs.csv
+   ```
+
+5. **Schaden prüfen** (optional, pro Snapshot):
 
    ```bash
    python scripts/utilities/pool_integrity_run.py --env-file .env \
