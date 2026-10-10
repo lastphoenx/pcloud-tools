@@ -8,7 +8,7 @@ Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 |------|-----|-----|
 | **Jeder Upload** | Hartes Integrity-Gate (Subprozess: subtree `listfolder`, Snap-Archiv-Index) | `pcloud_push_json_pool_manifest_to_pcloud.py` → `_run_listfolder_integrity_gate()` |
 | **Jeder Upload** | `post_upload` in MariaDB | im Gate via `pool_integrity_run.py` (`check_type=post_upload`) |
-| **3×/Tag Timer** | `monthly_audit` (10 Snapshots/Lauf, je Subprozess) | `integrity-audit.service` |
+| **3×/Tag Timer** | `monthly_audit` (3 Snapshots/Lauf, je Subprozess) | `integrity-audit.service` |
 | **Wrapper (optional)** | Zweiter Lauf | nur bei `PCLOUD_POST_UPLOAD_INTEGRITY=1` (Default: `skip`) |
 
 **Log-Marker:** `[integrity-gate] Post-Upload Integritaet (Subprozess, subtree listfolder)...`
@@ -22,7 +22,7 @@ Stand: August 2026 · pi-nas Pool-Mode (`/Backup/rtb_pool`)
 | Spalte | DB-Quelle | Wann befüllt |
 |--------|-----------|--------------|
 | **Post-Upload** | `backup_runs.integrity_*` | Automatisch nach jedem **erfolgreichen** Upload (`check_type=post_upload`) |
-| **Audit** | `snapshot_integrity_checks` (`monthly_audit`) | 3×/Tag **05:45, 13:45, 21:45** — je **10 Snapshots** (`INTEGRITY_AUDIT_MAX`, Subprozess je Snap) |
+| **Audit** | `snapshot_integrity_checks` (`monthly_audit`) | 3×/Tag **05:45, 13:45, 21:45** — je **3 Snapshots** (`INTEGRITY_AUDIT_MAX=3`, Subprozess je Snap; ~9/Tag) |
 | **Frische** | berechnet aus `monthly_audit_at` | `OK` / `STALE` (>35 Tage) / `FAILED` / `UNKNOWN` |
 
 View: `v_snapshot_integrity_status` → `generate_reports.sh` → `reports.json` → Dashboard.
@@ -95,7 +95,7 @@ Priorität für den **nächsten** Snapshot:
 3. Letzter Audit **≥ 35 Tage** alt → STALE, bevorzugt
 4. Sonst ältester Audit-Zeitstempel
 
-**Häufigkeit:** 3×10 = **30 Audits/Tag** (Subprozess je Snapshot — kein `PoolRemoteCache` / Master-Index im Parent).
+**Häufigkeit:** Default `INTEGRITY_AUDIT_MAX=3` → 3×3 = **~9 Audits/Tag** (reicht für ≤3 neue Backups/Tag + Rotation unter 35 Tage). Bei Backlog temporär erhöhen (z. B. 10). Subprozess je Snapshot — kein `PoolRemoteCache` im Parent.
 
 **Performance (gefiltert):** ~8s Stub-API + ~0.2s Checks. Cache = einmaliges `_pool`-listfolder pro Batch; Hauptgewinn = `manifest_scoped` (Check B war ~22s).
 
@@ -120,10 +120,16 @@ python scripts/integrity-backfill.py --env-file .env --audit --oldest-first
 
 ### Manuell ein Audit (wie Timer)
 
+`integrity-audit.service` ist **Type=oneshot** — `systemctl start` **ohne** `--no-block` wartet synchron, bis alle Snapshots des Laufs fertig sind (bei mehreren Snapshots pro Lauf kann das lange dauern; die Shell wirkt „hängend“, `activating` ist normal).
+
 ```bash
-sudo systemctl start integrity-audit.service
+sudo systemctl start --no-block integrity-audit.service
 journalctl -u integrity-audit.service -n 30 --no-pager
+# Fortschritt live (Ctrl+C beendet nur journalctl, nicht den Audit):
+journalctl -u integrity-audit.service -f
 ```
+
+Synchron warten (bewusst, Terminal blockiert bis Ende): `sudo systemctl start integrity-audit.service`
 
 ---
 

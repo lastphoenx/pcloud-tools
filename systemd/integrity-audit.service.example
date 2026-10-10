@@ -1,6 +1,8 @@
 [Unit]
 Description=pCloud Pool Integrity Audit (batch, shared pool cache)
 Documentation=file:///opt/apps/pcloud-tools/main/docs/POOL_INTEGRITY.md
+# Manuell aus SSH: systemctl start --no-block integrity-audit.service
+# (Type=oneshot: plain "start" wartet bis ExecStart endet — dauert mit MAX mehrere Minuten)
 After=network-online.target mariadb.service
 Wants=network-online.target
 
@@ -10,7 +12,7 @@ User=root
 WorkingDirectory=/opt/apps/pcloud-tools/main
 Environment=MAIN_DIR=/opt/apps/pcloud-tools/main
 Environment=ENV_FILE=/opt/apps/pcloud-tools/main/.env
-Environment=INTEGRITY_AUDIT_MAX=10
+Environment=INTEGRITY_AUDIT_MAX=3
 ExecStart=/opt/apps/pcloud-tools/main/scripts/integrity-audit-next.sh
 KillMode=control-group
 TimeoutStopSec=60

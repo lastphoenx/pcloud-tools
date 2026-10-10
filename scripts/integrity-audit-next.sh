@@ -2,15 +2,16 @@
 # integrity-audit-next.sh — Batch-Integritaets-Audit (Pool-Cache, mehrere Snapshots/Lauf)
 #
 # Prioritaet pro Snapshot: nie -> FAILED -> STALE (>=35d) -> aeltester Audit
-# INTEGRITY_AUDIT_MAX: Snapshots pro Lauf (default 10)
+# INTEGRITY_AUDIT_MAX: Snapshots pro Lauf (default 3; 3x Timer ≈ 9/Tag)
 #
-# systemd: integrity-audit.service + integrity-audit.timer (3x nach Backup +105min)
+# systemd: integrity-audit.service (Type=oneshot) + integrity-audit.timer
+# Manuell: systemctl start --no-block integrity-audit.service (plain start blockiert SSH)
 
 set -euo pipefail
 
 MAIN_DIR=${MAIN_DIR:-/opt/apps/pcloud-tools/main}
 ENV_FILE=${ENV_FILE:-${MAIN_DIR}/.env}
-INTEGRITY_AUDIT_MAX=${INTEGRITY_AUDIT_MAX:-10}
+INTEGRITY_AUDIT_MAX=${INTEGRITY_AUDIT_MAX:-3}
 
 if [[ -x "/opt/apps/pcloud-tools/venv/bin/python" ]]; then
   PY="/opt/apps/pcloud-tools/venv/bin/python"
