@@ -745,32 +745,33 @@ def _abort_legacy_json_index_path(reason: str) -> None:
     sys.exit(2)
 
 
-def _snapshots_root_from_env() -> str:
-    dest = (os.environ.get("PCLOUD_DEST") or "").strip()
-    if not dest:
-        return ""
-    return f"{pc._norm_remote_path(dest).rstrip('/')}/_snapshots"
+def _remote_content_index_path(snapshots_root: str) -> str:
+    return f"{snapshots_root.rstrip('/')}/_index/content_index.json"
 
 
 def _bootstrap_backup_db_from_remote_master(
     cfg: dict,
     db,
     master: str,
+    snapshots_root: str,
 ) -> None:
     """Leere/stale DB + fehlender lokaler Master: Remote-Download + Streaming-Import."""
     import pool_gc_index as gci
 
-    snaps_root = _snapshots_root_from_env()
-    if not snaps_root:
-        _log("[index-db][ERROR] PCLOUD_DEST fehlt — Remote-Master-Bootstrap unmöglich")
-        sys.exit(2)
+    remote = _remote_content_index_path(snapshots_root)
+    if not pc.stat_file_safe(cfg, path=remote).get("fileid"):
+        _log(
+            "[index-db] Kein Remote-Index — leere SQLite-DB "
+            f"(erstes Backup / neues Ziel: {remote})"
+        )
+        return
     os.makedirs(os.path.dirname(os.path.abspath(master)) or ".", exist_ok=True)
     _log("[index-db] Lokaler Master fehlt — Download von Remote + Streaming-Import …")
-    file_sha = gci.download_remote_master(cfg, snaps_root, master, log=_log)
+    file_sha = gci.download_remote_master(cfg, snapshots_root, master, log=_log)
     db.import_from_json_streaming(master, log=_log, known_sha256=file_sha)
 
 
-def _open_pool_index_db_for_run():
+def _open_pool_index_db_for_run(cfg: dict, snapshots_root: str):
     """Oeffnet die C1-SQLite oder None (nur wenn PCLOUD_POOL_INDEX_DB=0)."""
     if not _pool_index_db_enabled():
         return None
@@ -782,7 +783,10 @@ def _open_pool_index_db_for_run():
 
     auto = os.environ.get("PCLOUD_POOL_INDEX_DB_AUTOIMPORT", "1") != "0"
     master = pidb.default_master_path()
-    cfg = pc.effective_config()
+    snapshots_root = (snapshots_root or "").strip()
+    if not snapshots_root:
+        _log("[index-db][ERROR] snapshots_root fehlt — Bootstrap unmöglich")
+        sys.exit(2)
     try:
         db = pidb.open_db(pidb.default_db_path(), create=True)
     except Exception as e:
@@ -811,7 +815,7 @@ def _open_pool_index_db_for_run():
                 _log("[index-db] Master geändert → Streaming-Re-Import")
                 db.import_from_json_streaming(master, log=_log)
                 return db
-            _bootstrap_backup_db_from_remote_master(cfg, db, master)
+            _bootstrap_backup_db_from_remote_master(cfg, db, master, snapshots_root)
             return db
         if populated and match is None:
             _log("[index-db][warn] Master-JSON fehlt — nutze DB")
@@ -824,7 +828,7 @@ def _open_pool_index_db_for_run():
             _log("[index-db] DB leer/neu → Streaming-Import aus Master")
             db.import_from_json_streaming(master, log=_log)
             return db
-        _bootstrap_backup_db_from_remote_master(cfg, db, master)
+        _bootstrap_backup_db_from_remote_master(cfg, db, master, snapshots_root)
         return db
     except Exception as e:
         _log(f"[index-db][ERROR] {e}")
@@ -2683,7 +2687,7 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
     dest_snapshot_dir = f"{snapshots_root}/{snapshot_name}"
     basis_snapshot_dir = f"{snapshots_root}/{basis_snapshot_name}"
     archive_dir = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
-    db = None if dry else _open_pool_index_db_for_run()
+    db = None if dry else _open_pool_index_db_for_run(cfg, snapshots_root)
     index = None
     pool_refs: dict = {}
     _pending_refs: list = []
@@ -3558,7 +3562,7 @@ def push_pool_finalize_only(cfg: dict, manifest: dict, dest_root: str, *, dry: b
 
     _ensure_archived_manifest(snapshot_name)
 
-    db = None if dry else _open_pool_index_db_for_run()
+    db = None if dry else _open_pool_index_db_for_run(cfg, snapshots_root)
     index = {"pool_refs": {}}
     try:
         if db is not None:
@@ -3742,7 +3746,7 @@ def push_pool_mode(cfg: dict, manifest: dict, dest_root: str, *, dry: bool = Fal
         # Full-Pool: SQLite-Arbeitsindex (Turbo-Delta oeffnet eigenes db-Handle)
         _pending_refs: list = []
         if not dry:
-            db = _open_pool_index_db_for_run()
+            db = _open_pool_index_db_for_run(cfg, snapshots_root)
             if db is not None:
                 _log("[pool-mode] SQLite-Arbeitsindex aktiv (Full-Pool)")
 

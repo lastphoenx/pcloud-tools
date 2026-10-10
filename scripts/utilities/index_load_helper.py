@@ -42,6 +42,43 @@ def _local_master_candidates() -> list[str]:
     return out
 
 
+_V2_HEAD_PEEK_BYTES = 384
+_V2_REMOTE_PEEK_BYTES = 512
+
+
+def _bytes_look_like_v2_pool_index(head: bytes) -> bool:
+    if not head:
+        return False
+    if head.startswith(b'{"version":2'):
+        return True
+    window = head[:_V2_HEAD_PEEK_BYTES]
+    if b'"pool_refs"' in window and b'"items"' not in window:
+        return True
+    return False
+
+
+def _peek_local_v2_pool_index(path: str) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if st.st_size <= _max_local_index_bytes():
+        return False
+    try:
+        with open(path, "rb") as f:
+            return _bytes_look_like_v2_pool_index(f.read(_V2_HEAD_PEEK_BYTES))
+    except OSError:
+        return False
+
+
+def _peek_remote_v2_pool_index(cfg: dict, idx_path: str) -> bool:
+    try:
+        txt = pc.get_textfile(cfg, path=idx_path, maxbytes=_V2_REMOTE_PEEK_BYTES)
+    except Exception:
+        return False
+    return _bytes_look_like_v2_pool_index(txt.encode("utf-8", errors="replace"))
+
+
 def is_v2_pool_index(j: dict) -> bool:
     if not isinstance(j, dict):
         return False
@@ -88,6 +125,8 @@ def load_content_index_v2(
             j.setdefault("version", 2)
             return j
     idx_path = f"{snapshots_root.rstrip('/')}/_index/content_index.json"
+    if _peek_remote_v2_pool_index(cfg, idx_path):
+        raise RuntimeError(V2_POOL_INDEX_MSG)
     txt = pc.get_textfile(cfg, path=idx_path)
     j = json.loads(txt or "{}")
     if not isinstance(j, dict):
@@ -107,6 +146,8 @@ def load_content_index_legacy_items(
     """
     if prefer_local:
         for path in _local_master_candidates():
+            if _peek_local_v2_pool_index(path):
+                raise RuntimeError(V2_POOL_INDEX_MSG)
             j = _try_read_local_json(path)
             if j is None:
                 continue
@@ -118,6 +159,8 @@ def load_content_index_legacy_items(
             j.setdefault("version", 1)
             return j
     idx_path = f"{snaps_root.rstrip('/')}/_index/content_index.json"
+    if _peek_remote_v2_pool_index(cfg, idx_path):
+        raise RuntimeError(V2_POOL_INDEX_MSG)
     txt = pc.get_textfile(cfg, path=idx_path)
     j = json.loads(txt or '{"version":1,"items":{}}')
     if not isinstance(j, dict):
