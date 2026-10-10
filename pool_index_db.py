@@ -44,12 +44,33 @@ def _hash_file_sha256(path: str, block_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _archive_indexes_dir(env_vars: Optional[dict] = None) -> str:
+    if env_vars and env_vars.get("PCLOUD_ARCHIVE_DIR"):
+        archive = env_vars["PCLOUD_ARCHIVE_DIR"]
+    else:
+        archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    return os.path.join(archive, "indexes")
+
+
 def default_db_path() -> str:
+    """Backup-Pipeline (Turbo-Delta / Upload) — nicht von gc-engine beschrieben."""
     override = os.environ.get("PCLOUD_POOL_INDEX_DB_PATH")
     if override:
         return override
-    archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
-    return os.path.join(archive, "indexes", "pool_index.sqlite3")
+    return os.path.join(_archive_indexes_dir(), "pool_index.sqlite3")
+
+
+def default_ops_db_path(env_vars: Optional[dict] = None) -> str:
+    """
+    gc-engine: GC, Retention, delete-snapshots, Forecast.
+    Eigene Datei — Voll-Reimport berührt pool_index.sqlite3 (Backup) nicht.
+    """
+    if env_vars and env_vars.get("PCLOUD_GC_INDEX_DB_PATH"):
+        return env_vars["PCLOUD_GC_INDEX_DB_PATH"]
+    override = os.environ.get("PCLOUD_GC_INDEX_DB_PATH")
+    if override:
+        return override
+    return os.path.join(_archive_indexes_dir(env_vars), "pool_index_gc.sqlite3")
 
 
 def default_master_path() -> str:

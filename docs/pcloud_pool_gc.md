@@ -62,7 +62,7 @@ Während ein Backup läuft, setzt `pcloud_push_json_pool_manifest_to_pcloud.py` 
 
 ### Phase 1: Referenzen laden (gc-engine / SQLite)
 
-Standard (`PCLOUD_GC_USE_INDEX_DB=1`, Default): Remote-`content_index.json` → Disk (`download_binaryfile_to`), **Streaming-Import** (`ijson`) in `pool_index.sqlite3`, aktive SHAs per SQL — **kein** volles `pool_refs`-Dict im RAM. Forecast, `--retention-apply`, `--delete-snapshots` und Pool-GC nutzen **dieselbe** Purge-/Referenz-Logik (`pool_gc_index.py`).
+Standard (`PCLOUD_GC_USE_INDEX_DB=1`, Default): Remote-`content_index.json` → Disk, **Streaming-Import** (`ijson`) in **`pool_index_gc.sqlite3`** (nicht `pool_index.sqlite3` der Backup-Pipeline). Forecast, Retention, `delete-snapshots` und Pool-GC Phase 1 nutzen **dieselbe** Ops-Logik (`pool_gc_index.py`). Optional: `PCLOUD_GC_INDEX_DB_PATH`.
 
 Legacy (`PCLOUD_GC_USE_INDEX_DB=0`): `json.loads` des Master-Index (OOM-Risiko auf 8 GB Pi).
 

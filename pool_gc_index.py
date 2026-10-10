@@ -81,7 +81,8 @@ def open_synced_db(
     """Remote-Master auf Disk, SQLite spiegeln (streaming import wenn nötig)."""
     master_path, _ = master_paths(env_vars)
     download_remote_master(cfg, snapshots_root, master_path, log=log)
-    db_path = pidb.default_db_path()
+    db_path = pidb.default_ops_db_path(env_vars)
+    log(f"[gc-engine] Ops-SQLite (getrennt vom Backup-Index): {db_path}")
     db = pidb.open_db(db_path, create=True)
     if db.can_skip_master_reimport(master_path):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")

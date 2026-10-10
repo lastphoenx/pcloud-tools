@@ -808,6 +808,11 @@ def run_delete_snapshots(
             _log(
                 f"[delete-snapshots] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
             )
+            if not dry:
+                master_path, _ = gci.master_paths(env_vars)
+                _sync_pool_index_db_after_master(
+                    master_path, env_vars, deleted_snaps, dry=False,
+                )
         else:
             index, _ = _load_index(cfg, snapshots_root)
             purge_stats = _purge_snaps_from_index(index, deleted_snaps)
@@ -914,6 +919,11 @@ def run_retention_apply(
             _log(
                 f"[retention] Index bereinigt: {purge_stats.get('removed_snap_refs', 0)} snap-refs"
             )
+            if not dry:
+                master_path, _ = gci.master_paths(env_vars)
+                _sync_pool_index_db_after_master(
+                    master_path, env_vars, deleted_snaps, dry=False,
+                )
         else:
             index, _ = _load_index(cfg, snapshots_root)
             purge_stats = _purge_snaps_from_index(index, deleted_snaps)

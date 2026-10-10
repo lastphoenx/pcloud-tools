@@ -26,8 +26,11 @@ Der Index ist groß (~700–960 MB als JSON). Beim **Turbo-Delta**-Upload wird e
 
 | Ort | Format | Zweck |
 |-----|--------|--------|
-| **Lokal auf pi-nas** (`pool_index.sqlite3`) | SQLite | Arbeits-Index **nur während** des Uploads |
+| **Lokal auf pi-nas** (`pool_index.sqlite3`) | SQLite | Arbeits-Index **Backup / Turbo-Delta** (Upload) |
+| **Lokal auf pi-nas** (`pool_index_gc.sqlite3`) | SQLite | **gc-engine** — GC, Retention, `delete-snapshots`, Forecast (Voll-Reimport hier, Backup-DB unberührt) |
 | **In pCloud** (`_snapshots/_index/content_index.json`) | JSON (v2) | Offizielle Remote-Kopie, Chunk-Upload nach jedem Lauf |
+
+Nach scharfem Löschen/Retention: Remote + `content_index_master.json` werden aus der Ops-DB exportiert; die Backup-DB (`pool_index.sqlite3`) wird per `purge-snapshot` nachgezogen (`PCLOUD_POOL_INDEX_DB_SYNC_MODE=auto`), **ohne** Voll-Reimport.
 
 SQLite ersetzt **nicht** das Cloud-Format. Nach jedem erfolgreichen Lauf exportiert das Tool den SQLite-Stand wieder als JSON und lädt ihn nach pCloud hoch — wie vorher.
 
@@ -63,7 +66,8 @@ Mit `PCLOUD_POOL_INDEX_DB=1`:
 
 | Pfad | Rolle |
 |------|--------|
-| `/srv/pcloud-archive/indexes/pool_index.sqlite3` | SQLite-Arbeitsindex |
+| `/srv/pcloud-archive/indexes/pool_index.sqlite3` | SQLite Backup-Pipeline |
+| `/srv/pcloud-archive/indexes/pool_index_gc.sqlite3` | SQLite gc-engine (getrennt) |
 | `/srv/pcloud-archive/indexes/pool_index.sqlite3-wal` / `-shm` | SQLite WAL (normal bei laufender DB) |
 | `/srv/pcloud-archive/indexes/content_index_master.json` | Lokale Master-JSON (Dual-Track, nach jedem DB-Export) |
 | pCloud `_snapshots/_index/content_index.json` | Remote-Master (Chunk-Upload) |

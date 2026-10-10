@@ -22,6 +22,8 @@ cd /opt/apps/pcloud-tools/main
 
 Wrapper, Integrity-Audit und Health-Check nutzen dieselbe Konvention (`/opt/apps/pcloud-tools/venv/bin/python`), Fallback nur `python3` ohne venv.
 
+**Zwei SQLite-Dateien (nicht eine DB mit „extra Tabellen“):** Backup = `…/indexes/pool_index.sqlite3`; gc-engine = `…/indexes/pool_index_gc.sqlite3` (`PCLOUD_GC_INDEX_DB_PATH`). Getrennte Dateien = kein Lock/Re-Import-Konflikt mit laufendem Upload.
+
 **Nach `requirements.txt`-Änderung auf `main`:**
 
 ```bash
