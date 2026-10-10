@@ -87,6 +87,16 @@ except Exception as e:
 else:
     _GCI_IMPORT_ERR = ""
 
+try:
+    import pool_gc_manifest_guard as mg
+    import pool_index_db as pidb
+except Exception as e:
+    mg = None  # type: ignore
+    pidb = None  # type: ignore
+    _MG_IMPORT_ERR = str(e)
+else:
+    _MG_IMPORT_ERR = ""
+
 
 # Thread-safe Stats
 class _GCStats:
@@ -967,6 +977,29 @@ def run_pool_gc(
             f"{len(ref_lookup)} unique SHA256 ({scan_duration:.1f}s)"
         )
 
+        manifest_guard_meta: Dict[str, object] = {}
+        if mg is not None and pidb is not None:
+            ops_db = pidb.default_ops_db_path(env_vars)
+            guard = mg.build_gc_manifest_guard(
+                remote_snaps, ops_db, env_vars, log=_log,
+            )
+            manifest_guard_meta = {
+                "manifest_guard_missing_in_ops_db": guard.missing_in_ops_db,
+                "manifest_guard_protected_shas": len(guard.protected_shas),
+            }
+            if guard.abort_reason:
+                return {
+                    "error": guard.abort_reason,
+                    "aborted": True,
+                    **manifest_guard_meta,
+                }
+            referenced_sha256s = mg.ManifestProtectedShaLookup(
+                ref_lookup, guard.protected_shas,
+            )
+        elif _MG_IMPORT_ERR:
+            _log(f"[gc-guard][ERROR] Manifest-Guard nicht geladen: {_MG_IMPORT_ERR}")
+            return {"error": "manifest_guard_import_failed", "aborted": True}
+
         if len(ref_lookup) == 0:
             _log(
                 "[gc][ERROR] Keine Referenzen in Ops-Index — Abbruch (Sicherheit). "
@@ -1072,7 +1105,7 @@ def run_pool_gc(
         if dry:
             _log("[gc] ⚠ DRY-RUN: Keine echten Löschungen durchgeführt")
 
-        return {
+        out = {
             "duration": duration,
             "mode": "index",
             "unique_refs": len(referenced_sha256s),
@@ -1082,6 +1115,8 @@ def run_pool_gc(
             "bytes_freed": final_stats["bytes_freed"],
             "errors": final_stats["errors"],
         }
+        out.update(manifest_guard_meta)
+        return out
     finally:
         if ref_lookup is not None:
             ref_lookup.close()

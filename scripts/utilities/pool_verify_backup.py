@@ -435,8 +435,7 @@ def _stub_checks_per_snapshot(
             continue
         refs, src = _fetch_pool_refs(cfg, snaps_root, [snap])
         weak_index = (
-            not refs
-            or "Manifest-only" in src
+            "Manifest-only" in src
             or "noch nicht vorhanden" in src
             or "archive fehlt" in src
         )
@@ -1017,9 +1016,17 @@ def run_verify(
         if r["missing_count"] > 0:
             summary_parts.append(f"{snap}: {r['missing_count']} manifest pool gaps")
 
+    verification_tier = "weak" if weak_index_snaps and issues == 0 else "full"
+    if weak_index_snaps and issues == 0:
+        _out(
+            "[warn] verification_tier=weak — Check B teilweise ohne Archiv-Index; "
+            "kein harter Integritätsfehler, aber Dashboard/Exit sollte warnen."
+        )
+
     return {
         "ok": issues == 0,
         "issues": issues,
+        "verification_tier": verification_tier,
         "duration_sec": round(dt_total, 2),
         "snapshots": remote_snaps,
         "weak_index_snapshots": weak_index_snaps,
@@ -1073,7 +1080,12 @@ def main() -> int:
             stub_sample=args.stub_sample,
             verbose=True,
         )
-        exit_code = 0 if result.get("ok") else 1
+        if not result.get("ok"):
+            exit_code = 1
+        elif result.get("verification_tier") == "weak":
+            exit_code = 1
+        else:
+            exit_code = 0
     except Exception as e:
         result = {
             "ok": False,
@@ -1091,7 +1103,13 @@ def main() -> int:
 
     dt_total = result.get("duration_sec", 0)
     print("=" * 60)
-    if result.get("ok"):
+    if result.get("ok") and result.get("verification_tier") == "weak":
+        weak = result.get("weak_index_snapshots") or []
+        print(
+            f"⚠ CHECKS OK (schwach) — {len(weak)} Snapshot(s) ohne Archiv-Index "
+            f"({dt_total:.1f}s); Exit 1"
+        )
+    elif result.get("ok"):
         print(f"✓ ALLE CHECKS OK — Backup vollstaendig integr ({dt_total:.1f}s)")
     else:
         err = result.get("error") or result.get("error_summary") or f"{result.get('issues', 0)} PROBLEM(E)"

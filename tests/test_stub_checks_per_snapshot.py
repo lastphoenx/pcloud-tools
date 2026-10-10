@@ -64,6 +64,26 @@ class StubChecksPerSnapshotTests(unittest.TestCase):
         self.assertEqual(merged.get("missing_from_index"), 0)
         self.assertEqual(merged.get("index_check_skipped_snapshots"), ["snap-a"])
 
+    def test_empty_refs_with_present_archive_not_weak(self) -> None:
+        manifests = {"snap-a": {"f.txt": "cc" * 32}}
+        with mock.patch.object(
+            pvb,
+            "_fetch_pool_refs",
+            return_value=({}, "archive/snap-a_index.json (0 refs)"),
+        ):
+            with mock.patch.object(pvb, "check_stubs_vs_index") as csi:
+                csi.return_value = {
+                    "missing_from_index": 0,
+                    "manifest_missing_total": 0,
+                    "mode": "manifest_scoped",
+                }
+                _merged, weak, _src = pvb._stub_checks_per_snapshot(
+                    {}, "/pool/_snapshots", manifests, set(), ["snap-a"],
+                )
+        self.assertNotIn("snap-a", weak)
+        csi.assert_called_once()
+        self.assertNotEqual(csi.call_args[0][0], {})
+
 
 if __name__ == "__main__":
     unittest.main()

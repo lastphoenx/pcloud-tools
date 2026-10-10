@@ -68,6 +68,8 @@ Nach Purge/Export: `upload_pending=1` bis der Master-Upload gelingt. **Nur** `op
 
 `--audit-mode` ist deaktiviert (Stub-Scan / RAM-Set) bis Streaming-Umbau.
 
+**Manifest-Guard (Phase 1→2):** Nach Ops-Index-Lookup werden alle SHA256 aus lokalen Manifesten unter `$PCLOUD_ARCHIVE_DIR/manifests/` der **live** Remote-Snapshots zusätzlich geschützt. Fehlt ein live Snapshot in der Ops-DB, aber das Manifest existiert, läuft GC weiter (Log `[gc-guard][CRITICAL]`). **Abbruch** nur wenn weder Ops-Eintrag noch Manifest — dann kein blindes Löschen. Abschalten: `PCLOUD_GC_MANIFEST_GUARD=0`. Konsistenz-Monitoring: `scripts/pool_consistency_check.py`, Runbook `docs/pool-index-gap-runbook.md`.
+
 **Performance:** Import/Abfrage typisch Sekunden–wenige Minuten; abhängig von Index-Größe und Netz.
 
 Beispiel-Log:
