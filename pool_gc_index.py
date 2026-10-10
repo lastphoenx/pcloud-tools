@@ -48,6 +48,35 @@ def remote_index_path(snapshots_root: str) -> str:
     return f"{snapshots_root.rstrip('/')}/_index/content_index.json"
 
 
+def remote_master_sha256(cfg: dict, snapshots_root: str, *, log: LogFn) -> Optional[str]:
+    """pCloud checksumfile — kein 2-GB-Download nur für Vergleich."""
+    path = remote_index_path(snapshots_root)
+    try:
+        cs = pc.checksumfile(cfg, path=path)
+        h = (cs.get("sha256") or "").strip().lower()
+        return h or None
+    except Exception as e:
+        log(f"[gc-engine][warn] Remote checksumfile ({path}): {e}")
+        return None
+
+
+def _ops_db_can_skip_import(
+    db: pidb.PoolIndexDB,
+    master_path: str,
+    remote_sha: Optional[str],
+) -> bool:
+    if db.count_shas() == 0:
+        return False
+    stored = (db.get_meta("master_sha256") or "").strip().lower()
+    if stored and remote_sha and remote_sha == stored:
+        return True
+    if db.master_fingerprint_matches(master_path) is True:
+        return True
+    if db.master_file_sha256_matches(master_path) is True:
+        return True
+    return False
+
+
 def download_remote_master(
     cfg: dict,
     snapshots_root: str,
@@ -80,14 +109,36 @@ def open_synced_db(
 ) -> pidb.PoolIndexDB:
     """Remote-Master auf Disk, SQLite spiegeln (streaming import wenn nötig)."""
     master_path, _ = master_paths(env_vars)
-    download_remote_master(cfg, snapshots_root, master_path, log=log)
     db_path = pidb.default_ops_db_path(env_vars)
     log(f"[gc-engine] Ops-SQLite (getrennt vom Backup-Index): {db_path}")
     db = pidb.open_db(db_path, create=True)
-    if db.can_skip_master_reimport(master_path):
+
+    remote_sha = remote_master_sha256(cfg, snapshots_root, log=log)
+    stored = (db.get_meta("master_sha256") or "").strip().lower()
+    if remote_sha and stored and remote_sha == stored and db.count_shas() > 0:
+        log(
+            "[gc-engine] Remote-Index unverändert (SHA256) — "
+            "Download und Re-Import übersprungen"
+        )
+        if os.path.isfile(master_path):
+            db.refresh_master_metadata(master_path)
+        return db
+
+    if remote_sha and stored and remote_sha != stored:
+        log("[gc-engine] Remote-Index geändert seit letztem Ops-Import — Download …")
+    elif not stored or db.count_shas() == 0:
+        log("[gc-engine] Ops-Index leer oder ohne Fingerprint — Download …")
+    else:
+        log("[gc-engine] Remote-SHA unbekannt — Download …")
+
+    download_remote_master(cfg, snapshots_root, master_path, log=log)
+    remote_sha = remote_sha or remote_master_sha256(cfg, snapshots_root, log=log)
+
+    if _ops_db_can_skip_import(db, master_path, remote_sha):
         log("[gc-engine] SQLite aktuell — Re-Import übersprungen")
         db.refresh_master_metadata(master_path)
         return db
+
     log("[gc-engine] Streaming-Import Master → SQLite …")
     db.import_from_json_streaming(master_path, log=log)
     return db
