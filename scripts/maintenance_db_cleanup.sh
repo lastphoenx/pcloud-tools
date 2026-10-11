@@ -6,6 +6,9 @@
 # Usage:
 #   sudo ./scripts/maintenance_db_cleanup.sh
 #   sudo ./scripts/maintenance_db_cleanup.sh --purge-90d
+#   sudo ./scripts/maintenance_db_cleanup.sh --preview-failed
+#   sudo ./scripts/maintenance_db_cleanup.sh --failed-only
+#   sudo ./scripts/maintenance_db_cleanup.sh --failed-superseded   # Forensik weg
 
 set -euo pipefail
 
@@ -13,13 +16,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SQL_FILE="$REPO_ROOT/sql/maintenance_db_cleanup.sql"
 PURGE_90D=0
+PREVIEW_FAILED=0
+FAILED_ONLY=0
+FAILED_SUPERSEDED=0
 
 for arg in "$@"; do
   case "$arg" in
     --purge-90d) PURGE_90D=1 ;;
+    --preview-failed) PREVIEW_FAILED=1 ;;
+    --failed-only) FAILED_ONLY=1 ;;
+    --failed-superseded) FAILED_SUPERSEDED=1 ;;
     -h|--help)
-      echo "Usage: $0 [--purge-90d]"
-      echo "  --purge-90d  Zusaetzlich backup_runs aelter als 90 Tage loeschen"
+      echo "Usage: $0 [--purge-90d] [--preview-failed] [--failed-only] [--failed-superseded]"
+      echo "  --purge-90d           backup_runs aelter als 90 Tage loeschen"
+      echo "  --preview-failed      nur SELECTs (failed_only_preview.sql)"
+      echo "  --failed-only         DELETE nur FAILED ohne je SUCCESS"
+      echo "  --failed-superseded   optional: FAILED trotz SUCCESS (mysqldump empfohlen)"
       exit 0
       ;;
     *)
@@ -42,10 +54,19 @@ fi
 echo "==> SQL: $SQL_FILE"
 mysql pcloud_backup < "$SQL_FILE"
 
-FAILED_ONLY_SQL="$REPO_ROOT/sql/maintenance_db_cleanup_failed_only.sql"
-if [[ -f "$FAILED_ONLY_SQL" ]]; then
-  echo ""
-  echo "Optional (nie SUCCESS): mysql pcloud_backup < sql/maintenance_db_cleanup_failed_only.sql"
+if [[ "$PREVIEW_FAILED" -eq 1 ]]; then
+  echo "==> Preview: failed_only_preview.sql"
+  mysql pcloud_backup < "$REPO_ROOT/sql/maintenance_db_cleanup_failed_only_preview.sql"
+fi
+
+if [[ "$FAILED_ONLY" -eq 1 ]]; then
+  echo "==> DELETE: failed_only.sql (nur FAILED ohne je SUCCESS)"
+  mysql pcloud_backup < "$REPO_ROOT/sql/maintenance_db_cleanup_failed_only.sql"
+fi
+
+if [[ "$FAILED_SUPERSEDED" -eq 1 ]]; then
+  echo "==> DELETE: failed_superseded_optional.sql"
+  mysql pcloud_backup < "$REPO_ROOT/sql/maintenance_db_cleanup_failed_superseded_optional.sql"
 fi
 
 if [[ "$PURGE_90D" -eq 1 ]]; then

@@ -3,11 +3,13 @@
 -- Voraussetzung: backup-pipeline.service inactive
 --   systemctl is-active backup-pipeline.service
 --
--- Ausführung auf pi-nas (als root, DB pcloud_backup):
---   cd /opt/apps/pcloud-tools/main
+-- Ausführung auf pi-nas (Pipeline inactive):
+--   mysql pcloud_backup < sql/maintenance_db_cleanup_failed_only_preview.sql   # nur lesen
+--   mysqldump pcloud_backup backup_runs backup_phases > /tmp/backup_runs_$(date +%F).sql
 --   mysql pcloud_backup < sql/maintenance_db_cleanup_failed_only.sql
 --
--- Nur Preview (ohne DELETE): Kommentar bei DELETE-Block lassen, nur SELECTs laufen lassen.
+-- FAILED trotz SUCCESS (Forensik weg): nur bewusst —
+--   sql/maintenance_db_cleanup_failed_superseded_optional.sql
 
 USE pcloud_backup;
 
@@ -57,26 +59,7 @@ WHERE br.status = 'FAILED'
     WHERE o.snapshot_name = br.snapshot_name AND o.status = 'SUCCESS'
   );
 
-SELECT '=== PREVIEW: FAILED obwohl irgendwann SUCCESS (Kosmetik Audit) ===' AS '';
-
-SELECT br.run_id, br.snapshot_name, br.started_at, LEFT(COALESCE(br.error_message,''),80) AS err
-FROM backup_runs br
-WHERE br.status = 'FAILED'
-  AND EXISTS (
-    SELECT 1 FROM backup_runs o
-    WHERE o.snapshot_name = br.snapshot_name AND o.status = 'SUCCESS'
-  )
-ORDER BY br.snapshot_name, br.started_at;
-
-DELETE br
-FROM backup_runs br
-WHERE br.status = 'FAILED'
-  AND EXISTS (
-    SELECT 1 FROM backup_runs o
-    WHERE o.snapshot_name = br.snapshot_name AND o.status = 'SUCCESS'
-  );
-
-SELECT '=== NACH DELETE ===' AS '';
+SELECT '=== NACH DELETE (nur nie-SUCCESS FAILED) ===' AS '';
 
 SELECT status, COUNT(*) AS cnt FROM backup_runs GROUP BY status;
 

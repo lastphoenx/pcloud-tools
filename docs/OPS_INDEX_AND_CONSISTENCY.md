@@ -67,9 +67,8 @@ SELECT s.name, COUNT(r.sha_id) AS refs
 FROM snapshots s LEFT JOIN snap_refs r ON r.snap_id=s.id
 WHERE s.name='$GHOST' GROUP BY s.id;"
 
-# 3) Purge + leere Snapshot-Zeile (purge_snapshot löscht nur snap_refs)
+# 3) Purge (purge_snapshot entfernt snap_refs + snapshots-Zeile)
 $PY pool_index_db.py --db "$BACKUP_DB" purge-snapshot "$GHOST"
-sqlite3 "$BACKUP_DB" "DELETE FROM snapshots WHERE name='$GHOST';"
 
 # 4) Master exportieren + Chunk-Upload nach pCloud (Pipeline-Code)
 $PY -c "
@@ -92,7 +91,9 @@ Erwartung: `live_count` = `ops_db_count` = `backup_db_count` = `manifest_count` 
 ## MariaDB-Kosmetik
 
 - Standard: `scripts/maintenance_db_cleanup.sh` (superseded FAILED, RUNNING-Zombies, …).
-- Snapshots **ohne je SUCCESS**: `sql/maintenance_db_cleanup_failed_only.sql`
+- Preview: `./scripts/maintenance_db_cleanup.sh --preview-failed` oder `sql/maintenance_db_cleanup_failed_only_preview.sql`.
+- Snapshots **ohne je SUCCESS**: `--failed-only` / `sql/maintenance_db_cleanup_failed_only.sql`.
+- FAILED trotz SUCCESS (optional, Forensik weg): `--failed-superseded` / `sql/maintenance_db_cleanup_failed_superseded_optional.sql`.
 - Danach: `scripts/generate_reports.sh`
 
 ## RAM / Dauer

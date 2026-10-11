@@ -766,6 +766,7 @@ class PoolIndexDB:
         c = self.conn
         n = self.snap_ref_count(snapshot)
         c.execute("DELETE FROM snap_refs WHERE snap_id=?", (sid,))
+        c.execute("DELETE FROM snapshots WHERE id=?", (sid,))
         if commit:
             c.commit()
         return n

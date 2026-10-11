@@ -242,6 +242,7 @@ class PoolIndexDbTests(unittest.TestCase):
         n = self.db.purge_snapshot("snap-a")
         self.assertGreater(n, 0)
         self.assertEqual(self.db.snapshot_pair_count("snap-a"), 0)
+        self.assertNotIn("snap-a", self.db.snapshot_names())
         self.assertGreater(self.db.count_shas(), 0)
         out = os.path.join(self.dir, "after.json")
         self.db.export_content_index_json(out)

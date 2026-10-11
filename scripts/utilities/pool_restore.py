@@ -310,18 +310,24 @@ def snapshot_is_complete(cfg: dict, dest_root: str, snapshot: str) -> bool:
 
 
 def _resolve_fileid(cfg: dict, dest_root: str, item: dict) -> Optional[int]:
+    """
+    Pool-Objekt per SHA bevorzugen (aktuell nach RTB-Backfill), dann Stub/Index-fileid.
+    """
+    sha = item.get("sha256")
+    if sha:
+        try:
+            stat = pc.stat_file(
+                cfg, path=_pool_obj_path(dest_root, sha), with_checksum=False,
+            ) or {}
+            fid = stat.get("fileid")
+            if fid:
+                return int(fid)
+        except Exception:
+            pass
     fileid = item.get("fileid")
     if fileid:
         return int(fileid)
-    sha = item.get("sha256")
-    if not sha:
-        return None
-    try:
-        stat = pc.stat_file(cfg, path=_pool_obj_path(dest_root, sha), with_checksum=False) or {}
-        fid = stat.get("fileid")
-        return int(fid) if fid else None
-    except Exception:
-        return None
+    return None
 
 
 def _download_pool_item(
