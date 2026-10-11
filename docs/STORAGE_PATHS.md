@@ -53,10 +53,20 @@ Unterverzeichnisse (von Pipeline/Wrapper angelegt):
   deltas/
     delta_verify_<snap>.json
   resume/                 ← Chunked-Upload Resume-State
-  staging/json/           ← Upload-Scratch (pro folderid) — **nicht** ins RTB (`excludes.txt`)
+  staging/json/           ← Upload-Scratch (pro folderid) — **nicht** ins RTB (`excludes.txt`: nur staging/)
+  indexes/                ← in RTB mitgesichert (Master, pool_index*.sqlite3, ggf. .wal/.shm)
+  deltas/ resume/ state/ db-backups/  ← in RTB mitgesichert (Ist-Check unten)
 ```
 
-**RTB / Offsite:** Kanonisch schreibt die Pipeline nach **`/srv/pcloud-archive`** auf SSD2 (`sdd1`), nicht unter `SRC=/srv/nas`. RTB kopiert pro Lauf u. a. nach **`/mnt/backup/rtb_nas/<snap>/pcloud-archive/manifests/`** (Spiegel der Manifest-Sammlung zum Snap-Zeitpunkt, typisch ~1× pro Live-Snap-Anzahl Dateien). **Nicht** im pCloud-Pool (nur Stubs/Hashes der Nutzdaten). Deltas, Resume, `pool_index.sqlite3` stecken nicht im RTB-Snap. Offsite-Index-Spiegel: `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json`. USB-Timer (`pcloud-manifests-backup.service`) = **dritte** Kopie der SSD2-Manifeste (Ziel außerhalb `/srv/nas`), zusätzlich zu SSD2 + RTB-Spiegel. `staging/` ist in `excludes.txt` ausgeschlossen.
+**RTB / Offsite:** Kanonisch schreibt die Pipeline nach **`/srv/pcloud-archive`** auf SSD2 (`sdd1`), nicht unter `SRC=/srv/nas`. RTB legt pro Lauf einen Spiegel unter **`/mnt/backup/rtb_nas/<snap>/pcloud-archive/`** an — u. a. `manifests/`, `indexes/` (oft **~10–30 GiB** inkl. `content_index_master.json`, `pool_index.sqlite3` / `pool_index_gc.sqlite3` und WAL/SHM), `deltas/`, `resume/`, `state/`, `db-backups/`. Ausgeschlossen ist nur **`pcloud-archive/staging/`** (`rtb/excludes.txt`). **Nicht** im pCloud-Pool (nur Stubs/Hashes der Nutzdaten). Separater Offsite-Spiegel (schmal): `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json` — dort ist `pool_index.sqlite3` bewusst **nicht** (siehe `POOL_INDEX_DB.md`). USB-Timer (`pcloud-manifests-backup.service`) = **dritte** Kopie nur der SSD2-`manifests/` (Ziel außerhalb `/srv/nas`).
+
+Prüfen (pi-nas, `latest` = symlink auf jüngsten Snap):
+
+```bash
+readlink -f /mnt/backup/rtb_nas/latest
+du -sh /mnt/backup/rtb_nas/latest/pcloud-archive /mnt/backup/rtb_nas/latest/pcloud-archive/indexes
+ls /mnt/backup/rtb_nas/latest/pcloud-archive/
+```
 
 ---
 
@@ -147,10 +157,10 @@ python scripts/utilities/pool_verify_backup.py \
 | Daten | Lokal SSD2 | RTB lokal (`/mnt/backup/rtb_nas/<snap>/`) | pCloud (Pool/Snapshots) | RTB-Offsite (Spiegel → pCloud) |
 |-------|------------|-------------------------------------------|-------------------------|--------------------------------|
 | Nutzer-Snapshots (RTB-Inhalt) | — | ja (Quelle der Pipeline) | Stubs + Pool-Hashes | ja (Kern-Backup) |
-| `content_index_master.json` | ja | nein | ja (Remote-Master) | ja (`raspi5nas/…`) |
-| `manifests/*.json` (≈ Live-Snap-Anzahl) | ja (kanonisch) | ja (`<snap>/pcloud-archive/manifests/`) | nein | nein (USB = 3. Kopie, rtb-Repo) |
-| `pool_index.sqlite3` (Arbeits-DB) | ja | nein | nein | nein (rebuildbar) |
-| Deltas / Resume | ja | nein | nein | nein |
+| `content_index_master.json` | ja | ja (`…/pcloud-archive/indexes/`, inkl. `.bak*`) | ja (Remote-Master) | ja (nur Master, `raspi5nas/…`) |
+| `manifests/*.json` (≈ Live-Snap-Anzahl) | ja (kanonisch) | ja (`…/pcloud-archive/manifests/`) | nein | nein (USB = 3. Kopie, rtb-Repo) |
+| `pool_index*.sqlite3` (Arbeits-/GC-DB) | ja | ja (`indexes/`, inkl. `-wal`/`-shm`) | nein | nein (Offsite-Spiegel rebuildbar) |
+| Deltas / Resume / state / db-backups | ja | ja (`…/pcloud-archive/…`) | nein | nein |
 
 Manifeste neu erzeugen ist **Aufwand** (RTB-Re-Scan), kein Datenverlust der Nutzer-Backups. **Optional (rtb-Repo):** `pcloud_manifests_usb_backup.sh` + `pcloud-manifests-backup.service` — `rsync` von `/srv/pcloud-archive/manifests` auf Backup-HDD (**dritte** Kopie neben SSD2 und RTB-Spiegel im jeweiligen Snap). Täglich inkrementell.
 
