@@ -376,6 +376,7 @@
     .badge.failed  { background: rgba(239,68,68,0.15);  color: var(--red); }
     .badge.stale   { background: rgba(245,158,11,0.15); color: var(--yellow); }
     .badge.unknown { background: rgba(148,163,184,0.15); color: var(--muted); }
+    .badge.archived { background: rgba(148,163,184,0.12); color: var(--muted); font-weight: 500; }
     .report-table tr.row-failed td { background: rgba(239,68,68,0.08); }
     .report-table tr.row-running td { background: rgba(234,179,8,0.08); }
     .badge.running { background: rgba(59,130,246,0.15); color: var(--blue); }
@@ -996,9 +997,9 @@
       if (onRemote === false || /no_valid_snapshots/i.test(sum)) {
         return {
           kind: 'gone',
-          badge: 'nicht mehr auf pCloud',
-          badgeCls: 'unknown',
-          explain: 'Ordner ist per Retention/Pool-GC weg. Die DB-Zeile ist Historie, kein Live-Schaden. Matrix zeigt solche Snaps oft gar nicht.',
+          badge: 'Retention / Archiv',
+          badgeCls: 'archived',
+          explain: 'Remote-Ordner absichtlich entfernt (Retention/Pool-GC). MariaDB behält alte Audit-Zeilen — kein aktueller Backup-Fehler. Live-Matrix: pool_audit_status.',
           currentN: 0,
           currentSrc: '',
           histN: 0
@@ -1213,6 +1214,10 @@
       const catchupN = sb.catchup_count || 0;
       const incompleteN = sb.incomplete_count || 0;
       const zombieN = sb.running_zombies || 0;
+      const liveRemoteN = (sb.remote_complete_count != null)
+        ? Number(sb.remote_complete_count)
+        : ((sb.remote_complete || []).length);
+      const intDbLive = Math.max(0, intTotal - intGone);
       if (incompleteN > 0 && tileCls === 'ok') tileCls = 'bad';
       else if ((catchupN > 0 || zombieN > 0) && tileCls === 'ok') tileCls = 'warning';
 
@@ -1281,15 +1286,22 @@
           + '<div class="big">' + intStale + '</div><div class="lbl">Pr\u00fcfung alt</div></div>'
           + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'au_ok\')" title="Klicken: Snapshots mit aktuellem Audit OK">'
           + '<div class="big">' + intAuOk + '</div><div class="lbl">Audit OK</div></div>'
-          + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'all\')" title="Klicken: Live-Zeilen (GC-Historie aus)">'
-          + '<div class="big">' + intTotal + '</div><div class="lbl">Snapshots (DB)</div></div>'
+          + '<div class="summary-box green" title="Remote-Ordner mit .upload_complete (pool_audit_status, gleiche Quelle wie Catch-up)">'
+          + '<div class="big">' + (liveRemoteN > 0 ? liveRemoteN : '\u2014') + '</div><div class="lbl">live auf pCloud</div></div>'
+          + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'all\')" title="MariaDB-Zeilen f\u00fcr Snapshots die noch einen Remote-Ordner haben (' + intDbLive + '). Gesamt inkl. Archiv: ' + intTotal + '">'
+          + '<div class="big">' + intDbLive + '</div><div class="lbl">Integrit\u00e4t (live)</div></div>'
+          + '<div class="summary-box clickable gray" onclick="openIntegrityDetail(\'gone\')" title="Alle Namen die je in backup_runs/Integrit\u00e4t standen — inkl. ' + intGone + ' ohne Remote-Ordner (Retention/GC)">'
+          + '<div class="big">' + intTotal + '</div><div class="lbl">MariaDB (gesamt)</div></div>'
           + '</div>';
-        html += '<div class="integrity-hint"><strong>Nachz\u00e4hlung auf pCloud</strong> \u2014 nicht der Live-Sync (Catch-up oben). '
-          + '<strong>Post-Upload offen</strong> = Gate nach Backup noch ohne sp\u00e4teren OK-Audit'
+        html += '<div class="integrity-hint"><strong>Zwei Ebenen:</strong> '
+          + '<strong>' + (liveRemoteN > 0 ? liveRemoteN : '?') + ' live auf pCloud</strong> (Health-Check / pool_audit_status) '
+          + 'vs. <strong>' + intTotal + ' in MariaDB</strong> (davon ' + intGone + ' nur Archiv, Standard ausgeblendet). '
+          + 'Nachz\u00e4hlung/Integrit\u00e4t \u2014 nicht Catch-up (oben). '
+          + '<strong>Post-Upload offen</strong> = Gate ohne sp\u00e4teren OK-Audit'
           + (intPuHist > 0 ? ' \u00b7 ' + intPuHist + '\u00d7 historisch (sp\u00e4ter OK)' : '')
-          + ' \u00b7 <strong>Pr\u00fcfung alt</strong> = letzter Audit OK, &gt;35 Tage her'
-          + (intGone > 0 ? ' \u00b7 <a href="#" onclick="openIntegrityDetail(\'gone\');return false;" style="color:var(--muted)">' + intGone + '\u00d7 nicht mehr auf pCloud</a> (Retention/GC, Standard ausgeblendet)' : '')
-          + (intNoMan > 0 ? ' \u00b7 ' + intNoMan + '\u00d7 Manifest fehlt (Check nicht m\u00f6glich)' : '')
+          + ' \u00b7 <strong>Pr\u00fcfung alt</strong> = Audit OK, &gt;35 Tage'
+          + (intGone > 0 ? ' \u00b7 <a href="#" onclick="openIntegrityDetail(\'gone\');return false;" style="color:var(--muted)">' + intGone + '\u00d7 Retention/Archiv</a>' : '')
+          + (intNoMan > 0 ? ' \u00b7 ' + intNoMan + '\u00d7 Manifest fehlt' : '')
           + '</div>';
       } else {
         html += '<div class="integrity-hint" style="margin-top:6px">'
@@ -1320,15 +1332,16 @@
 
       if (intSnaps.length > 0) {
         html += '<button class="detail-toggle" id="btn-integrity" onclick="toggleDetail(\'integrity\')">'
-          + '<span>Pool-Integrit&auml;t (' + (intSnaps.length - intGone) + ' live'
-          + (intGone > 0 ? ', ' + intGone + ' GC' : '') + ')</span><span class="arrow">\u25BC</span></button>'
+          + '<span>Pool-Integrit&auml;t \u2014 ' + intDbLive + ' live, ' + intTotal + ' DB'
+          + (intGone > 0 ? ', ' + intGone + ' Archiv' : '') + '</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-integrity"><div class="tile-detail-inner">'
           + '<div class="integrity-hint" style="margin:8px 12px 10px">'
-          + '<strong>Standard: nur noch auf pCloud.</strong> '
+          + '<strong>Standard: Zeilen mit Remote-Ordner</strong> (wie pool_audit_status: '
+          + (liveRemoteN > 0 ? liveRemoteN + ' complete' : 'live-Z\u00e4hlung aus Health-Check') + '). '
           + (intGone > 0
-            ? '<label style="margin-left:8px;cursor:pointer"><input type="checkbox" id="integrity-show-gone" onchange="toggleIntegrityGone(this.checked)"> GC-Historie (' + intGone + ')</label> '
+            ? '<label style="margin-left:4px;cursor:pointer"><input type="checkbox" id="integrity-show-gone" onchange="toggleIntegrityGone(this.checked)"> Retention/Archiv anzeigen (' + intGone + ' \u2014 nur MariaDB, kein Remote)</label> '
             : '')
-          + 'Lage = was jetzt gilt. Manifest fehlt = Complete ohne lokales JSON.'
+          + 'Spalte <em>Lage</em> = Interpretation jetzt; alte OK-Audits bei Archiv-Zeilen sind Historie.'
           + '</div>'
           + '<table class="report-table"><thead><tr>'
           + '<th>Snapshot</th>'

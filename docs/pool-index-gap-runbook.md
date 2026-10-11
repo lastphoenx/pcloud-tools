@@ -44,6 +44,18 @@
 - Wenn Remote schon `.upload_complete` hat, aber `pool_index.sqlite3` den Snapshot nicht (0 `snap_refs`): **nicht** normales `--finalize-only` (überspringt dann still) — stattdessen **`--finalize-only --index-repair`** (ohne `--dry-run`). Dry-Run zeigt nur die geplanten Refs; scharf schreibt SQLite + Master. Integrity-Gate bleibt aus (bekannte Pool-Lücken bis RTB-Backfill).
 - Nach Master-Sync: Ops-DB folgt per `checksumfile`/Import automatisch.
 
+### Ops-DB nur synchronisieren (ohne GC-Dry-Run)
+
+Wenn Backup-DB und Remote schon passen, aber `pool_consistency_check` `live_not_in_ops_db` meldet (z. B. neuer Snapshot nach Finalize):
+
+```bash
+cd /opt/apps/pcloud-tools/main
+/opt/apps/pcloud-tools/venv/bin/python scripts/utilities/pool_ops_index_sync.py --env-file .env
+/opt/apps/pcloud-tools/venv/bin/python scripts/pool_consistency_check.py --env-file .env
+```
+
+Dauer: vor allem **Streaming-Import** des Remote-Masters (~wie GC Phase 1), **ohne** Orphan-Listing des vollen Dry-Runs. Schreibt nichts nach pCloud (`repair_writes` nur mit `--repair-writes`).
+
 ## Pool aus RTB (nach Index-Reparatur)
 
 ```bash
