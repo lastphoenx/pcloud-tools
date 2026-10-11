@@ -42,6 +42,12 @@ fi
 echo "==> SQL: $SQL_FILE"
 mysql pcloud_backup < "$SQL_FILE"
 
+FAILED_ONLY_SQL="$REPO_ROOT/sql/maintenance_db_cleanup_failed_only.sql"
+if [[ -f "$FAILED_ONLY_SQL" ]]; then
+  echo ""
+  echo "Optional (nie SUCCESS): mysql pcloud_backup < sql/maintenance_db_cleanup_failed_only.sql"
+fi
+
 if [[ "$PURGE_90D" -eq 1 ]]; then
   echo "==> Purge: backup_runs > 90 Tage"
   mysql pcloud_backup -e "

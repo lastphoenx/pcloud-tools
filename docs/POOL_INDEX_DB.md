@@ -219,5 +219,6 @@ python pool_index_db.py purge-snapshot 2026-07-16-040030
 
 ## Siehe auch
 
+- [OPS_INDEX_AND_CONSISTENCY.md](OPS_INDEX_AND_CONSISTENCY.md) — Ops vs Backup, Konsistenz-Check, Geister-Snapshots, `pool_ops_index_sync`
 - [README — Speicher (RAM)](../../README.md#speicher-ram-auf-dem-raspberry-pi)
 - [CHANGELOG_2026-08.md](CHANGELOG_2026-08.md)

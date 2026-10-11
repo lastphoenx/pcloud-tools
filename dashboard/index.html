@@ -69,13 +69,31 @@
     .overall-label { font-size: 16px; font-weight: 600; }
     .overall-explain { font-size: 13px; color: var(--muted); }
 
+    .dashboard-shell {
+      width: 100%;
+      max-width: 100%;
+      margin: 0 auto;
+    }
     .tiles {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 16px;
     }
+    /* Viewport, nicht Monitor-Zoll: Smartphone / Tablet / Desktop */
     @media (max-width: 1000px) { .tiles { grid-template-columns: 1fr; } }
     @media (min-width: 1001px) and (max-width: 1280px) { .tiles { grid-template-columns: 1fr 1fr; } }
+    @media (min-width: 1281px) and (max-width: 1599px) {
+      .dashboard-shell { max-width: 1280px; }
+    }
+    @media (min-width: 1600px) {
+      .dashboard-shell { max-width: 1520px; }
+      #detail-sections {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+        align-items: start;
+      }
+    }
 
     .tile {
       background: var(--surface);
@@ -671,6 +689,8 @@
 </head>
 <body>
 
+  <div class="dashboard-shell">
+
   <div class="header">
     <div class="header-left">
       <h1>&#x1F5A5;&#xFE0F; Backup &amp; Monitoring Dashboard</h1>
@@ -776,6 +796,8 @@
     <span>Auto-Refresh in <strong id="countdown">60</strong>s</span>
     <span id="last-update">&#x2014;</span>
   </div>
+
+  </div><!-- .dashboard-shell -->
 
   <script>
     const STATUS_URL  = '/monitoring/status.json';
