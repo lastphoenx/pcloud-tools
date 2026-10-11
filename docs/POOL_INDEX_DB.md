@@ -82,7 +82,9 @@ Täglich kopiert `rtb/raspi5nas_backup.sh` nur **`content_index_master.json`** n
 
 **Nicht** gespiegelt: `pool_index.sqlite3` — ändert sich täglich, ~7 GB pro Pool-Objekt, jederzeit per Streaming-Import neu aufbaubar (Pipeline oder `scripts/utilities/pool_ops_index_sync.py`). RTB-`excludes.txt`: `/Backup/raspi5nas/pcloud-archive-indexes/pool_index.sqlite3`.
 
-**Neuaufbau der Backup-DB:** Fehlt `pool_index.sqlite3`, importiert der nächste Lauf die Master-JSON per **Streaming** (nicht `pool_index_db.py import --json` — lädt die ganze JSON in RAM). Erster Lauf nach Totalverlust: typisch ~20–35 min Zusatzzeit.
+**Neuaufbau der Backup-DB:** Fehlt `pool_index.sqlite3`, importiert der nächste Pipeline-Lauf per Streaming, oder manuell `pool_index_db.py import --json …` (CLI nutzt seit 2026-10 ebenfalls **Streaming** via ijson). Erster Lauf nach Totalverlust: typisch ~20–35 min Zusatzzeit.
+
+**Lokale `.bak`/`*.bak` unter `indexes/`:** Manuelle Sicherungen der SQLite (z. B. vor Migration) — liegen nur auf SSD2, nicht in RTB. Nach Verifikation der aktiven DB (`PRAGMA freelist_count` etc.) können alte `pool_index.sqlite3.bak-*` gelöscht werden.
 
 Nach Deploy: einmalig alte `pool_index.sqlite3` im Spiegelordner entfernen (Skript macht das beim nächsten `raspi5nas_backup`-Lauf).
 

@@ -56,7 +56,7 @@ Unterverzeichnisse (von Pipeline/Wrapper angelegt):
   staging/json/           ← Upload-Scratch (pro folderid) — **nicht** ins RTB (`excludes.txt`)
 ```
 
-**RTB:** Manifeste/Index/Deltas werden mitgesichert (Mergerfs-Spiegel `/srv/nas/pcloud-archive/`). Nur `staging/` ist Scratch — in `rtb/excludes.txt` ausgeschlossen. Seit `1f0a1c9` werden leere `staging/json/<id>/` nach Upload entfernt.
+**RTB / Offsite:** `/srv/pcloud-archive` liegt auf **SSD2 (`sdd1`)**, nicht unter `SRC=/srv/nas`. Manifeste, Deltas, Resume und die lokale `pool_index.sqlite3` sind **nicht** im RTB-Snapshot und **nicht** im pCloud-Pool-Backup der Nutzdaten-Snapshots (Manifest-Test: nur Nutzdaten + Spiegel-Master-JSON). Offsite-Index-Spiegel: ausschließlich `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json` (wenn ein RTB-Lauf mitzieht). `staging/` ist zusätzlich in `excludes.txt` ausgeschlossen.
 
 ---
 
@@ -142,7 +142,17 @@ python scripts/utilities/pool_verify_backup.py \
 
 **raspi5nas-Spiegel (rtb-Repo):** `raspi5nas_backup.sh` legt täglich u. a. `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json` ab (~1–2 GB). **`pool_index.sqlite3` wird nicht gespiegelt** (rebuild per Pipeline-Streaming oder `pool_ops_index_sync.py`; RTB-`excludes.txt` schließt eine Altdatei im Spiegel aus). Spart ~7 GB neues Pool-Objekt pro Tageskopie. Siehe `docs/POOL_INDEX_DB.md` § Offsite-Spiegel.
 
-Pipeline-Artefakte unter `/srv/pcloud-archive/` (außer dem Spiegelpfad oben) kommen über RTB ins Offsite-Backup, wenn ein Snapshot fällig ist.
+**Notfall / Was wo liegt:**
+
+| Daten | Lokal SSD2 | pCloud (Pool/Snapshots) | RTB-Offsite (NAS → pCloud) |
+|-------|------------|-------------------------|----------------------------|
+| Nutzer-Snapshots (RTB) | — | Stubs + Pool-Hashes | ja (Kern-Backup) |
+| `content_index_master.json` | ja | ja (Remote-Master) | ja (Spiegel `raspi5nas/…`) |
+| `manifests/*.json` (~97×) | ja | nein | nein |
+| `pool_index.sqlite3` (Arbeits-DB) | ja | nein | nein (rebuildbar) |
+| Deltas / Resume | ja | nein | nein |
+
+Manifeste neu erzeugen ist **Aufwand** (aus RTB/Stubs), kein Datenverlust der Backups selbst. Optional: gelegentliche Kopie von `manifests/` (~7 GB) auf andere Platte — nicht automatisiert.
 
 **Unvollständiger pCloud-Upload — Retry-Entscheidung:**
 

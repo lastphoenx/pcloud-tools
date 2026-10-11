@@ -1400,7 +1400,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--db", default=None, help="SQLite path (default: PCLOUD_POOL_INDEX_DB_PATH)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_imp = sub.add_parser("import", help="Replace DB from content_index JSON")
+    p_imp = sub.add_parser(
+        "import",
+        help="Replace DB from content_index JSON (streaming, ijson — safe for ~1 GB master)",
+    )
     p_imp.add_argument("--json", required=True)
 
     p_exp = sub.add_parser("export", help="Stream v2 content_index.json")
@@ -1436,7 +1439,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "import":
         with open_db(db_path) as db:
-            st = db.import_from_json(args.json, log=_cli_log)
+            st = db.import_from_json_streaming(args.json, log=_cli_log)
             print(json.dumps(st, indent=2))
         return 0
 
