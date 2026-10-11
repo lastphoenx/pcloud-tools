@@ -24,8 +24,10 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-sys.path.insert(0, os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main"))
+_MAIN = os.environ.get("MAIN_DIR", "/opt/apps/pcloud-tools/main")
+sys.path.insert(0, _MAIN)
 import pcloud_bin_lib as pc
+from catchup_retention_filter import filter_catchup_missing
 
 _SNAP_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}-\d{6}$")
 _JSON_MODE = False
@@ -401,7 +403,25 @@ def main() -> int:
     if ok_hidden:
         _log(f"({ok_hidden} Snapshot(s) mit RTB+Man+Cmp — alles ok, nicht gezeigt)")
 
-    catchup = sorted(rtb_set - complete_set)
+    catchup_raw = sorted(rtb_set - complete_set)
+    filt = filter_catchup_missing(
+        catchup_raw,
+        complete_set,
+        rtb_set,
+        env_vars,
+        rtb_root=args.rtb_root,
+    )
+    if filt.get("ok"):
+        catchup = list(filt.get("catchup") or [])
+        skipped_retention = list(filt.get("skipped_retention") or [])
+        skipped_env = list(filt.get("skipped_env") or [])
+        filter_warnings = list(filt.get("warnings") or [])
+    else:
+        catchup = catchup_raw
+        skipped_retention = []
+        skipped_env = []
+        filter_warnings = list(filt.get("warnings") or [])
+    catchup = sorted(catchup)
     manifest_no_complete = sorted(manifest_set - complete_set)
     complete_no_manifest = sorted(complete_set - manifest_set)
     remote_no_rtb = sorted(complete_set - rtb_set)
@@ -413,6 +433,10 @@ def main() -> int:
         payload = {
             "catchup": catchup,
             "catchup_count": len(catchup),
+            "catchup_skipped_retention": skipped_retention,
+            "catchup_skipped_env": skipped_env,
+            "catchup_skipped_count": len(skipped_retention) + len(skipped_env),
+            "catchup_filter_warnings": filter_warnings,
             "incomplete_remote": incomplete_remote,
             "incomplete_count": len(incomplete_remote),
             "rtb_count": len(rtb_snaps),
@@ -428,8 +452,15 @@ def main() -> int:
 
     _log("")
     _log("--- Zusammenfassung ---")
+    if skipped_retention or skipped_env:
+        parts = []
+        if skipped_retention:
+            parts.append(f"Retention ({len(skipped_retention)}): {', '.join(skipped_retention)}")
+        if skipped_env:
+            parts.append(f"Skip-Liste ({len(skipped_env)}): {', '.join(skipped_env)}")
+        _log(f"○ Catch-up übersprungen — {', '.join(parts)}")
     if not catchup:
-        _log("✓ Alle RTB-Snapshots haben .upload_complete auf pCloud")
+        _log("✓ Alle RTB-Snapshots haben .upload_complete auf pCloud (nach Filter)")
     else:
         _log(f"✗ Catch-up noetig ({len(catchup)}): {', '.join(catchup)}")
 

@@ -484,8 +484,8 @@ PCLOUD_CATCHUP_MAX_PER_RUN=1
 ```
 
 ### `PCLOUD_CATCHUP_SKIP_SNAPSHOTS`
-**Beschreibung:** Komma-Liste — Snapshots vom automatischen Catch-up ausnehmen (Legacy-Full-System, manuell gelöscht).  
-**Verwendet in:** `wrapper_pcloud_pool_sync_1to1.sh`
+**Beschreibung:** Komma-Liste — Snapshots **manuell** vom Catch-up ausnehmen (Legacy, das die Zeit-Retention noch behalten würde). Alte Retention-Kandidaten (`DAYS_FULL` + `to_delete`) werden automatisch übersprungen (`catchup_retention_filter.py` — Wrapper, `pool_audit_status.py`, Dashboard).  
+**Verwendet in:** `catchup_retention_filter.py` (via `wrapper_pcloud_pool_sync_1to1.sh`, Audit)
 
 ```bash
 PCLOUD_CATCHUP_SKIP_SNAPSHOTS=2026-05-21-040007,2026-05-28-023609

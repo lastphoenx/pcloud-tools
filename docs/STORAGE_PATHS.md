@@ -56,7 +56,7 @@ Unterverzeichnisse (von Pipeline/Wrapper angelegt):
   staging/json/           ← Upload-Scratch (pro folderid) — **nicht** ins RTB (`excludes.txt`)
 ```
 
-**RTB / Offsite:** `/srv/pcloud-archive` liegt auf **SSD2 (`sdd1`)**, nicht unter `SRC=/srv/nas`. Manifeste, Deltas, Resume und die lokale `pool_index.sqlite3` sind **nicht** im RTB-Snapshot und **nicht** im pCloud-Pool-Backup der Nutzdaten-Snapshots (Manifest-Test: nur Nutzdaten + Spiegel-Master-JSON). Offsite-Index-Spiegel: ausschließlich `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json` (wenn ein RTB-Lauf mitzieht). `staging/` ist zusätzlich in `excludes.txt` ausgeschlossen.
+**RTB / Offsite:** `/srv/pcloud-archive` liegt auf **SSD2 (`sdd1`)**, nicht unter `SRC=/srv/nas`. Manifeste, Deltas, Resume und die lokale `pool_index.sqlite3` liegen **nicht** in den RTB-Snapshot-Ordnern unter `/mnt/backup/rtb_nas/<snap>/` und **nicht** im pCloud-Pool (nur Stubs/Hashes der Nutzdaten). Offsite-Index-Spiegel: `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json` (wenn ein RTB-Lauf mitzieht). Manifeste optional per USB-Timer (`pcloud-manifests-backup.service`, Ziel außerhalb `/srv/nas`) — **nicht** dasselbe wie RTB-Offsite. `staging/` ist in `excludes.txt` ausgeschlossen.
 
 ---
 
@@ -144,13 +144,13 @@ python scripts/utilities/pool_verify_backup.py \
 
 **Notfall / Was wo liegt:**
 
-| Daten | Lokal SSD2 | pCloud (Pool/Snapshots) | RTB-Offsite (NAS → pCloud) |
-|-------|------------|-------------------------|----------------------------|
-| Nutzer-Snapshots (RTB) | — | Stubs + Pool-Hashes | ja (Kern-Backup) |
-| `content_index_master.json` | ja | ja (Remote-Master) | ja (Spiegel `raspi5nas/…`) |
-| `manifests/*.json` (~97×) | ja | nein | nein |
-| `pool_index.sqlite3` (Arbeits-DB) | ja | nein | nein (rebuildbar) |
-| Deltas / Resume | ja | nein | nein |
+| Daten | Lokal SSD2 | RTB lokal (`/mnt/backup/rtb_nas/<snap>/`) | pCloud (Pool/Snapshots) | RTB-Offsite (Spiegel → pCloud) |
+|-------|------------|-------------------------------------------|-------------------------|--------------------------------|
+| Nutzer-Snapshots (RTB-Inhalt) | — | ja (Quelle der Pipeline) | Stubs + Pool-Hashes | ja (Kern-Backup) |
+| `content_index_master.json` | ja | nein | ja (Remote-Master) | ja (`raspi5nas/…`) |
+| `manifests/*.json` (≈ Live-Snap-Anzahl) | ja | nein | nein | nein (optional USB-Spiegel, rtb-Repo) |
+| `pool_index.sqlite3` (Arbeits-DB) | ja | nein | nein | nein (rebuildbar) |
+| Deltas / Resume | ja | nein | nein | nein |
 
 Manifeste neu erzeugen ist **Aufwand** (RTB-Re-Scan), kein Datenverlust der Nutzer-Backups. **Optional (rtb-Repo):** `pcloud_manifests_usb_backup.sh` + `pcloud-manifests-backup.service` (Zielpfad in `Environment=` der Unit) + Timer — `rsync` auf Backup-HDD **außerhalb** `/srv/nas`. Täglich inkrementell.
 

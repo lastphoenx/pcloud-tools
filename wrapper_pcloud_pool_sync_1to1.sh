@@ -124,6 +124,53 @@ _log() {
   fi
 }
 
+# Catch-up: Retention-Kandidaten + PCLOUD_CATCHUP_SKIP_SNAPSHOTS (Python, gleiche Logik wie Audit)
+_apply_catchup_filters() {
+  local filter_py="${MAIN_DIR}/scripts/catchup_filter_cli.py"
+  if [[ ${#missing_snaps[@]} -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ! -f "$filter_py" ]]; then
+    _log WARN "Catch-up filter script missing — continuing without filter"
+    return 0
+  fi
+  if ! command -v jq &>/dev/null; then
+    _log WARN "jq missing — Catch-up retention filter skipped"
+    return 0
+  fi
+  local filter_json _rc=0
+  set +e
+  filter_json="$("$PY" "$filter_py" --env-file "$ENV_FILE" --rtb-root "$RTB" \
+    --missing "${missing_snaps[@]}" \
+    --remote-complete "${remote_snaps[@]}" \
+    --local "${local_snaps[@]}" 2>/dev/null)"
+  _rc=$?
+  set -e
+  if [[ $_rc -ne 0 || -z "$filter_json" || "$filter_json" != \{* ]]; then
+    _log WARN "Catch-up filter failed — continuing without filter (safe: will upload)"
+    return 0
+  fi
+  local ok
+  ok="$(echo "$filter_json" | jq -r '.ok // false')"
+  if [[ "$ok" != "true" ]]; then
+    local w
+    w="$(echo "$filter_json" | jq -r '.warnings | join("; ")' 2>/dev/null || true)"
+    _log WARN "Catch-up filter error — continuing without filter: ${w:-unknown}"
+    return 0
+  fi
+  local w s
+  while IFS= read -r w; do
+    [[ -n "$w" ]] && _log WARN "Catch-up filter: $w"
+  done < <(echo "$filter_json" | jq -r '.warnings[]?' 2>/dev/null || true)
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && _log INFO "Catch-up skip (Retention-Kandidat): $s"
+  done < <(echo "$filter_json" | jq -r '.skipped_retention[]?' 2>/dev/null || true)
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && _log INFO "Catch-up skip (PCLOUD_CATCHUP_SKIP_SNAPSHOTS): $s"
+  done < <(echo "$filter_json" | jq -r '.skipped_env[]?' 2>/dev/null || true)
+  mapfile -t missing_snaps < <(echo "$filter_json" | jq -r '.catchup[]?' 2>/dev/null || true)
+}
+
 # ========= MariaDB Run-History Tracking =========
 # Config (loaded from .env via source)
 PCLOUD_DB_HOST=${PCLOUD_DB_HOST:-localhost}
@@ -971,25 +1018,8 @@ for s in "${local_snaps[@]}"; do
   missing_snaps+=("$s")
 done
 
-# Optional: Snapshots dauerhaft vom Catch-up ausnehmen (z. B. Legacy-Full-Backup)
-if [[ -n "${PCLOUD_CATCHUP_SKIP_SNAPSHOTS:-}" && ${#missing_snaps[@]} -gt 0 ]]; then
-  _skip_list=()
-  IFS=',' read -ra _skip_list <<< "${PCLOUD_CATCHUP_SKIP_SNAPSHOTS}"
-  _filtered=()
-  for s in "${missing_snaps[@]}"; do
-  for _skip in "${_skip_list[@]}"; do
-      _skip="${_skip#"${_skip%%[![:space:]]*}"}"
-      _skip="${_skip%"${_skip##*[![:space:]]}"}"
-      [[ -z "$_skip" ]] && continue
-      if [[ "$s" == "$_skip" ]]; then
-        _log INFO "Catch-up skip (PCLOUD_CATCHUP_SKIP_SNAPSHOTS): $s"
-        continue 2
-      fi
-    done
-    _filtered+=("$s")
-  done
-  missing_snaps=("${_filtered[@]}")
-fi
+# Retention-Kandidaten + PCLOUD_CATCHUP_SKIP_SNAPSHOTS (catchup_retention_filter.py)
+_apply_catchup_filters
 
 # Ohne explizites Target: latest vor restlichem Backlog (chronologisch)
 if [[ -z "$TARGET_SNAPSHOT" && ${#missing_snaps[@]} -gt 1 ]]; then

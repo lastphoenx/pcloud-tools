@@ -241,7 +241,7 @@ python pcloud_pool_gc.py \
 5. Index bereinigen; lokale `manifests/<snap>.json` für gelöschte Snapshots entfernen (verhindert monatliche `stale_local_manifests`-Warnung)
 6. optional `--run-gc` — **Abbruch**, wenn GC-Kandidaten > `PCLOUD_GC_MAX_DELETE_PCT` (15 %) des Pools; Override `--max-delete-pct P`
 
-**Catch-up:** `PCLOUD_CATCHUP_MAX_PER_RUN=1` in `.env` — Retention-Limits verhindern Massenlöschung wie August (43 Snaps).
+**Catch-up:** `PCLOUD_CATCHUP_MAX_PER_RUN=1` in `.env` — Retention-Limits verhindern Massenlöschung wie August (43 Snaps). Lokale RTB-Snapshots, die die **Zeit-Retention** löschen würde, werden vom Catch-up nicht erneut hochgeladen (`catchup_retention_filter.py`; neuestes `latest` nie überspringen). `PCLOUD_CATCHUP_SKIP_SNAPSHOTS` nur für Legacy-Ausnahmen.
 
 **Wichtig:** Cron **immer** mit `--env-file .env`.
 

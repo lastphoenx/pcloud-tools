@@ -1834,6 +1834,14 @@
       if ((sb.catchup_count || 0) > 0) {
         rows += drow('Catch-up', sb.catchup_count + ': ' + (sb.catchup || []).join(', '), 'yellow', 160);
       }
+      if ((sb.catchup_skipped_count || 0) > 0) {
+        const p = [];
+        if ((sb.catchup_skipped_retention || []).length)
+          p.push('Retention: ' + (sb.catchup_skipped_retention || []).join(', '));
+        if ((sb.catchup_skipped_env || []).length)
+          p.push('Skip-Liste: ' + (sb.catchup_skipped_env || []).join(', '));
+        rows += drow('Catch-up übersprungen', p.join(' | '), 'green', 200);
+      }
       if ((sb.incomplete_count || 0) > 0) {
         rows += drow('Incomplete Remotes', (sb.incomplete_remote || []).join(', '), 'red', 160);
       }
@@ -2527,6 +2535,17 @@
       html += '<div class="info-row"><span class="lbl">Catch-up (RTB ohne Marker)</span>'
         + '<span class="val ' + catchupCls + '" title="' + esc(names || 'keine') + '">'
         + (n === 0 ? '\u2713 leer' : n + ' Snapshot(s)') + '</span></div>';
+      const skR = (sb.catchup_skipped_retention || []);
+      const skE = (sb.catchup_skipped_env || []);
+      const skN = sb.catchup_skipped_count || (skR.length + skE.length);
+      if (skN > 0) {
+        const skParts = [];
+        if (skR.length) skParts.push('Retention: ' + skR.join(', '));
+        if (skE.length) skParts.push('Skip-Liste: ' + skE.join(', '));
+        html += '<div class="info-row"><span class="lbl">Catch-up übersprungen</span>'
+          + '<span class="val green" title="' + esc(skParts.join(' | ')) + '">'
+          + skN + ' Snapshot(s)</span></div>';
+      }
       if (inc > 0) {
         html += '<div class="info-row"><span class="lbl">Incomplete Remotes</span>'
           + '<span class="val red" title="' + esc((sb.incomplete_remote || []).join(', ')) + '">'
