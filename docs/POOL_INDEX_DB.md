@@ -75,6 +75,18 @@ Mit `PCLOUD_POOL_INDEX_DB=1`:
 
 ---
 
+## RTB lokaler Snap (`/mnt/backup/rtb_nas/<snap>/pcloud-archive/`)
+
+**Mitgesichert:** `content_index_master.json` (Restore neben pCloud-Remote-Master).
+
+**Ausgeschlossen** (`rtb/excludes.txt`, Schicht A — wie raspi5nas-Spiegel): `pool_index.sqlite3`, `pool_index_gc.sqlite3`, WAL/SHM, `pool_index*.sqlite3*`, `indexes/*.bak`, `content_index_master.json.bak*`. Nur auf SSD2; Rebuild per Streaming-Import (~20–35 min).
+
+**Trigger:** Änderungen unter `pcloud-archive/` allein starten **kein** RTB (`rtb_check_excludes.sh`). Landen im Snap, wenn Nutzerdaten o. Ä. ein Backup auslösen.
+
+Alt-Snaps vor Deploy der Excludes können SQLite/.bak noch enthalten (Hardlinks) — neue Snaps nicht.
+
+---
+
 ## Offsite-Spiegel (raspi5nas)
 
 Täglich kopiert `rtb/raspi5nas_backup.sh` nur **`content_index_master.json`** nach  
@@ -84,7 +96,7 @@ Täglich kopiert `rtb/raspi5nas_backup.sh` nur **`content_index_master.json`** n
 
 **Neuaufbau der Backup-DB:** Fehlt `pool_index.sqlite3`, importiert der nächste Pipeline-Lauf per Streaming, oder manuell `pool_index_db.py import --json …` (CLI nutzt seit 2026-10 ebenfalls **Streaming** via ijson). Erster Lauf nach Totalverlust: typisch ~20–35 min Zusatzzeit.
 
-**Lokale `.bak`/`*.bak` unter `indexes/`:** Manuelle Sicherungen der SQLite (z. B. vor Migration) — liegen nur auf SSD2, nicht in RTB. Nach Verifikation der aktiven DB (`PRAGMA freelist_count` etc.) können alte `pool_index.sqlite3.bak-*` gelöscht werden.
+**Lokale `.bak` unter `indexes/`:** Manuelle Kopien (SQLite/Master) — nur SSD2, **nicht** RTB (`excludes.txt`). Nach Verifikation der aktiven DB/JSON können alte `*.bak-*` auf SSD2 gelöscht werden (spart Platz; Alt-RTB-Snaps behalten Hardlinks bis Retention).
 
 Nach Deploy: einmalig alte `pool_index.sqlite3` im Spiegelordner entfernen (Skript macht das beim nächsten `raspi5nas_backup`-Lauf).
 
