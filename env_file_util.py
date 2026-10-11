@@ -21,7 +21,8 @@ def strip_env_value(raw: str) -> str:
             in_double = not in_double
         elif ch == "#" and not in_single and not in_double:
             if i == 0 or value[i - 1].isspace():
-                return value[:i].rstrip()
+                value = value[:i].rstrip()
+                break
     return value.strip().strip("'\"")
 
 
