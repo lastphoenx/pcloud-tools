@@ -52,7 +52,7 @@ from __future__ import annotations
 import os, sys, json, argparse, time, datetime, hashlib, gc, subprocess, tempfile
 import concurrent.futures
 import threading
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from enum import Enum
 
 
@@ -2112,6 +2112,45 @@ def _ensure_archived_manifest(
     return archive_path
 
 
+def _normalize_gate_verify_result(result: dict, proc_returncode: int) -> dict:
+    """
+    pool_verify_backup exit 1 bei verification_tier=weak (kein Remote-Archiv-Index
+    vor Finalize). Im Gate ist das erwartbar — Stubs/listfolder zählen, nicht Exit-Code.
+    """
+    issues = int(result.get("issues") or 0)
+    tier = result.get("verification_tier") or "full"
+    if issues == 0 and tier == "weak":
+        result["ok"] = True
+        result["gate_weak_index_accepted"] = True
+        return result
+    if proc_returncode != 0 and result.get("ok"):
+        result["ok"] = False
+    return result
+
+
+def _integrity_gate_failure_summary(result: dict) -> str:
+    parts: List[str] = []
+    es = result.get("error_summary") or result.get("error")
+    if es:
+        parts.append(str(es))
+    issues = int(result.get("issues") or 0)
+    if issues:
+        parts.append(f"{issues} issue(s)")
+    tier = result.get("verification_tier")
+    if tier:
+        parts.append(f"tier={tier}")
+    weak = result.get("weak_index_snapshots") or []
+    if weak:
+        parts.append(f"weak_index={','.join(weak[:3])}")
+    stub = result.get("stubs_vs_index") or {}
+    mm = int(stub.get("manifest_missing_total") or 0)
+    if mm:
+        parts.append(f"stubs_missing={mm}")
+    if not parts:
+        parts.append("integrity failed (kein error_summary — Report unter integrity/*_gate_fail_*.json)")
+    return "; ".join(parts)
+
+
 def _run_verify_subprocess(
     snapshot_name: str,
     dest_root: str,
@@ -2148,6 +2187,8 @@ def _run_verify_subprocess(
         "--json-out",
         json_out,
     ]
+    archive = os.environ.get("PCLOUD_ARCHIVE_DIR", "/srv/pcloud-archive")
+    integrity_dir = os.path.join(archive, "integrity")
     try:
         proc = subprocess.run(argv, check=False)
         if not os.path.isfile(json_out) or os.path.getsize(json_out) == 0:
@@ -2156,8 +2197,18 @@ def _run_verify_subprocess(
             )
         with open(json_out, encoding="utf-8") as f:
             result = json.load(f)
-        if proc.returncode != 0 and result.get("ok"):
-            result["ok"] = False
+        result = _normalize_gate_verify_result(result, proc.returncode)
+        if not result.get("ok"):
+            os.makedirs(integrity_dir, exist_ok=True)
+            fail_path = os.path.join(
+                integrity_dir,
+                f"integrity_{snapshot_name}_gate_fail_{int(time.time())}.json",
+            )
+            try:
+                shutil.copy2(json_out, fail_path)
+                _log(f"[integrity-gate] Verify-Report: {fail_path}")
+            except OSError as copy_err:
+                _log(f"[integrity-gate][warn] Verify-Report nicht gespeichert: {copy_err}")
         return result
     finally:
         try:
@@ -2226,12 +2277,20 @@ def _run_listfolder_integrity_gate(
                 result = _run_verify_subprocess(snapshot_name, dest_root, manifests_dir, env_file)
 
     if not result.get("ok"):
-        summary = result.get("error_summary") or result.get("error") or "integrity failed"
+        summary = _integrity_gate_failure_summary(result)
         _log(f"[integrity-gate][ERROR] Complete-Marker wird NICHT gesetzt")
         _log(f"[integrity-gate][ERROR] {summary}")
         raise RuntimeError(f"Integrity-Gate fehlgeschlagen: {summary}")
 
-    _log(f"[integrity-gate] ✓ OK ({time.time() - t0:.1f}s)")
+    if result.get("gate_weak_index_accepted"):
+        weak = result.get("weak_index_snapshots") or []
+        _log(
+            "[integrity-gate] ✓ OK (weak tier — kein Remote-Archiv-Index vor Finalize, "
+            f"Stubs/listfolder OK; snaps={','.join(weak[:3])}) "
+            f"({time.time() - t0:.1f}s)"
+        )
+    else:
+        _log(f"[integrity-gate] ✓ OK ({time.time() - t0:.1f}s)")
 
     ok, _ = run_integrity_for_snapshot(
         env=env,
