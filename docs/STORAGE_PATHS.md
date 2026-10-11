@@ -140,7 +140,9 @@ python scripts/utilities/pool_verify_backup.py \
 
 **Deploy excludes.txt:** Änderungen nur im Repo `rtb`, auf pi-nas `git pull` — nicht `/opt/apps/rtb/excludes.txt` per Hand editieren (blockiert sonst `git pull`).
 
-**Kein separater Pipeline-Export:** `raspi5nas_backup.sh` kopiert **nicht** mehr nach `Backup/raspi5nas/pcloud-*`. Offsite-Manifeste/Temp kommen über RTB, wenn ein Snapshot fällig ist.
+**raspi5nas-Spiegel (rtb-Repo):** `raspi5nas_backup.sh` legt täglich u. a. `Backup/raspi5nas/pcloud-archive-indexes/content_index_master.json` ab (~1–2 GB). **`pool_index.sqlite3` wird nicht gespiegelt** (rebuild per Pipeline-Streaming oder `pool_ops_index_sync.py`; RTB-`excludes.txt` schließt eine Altdatei im Spiegel aus). Spart ~7 GB neues Pool-Objekt pro Tageskopie. Siehe `docs/POOL_INDEX_DB.md` § Offsite-Spiegel.
+
+Pipeline-Artefakte unter `/srv/pcloud-archive/` (außer dem Spiegelpfad oben) kommen über RTB ins Offsite-Backup, wenn ein Snapshot fällig ist.
 
 **Unvollständiger pCloud-Upload — Retry-Entscheidung:**
 

@@ -75,6 +75,19 @@ Mit `PCLOUD_POOL_INDEX_DB=1`:
 
 ---
 
+## Offsite-Spiegel (raspi5nas)
+
+Täglich kopiert `rtb/raspi5nas_backup.sh` nur **`content_index_master.json`** nach  
+`/srv/nas/Backup/raspi5nas/pcloud-archive-indexes/` (RTB/pCloud-Offsite, wenn ein Snapshot läuft).
+
+**Nicht** gespiegelt: `pool_index.sqlite3` — ändert sich täglich, ~7 GB pro Pool-Objekt, jederzeit per Streaming-Import neu aufbaubar (Pipeline oder `scripts/utilities/pool_ops_index_sync.py`). RTB-`excludes.txt`: `/Backup/raspi5nas/pcloud-archive-indexes/pool_index.sqlite3`.
+
+**Neuaufbau der Backup-DB:** Fehlt `pool_index.sqlite3`, importiert der nächste Lauf die Master-JSON per **Streaming** (nicht `pool_index_db.py import --json` — lädt die ganze JSON in RAM). Erster Lauf nach Totalverlust: typisch ~20–35 min Zusatzzeit.
+
+Nach Deploy: einmalig alte `pool_index.sqlite3` im Spiegelordner entfernen (Skript macht das beim nächsten `raspi5nas_backup`-Lauf).
+
+---
+
 ## Umgebungsvariablen
 
 | Variable | Default | Was sie tut |
