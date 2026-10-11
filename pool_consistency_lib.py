@@ -22,6 +22,7 @@ def evaluate_pool_consistency(
     upload_pending: bool = False,
     reapply_purge: str = "",
     pool_gaps: Optional[int] = None,
+    pool_gaps_index: Optional[int] = None,
     live_ops_zero_refs: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
@@ -62,6 +63,8 @@ def evaluate_pool_consistency(
 
     if pool_gaps is not None and pool_gaps > 0:
         critical.append(f"pool_files_missing:{pool_gaps}")
+    if pool_gaps_index is not None and pool_gaps_index > 0:
+        warn.append(f"pool_index_listing_gaps:{pool_gaps_index}")
 
     if upload_pending:
         warn.append("ops_upload_pending")
@@ -97,4 +100,5 @@ def evaluate_pool_consistency(
         "critical_reasons": critical,
         "warn_reasons": warn,
         "pool_gaps": pool_gaps,
+        "pool_gaps_index": pool_gaps_index,
     }

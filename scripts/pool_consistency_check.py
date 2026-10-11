@@ -74,12 +74,30 @@ def _last_live_count(jsonl_path: str) -> Optional[int]:
     return last
 
 
+def _collect_pool_sha_set(cfg: dict, pool_root: str) -> Set[str]:
+    pool_shas: Set[str] = set()
+    for pf in pgc._iter_pool_files_by_prefix(cfg, pool_root, quiet=True):
+        name = str(pf.get("name", "")).lower()
+        if name:
+            pool_shas.add(name)
+    return pool_shas
+
+
+def _count_missing_in_pool(sha_iter, pool_shas: Set[str]) -> int:
+    missing = 0
+    for sha in sha_iter:
+        if sha not in pool_shas:
+            missing += 1
+    return missing
+
+
 def run_check(
     cfg: dict,
     env_vars: dict,
     *,
     manifests_dir: str,
     pool_check: bool = False,
+    pool_check_index: bool = False,
     jsonl_path: str,
 ) -> Dict[str, Any]:
     dest = (env_vars.get("PCLOUD_DEST") or os.environ.get("PCLOUD_DEST") or "").rstrip("/")
@@ -105,21 +123,27 @@ def run_check(
     last_live = _last_live_count(jsonl_path)
 
     pool_gaps: Optional[int] = None
+    pool_gaps_index: Optional[int] = None
+    if pool_check or pool_check_index:
+        pool_shas = _collect_pool_sha_set(cfg, pool_root)
+
     if pool_check:
+        man_store, _missing_mani = mg.load_live_manifest_shas(manifests_dir, live)
+        try:
+            pool_gaps = _count_missing_in_pool(man_store.iter_shas(), pool_shas)
+        finally:
+            man_store.close()
+
+    if pool_check_index:
         import pool_gc_index as gci  # noqa: E402
 
         ref_lookup = gci.referenced_shas_for_gc(
             cfg, snaps_root, env_vars, live, log=lambda _m: None,
         )
         try:
-            pool_shas = set()
-            for pf in pgc._iter_pool_files_by_prefix(cfg, pool_root, quiet=True):
-                pool_shas.add(str(pf.get("name", "")).lower())
-            missing = 0
-            for sha in ref_lookup.iter_shas():
-                if sha not in pool_shas:
-                    missing += 1
-            pool_gaps = missing
+            pool_gaps_index = _count_missing_in_pool(
+                ref_lookup.iter_shas(), pool_shas,
+            )
         finally:
             ref_lookup.close()
 
@@ -133,6 +157,7 @@ def run_check(
         upload_pending=pending["upload_pending"],
         reapply_purge=pending["reapply_purge"],
         pool_gaps=pool_gaps,
+        pool_gaps_index=pool_gaps_index,
         live_ops_zero_refs=zero_ops_refs,
     )
     verdict["live_zero_ops_refs"] = zero_ops_refs
@@ -185,7 +210,12 @@ def _main_impl() -> int:
     ap.add_argument(
         "--pool",
         action="store_true",
-        help="Zähle Index-SHAs ohne Pool-Datei (langsam, API)",
+        help="Manifest-SHAs (live) ohne Pool-Listing → kritisch (langsam, API+ijson)",
+    )
+    ap.add_argument(
+        "--pool-index",
+        action="store_true",
+        help="Zusätzlich: alle Ops-Index-SHAs vs. Pool → nur WARN (Phantom-Refs)",
     )
     ap.add_argument(
         "--jsonl",
@@ -212,6 +242,7 @@ def _main_impl() -> int:
         env_vars,
         manifests_dir=manifests_dir,
         pool_check=args.pool,
+        pool_check_index=args.pool_index,
         jsonl_path=args.jsonl,
     )
 

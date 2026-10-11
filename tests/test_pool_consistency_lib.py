@@ -55,6 +55,28 @@ class PoolConsistencyLibTests(unittest.TestCase):
         )
         self.assertEqual(r["level"], pcl.LEVEL_CRITICAL)
 
+    def test_warn_pool_index_listing_gaps_only(self) -> None:
+        r = pcl.evaluate_pool_consistency(
+            live={"a"},
+            ops_db_names={"a"},
+            backup_db_names={"a"},
+            manifest_names={"a"},
+            pool_gaps_index=159,
+        )
+        self.assertEqual(r["level"], pcl.LEVEL_WARN)
+        self.assertIn("pool_index_listing_gaps:159", r["warn_reasons"])
+
+    def test_critical_pool_manifest_gaps(self) -> None:
+        r = pcl.evaluate_pool_consistency(
+            live={"a"},
+            ops_db_names={"a"},
+            backup_db_names={"a"},
+            manifest_names={"a"},
+            pool_gaps=3,
+        )
+        self.assertEqual(r["level"], pcl.LEVEL_CRITICAL)
+        self.assertIn("pool_files_missing:3", r["critical_reasons"])
+
     def test_planned_retention_drop_not_critical_at_30pct(self) -> None:
         live = {f"s{i:03d}" for i in range(98)}
         r = pcl.evaluate_pool_consistency(

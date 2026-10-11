@@ -29,6 +29,10 @@ Lesender Vergleich (Exit 0 / 1 / 2):
 | `live_not_in_backup_db` | **Kritisch** — Live-Snap fehlt in Backup-DB. |
 | `stale_ops_snapshots` | **Warnung** — Name noch in Index (`snapshots`-Tabelle / Master), **kein** Remote-Ordner mehr. |
 | `stale_local_manifests` | **Warnung** — lokales Manifest ohne Remote-Ordner. |
+| `pool_files_missing` (`--pool`) | **Kritisch** — SHA aus **Manifesten** lebender Snaps fehlt im Pool-Listing. |
+| `pool_index_listing_gaps` (`--pool-index`) | **Warnung** — Ops-Index-SHA vs. Listing (oft Phantom-Refs, siehe `pool_gap_report.py`). |
+
+Optional langsam: `--pool` (Monitoring), bei Verdacht zusätzlich `--pool-index`. Ohne Flags: kein Pool-API-Scan.
 
 WARN ≠ „Sync kaputt“. Nach erfolgreichem Ops-Sync kann `stale_ops_*` bleiben (Geister-Eintrag im Master).
 

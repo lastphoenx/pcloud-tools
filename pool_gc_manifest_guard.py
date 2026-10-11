@@ -98,6 +98,15 @@ class ManifestProtectedShaStore:
     def __len__(self) -> int:
         return self._count
 
+    def iter_shas(self, *, batch_size: int = 8192):
+        cur = self._conn.execute("SELECT sha FROM prot")
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield str(row[0]).lower()
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -119,6 +128,22 @@ def _stream_manifest_shas(path: str, store: ManifestProtectedShaStore) -> None:
             sha = it.get("sha256")
             if sha:
                 store.add_sha(str(sha))
+
+
+def load_live_manifest_shas(
+    manifests_dir: str,
+    live: Set[str],
+) -> Tuple[ManifestProtectedShaStore, List[str]]:
+    """Alle file-SHAs aus Manifesten lebender Snapshots (ijson). missing = kein JSON."""
+    store = ManifestProtectedShaStore()
+    missing: List[str] = []
+    for snap in sorted(live):
+        path = os.path.join(manifests_dir, f"{snap}.json")
+        if not os.path.isfile(path):
+            missing.append(snap)
+            continue
+        _stream_manifest_shas(path, store)
+    return store, missing
 
 
 def load_gap_manifest_protection(
