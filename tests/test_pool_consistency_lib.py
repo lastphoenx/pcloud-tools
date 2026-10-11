@@ -44,15 +44,29 @@ class PoolConsistencyLibTests(unittest.TestCase):
         self.assertEqual(r["level"], pcl.LEVEL_WARN)
 
     def test_critical_live_drop(self) -> None:
-        live = {f"s{i:03d}" for i in range(80)}
+        live = {f"s{i:03d}" for i in range(65)}
         r = pcl.evaluate_pool_consistency(
             live=live,
             ops_db_names=live,
             backup_db_names=live,
             manifest_names=live,
             last_live_count=100,
+            live_drop_warn_ratio=0.30,
         )
         self.assertEqual(r["level"], pcl.LEVEL_CRITICAL)
+
+    def test_planned_retention_drop_not_critical_at_30pct(self) -> None:
+        live = {f"s{i:03d}" for i in range(98)}
+        r = pcl.evaluate_pool_consistency(
+            live=live,
+            ops_db_names=live,
+            backup_db_names=live,
+            manifest_names=live,
+            last_live_count=114,
+            live_drop_warn_ratio=0.30,
+        )
+        self.assertEqual(r["level"], pcl.LEVEL_OK)
+        self.assertNotIn("live_count_drop", " ".join(r["critical_reasons"]))
 
 
 if __name__ == "__main__":

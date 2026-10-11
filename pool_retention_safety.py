@@ -149,6 +149,32 @@ def check_gc_delete_allowed(
     return None
 
 
+def live_drop_warn_ratio(env_vars: Optional[Dict[str, str]]) -> float:
+    """
+    Anteil Live-Snapshot-Rückgang vs. letzter JSONL-Zeile, bevor critical.
+    Default: PCLOUD_RETENTION_MAX_DELETE_PCT (30) — geplante Monats-Retention nicht als Incident.
+    """
+    custom = (env_get(env_vars, "PCLOUD_POOL_CONSISTENCY_LIVE_DROP_RATIO", "") or "").strip()
+    if custom:
+        return float(custom)
+    pct = float(env_get(env_vars, "PCLOUD_RETENTION_MAX_DELETE_PCT", "30") or 30)
+    return pct / 100.0
+
+
+def record_consistency_jsonl(main_dir: str, env_file: str) -> None:
+    """Nach erfolgreicher Retention: JSONL-Basis aktualisieren (live_count_drop)."""
+    script = os.path.join(main_dir, "scripts", "pool_consistency_check.py")
+    if not os.path.isfile(script):
+        return
+    subprocess.run(
+        [sys.executable, script, "--env-file", env_file],
+        cwd=main_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def run_consistency_gate(
     main_dir: str,
     env_file: str,

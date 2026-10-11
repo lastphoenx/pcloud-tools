@@ -917,6 +917,10 @@ def run_retention_apply(
     elif run_gc and dry:
         _log("[retention] --run-gc mit --dry-run: GC separat mit --dry-run ausfuehren")
 
+    if not dry and errors == 0 and prs and deleted_snaps:
+        prs.record_consistency_jsonl(main_dir, env_file)
+        _log("[retention] Konsistenz-JSONL nach Retention aktualisiert")
+
     _log("[retention] ===== DONE =====")
     return result
 
@@ -1383,13 +1387,16 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         sys.exit(2)
 
     if args.retention_forecast:
-        run_retention_forecast(
+        fc_result = run_retention_forecast(
             cfg, pool_root, rtb_root,
             verbose=args.verbose,
             env_file=args.env_file,
             allow_rtb_mode=args.allow_rtb_mode,
             max_delete_snapshots=args.max_delete_snapshots,
         )
+        if fc_result.get("aborted"):
+            _log(f"[retention-forecast] ⚠ Abgebrochen: {fc_result['aborted']}")
+            sys.exit(2)
         sys.exit(0)
 
     if args.retention_apply:

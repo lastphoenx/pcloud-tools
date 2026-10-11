@@ -25,6 +25,7 @@ import pool_consistency_lib as pcl  # noqa: E402
 import pool_gc_manifest_guard as mg  # noqa: E402
 import pool_index_db as pidb  # noqa: E402
 import pcloud_pool_gc as pgc  # noqa: E402
+import pool_retention_safety as prs  # noqa: E402
 
 
 def _read_ops_pending(ops_db: str) -> Dict[str, Any]:
@@ -128,6 +129,7 @@ def run_check(
         backup_db_names=backup_names,
         manifest_names=man_names,
         last_live_count=last_live,
+        live_drop_warn_ratio=prs.live_drop_warn_ratio(env_vars),
         upload_pending=pending["upload_pending"],
         reapply_purge=pending["reapply_purge"],
         pool_gaps=pool_gaps,
