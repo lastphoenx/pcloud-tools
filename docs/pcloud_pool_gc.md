@@ -68,7 +68,7 @@ Nach Purge/Export: `upload_pending=1` bis der Master-Upload gelingt. **Nur** `op
 
 `--audit-mode` ist deaktiviert (Stub-Scan / RAM-Set) bis Streaming-Umbau.
 
-**Manifest-Guard (Phase 1→2):** Nur bei **Index-Lücken** (live Snapshot fehlt in `snapshots` oder hat **0** `snap_refs`) werden die zugehörigen lokalen Manifeste per **ijson** gestreamt in eine **Temp-SQLite** (`:memory:`) geladen und deren SHA256 zusätzlich geschützt. Lückenlos → kein Manifest-Lesen. **Abbruch** wenn ein Lücken-Snapshot kein lesbares Manifest hat (fehlend oder defekt). Abschalten: `PCLOUD_GC_MANIFEST_GUARD=0`. Konsistenz: `scripts/pool_consistency_check.py` (`--pool` nutzt SQL-`iter_shas`, kein Lookup-Iterate), Runbook `docs/pool-index-gap-runbook.md`.
+**Manifest-Guard (Phase 1→2):** Nur bei **Index-Lücken** (live Snapshot fehlt in `snapshots` oder hat **0** `snap_refs`) werden die zugehörigen lokalen Manifeste per **ijson** gestreamt in eine **Temp-SQLite** (`:memory:`) geladen und deren SHA256 zusätzlich geschützt. Lückenlos → kein Manifest-Lesen. **Abbruch** wenn ein Lücken-Snapshot kein lesbares Manifest hat (fehlend oder defekt). Abschalten: `PCLOUD_GC_MANIFEST_GUARD=0`. **Konsistenz-Check** (separat vom GC): `scripts/pool_consistency_check.py` — `--pool` vergleicht **Manifest-SHAs** lebender Snapshots mit dem Pool-Listing (kritisch); `--pool-index` alle Ops-Index-SHAs (oft nur WARN, Phantom-Refs). Siehe `docs/OPS_INDEX_AND_CONSISTENCY.md`, Runbook `docs/pool-index-gap-runbook.md`.
 
 **Performance:** Import/Abfrage typisch Sekunden–wenige Minuten; abhängig von Index-Größe und Netz.
 

@@ -154,6 +154,16 @@ python scripts/utilities/pool_verify_backup.py \
 
 Manifeste neu erzeugen ist **Aufwand** (RTB-Re-Scan), kein Datenverlust der Nutzer-Backups. **Optional (rtb-Repo):** `pcloud_manifests_usb_backup.sh` + `pcloud-manifests-backup.service` (Zielpfad in `Environment=` der Unit) + Timer — `rsync` auf Backup-HDD **außerhalb** `/srv/nas`. Täglich inkrementell.
 
+**Pi-nas Einmal-Setup (Manifest-Spiegel, öffentliche Skripte):**
+
+1. `git pull` in `/opt/apps/rtb` — Pfade in `pcloud-manifests-backup.service` (`Environment=PCLOUD_MANIFESTS_BACKUP_DEST=…`) anpassen; Ziel **nicht** unter `/srv/nas`.
+2. `sudo cp /opt/apps/rtb/pcloud-manifests-backup.{service,timer} /etc/systemd/system/`
+3. `sudo systemctl daemon-reload && sudo systemctl enable --now pcloud-manifests-backup.timer` (Standard: 10:30 + 22:15)
+4. Manuell testen: `sudo systemctl start pcloud-manifests-backup.service` (nicht das Skript ohne Unit — `Environment=` fehlt sonst)
+5. Pipeline-Tools: `/opt/apps/pcloud-tools/venv/bin/python3` (ijson etc.)
+
+Log: `/var/log/backup/pcloud_manifests_backup.log`. Details: `rtb/README.md`.
+
 **Unvollständiger pCloud-Upload — Retry-Entscheidung:**
 
 | Situation | Befehl | Was passiert |
