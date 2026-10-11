@@ -15,6 +15,10 @@ import pool_retention_safety as prs  # noqa: E402
 
 
 class CatchupRetentionFilterTests(unittest.TestCase):
+    # Gleiche ISO-Woche wie 2026-08-06 — sonst ist 08-06 Wochen-Keeper und nicht in to_delete.
+    WEEK_SIBLING = "2026-08-09-224716"
+    LATEST = "2026-10-11-040229"
+
     def _env_time(self, days_full: int = 62) -> dict:
         return {
             "PCLOUD_REMOTE_RETENTION_DAYS_FULL": str(days_full),
@@ -23,8 +27,8 @@ class CatchupRetentionFilterTests(unittest.TestCase):
 
     def test_old_retention_candidate_skipped(self) -> None:
         old = "2026-08-06-172826"
-        remote = {"2026-10-11-040229"}
-        local = {old, "2026-10-11-040229"}
+        remote = {self.LATEST, self.WEEK_SIBLING}
+        local = {old, self.LATEST, self.WEEK_SIBLING}
         res = crf.filter_catchup_missing([old], remote, local, self._env_time())
         self.assertTrue(res["ok"])
         self.assertEqual(res["catchup"], [])
@@ -41,9 +45,9 @@ class CatchupRetentionFilterTests(unittest.TestCase):
 
     def test_latest_never_skipped_even_if_retention_candidate(self) -> None:
         old = "2026-08-06-172826"
-        latest = "2026-10-11-040229"
-        remote = {latest}
-        local = {old, latest}
+        latest = self.LATEST
+        remote = {latest, self.WEEK_SIBLING}
+        local = {old, latest, self.WEEK_SIBLING}
         res = crf.filter_catchup_missing(
             [old, latest], remote, local, self._env_time(), latest_name=latest,
         )
@@ -57,8 +61,8 @@ class CatchupRetentionFilterTests(unittest.TestCase):
             **self._env_time(),
             "PCLOUD_CATCHUP_SKIP_SNAPSHOTS": legacy,
         }
-        remote = {"2026-10-11-040229"}
-        local = {old, legacy, "2026-10-11-040229"}
+        remote = {self.LATEST, self.WEEK_SIBLING}
+        local = {old, legacy, self.LATEST, self.WEEK_SIBLING}
         res = crf.filter_catchup_missing(
             [old, legacy], remote, local, env,
         )

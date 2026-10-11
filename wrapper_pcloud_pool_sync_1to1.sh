@@ -124,6 +124,29 @@ _log() {
   fi
 }
 
+# Nur PCLOUD_CATCHUP_SKIP_SNAPSHOTS (Fallback wenn Python/jq-Filter ausfällt)
+_apply_catchup_env_skip_bash() {
+  if [[ -z "${PCLOUD_CATCHUP_SKIP_SNAPSHOTS:-}" || ${#missing_snaps[@]} -eq 0 ]]; then
+    return 0
+  fi
+  local _skip_list=()
+  IFS=',' read -ra _skip_list <<< "${PCLOUD_CATCHUP_SKIP_SNAPSHOTS}"
+  local _filtered=() s _skip
+  for s in "${missing_snaps[@]}"; do
+    for _skip in "${_skip_list[@]}"; do
+      _skip="${_skip#"${_skip%%[![:space:]]*}"}"
+      _skip="${_skip%"${_skip##*[![:space:]]}"}"
+      [[ -z "$_skip" ]] && continue
+      if [[ "$s" == "$_skip" ]]; then
+        _log INFO "Catch-up skip (PCLOUD_CATCHUP_SKIP_SNAPSHOTS): $s"
+        continue 2
+      fi
+    done
+    _filtered+=("$s")
+  done
+  missing_snaps=("${_filtered[@]}")
+}
+
 # Catch-up: Retention-Kandidaten + PCLOUD_CATCHUP_SKIP_SNAPSHOTS (Python, gleiche Logik wie Audit)
 _apply_catchup_filters() {
   local filter_py="${MAIN_DIR}/scripts/catchup_filter_cli.py"
@@ -131,11 +154,13 @@ _apply_catchup_filters() {
     return 0
   fi
   if [[ ! -f "$filter_py" ]]; then
-    _log WARN "Catch-up filter script missing — continuing without filter"
+    _log WARN "Catch-up filter script missing — retention filter skipped; applying env skip list only"
+    _apply_catchup_env_skip_bash
     return 0
   fi
   if ! command -v jq &>/dev/null; then
-    _log WARN "jq missing — Catch-up retention filter skipped"
+    _log WARN "jq missing — retention filter skipped; applying env skip list only"
+    _apply_catchup_env_skip_bash
     return 0
   fi
   local filter_json _rc=0
@@ -147,7 +172,8 @@ _apply_catchup_filters() {
   _rc=$?
   set -e
   if [[ $_rc -ne 0 || -z "$filter_json" || "$filter_json" != \{* ]]; then
-    _log WARN "Catch-up filter failed — continuing without filter (safe: will upload)"
+    _log WARN "Catch-up filter failed — retention filter skipped; applying env skip list only"
+    _apply_catchup_env_skip_bash
     return 0
   fi
   local ok
@@ -155,7 +181,8 @@ _apply_catchup_filters() {
   if [[ "$ok" != "true" ]]; then
     local w
     w="$(echo "$filter_json" | jq -r '.warnings | join("; ")' 2>/dev/null || true)"
-    _log WARN "Catch-up filter error — continuing without filter: ${w:-unknown}"
+    _log WARN "Catch-up filter error — retention filter skipped: ${w:-unknown}; applying env skip list only"
+    _apply_catchup_env_skip_bash
     return 0
   fi
   local w s

@@ -13,26 +13,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from catchup_retention_filter import filter_catchup_missing  # noqa: E402
-
-
-def _load_env_file(path: str) -> dict:
-    env: dict = {}
-    if not path or not os.path.isfile(path):
-        return env
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            key = key.strip()
-            val = val.strip()
-            if "#" in val:
-                val = val.split("#", 1)[0].strip()
-            if val and val[0] in "\"'" and val[-1] == val[0]:
-                val = val[1:-1]
-            env[key] = val
-    return env
+from env_file_util import load_env_file  # noqa: E402
 
 
 def main() -> int:
@@ -46,7 +27,7 @@ def main() -> int:
     ap.add_argument("--max-skip-warn", type=int, default=5)
     args = ap.parse_args()
 
-    env_vars = _load_env_file(args.env_file)
+    env_vars = load_env_file(args.env_file)
     rtb = args.rtb_root or env_vars.get("RTB") or os.environ.get("RTB", "/mnt/backup/rtb_nas")
 
     result = filter_catchup_missing(
