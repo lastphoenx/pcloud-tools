@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Set
 LEVEL_OK = 0
 LEVEL_WARN = 1
 LEVEL_CRITICAL = 2
+LEVEL_CHECK_FAILED = 3
 
 
 def evaluate_pool_consistency(

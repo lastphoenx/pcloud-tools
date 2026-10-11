@@ -114,17 +114,38 @@ class RtbMarkerTests(unittest.TestCase):
 
 class ConsistencyGateTests(unittest.TestCase):
     def test_gate_blocks_critical_level(self) -> None:
+        out = '{"level":2,"level_name":"critical","critical_reasons":["x"]}'
         with mock.patch("subprocess.run") as run:
-            run.return_value = mock.Mock(returncode=2, stdout="{}", stderr="[CRITICAL] x")
+            run.return_value = mock.Mock(returncode=2, stdout=out, stderr="[CRITICAL] x")
             err = prs.run_consistency_gate(ROOT, ".env", max_allowed_level=1)
         self.assertIsNotNone(err)
         self.assertIn("level=2", err or "")
 
     def test_gate_allows_warning(self) -> None:
+        out = '{"level":1,"level_name":"warn","warn_reasons":["stale"]}'
         with mock.patch("subprocess.run") as run:
-            run.return_value = mock.Mock(returncode=1, stdout="{}", stderr="[WARN] x")
+            run.return_value = mock.Mock(returncode=1, stdout=out, stderr="[WARN] x")
             err = prs.run_consistency_gate(ROOT, ".env", max_allowed_level=1)
         self.assertIsNone(err)
+
+    def test_gate_blocks_crash_without_json(self) -> None:
+        with mock.patch("subprocess.run") as run:
+            run.return_value = mock.Mock(
+                returncode=1,
+                stdout="Kein PCLOUD_TOKEN gefunden\n",
+                stderr="",
+            )
+            err = prs.run_consistency_gate(ROOT, ".env", max_allowed_level=1)
+        self.assertIsNotNone(err)
+        self.assertIn("ohne gültiges JSON", err or "")
+
+    def test_gate_blocks_check_failed_exit(self) -> None:
+        out = '{"level":3,"level_name":"check_failed","error":"boom"}'
+        with mock.patch("subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=3, stdout=out, stderr="")
+            err = prs.run_consistency_gate(ROOT, ".env", max_allowed_level=1)
+        self.assertIsNotNone(err)
+        self.assertIn("fehlgeschlagen", err or "")
 
 
 if __name__ == "__main__":

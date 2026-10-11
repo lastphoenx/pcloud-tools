@@ -3,10 +3,13 @@
 """Retention-Modus, Lösch-Grenzen (Abbruch) und Konsistenz-Gate (A3/A5)."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
+
+import pool_consistency_lib as pcl
 
 MODE_TIME = "time"
 MODE_RTB_MIRROR = "rtb-mirror"
@@ -175,6 +178,20 @@ def record_consistency_jsonl(main_dir: str, env_file: str) -> None:
     )
 
 
+def parse_consistency_verdict(stdout: str) -> Optional[Dict[str, object]]:
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and "level" in data:
+            return data
+    return None
+
+
 def run_consistency_gate(
     main_dir: str,
     env_file: str,
@@ -182,8 +199,7 @@ def run_consistency_gate(
     max_allowed_level: int = 1,
 ) -> Optional[str]:
     """
-    pool_consistency_check.py — Exit-Code = level (0 OK, 1 Warn, 2 kritisch).
-    Default: Warnungen erlaubt, kritisch (2) blockiert.
+    pool_consistency_check: Exit 0/1/2 = Level; 3 = Check-Crash; ohne JSON = blockieren.
     """
     script = os.path.join(main_dir, "scripts", "pool_consistency_check.py")
     if not os.path.isfile(script):
@@ -194,12 +210,34 @@ def run_consistency_gate(
         capture_output=True,
         text=True,
     )
-    level = proc.returncode
+    verdict = parse_consistency_verdict(proc.stdout or "")
+    valid_names = ("ok", "warn", "critical")
+    if verdict is None:
+        err_tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        return (
+            f"pool_consistency_check ohne gültiges JSON (exit={proc.returncode}); "
+            f"Retention/GC abgebrochen. {err_tail}"
+        )
+    level_name = str(verdict.get("level_name") or "")
+    if level_name == "check_failed" or proc.returncode == pcl.LEVEL_CHECK_FAILED:
+        return (
+            f"pool_consistency_check fehlgeschlagen: {verdict.get('error', level_name)}"
+        )
+    if proc.returncode not in (pcl.LEVEL_OK, pcl.LEVEL_WARN, pcl.LEVEL_CRITICAL):
+        return (
+            f"pool_consistency_check unerwarteter exit={proc.returncode}; "
+            f"Retention/GC abgebrochen."
+        )
+    if level_name and level_name not in valid_names:
+        return f"pool_consistency_check unbekanntes level_name={level_name}"
+    try:
+        level = int(verdict.get("level", pcl.LEVEL_CRITICAL))
+    except (TypeError, ValueError):
+        return "pool_consistency_check: level im JSON ungültig"
     if level <= max_allowed_level:
         return None
-    detail = (proc.stdout or "").strip().split("\n")[-1:] or []
     err_tail = (proc.stderr or "").strip()[-500:]
     return (
         f"pool_consistency_check level={level} (max erlaubt {max_allowed_level}); "
-        f"Retention/GC abgebrochen. {detail} {err_tail}"
+        f"Retention/GC abgebrochen. {err_tail}"
     )

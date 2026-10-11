@@ -144,6 +144,36 @@ def run_check(
 
 
 def main() -> int:
+    try:
+        return _main_impl()
+    except SystemExit as exc:
+        code = exc.code
+        if isinstance(code, int) and code in (
+            pcl.LEVEL_OK,
+            pcl.LEVEL_WARN,
+            pcl.LEVEL_CRITICAL,
+        ):
+            raise
+        fail = {
+            "level": pcl.LEVEL_CHECK_FAILED,
+            "level_name": "check_failed",
+            "error": str(code if code is not None else exc),
+        }
+        print(json.dumps(fail, ensure_ascii=False, separators=(",", ":")))
+        print(f"[CHECK_FAILED] {fail['error']}", file=sys.stderr)
+        return pcl.LEVEL_CHECK_FAILED
+    except Exception as exc:
+        fail = {
+            "level": pcl.LEVEL_CHECK_FAILED,
+            "level_name": "check_failed",
+            "error": str(exc),
+        }
+        print(json.dumps(fail, ensure_ascii=False, separators=(",", ":")))
+        print(f"[CHECK_FAILED] {exc}", file=sys.stderr)
+        return pcl.LEVEL_CHECK_FAILED
+
+
+def _main_impl() -> int:
     ap = argparse.ArgumentParser(description="Pool/Snapshot Konsistenz (read-only)")
     ap.add_argument("--env-file", default=".env")
     ap.add_argument("--env-dir", default=".")

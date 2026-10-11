@@ -157,17 +157,9 @@ class _GCStats:
 
 
 def _load_env_file(path: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    if not path or not os.path.isfile(path):
-        return out
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            out[k.strip()] = v.strip().strip("'\"")
-    return out
+    from env_file_util import load_env_file
+
+    return load_env_file(path)
 
 
 def _snap_names(entry) -> Set[str]:
