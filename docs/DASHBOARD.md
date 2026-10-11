@@ -14,7 +14,7 @@ Das **Monitoring Dashboard** ist eine vollständig selbst-gehostete Web-UI für 
 ✅ **Malware & Integrität** Monitoring mit DB-Daten  
 ✅ **Performance-Statistiken** (30 Tage)  
 ✅ **Timer-Status** aller systemd-Timer  
-✅ **Responsive Design** — Layout nach **Viewport-Breite** (CSS Media Queries), nicht nach Monitor-Zoll: &lt;1000px eine Spalte, 1001–1280px zwei Kacheln, ab 1281px drei Kacheln; ab 1600px Detail-Panels zweispaltig, max. Breite ~1520px (24″/27″ mit gleicher Pixelbreite verhalten sich gleich)
+✅ **Responsive Design** — Layout nach **Viewport-Breite** (Media Queries): &lt;1000px eine Kachel-Spalte, 1001–1280px zwei, ab 1281px drei (volle Browserbreite); ab 1600px Detail-Panels unter den Kacheln zweispaltig
 
 **Vorteile:**
 - 🚀 **Kein Framework** - Vanilla HTML/JS (lädt in < 1 Sekunde)
