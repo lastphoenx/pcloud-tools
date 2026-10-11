@@ -152,7 +152,7 @@ python scripts/utilities/pool_verify_backup.py \
 | `pool_index.sqlite3` (Arbeits-DB) | ja | nein | nein (rebuildbar) |
 | Deltas / Resume | ja | nein | nein |
 
-Manifeste neu erzeugen ist **Aufwand** (aus RTB/Stubs), kein Datenverlust der Backups selbst. Optional: gelegentliche Kopie von `manifests/` (~7 GB) auf andere Platte — nicht automatisiert.
+Manifeste neu erzeugen ist **Aufwand** (RTB-Re-Scan), kein Datenverlust der Nutzer-Backups. **Optional (rtb-Repo):** `pcloud_manifests_usb_backup.sh` + Timer `pcloud-manifests-backup` — `rsync` nach `PCLOUD_MANIFESTS_BACKUP_DEST` auf **USB außerhalb** `/srv/nas` (nicht RTB, nicht pCloud-Pool). Täglich inkrementell; alte Snap-Manifeste ändern sich nicht, nur neue/Retention-Löschungen.
 
 **Unvollständiger pCloud-Upload — Retry-Entscheidung:**
 
