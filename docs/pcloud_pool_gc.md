@@ -234,13 +234,17 @@ python pcloud_pool_gc.py \
 ```
 
 **Ablauf `--retention-apply`:**
-1. Retention-Modus aus `.env` (`PCLOUD_REMOTE_RETENTION_DAYS_FULL` > 0 → **Zeit-Retention** 62d + Wochen-Tier; sonst rtb-spiegel)
-2. **Sicherheitsabbruch**, wenn rtb-spiegel aktiv und RTB nicht gemountet oder 0 lokale Snapshots
-3. Kandidaten löschen → `content_index.json` bereinigen
-4. Verwaiste `_index/archive/<snap>_index.json` entfernen (kein Remote-Snapshot mehr)
-5. Optional `--run-gc`: verwaiste Pool-Dateien entfernen
+1. `pool_consistency_check` (kritisch = Exit 2 blockiert; Warnungen OK — Default `--consistency-max-level 1`)
+2. Retention-Modus aus `--env-file`: `DAYS_FULL>0` → Zeit-Retention; **kein** stiller rtb-spiegel
+3. rtb-spiegel: `PCLOUD_RETENTION_MODE=rtb-mirror`, `--allow-rtb-mode`, `backup.marker` im RTB-Root
+4. **Abbruch** (nichts löschen), wenn `to_delete` > `PCLOUD_RETENTION_MAX_DELETE_SNAPS` (40) oder > 30 % Remote — Override `--max-delete-snapshots N`
+5. Index bereinigen; optional `--run-gc` — **Abbruch**, wenn GC-Kandidaten > `PCLOUD_GC_MAX_DELETE_PCT` (15 %) des Pools; Override `--max-delete-pct P`
 
-**Wichtig:** Zeit-Retention liest `PCLOUD_REMOTE_RETENTION_*` aus der `--env-file` (nicht nur aus der Shell-Umgebung). Ohne das würde Cron fälschlich rtb-spiegel nutzen.
+**Catch-up:** `PCLOUD_CATCHUP_MAX_PER_RUN=1` in `.env` — Retention-Limits verhindern Massenlöschung wie August (43 Snaps).
+
+**Wichtig:** Cron **immer** mit `--env-file .env`.
+
+**Monats-Wrapper:** `scripts/run_monthly_retention.sh` (Forecast → Apply + GC, Pipeline muss stehen).
 
 Der Wrapper ruft **kein** `--retention-sync` mehr auf — Retention gehört ins GC-Skript.
 
@@ -254,11 +258,12 @@ Siehe auch pi-nas-Übersicht: [Doku/cron-jobs.md](https://github.com/lastphoenx/
   --env-file .env --pool-root /Backup/rtb_pool --grace-hours 24 \
   >> /var/log/backup/pool_gc.log 2>&1
 
-# Retention + GC (z.B. monatlich)
-0 4 1 * * cd /opt/apps/pcloud-tools/main && python pcloud_pool_gc.py \
+# Retention + GC (z.B. monatlich) — oder scripts/run_monthly_retention.sh
+0 4 1 * * cd /opt/apps/pcloud-tools/main && /opt/apps/pcloud-tools/venv/bin/python pcloud_pool_gc.py \
   --env-file .env --pool-root /Backup/rtb_pool \
   --retention-apply --run-gc --grace-hours 24 \
   >> /var/log/backup/pool_retention.log 2>&1
+# Einmalig groß aufräumen: --max-delete-snapshots 60 --max-delete-pct 50
 ```
 
 ---

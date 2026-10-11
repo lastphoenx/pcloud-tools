@@ -15,6 +15,8 @@ if SYNC_DIR not in sys.path:
 
 import pool_ops_index_sync as sync  # noqa: E402
 
+_ARGV = ["pool_ops_index_sync.py", "--env-file", ".env"]
+
 
 class PoolOpsIndexSyncTests(unittest.TestCase):
     def test_main_success_counts_and_exits_0(self) -> None:
@@ -22,17 +24,19 @@ class PoolOpsIndexSyncTests(unittest.TestCase):
         fake_db.snapshot_names.return_value = ["a", "b"]
         fake_db.count_shas.return_value = 42
 
-        with mock.patch.object(sync.pc, "effective_config", return_value={}):
-            with mock.patch.object(sync.pgc, "_load_env_file", return_value={"PCLOUD_DEST": "/pool"}):
-                with mock.patch.object(sync.gci, "open_synced_db", return_value=fake_db):
-                    rc = sync.main()
+        with mock.patch.object(sys, "argv", _ARGV):
+            with mock.patch.object(sync.pc, "effective_config", return_value={}):
+                with mock.patch.object(sync.pgc, "_load_env_file", return_value={"PCLOUD_DEST": "/pool"}):
+                    with mock.patch.object(sync.gci, "open_synced_db", return_value=fake_db):
+                        rc = sync.main()
         self.assertEqual(rc, 0)
         fake_db.close.assert_called_once()
 
     def test_main_missing_dest_exits_2(self) -> None:
-        with mock.patch.object(sync.pc, "effective_config", return_value={}):
-            with mock.patch.object(sync.pgc, "_load_env_file", return_value={}):
-                rc = sync.main()
+        with mock.patch.object(sys, "argv", _ARGV):
+            with mock.patch.object(sync.pc, "effective_config", return_value={}):
+                with mock.patch.object(sync.pgc, "_load_env_file", return_value={}):
+                    rc = sync.main()
         self.assertEqual(rc, 2)
 
 

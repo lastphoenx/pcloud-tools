@@ -88,6 +88,14 @@ else:
     _GCI_IMPORT_ERR = ""
 
 try:
+    import pool_retention_safety as prs
+except Exception as e:
+    prs = None  # type: ignore
+    _PRS_IMPORT_ERR = str(e)
+else:
+    _PRS_IMPORT_ERR = ""
+
+try:
     import pool_gc_manifest_guard as mg
     import pool_index_db as pidb
 except Exception as e:
@@ -271,14 +279,21 @@ def _resolve_retention_deletes(
     remote_snaps: Set[str],
     local_snaps: Set[str],
     env_vars: Optional[Dict[str, str]] = None,
-) -> Tuple[Set[str], str]:
-    if _time_retention_enabled(env_vars):
+    *,
+    allow_rtb_mode: bool = False,
+) -> Tuple[Set[str], str, Optional[str]]:
+    if prs is None:
+        return set(), "blocked", f"pool_retention_safety nicht geladen: {_PRS_IMPORT_ERR}"
+    mode, err = prs.resolve_retention_mode(env_vars, allow_rtb_mode=allow_rtb_mode)
+    if err:
+        return set(), f"blocked ({mode})", err
+    if mode == prs.MODE_TIME:
         days_full, weekly_weeks = _time_retention_params(env_vars)
         keep, to_delete = compute_time_retention_keep(remote_snaps, env_vars)
-        mode = f"zeit:{days_full}d+{weekly_weeks}w (behalten {len(keep)})"
-        return to_delete, mode
+        label = f"zeit:{days_full}d+{weekly_weeks}w (behalten {len(keep)})"
+        return to_delete, label, None
     to_delete = remote_snaps - local_snaps
-    return to_delete, f"rtb-spiegel (remote ohne lokales RTB, del {len(to_delete)})"
+    return to_delete, f"rtb-spiegel (remote ohne lokales RTB, del {len(to_delete)})", None
 
 
 def _retention_safety_abort(
@@ -503,6 +518,8 @@ def run_retention_forecast(
     *,
     verbose: bool = False,
     env_file: str = ".env",
+    allow_rtb_mode: bool = False,
+    max_delete_snapshots: Optional[int] = None,
 ) -> dict:
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
     snapshots_root = f"{dest_root}/_snapshots"
@@ -510,14 +527,28 @@ def run_retention_forecast(
     env_vars = _load_env_file(env_file)
 
     _log("[retention-forecast] ===== START =====")
+    if prs:
+        _log(f"[retention-forecast] Env: {prs.retention_env_summary(env_vars)}")
     local_snaps = _list_local_rtb_snaps(rtb_root)
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
     abort = _retention_safety_abort(rtb_root, local_snaps, remote_snaps, env_vars)
     if abort:
         _log(f"[retention-forecast][ERROR] Sicherheitsabbruch: {abort}")
         return {"aborted": abort, "local_snaps": len(local_snaps), "remote_snaps": len(remote_snaps)}
-    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps, env_vars)
+    to_delete_set, mode, mode_err = _resolve_retention_deletes(
+        remote_snaps, local_snaps, env_vars, allow_rtb_mode=allow_rtb_mode,
+    )
+    if mode_err:
+        _log(f"[retention-forecast][ERROR] {mode_err}")
+        return {"aborted": mode_err, "local_snaps": len(local_snaps), "remote_snaps": len(remote_snaps)}
     to_delete = sorted(to_delete_set)
+    if prs:
+        limit_err = prs.check_snapshot_delete_allowed(
+            len(to_delete), len(remote_snaps), env_vars, max_delete_snapshots,
+        )
+        if limit_err:
+            _log(f"[retention-forecast][ERROR] {limit_err}")
+            return {"aborted": limit_err, "local_snaps": len(local_snaps), "remote_snaps": len(remote_snaps)}
     keep_remote = remote_snaps - to_delete_set
 
     _log(f"[retention-forecast] Modus: {mode}")
@@ -624,6 +655,10 @@ def run_delete_snapshots(
     grace_hours: int = 24,
     verbose: bool = False,
     env_file: str = ".env",
+    max_delete_snapshots: Optional[int] = None,
+    max_delete_pct: Optional[float] = None,
+    skip_consistency_check: bool = False,
+    consistency_max_level: int = 1,
 ) -> dict:
     """
     Gezielt einzelne Remote-Snapshots löschen + pool_refs bereinigen.
@@ -634,14 +669,34 @@ def run_delete_snapshots(
     env_vars = _load_env_file(env_file)
 
     to_delete = sorted({s.strip() for s in snap_names if s and s.strip()})
+    main_dir = os.path.dirname(os.path.abspath(__file__))
     _log("[delete-snapshots] ===== START =====")
     if dry:
         _log("[delete-snapshots] DRY-RUN — keine Loeschungen")
+    if prs:
+        env_err = prs.validate_env_file_exists(env_file)
+        if env_err:
+            _log(f"[delete-snapshots][ERROR] {env_err}")
+            return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": env_err}
+    if not dry and not skip_consistency_check and prs:
+        gate = prs.run_consistency_gate(
+            main_dir, env_file, max_allowed_level=consistency_max_level,
+        )
+        if gate:
+            _log(f"[delete-snapshots][ERROR] {gate}")
+            return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": gate}
     if not to_delete:
         _log("[delete-snapshots] Keine Snapshot-Namen angegeben")
         return {"deleted": 0, "errors": 0, "to_delete": []}
 
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
+    if prs:
+        limit_err = prs.check_snapshot_delete_allowed(
+            len(to_delete), len(remote_snaps), env_vars, max_delete_snapshots,
+        )
+        if limit_err:
+            _log(f"[delete-snapshots][ERROR] {limit_err}")
+            return {"deleted": 0, "errors": 1, "to_delete": to_delete, "aborted": limit_err}
     _log(f"[delete-snapshots] Explizit: {len(to_delete)} | Remote-Ordner: {len(remote_snaps)}")
 
     poll_sec = int(_env_get(env_vars, "PCLOUD_RETENTION_DELETE_POLL_SEC", "60") or 60)
@@ -711,6 +766,7 @@ def run_delete_snapshots(
         gc_result = run_pool_gc(
             cfg, dest_root, dry=False, audit_mode=False,
             grace_hours=grace_hours, verbose=verbose, env_file=env_file,
+            max_delete_pct=max_delete_pct,
         )
         result["gc"] = gc_result
     elif run_gc and dry:
@@ -730,14 +786,33 @@ def run_retention_apply(
     grace_hours: int = 24,
     verbose: bool = False,
     env_file: str = ".env",
+    allow_rtb_mode: bool = False,
+    max_delete_snapshots: Optional[int] = None,
+    max_delete_pct: Optional[float] = None,
+    skip_consistency_check: bool = False,
+    consistency_max_level: int = 1,
 ) -> dict:
     dest_root = pc._norm_remote_path(dest_root).rstrip("/")
     snapshots_root = f"{dest_root}/_snapshots"
     env_vars = _load_env_file(env_file)
+    main_dir = os.path.dirname(os.path.abspath(__file__))
 
     _log("[retention] ===== RETENTION APPLY =====")
     if dry:
         _log("[retention] DRY-RUN — keine Loeschungen")
+    if prs:
+        env_err = prs.validate_env_file_exists(env_file)
+        if env_err:
+            _log(f"[retention][ERROR] {env_err}")
+            return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": env_err}
+        _log(f"[retention] Env: {prs.retention_env_summary(env_vars)}")
+    if not dry and not skip_consistency_check and prs:
+        gate = prs.run_consistency_gate(
+            main_dir, env_file, max_allowed_level=consistency_max_level,
+        )
+        if gate:
+            _log(f"[retention][ERROR] {gate}")
+            return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": gate}
 
     local_snaps = _list_local_rtb_snaps(rtb_root)
     remote_snaps = _list_remote_snapshot_names(cfg, snapshots_root)
@@ -745,8 +820,26 @@ def run_retention_apply(
     if abort:
         _log(f"[retention][ERROR] Sicherheitsabbruch: {abort}")
         return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": abort}
-    to_delete_set, mode = _resolve_retention_deletes(remote_snaps, local_snaps, env_vars)
+    to_delete_set, mode, mode_err = _resolve_retention_deletes(
+        remote_snaps, local_snaps, env_vars, allow_rtb_mode=allow_rtb_mode,
+    )
+    if mode_err:
+        _log(f"[retention][ERROR] {mode_err}")
+        return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": mode_err}
     to_delete = sorted(to_delete_set)
+    if prs:
+        retention_mode = prs.resolve_retention_mode(env_vars, allow_rtb_mode=allow_rtb_mode)[0]
+        if retention_mode == prs.MODE_RTB_MIRROR:
+            marker_err = prs.check_rtb_backup_marker(rtb_root)
+            if marker_err:
+                _log(f"[retention][ERROR] {marker_err}")
+                return {"deleted": 0, "errors": 1, "to_delete": [], "aborted": marker_err}
+        limit_err = prs.check_snapshot_delete_allowed(
+            len(to_delete), len(remote_snaps), env_vars, max_delete_snapshots,
+        )
+        if limit_err:
+            _log(f"[retention][ERROR] {limit_err}")
+            return {"deleted": 0, "errors": 1, "to_delete": to_delete, "aborted": limit_err}
 
     _log(f"[retention] Modus: {mode}")
     _log(f"[retention] Zu loeschen: {len(to_delete)} Remote-Snapshots")
@@ -816,8 +909,11 @@ def run_retention_apply(
         gc_result = run_pool_gc(
             cfg, dest_root, dry=False, audit_mode=False,
             grace_hours=grace_hours, verbose=verbose, env_file=env_file,
+            max_delete_pct=max_delete_pct,
         )
         result["gc"] = gc_result
+        if gc_result.get("aborted"):
+            result["errors"] = result.get("errors", 0) + 1
     elif run_gc and dry:
         _log("[retention] --run-gc mit --dry-run: GC separat mit --dry-run ausfuehren")
 
@@ -872,6 +968,9 @@ def run_pool_gc(
     grace_hours: int = 24,
     verbose: bool = False,
     env_file: str = ".env",
+    max_delete_pct: Optional[float] = None,
+    skip_consistency_check: bool = False,
+    consistency_max_level: int = 1,
 ) -> dict:
     """
     Führt Pool Garbage Collection aus (OPTIMIZED VERSION).
@@ -900,9 +999,25 @@ def run_pool_gc(
     snapshots_root = f"{dest_root.rstrip('/')}/_snapshots"
     pool_root = f"{dest_root.rstrip('/')}/_pool"
     env_vars = _load_env_file(env_file)
-    
+    main_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if not dry and not skip_consistency_check and prs:
+        req = (_env_get(env_vars, "PCLOUD_GC_REQUIRE_CONSISTENCY", "0") or "0").strip()
+        if req in ("1", "true", "yes"):
+            gate = prs.run_consistency_gate(
+                main_dir, env_file, max_allowed_level=consistency_max_level,
+            )
+            if gate:
+                _log(f"[gc][ERROR] {gate}")
+                return {"error": gate, "aborted": True}
+
     _log("[gc] ===== POOL GARBAGE COLLECTION START =====")
     _log(f"[gc] Mode: {'AUDIT (Deep-Validation)' if audit_mode else 'STANDARD (Index-basiert)'}")
+    if prs:
+        pct_lim = max_delete_pct
+        if pct_lim is None:
+            pct_lim = float(prs.env_get(env_vars, "PCLOUD_GC_MAX_DELETE_PCT", "15") or 15)
+        _log(f"[gc] Pool-Lösch-Anteil max: {pct_lim}% (Override: --max-delete-pct)")
     _log(f"[gc] Snapshots: {snapshots_root}")
     _log(f"[gc] Pool: {pool_root}")
     _log(f"[gc] Grace Period: {grace_hours}h")
@@ -1063,8 +1178,16 @@ def run_pool_gc(
             return {"error": str(e)}
 
         check_stats = stats.get_stats()
+        pending_gc = len(pool_files_to_delete)
+        if prs:
+            gc_lim_err = prs.check_gc_delete_allowed(
+                pending_gc, pool_files_found, env_vars, max_delete_pct,
+            )
+            if gc_lim_err:
+                _log(f"[gc][ERROR] {gc_lim_err}")
+                return {"error": gc_lim_err, "aborted": True}
         _log(
-            f"[gc] Check complete: {len(pool_files_to_delete)} to delete, "
+            f"[gc] Check complete: {pending_gc} to delete, "
             f"{check_stats['pool_files_kept']} to keep"
         )
 
@@ -1198,7 +1321,40 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         metavar="SNAP,...",
         help="Gezielt Remote-Snapshots löschen (Komma-Liste), Index bereinigen — kein Retention-Modus",
     )
-    
+    parser.add_argument(
+        "--allow-rtb-mode",
+        "--allow-rtb-mirror",
+        action="store_true",
+        dest="allow_rtb_mode",
+        help="rtb-spiegel nur mit PCLOUD_RETENTION_MODE=rtb-mirror + backup.marker",
+    )
+    parser.add_argument(
+        "--max-delete-snapshots",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Explizite Snapshot-Obergrenze dieses Lauf (sonst Env 40 / 30%%)",
+    )
+    parser.add_argument(
+        "--max-delete-pct",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Max. Anteil Pool-Dateien als GC-Kandidaten (Env: PCLOUD_GC_MAX_DELETE_PCT, Default 15)",
+    )
+    parser.add_argument(
+        "--skip-consistency-check",
+        action="store_true",
+        help="pool_consistency_check vor scharfem Lauf überspringen",
+    )
+    parser.add_argument(
+        "--consistency-max-level",
+        type=int,
+        default=1,
+        metavar="L",
+        help="Erlaubtes Konsistenz-Level (1=Warn OK, 2=kritisch blockiert); Default 1",
+    )
+
     args = parser.parse_args()
 
     if args.retention_forecast and args.retention_apply:
@@ -1228,7 +1384,11 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
 
     if args.retention_forecast:
         run_retention_forecast(
-            cfg, pool_root, rtb_root, verbose=args.verbose, env_file=args.env_file,
+            cfg, pool_root, rtb_root,
+            verbose=args.verbose,
+            env_file=args.env_file,
+            allow_rtb_mode=args.allow_rtb_mode,
+            max_delete_snapshots=args.max_delete_snapshots,
         )
         sys.exit(0)
 
@@ -1240,7 +1400,15 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
             grace_hours=args.grace_hours,
             verbose=args.verbose,
             env_file=args.env_file,
+            allow_rtb_mode=args.allow_rtb_mode,
+            max_delete_snapshots=args.max_delete_snapshots,
+            max_delete_pct=args.max_delete_pct,
+            skip_consistency_check=args.skip_consistency_check,
+            consistency_max_level=args.consistency_max_level,
         )
+        if result.get("aborted"):
+            _log(f"[retention] ⚠ Abgebrochen: {result['aborted']}")
+            sys.exit(2)
         if result.get("errors", 0) > 0:
             _log("[retention] ⚠ Abgeschlossen mit Fehlern")
             sys.exit(1)
@@ -1256,7 +1424,14 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
             grace_hours=args.grace_hours,
             verbose=args.verbose,
             env_file=args.env_file,
+            max_delete_snapshots=args.max_delete_snapshots,
+            max_delete_pct=args.max_delete_pct,
+            skip_consistency_check=args.skip_consistency_check,
+            consistency_max_level=args.consistency_max_level,
         )
+        if result.get("aborted"):
+            _log(f"[delete-snapshots] ⚠ Abgebrochen: {result['aborted']}")
+            sys.exit(2)
         if result.get("errors", 0) > 0:
             _log("[delete-snapshots] ⚠ Abgeschlossen mit Fehlern")
             sys.exit(1)
@@ -1272,6 +1447,9 @@ CRON BEISPIEL (wöchentlich, Sonntag 3 Uhr, 24h Grace):
         grace_hours=args.grace_hours,
         verbose=args.verbose,
         env_file=args.env_file,
+        max_delete_pct=args.max_delete_pct,
+        skip_consistency_check=args.skip_consistency_check,
+        consistency_max_level=args.consistency_max_level,
     )
     
     # Exit Code
