@@ -28,7 +28,7 @@ Lesender Vergleich (Exit 0 / 1 / 2):
 | `live_not_in_ops_db` | **Kritisch** — Snapshot-Ordner auf pCloud, fehlt in Ops-DB (nach Finalize bis Sync/GC). |
 | `live_not_in_backup_db` | **Kritisch** — Live-Snap fehlt in Backup-DB. |
 | `stale_ops_snapshots` | **Warnung** — Name noch in Index (`snapshots`-Tabelle / Master), **kein** Remote-Ordner mehr. |
-| `stale_local_manifests` | **Warnung** — lokales Manifest ohne Remote-Ordner. |
+| `stale_local_manifests` | **Warnung** — lokales Manifest ohne Remote-Ordner (nach `--retention-apply` / `--delete-snapshots` werden betroffene Dateien automatisch entfernt). |
 | `pool_files_missing` (`--pool`) | **Kritisch** — SHA aus **Manifesten** lebender Snaps fehlt im Pool-Listing. |
 | `pool_index_listing_gaps` (`--pool-index`) | **Warnung** — Ops-Index-SHA vs. Listing (oft Phantom-Refs, siehe `pool_gap_report.py`). |
 

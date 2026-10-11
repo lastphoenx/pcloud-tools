@@ -238,7 +238,8 @@ python pcloud_pool_gc.py \
 2. Retention-Modus aus `--env-file`: `DAYS_FULL>0` → Zeit-Retention; **kein** stiller rtb-spiegel
 3. rtb-spiegel: `PCLOUD_RETENTION_MODE=rtb-mirror`, `--allow-rtb-mode`, `backup.marker` im RTB-Root
 4. **Abbruch** (nichts löschen), wenn `to_delete` > `PCLOUD_RETENTION_MAX_DELETE_SNAPS` (40) oder > 30 % Remote — Override `--max-delete-snapshots N`
-5. Index bereinigen; optional `--run-gc` — **Abbruch**, wenn GC-Kandidaten > `PCLOUD_GC_MAX_DELETE_PCT` (15 %) des Pools; Override `--max-delete-pct P`
+5. Index bereinigen; lokale `manifests/<snap>.json` für gelöschte Snapshots entfernen (verhindert monatliche `stale_local_manifests`-Warnung)
+6. optional `--run-gc` — **Abbruch**, wenn GC-Kandidaten > `PCLOUD_GC_MAX_DELETE_PCT` (15 %) des Pools; Override `--max-delete-pct P`
 
 **Catch-up:** `PCLOUD_CATCHUP_MAX_PER_RUN=1` in `.env` — Retention-Limits verhindern Massenlöschung wie August (43 Snaps).
 

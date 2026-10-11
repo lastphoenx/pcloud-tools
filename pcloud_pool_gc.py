@@ -332,6 +332,27 @@ def _delete_remote_archive_index(
         return False
 
 
+def _remove_local_manifest_for_snap(
+    snap: str, env_vars: Optional[dict], *, dry: bool = False
+) -> bool:
+    """Entfernt lokales manifests/<snap>.json (Konsistenz-Check stale_local_manifests)."""
+    if mg is None:
+        return False
+    path = os.path.join(mg._manifests_dir(env_vars), f"{snap}.json")
+    if not os.path.isfile(path):
+        return False
+    if dry:
+        _log(f"[dry] remove local manifest: {path}")
+        return True
+    try:
+        os.remove(path)
+        _log(f"[retention] ✓ Lokales Manifest entfernt: {os.path.basename(path)}")
+        return True
+    except OSError as e:
+        _log(f"[retention][warn] Lokales Manifest nicht gelöscht ({snap}): {e}")
+        return False
+
+
 def _purge_orphan_archive_indexes(
     cfg: dict,
     snapshots_root: str,
@@ -738,6 +759,8 @@ def run_delete_snapshots(
             _sync_pool_index_db_after_master(
                 master_path, env_vars, deleted_snaps, dry=False,
             )
+        for snap in sorted(deleted_snaps):
+            _remove_local_manifest_for_snap(snap, env_vars, dry=dry)
     else:
         _log("[delete-snapshots] Index unveraendert")
 
@@ -878,6 +901,8 @@ def run_retention_apply(
             _sync_pool_index_db_after_master(
                 master_path, env_vars, deleted_snaps, dry=False,
             )
+        for snap in sorted(deleted_snaps):
+            _remove_local_manifest_for_snap(snap, env_vars, dry=dry)
     else:
         _log("[retention] Nichts zu loeschen — Index unveraendert")
 
