@@ -2722,6 +2722,61 @@ def _delta_phase3_cleanup(
     return folders_removed, stubs_deleted
 
 
+def _copyfolder_with_heartbeat(
+    cfg: dict,
+    *,
+    from_path: str,
+    to_folderid: int,
+    basis_snapshot_name: str,
+    snapshot_name: str,
+    copy_try: int,
+    copy_attempts: int,
+) -> dict:
+    """
+    Blockierender pCloud copyfolder-Call mit periodischem Log.
+
+    PCLOUD_COPYFOLDER_TIMEOUT ist ein Socket-Read-Idle-Timeout (kein Gesamt-Cap).
+    Zwischen-Bytes von pCloud werden nicht geloggt — nur elapsed + konfiguriertes Idle-Limit.
+    """
+    heartbeat_sec = int(os.environ.get("PCLOUD_COPYFOLDER_HEARTBEAT_SEC", "900") or "900")
+    idle_timeout = int(cfg.get("timeout", 0) or 0)
+    if heartbeat_sec <= 0:
+        return pc.copyfolder(
+            cfg,
+            from_path=from_path,
+            to_folderid=to_folderid,
+            copycontentonly=True,
+        )
+
+    heartbeat_sec = max(60, heartbeat_sec)
+    done = threading.Event()
+    t0 = time.time()
+
+    def _heartbeat() -> None:
+        while not done.wait(timeout=heartbeat_sec):
+            elapsed = time.time() - t0
+            _log(
+                f"[delta-mode] copyfolder: warte auf pCloud-API … "
+                f"elapsed={elapsed:.0f}s (~{elapsed / 60:.1f}min), "
+                f"basis={basis_snapshot_name} -> {snapshot_name}, "
+                f"versuch={copy_try}/{copy_attempts}, "
+                f"socket_idle_timeout={idle_timeout}s"
+            )
+
+    hb = threading.Thread(target=_heartbeat, name="copyfolder-heartbeat", daemon=True)
+    hb.start()
+    try:
+        return pc.copyfolder(
+            cfg,
+            from_path=from_path,
+            to_folderid=to_folderid,
+            copycontentonly=True,
+        )
+    finally:
+        done.set()
+        hb.join(timeout=2.0)
+
+
 def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapshot_name: str,
                          *, dry: bool = False, verbose: bool = False) -> dict:
     """
@@ -2910,11 +2965,14 @@ def push_pool_delta_mode(cfg: dict, manifest: dict, dest_root: str, basis_snapsh
                 # nach to_folderid. to_folderid MUSS daher der Snapshot-Ordner SELBST
                 # sein - nicht der _snapshots-Parent.
                 dest_fid = pc.ensure_path(cfg, dest_snapshot_dir)
-                pc.copyfolder(
+                _copyfolder_with_heartbeat(
                     cfg,
                     from_path=basis_snapshot_dir,
                     to_folderid=dest_fid,
-                    copycontentonly=True,
+                    basis_snapshot_name=basis_snapshot_name,
+                    snapshot_name=snapshot_name,
+                    copy_try=copy_try,
+                    copy_attempts=copy_attempts,
                 )
                 copy_duration = time.time() - t_copy_start
                 _log(f"[delta-mode] ✓ Struktur geklont in {copy_duration:.1f}s")

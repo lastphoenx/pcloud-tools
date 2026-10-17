@@ -143,6 +143,17 @@ PCLOUD_DELTA_RESUME_INCOMPLETE=auto
 PCLOUD_COPYFOLDER_TIMEOUT=2400
 ```
 
+**Hinweis:** Das ist kein maximales Laufzeit-Limit für den gesamten `copyfolder`-Call, sondern die maximale **Leerlaufzeit zwischen empfangenen Bytes** auf der HTTP-Verbindung (`requests` Read-Timeout). Lange Läufe (z. B. 3 h+) sind möglich, solange pCloud die Verbindung regelmäßig am Leben hält. Abbruch im Log: `ReadTimeout` / `copyfolder Versuch …` in `pcloud_sync.log`.
+
+### `PCLOUD_COPYFOLDER_HEARTBEAT_SEC`
+**Beschreibung:** Während Phase 1 (`copyfolder`) periodisch in das Log schreiben, dass noch auf die pCloud-API gewartet wird (kein Byte-Trace).  
+**Default:** `900` (15 min); `0` = Heartbeat aus  
+**Verwendet in:** `pcloud_push_json_pool_manifest_to_pcloud.py`
+
+```bash
+PCLOUD_COPYFOLDER_HEARTBEAT_SEC=900
+```
+
 ---
 
 ## API-Schonung & Circuit Breaker
