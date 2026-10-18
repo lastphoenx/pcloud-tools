@@ -2742,6 +2742,59 @@
       return esc(text);
     }
 
+    function cheatCopyPayloadB64(text) {
+      try {
+        return btoa(unescape(encodeURIComponent(text)));
+      } catch (e) {
+        return '';
+      }
+    }
+
+    function cheatCopyPayloadFromB64(b64) {
+      try {
+        return decodeURIComponent(escape(atob(b64)));
+      } catch (e) {
+        return '';
+      }
+    }
+
+    /** HTTP auf LAN-IP ist kein „secure context“ — Clipboard API oft blockiert; execCommand-Fallback. */
+    function copyTextToClipboard(text, btn) {
+      function done(ok) {
+        btn.textContent = ok ? 'OK' : 'Fehler';
+        if (ok) btn.classList.add('copied');
+        setTimeout(function() {
+          btn.textContent = 'Kopieren';
+          btn.classList.remove('copied');
+        }, ok ? 1500 : 2000);
+      }
+      function fallbackCopy() {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+          return document.execCommand('copy');
+        } catch (e) {
+          return false;
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function() { done(true); }).catch(function() {
+          done(fallbackCopy());
+        });
+      } else {
+        done(fallbackCopy());
+      }
+    }
+
     function renderCheats() {
       const grid = document.getElementById('cheats-grid');
       if (!grid) return;
@@ -2750,29 +2803,22 @@
         html += '<div class="cheat-section"><h3>' + esc(sec.title) + '</h3>';
         sec.items.forEach(function(item) {
           const text = item.cmd || item.url || '';
+          const copyB64 = cheatCopyPayloadB64(text);
           html += '<div class="cheat-item">'
             + '<div class="cheat-label">' + esc(item.label) + '</div>'
             + (item.hint ? '<div class="cheat-hint">' + esc(item.hint) + '</div>' : '')
             + '<div class="cheat-row"><pre class="cheat-cmd">' + cheatBodyHtml(item) + '</pre>'
-            + '<button type="button" class="cheat-copy">Kopieren</button></div>'
+            + '<button type="button" class="cheat-copy" data-copy-b64="' + esc(copyB64) + '">Kopieren</button></div>'
             + '</div>';
         });
         html += '</div>';
       });
       grid.innerHTML = html;
-      grid.querySelectorAll('.cheat-row').forEach(function(row) {
-        const pre = row.querySelector('.cheat-cmd');
-        const btn = row.querySelector('.cheat-copy');
-        if (!pre || !btn) return;
+      grid.querySelectorAll('.cheat-copy').forEach(function(btn) {
         btn.addEventListener('click', function() {
-          const t = pre.textContent || '';
-          navigator.clipboard.writeText(t).then(function() {
-            btn.textContent = 'OK';
-            btn.classList.add('copied');
-            setTimeout(function() { btn.textContent = 'Kopieren'; btn.classList.remove('copied'); }, 1500);
-          }).catch(function() {
-            btn.textContent = 'Fehler';
-          });
+          const b64 = btn.getAttribute('data-copy-b64') || '';
+          const t = cheatCopyPayloadFromB64(b64) || '';
+          copyTextToClipboard(t, btn);
         });
       });
     }
