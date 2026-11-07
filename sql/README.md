@@ -26,6 +26,7 @@ These scripts manage the **pcloud_backup** database, which tracks backup runs, p
 ```bash
 mysql -u pcloud_backup -p pcloud_backup < sql/migrate_integrity_checks.sql
 mysql -u pcloud_backup -p pcloud_backup < sql/migrate_integrity_v2.sql
+mysql -u pcloud_backup -p pcloud_backup < sql/migrate_rtb_run_metrics.sql
 ```
 
 Creates integrity columns on `backup_runs` + `snapshot_integrity_checks` (monthly audit only, 1 row/snapshot).

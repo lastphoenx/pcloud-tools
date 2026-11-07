@@ -393,6 +393,10 @@
     .badge.unknown { background: rgba(148,163,184,0.15); color: var(--muted); }
     .badge.archived { background: rgba(148,163,184,0.12); color: var(--muted); font-weight: 500; }
     .report-table tr.row-failed td { background: rgba(239,68,68,0.08); }
+    .report-table tr.row-stale-pbs td { background: rgba(245, 158, 11, 0.09); }
+    .report-table td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .report-table th.num { text-align: right; }
+    .report-table td.pbs-col { text-align: center; white-space: nowrap; }
     .report-table tr.row-running td { background: rgba(234,179,8,0.08); }
     .badge.running { background: rgba(59,130,246,0.15); color: var(--blue); }
     .integrity-explain {
@@ -930,9 +934,40 @@
       return '<span class="badge ' + cls + '"' + title + '>' + esc(st) + '</span>';
     }
 
+    function formatGbCell(gb, label) {
+      if (gb === undefined || gb === null || gb === '') return '\u2014';
+      const n = Number(gb);
+      if (!isFinite(n)) return '\u2014';
+      if (n === 0) {
+        return '<span class="muted" title="' + esc(label) + ': 0 Bytes">0</span>';
+      }
+      return '<span title="' + esc(label) + '">' + String(gb) + '</span>';
+    }
+
+    function backupRunPbsBadge(r) {
+      if (r.gb_pbs === undefined && r.pbs_bytes_transferred === undefined) return '\u2014';
+      const pbs = Number(r.gb_pbs);
+      if (pbs > 0) {
+        return '<span class="badge ok" title="Backup/pbs2 Einheiten mit rsync-Delta">PBS \u2713</span>';
+      }
+      if (r.status === 'SUCCESS') {
+        return '<span class="badge warning" title="SUCCESS ohne PBS-Replik-Delta \u2014 vzdump/PBS pr\u00fcfen">PBS \u2014</span>';
+      }
+      return '<span class="muted">\u2014</span>';
+    }
+
+    function backupRunDataCells(r) {
+      return '<td class="num" title="RTB rsync (NAS-Snapshot)">' + formatGbCell(r.gb_rtb, 'RTB rsync GB') + '</td>'
+        + '<td class="num" title="pCloud Pool-Upload (neue Bytes)">' + formatGbCell(r.gb_uploaded, 'Pool upload GB') + '</td>'
+        + '<td class="pbs-col">' + backupRunPbsBadge(r) + '</td>';
+    }
+
     function backupRunRowClass(r) {
       if (r.status === 'FAILED') return 'row-failed';
       if (r.status === 'RUNNING') return 'row-running';
+      if (r.status === 'SUCCESS' && Number(r.gb_rtb) === 0 && Number(r.gb_pbs) === 0) {
+        return 'row-stale-pbs';
+      }
       return '';
     }
 
@@ -1271,6 +1306,7 @@
         +     rtbLastBackupSummaryHTML(rtb)
         +     rtbExcludePolicyHTML(rtb)
         +     (cloud.checks && cloud.checks.backup_age  ? renderPCloudAge(cloud.checks.backup_age)  : '')
+        +     (cloud.checks && cloud.checks.pbs_replica ? renderPbsReplica(cloud.checks.pbs_replica) : '')
         +     renderSyncBacklog(sb)
         +     (cloud.checks && cloud.checks.pcloud_quota ? renderPCloudQuota(cloud.checks.pcloud_quota) : '')
         +     (perf.total_runs ? (
@@ -1334,15 +1370,18 @@
           + '<span>Letzte Backup-L&auml;ufe</span><span class="arrow">\u25BC</span></button>'
           + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
           + '<table class="report-table"><thead><tr>'
-          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th><th>GB</th><th>Versuch</th>'
+          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th>'
+          + '<th class="num" title="RTB rsync GB">RTB</th><th class="num" title="pCloud upload GB">Pool</th><th>PBS</th><th>Versuch</th>'
           + '</tr></thead><tbody>'
+          + '<tr class="integrity-hint" style="display:table-row"><td colspan="8" style="font-size:11px;padding:6px 10px;border:none">'
+          + 'Gelb: SUCCESS ohne RTB/PBS-Delta. <strong>Pool 0</strong> = kein neuer pCloud-Upload; <strong>PBS \u2014</strong> = keine neuen pbs2-Chunks im RTB.</td></tr>'
           + recent.map(r =>
               '<tr class="' + backupRunRowClass(r) + '">'
             + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
             + '<td>' + backupRunStatusBadge(r) + '</td>'
             + '<td>' + fmtTs(r.started_at) + '</td>'
             + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
-            + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
+            + backupRunDataCells(r)
             + '<td>' + ((attemptCounts[r.snapshot] || 1) > 1 ? attemptCounts[r.snapshot] : '\u2014') + '</td>'
             + '</tr>'
             ).join('')
@@ -1951,7 +1990,8 @@
         + 'Retries/Manuell: Badge &bdquo;Retry &times;N&ldquo; (aus DB-Historie).</div>'
         + '<table class="report-table">'
         + '<thead><tr>'
-        + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th><th>GB</th><th>Versuch</th>'
+        + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Ende</th><th>Dauer</th><th>Dateien</th>'
+        + '<th class="num">RTB</th><th class="num">Pool</th><th>PBS</th><th>Versuch</th>'
         + '</tr></thead><tbody>'
         + recent.map(r => '<tr class="' + backupRunRowClass(r) + '">'
             + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
@@ -1960,7 +2000,7 @@
             + '<td>' + fmtTs(r.finished_at) + '</td>'
             + '<td>' + (r.duration_sec ? Math.round(r.duration_sec/60) + 'm' : '\u2014') + '</td>'
             + '<td>' + (r.files_uploaded || '\u2014') + '</td>'
-            + '<td>' + (r.gb_uploaded !== undefined ? r.gb_uploaded : '\u2014') + '</td>'
+            + backupRunDataCells(r)
             + '<td>' + ((attemptCounts[r.snapshot] || 1) > 1 ? attemptCounts[r.snapshot] : '\u2014') + '</td>'
           + '</tr>').join('')
         + '</tbody></table>';
@@ -2565,6 +2605,17 @@
         return h !== undefined ? (h < 24 ? h + 'h' : Math.floor(h/24) + 'd ' + (h%24) + 'h') : '\u2014';
       })();
       return '<div class="info-row"><span class="lbl">pCloud Backup-Alter</span><span class="val">' + msg + '</span></div>';
+    }
+
+    function renderPbsReplica(pr) {
+      if (!pr || pr.message === undefined) return '';
+      const st = Number(pr.status);
+      const cls = st === 0 ? 'green' : st === 1 ? 'yellow' : st === 2 ? 'red' : '';
+      const hrs = pr.newest_file_age_hours;
+      const extra = hrs !== undefined && hrs !== null ? ' (' + hrs + 'h)' : '';
+      return '<div class="info-row"><span class="lbl">PBS-Replik (NAS)</span>'
+        + '<span class="val' + (cls ? ' ' + cls : '') + '" title="j\u00fcngste Datei unter Backup/pbs2">'
+        + esc(String(pr.message).replace(/^OK:\s*/, '')) + esc(extra) + '</span></div>';
     }
 
     function renderPCloudQuota(pq) {

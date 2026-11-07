@@ -242,6 +242,9 @@ get_recent_backups() {
       COALESCE(duration_sec, 0) AS duration_sec,
       COALESCE(files_uploaded, 0) AS files_uploaded,
       COALESCE(ROUND(bytes_uploaded / 1024 / 1024 / 1024, 2), 0) AS gb_uploaded,
+      COALESCE(ROUND(rtb_bytes_transferred / 1024 / 1024 / 1024, 2), 0) AS gb_rtb,
+      COALESCE(ROUND(pbs_bytes_transferred / 1024 / 1024 / 1024, 3), 0) AS gb_pbs,
+      COALESCE(rtb_units_changed, 0) AS rtb_units_changed,
       COALESCE(gap_backfill_mode, 0) AS gap_backfill_mode,
       COALESCE(error_message, '') AS error_message
     FROM backup_runs
@@ -257,7 +260,7 @@ get_recent_backups() {
   local json="["
   local first=1
 
-  while IFS=$'\t' read -r snapshot_name status started_at finished_at duration_sec files_uploaded gb_uploaded gap_backfill_mode error_message; do
+  while IFS=$'\t' read -r snapshot_name status started_at finished_at duration_sec files_uploaded gb_uploaded gb_rtb gb_pbs rtb_units_changed gap_backfill_mode error_message; do
     [[ "$first" -eq 0 ]] && json="${json},"
     first=0
     local err_escaped
@@ -272,6 +275,9 @@ get_recent_backups() {
     json="${json}\"duration_sec\":${duration_sec},"
     json="${json}\"files_uploaded\":${files_uploaded},"
     json="${json}\"gb_uploaded\":${gb_uploaded},"
+    json="${json}\"gb_rtb\":${gb_rtb},"
+    json="${json}\"gb_pbs\":${gb_pbs},"
+    json="${json}\"rtb_units_changed\":${rtb_units_changed},"
     json="${json}\"gap_backfill\":$([ "$gap_backfill_mode" = "1" ] && echo "true" || echo "false"),"
     json="${json}\"error\":\"${err_escaped}\""
     json="${json}}"

@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS backup_runs (
     
     files_uploaded INT UNSIGNED DEFAULT 0,
     bytes_uploaded BIGINT UNSIGNED DEFAULT 0,
+    rtb_bytes_transferred BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Total rsync bytes (all RTB units)',
+    rtb_files_transferred INT UNSIGNED NOT NULL DEFAULT 0,
+    rtb_units_changed INT UNSIGNED NOT NULL DEFAULT 0,
+    pbs_bytes_transferred BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Bytes under Backup/pbs2/* units',
     files_total INT UNSIGNED DEFAULT 0,
     bytes_total BIGINT UNSIGNED DEFAULT 0,
     

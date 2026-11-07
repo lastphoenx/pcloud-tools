@@ -59,6 +59,9 @@ PCLOUD_API_HOST="${PCLOUD_API_HOST:-eapi.pcloud.com}"
 # Thresholds (configurable via .env)
 BACKUP_AGE_WARNING_HOURS="${BACKUP_AGE_WARNING_HOURS:-48}"
 BACKUP_AGE_CRITICAL_HOURS="${BACKUP_AGE_CRITICAL_HOURS:-72}"
+PBS_REPLICA_DIR="${PBS_REPLICA_DIR:-/srv/nas/Backup/pbs2}"
+PBS_REPLICA_WARN_HOURS="${PBS_REPLICA_WARN_HOURS:-36}"
+PBS_REPLICA_CRIT_HOURS="${PBS_REPLICA_CRIT_HOURS:-72}"
 QUOTA_WARNING_GB="${QUOTA_WARNING_GB:-500}"    # 5% of 10TB
 QUOTA_CRITICAL_GB="${QUOTA_CRITICAL_GB:-200}"  # 2% of 10TB
 DISK_WARNING_PERCENT="${DISK_WARNING_PERCENT:-10}"
@@ -318,6 +321,77 @@ check_backup_age() {
   CHECK_RESULTS[backup_age_status]=$GLOBAL_STATUS
   # Get the LAST (most recent) issue message for this check
   CHECK_RESULTS[backup_age_message]="$(echo "${ISSUES[@]}" | grep -E 'OK:|WARNING:|CRITICAL:' | tail -n1 || echo 'No status available')"
+}
+
+# =====================================================
+# CHECK 1b: PBS replica freshness on NAS (vm/ct/.chunks)
+# =====================================================
+check_pbs_replica_freshness() {
+  [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[1b] PBS replica on NAS${NC}"
+
+  local status_before=$GLOBAL_STATUS
+  CHECK_RESULTS[pbs_replica_status]=0
+  CHECK_RESULTS[pbs_replica_message]="OK: PBS replica path not checked"
+  CHECK_RESULTS[pbs_replica_newest_hours]=0
+  CHECK_RESULTS[pbs_replica_path]="$PBS_REPLICA_DIR"
+
+  if [[ ! -d "$PBS_REPLICA_DIR" ]]; then
+    log_issue "WARNING" "PBS replica directory missing: $PBS_REPLICA_DIR"
+    set_status 1
+    CHECK_RESULTS[pbs_replica_status]=1
+    CHECK_RESULTS[pbs_replica_message]="WARNING: directory missing"
+    return
+  fi
+
+  local newest_epoch=0
+  local sub
+  for sub in vm ct .chunks; do
+    [[ -d "${PBS_REPLICA_DIR}/${sub}" ]] || continue
+    local m
+    m=$(find "${PBS_REPLICA_DIR}/${sub}" -type f -printf '%T@\n' 2>/dev/null \
+      | awk 'BEGIN{max=0} {if ($1+0 > max) max=$1+0} END {printf "%.0f", max}' || echo "0")
+    [[ -n "$m" && "$m" -gt "$newest_epoch" ]] && newest_epoch=$m
+  done
+
+  if [[ "$newest_epoch" -eq 0 ]]; then
+    log_issue "WARNING" "PBS replica: no files under ${PBS_REPLICA_DIR}/{vm,ct,.chunks}"
+    set_status 1
+    CHECK_RESULTS[pbs_replica_status]=1
+    CHECK_RESULTS[pbs_replica_message]="WARNING: no replica files found"
+    return
+  fi
+
+  local now_epoch newest_hours
+  now_epoch=$(date +%s)
+  newest_hours=$(( (now_epoch - newest_epoch) / 3600 ))
+  CHECK_RESULTS[pbs_replica_newest_hours]=$newest_hours
+
+  local age_display
+  if [[ $newest_hours -ge 24 ]]; then
+    age_display="$(( newest_hours / 24 ))d $(( newest_hours % 24 ))h"
+  else
+    age_display="${newest_hours}h"
+  fi
+
+  if [[ $newest_hours -ge $PBS_REPLICA_CRIT_HOURS ]]; then
+    log_issue "CRITICAL" "PBS replica stale: newest file ${age_display} ago (${PBS_REPLICA_DIR})"
+    set_status 2
+    CHECK_RESULTS[pbs_replica_status]=2
+    CHECK_RESULTS[pbs_replica_message]="CRITICAL: newest ${age_display} ago"
+  elif [[ $newest_hours -ge $PBS_REPLICA_WARN_HOURS ]]; then
+    log_issue "WARNING" "PBS replica aging: newest file ${age_display} ago"
+    set_status 1
+    CHECK_RESULTS[pbs_replica_status]=1
+    CHECK_RESULTS[pbs_replica_message]="WARNING: newest ${age_display} ago"
+  else
+    log_issue "OK" "PBS replica fresh (newest file ${age_display} ago)"
+    CHECK_RESULTS[pbs_replica_status]=0
+    CHECK_RESULTS[pbs_replica_message]="OK: newest ${age_display} ago"
+  fi
+
+  if [[ $GLOBAL_STATUS -lt $status_before ]]; then
+    : # keep worse global status
+  fi
 }
 
 # =====================================================
@@ -613,6 +687,7 @@ check_sync_backlog() {
 [[ $VERBOSE -eq 1 ]] && echo -e "${GREEN}=== pCloud Backup Health Check ===${NC}"
 
 check_backup_age
+check_pbs_replica_freshness
 check_pcloud_quota
 check_disk_space
 check_database
@@ -656,6 +731,13 @@ if [[ $JSON_MODE -eq 1 ]]; then
   echo "      \"rtb_age_hours\": ${CHECK_RESULTS[rtb_age_hours]:-0},"
   echo "      \"pcloud_snapshot\": \"$(escape_json "${CHECK_RESULTS[pcloud_snapshot]:-unknown}")\","
   echo "      \"pcloud_age_hours\": ${CHECK_RESULTS[pcloud_age_hours]:-0}"
+  echo "    },"
+  
+  echo "    \"pbs_replica\": {"
+  echo "      \"status\": ${CHECK_RESULTS[pbs_replica_status]:-3},"
+  echo "      \"message\": \"$(escape_json "${CHECK_RESULTS[pbs_replica_message]:-Check not run}")\","
+  echo "      \"path\": \"$(escape_json "${CHECK_RESULTS[pbs_replica_path]:-}")\","
+  echo "      \"newest_file_age_hours\": ${CHECK_RESULTS[pbs_replica_newest_hours]:-0}"
   echo "    },"
   
   # pCloud Quota Check

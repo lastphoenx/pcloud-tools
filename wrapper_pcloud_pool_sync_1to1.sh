@@ -348,6 +348,42 @@ _db_update_metrics() {
   _mysql "UPDATE backup_runs SET ${updates} WHERE run_id='${RUN_ID}';" 2>/dev/null || true
 }
 
+# RTB staged-backup summary written to $SNAP/.rtb_backup_summary.json by rtb_staged_backup.sh
+_db_apply_rtb_summary_from_snapshot() {
+  [[ "${PCLOUD_ENABLE_DB}" != "1" || -z "$RUN_ID" ]] && return 0
+
+  local snap_dir="$1"
+  local summary="${snap_dir}/.rtb_backup_summary.json"
+  [[ -f "$summary" ]] || return 0
+
+  local metrics
+  metrics="$("${PY}" - "$summary" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    s = json.load(f)
+def nint(k):
+    try:
+        return int(s.get(k, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+print("\t".join(str(x) for x in (
+    nint("bytes_transferred"),
+    nint("files_transferred"),
+    nint("units_changed"),
+    nint("pbs_bytes_transferred"),
+)))
+PY
+)" 2>/dev/null || return 0
+
+  local rtb_b rtb_f rtb_u pbs_b
+  IFS=$'\t' read -r rtb_b rtb_f rtb_u pbs_b <<<"$metrics"
+  [[ -z "${rtb_b:-}" ]] && return 0
+
+  _db_update_metrics "rtb_bytes_transferred = ${rtb_b}, rtb_files_transferred = ${rtb_f}, rtb_units_changed = ${rtb_u}, pbs_bytes_transferred = ${pbs_b}"
+  _log INFO "RTB metrics: ${rtb_b} bytes (${rtb_f} files, ${rtb_u} units changed; PBS ${pbs_b} bytes)"
+}
+
 require_file(){
   [[ -f "$1" ]] || { _log ERROR "Datei fehlt: $1"; exit 2; }
 }
@@ -609,6 +645,7 @@ build_and_push() {
 
   # DB-Tracking: ein Run pro Snapshot (wichtig für Bootstrap/Kettenläufe)
   _db_run_start "$SNAPNAME" "$SNAP"
+  _db_apply_rtb_summary_from_snapshot "$SNAP"
 
   _db_fail_and_return() {
     local msg="$1"
