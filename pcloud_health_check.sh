@@ -345,10 +345,11 @@ check_pbs_replica_freshness() {
 
   local newest_epoch=0
   local sub
+  # maxdepth: full tree scan auf pbs2 kann Minuten dauern und aggregate_status blockieren
   for sub in vm ct .chunks; do
     [[ -d "${PBS_REPLICA_DIR}/${sub}" ]] || continue
     local m
-    m=$(find "${PBS_REPLICA_DIR}/${sub}" -type f -printf '%T@\n' 2>/dev/null \
+    m=$(find "${PBS_REPLICA_DIR}/${sub}" -maxdepth 5 -type f -printf '%T@\n' 2>/dev/null \
       | awk 'BEGIN{max=0} {if ($1+0 > max) max=$1+0} END {printf "%.0f", max}' || echo "0")
     [[ -n "$m" && "$m" -gt "$newest_epoch" ]] && newest_epoch=$m
   done

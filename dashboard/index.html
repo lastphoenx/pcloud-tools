@@ -1365,17 +1365,10 @@
 
       html += '</div>';
 
-      if (recent.length > 0) {
-        html += '<button class="detail-toggle" id="btn-backup" onclick="toggleDetail(\'backup\')">'
-          + '<span>Letzte Backup-L&auml;ufe</span><span class="arrow">\u25BC</span></button>'
-          + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
-          + '<table class="report-table"><thead><tr>'
-          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th>'
-          + '<th class="num" title="RTB rsync GB">RTB</th><th class="num" title="pCloud upload GB">Pool</th><th>PBS</th><th>Versuch</th>'
-          + '</tr></thead><tbody>'
-          + '<tr class="integrity-hint" style="display:table-row"><td colspan="8" style="font-size:11px;padding:6px 10px;border:none">'
-          + 'Gelb: SUCCESS ohne RTB/PBS-Delta. <strong>Pool 0</strong> = kein neuer pCloud-Upload; <strong>PBS \u2014</strong> = keine neuen pbs2-Chunks im RTB.</td></tr>'
-          + recent.map(r =>
+      {
+        const repErr = (reports || {}).error || '';
+        const backupRows = recent.length > 0
+          ? recent.map(r =>
               '<tr class="' + backupRunRowClass(r) + '">'
             + '<td>' + backupRunSnapshotCell(r, attemptCounts) + '</td>'
             + '<td>' + backupRunStatusBadge(r) + '</td>'
@@ -1385,6 +1378,25 @@
             + '<td>' + ((attemptCounts[r.snapshot] || 1) > 1 ? attemptCounts[r.snapshot] : '\u2014') + '</td>'
             + '</tr>'
             ).join('')
+          : '<tr><td colspan="8" class="integrity-hint" style="border:none">'
+            + (repErr ? esc(repErr) + ' &mdash; '
+              : 'Keine Eintr&auml;ge in <code>reports.json</code> (recent_backups). ')
+            + 'Auf pi-nas: <code>sudo .../sql/migrate_rtb_run_metrics.sql</code>, dann '
+            + '<code>sudo .../scripts/generate_reports.sh</code>.</td></tr>';
+        html += '<button class="detail-toggle" id="btn-backup" onclick="toggleDetail(\'backup\')">'
+          + '<span>Letzte Backup-L&auml;ufe</span>'
+          + (recent.length > 0 ? '' : ' <span class="badge warning">leer</span>')
+          + '<span class="arrow">\u25BC</span></button>'
+          + '<div class="tile-detail" id="detail-backup"><div class="tile-detail-inner">'
+          + '<table class="report-table"><thead><tr>'
+          + '<th>Snapshot</th><th>Status</th><th>Start</th><th>Dauer</th>'
+          + '<th class="num" title="RTB rsync GB">RTB</th><th class="num" title="pCloud upload GB">Pool</th><th>PBS</th><th>Versuch</th>'
+          + '</tr></thead><tbody>'
+          + (recent.length > 0
+            ? '<tr class="integrity-hint" style="display:table-row"><td colspan="8" style="font-size:11px;padding:6px 10px;border:none">'
+              + 'Gelb: SUCCESS ohne RTB/PBS-Delta. <strong>Pool 0</strong> = kein neuer pCloud-Upload; <strong>PBS \u2014</strong> = keine neuen pbs2-Chunks im RTB.</td></tr>'
+            : '')
+          + backupRows
           + '</tbody></table></div></div>';
       }
 

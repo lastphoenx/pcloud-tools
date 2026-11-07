@@ -231,9 +231,22 @@ check_db() {
 # =====================================================
 # Query: Recent Backups (last 10)
 # =====================================================
+_backup_runs_has_rtb_metrics() {
+  local n
+  n=$(db_query "
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema='${PCLOUD_DB_NAME}' AND table_name='backup_runs'
+      AND column_name='rtb_bytes_transferred';
+  " 2>/dev/null || echo "0")
+  [[ "${n:-0}" == "1" ]]
+}
+
 get_recent_backups() {
   local result
-  result=$(db_query "
+  local has_rtb=0
+  if _backup_runs_has_rtb_metrics; then
+    has_rtb=1
+    result=$(db_query "
     SELECT
       snapshot_name,
       status,
@@ -251,6 +264,24 @@ get_recent_backups() {
     ORDER BY started_at DESC
     LIMIT 15;
   " 2>/dev/null || echo "")
+  else
+    log "WARN: migrate_rtb_run_metrics.sql fehlt — recent_backups ohne gb_rtb/gb_pbs"
+    result=$(db_query "
+    SELECT
+      snapshot_name,
+      status,
+      $(mdb_ts_sql started_at) AS started_at,
+      $(mdb_ts_sql finished_at) AS finished_at,
+      COALESCE(duration_sec, 0) AS duration_sec,
+      COALESCE(files_uploaded, 0) AS files_uploaded,
+      COALESCE(ROUND(bytes_uploaded / 1024 / 1024 / 1024, 2), 0) AS gb_uploaded,
+      COALESCE(gap_backfill_mode, 0) AS gap_backfill_mode,
+      COALESCE(error_message, '') AS error_message
+    FROM backup_runs
+    ORDER BY started_at DESC
+    LIMIT 15;
+  " 2>/dev/null || echo "")
+  fi
 
   if [[ -z "$result" ]]; then
     echo "[]"
@@ -260,6 +291,7 @@ get_recent_backups() {
   local json="["
   local first=1
 
+  if [[ "$has_rtb" -eq 1 ]]; then
   while IFS=$'\t' read -r snapshot_name status started_at finished_at duration_sec files_uploaded gb_uploaded gb_rtb gb_pbs rtb_units_changed gap_backfill_mode error_message; do
     [[ "$first" -eq 0 ]] && json="${json},"
     first=0
@@ -282,6 +314,30 @@ get_recent_backups() {
     json="${json}\"error\":\"${err_escaped}\""
     json="${json}}"
   done <<< "$result"
+  else
+  while IFS=$'\t' read -r snapshot_name status started_at finished_at duration_sec files_uploaded gb_uploaded gap_backfill_mode error_message; do
+    [[ "$first" -eq 0 ]] && json="${json},"
+    first=0
+    local err_escaped
+    err_escaped=$(escape_json "$error_message")
+    local finished_json="null"
+    [[ "$finished_at" != "NULL" && -n "$finished_at" ]] && finished_json="\"${finished_at}\""
+    json="${json}{"
+    json="${json}\"snapshot\":\"${snapshot_name}\","
+    json="${json}\"status\":\"${status}\","
+    json="${json}\"started_at\":\"${started_at}\","
+    json="${json}\"finished_at\":${finished_json},"
+    json="${json}\"duration_sec\":${duration_sec},"
+    json="${json}\"files_uploaded\":${files_uploaded},"
+    json="${json}\"gb_uploaded\":${gb_uploaded},"
+    json="${json}\"gb_rtb\":0,"
+    json="${json}\"gb_pbs\":0,"
+    json="${json}\"rtb_units_changed\":0,"
+    json="${json}\"gap_backfill\":$([ "$gap_backfill_mode" = "1" ] && echo "true" || echo "false"),"
+    json="${json}\"error\":\"${err_escaped}\""
+    json="${json}}"
+  done <<< "$result"
+  fi
 
   json="${json}]"
   echo "$json"
