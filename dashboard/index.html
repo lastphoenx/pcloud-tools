@@ -2289,11 +2289,31 @@
       return '';
     }
 
+    function rtbHasRealTrigger(rtb) {
+      if (!rtb || rtb.dry_run_result !== 'changes_detected') return false;
+      const d = rtb.dry_run_delta;
+      return !!(d && d.count > 0);
+    }
+
     // Returns {text, cls} for the dry-run pre-check result, or null
     function rtbDryRunObj(rtb) {
       const r  = rtb.dry_run_result;
       const ts = rtb.dry_run_ts ? '  (' + fmtTs(rtb.dry_run_ts) + ')' : '';
       const n  = (rtb.dry_run_delta && rtb.dry_run_delta.count) ? rtb.dry_run_delta.count : null;
+      if (r === 'changes_detected' && !rtbHasRealTrigger(rtb)) {
+        const pip = rtb.dry_run_pipeline_only;
+        if (pip && pip.count) {
+          return {
+            text: '\u2713 Kein Nutzer-Trigger \u2014 nur Pipeline (' + pip.count + ' Pfad'
+              + (pip.count === 1 ? '' : 'e') + ', triggert nicht)' + ts,
+            cls: 'green',
+          };
+        }
+        return {
+          text: '\u2713 Kein Backup n\u00f6tig \u2014 Scope ohne echten Trigger' + ts,
+          cls: 'green',
+        };
+      }
       if (r === 'changes_detected') {
         const cnt = n ? ' (' + n + ')' : '';
         return { text: '\u26a1 \xc4nderungen erkannt' + cnt + ' \u2014 Backup steht bevor' + ts, cls: 'yellow' };
@@ -2336,6 +2356,19 @@
     }
 
     function rtbBackupScopeHTML(rtb) {
+      if (!rtbHasRealTrigger(rtb)) {
+        const sc = rtb.dry_run_backup_scope;
+        if (sc && sc.count && !(rtb.dry_run_pipeline_only && rtb.dry_run_pipeline_only.count)) {
+          return rtbDeltaDetailsBlock(
+            sc,
+            'Abweichung vs. letzter Snapshot (triggert nicht)',
+            'rtb-policy-details scope',
+            true,
+            'no_changes'
+          );
+        }
+        return '';
+      }
       if (rtb.dry_run_pipeline_only && rtb.dry_run_pipeline_only.count
           && rtb.dry_run_result !== 'changes_detected') {
         return '';
@@ -2346,7 +2379,7 @@
     function rtbPipelineOnlyHTML(rtb) {
       const d = rtb.dry_run_pipeline_only;
       if (!d || !d.count) return '';
-      if (rtb.dry_run_result === 'changes_detected') return '';
+      if (rtb.dry_run_result === 'changes_detected' && rtbHasRealTrigger(rtb)) return '';
       return rtbDeltaDetailsBlock(
         d,
         'Pipeline (triggert nicht)',
