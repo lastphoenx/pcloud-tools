@@ -65,6 +65,8 @@ PBS_REPLICA_CRIT_HOURS="${PBS_REPLICA_CRIT_HOURS:-72}"
 QUOTA_WARNING_GB="${QUOTA_WARNING_GB:-500}"    # 5% of 10TB
 QUOTA_CRITICAL_GB="${QUOTA_CRITICAL_GB:-200}"  # 2% of 10TB
 DISK_WARNING_PERCENT="${DISK_WARNING_PERCENT:-10}"
+ROOT_INODE_WARN_PERCENT="${ROOT_INODE_WARN_PERCENT:-90}"
+ROOT_INODE_CRITICAL_FREE="${ROOT_INODE_CRITICAL_FREE:-500}"
 
 # Mode
 MODE="${1:-normal}"
@@ -471,6 +473,24 @@ check_disk_space() {
   [[ $VERBOSE -eq 1 ]] && echo -e "\n${GREEN}[3] Disk Space${NC}"
   
   local overall_status=0
+
+  # --- OS root (/) inodes — RTB logs, samba, apt; unrelated to /mnt/backup free space ---
+  local root_iuse_pct=0 root_ifree=0
+  if root_inode_line="$(df -i / 2>/dev/null | tail -n 1)"; then
+    root_iuse_pct=$(echo "$root_inode_line" | awk '{print $5}' | tr -d '%')
+    root_ifree=$(echo "$root_inode_line" | awk '{print $4}')
+    [[ $VERBOSE -eq 1 ]] && echo "  OS root (/): inodes ${root_iuse_pct}% used, ${root_ifree} free"
+    if [[ "$root_iuse_pct" =~ ^[0-9]+$ ]]; then
+      if (( root_iuse_pct >= 100 )) || [[ "$root_ifree" =~ ^[0-9]+$ && root_ifree -lt ROOT_INODE_CRITICAL_FREE ]]; then
+        log_issue "CRITICAL" "Root (/) inode exhaustion: ${root_iuse_pct}% used, ${root_ifree} free (RTB/Samba logs often on /)"
+        set_status 2
+        overall_status=2
+      elif (( root_iuse_pct >= ROOT_INODE_WARN_PERCENT )); then
+        log_issue "WARNING" "Root (/) inodes high: ${root_iuse_pct}% used, ${root_ifree} free"
+        [[ $overall_status -lt 1 ]] && set_status 1 && overall_status=1
+      fi
+    fi
+  fi
   
   # --- RTB Source ---
   if [[ -d "/mnt/backup" ]]; then
@@ -553,6 +573,8 @@ check_disk_space() {
   CHECK_RESULTS[staging_avail]="${staging_avail:-unknown}"
   CHECK_RESULTS[disk_status]=$overall_status
   CHECK_RESULTS[disk_message]="$([[ $overall_status -eq 0 ]] && echo 'Healthy' || echo 'Check issues')"
+  CHECK_RESULTS[root_inode_iuse_pct]="${root_iuse_pct:-0}"
+  CHECK_RESULTS[root_inode_ifree]="${root_ifree:-0}"
 }
 
 # =====================================================
